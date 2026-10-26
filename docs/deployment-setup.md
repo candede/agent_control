@@ -87,6 +87,286 @@ browser startup. Configured bearer requests require actual supported token/
 identity proof, not a qualification artifact. This guide claims no live OBO,
 provider or MCP deployment result.
 
+The [current local qualification procedure](operations.md#current-release-qualification-for-deployment-testing)
+rebuilds manifest-matching images and distinguishes real local SQL/container/
+Azurite proof from unavailable Entra/provider/App Service proof. Follow the
+ordinary configured `deploy-local.ps1 start/check/stop` lifecycle below only for
+an explicitly authorized testing target. No qualification receipt enables reads
+or controls at runtime, and these instructions do not authorize phase12 or an
+existing production project.
+
+## Local FastMCP foundation (phase 05)
+
+Use the [current client-specific onboarding and workflow recipes](mcp-clients.md)
+for exact downstream callbacks, discovery/resource/PKCE, DCR, supported client
+editions, refresh, confirmation and proof limitations. The upstream Entra callback
+below is different from the client's OAuth return URI.
+
+The installable `mcp/` package now implements tenant-specific OAuth,
+authenticated Streamable HTTP, encrypted OAuth state and a typed canonical API
+adapter. Phases06–07 register124 typed saved-read, explicit collection,
+investigation and exact shared/package/Studio control tools automatically.
+See the [implemented catalog](mcp-integration.md#implemented-typed-business-catalog-phase-06)
+for exact paging, output and delegated-only contracts, and
+[exact controls](mcp-integration.md#implemented-exact-controls-phase-07) for
+Admin/provider permissions, client confirmation, receipt expiry and non-replay.
+The web app remains independent.
+This section is source/setup guidance, not permission to register applications,
+grant consent, deploy, reset storage or test customer accounts.
+
+Use Python **3.14** and uv **0.12.17**. Install only through the approved feed;
+there is no public-index fallback or automatic Python download:
+
+```sh
+cd mcp
+UV_PYTHON_DOWNLOADS=never uv sync --frozen \
+  --index-url https://packagefeedproxy.microsoft.io/pypi/simple
+uv run --frozen --no-sync pytest
+uv run --frozen --no-sync ruff check src tests
+uv run --frozen --no-sync mypy src
+```
+
+The manifest pins direct dependencies and the build backend; `uv.lock` records
+transitive versions, approved-feed source URLs and artifact hashes. If uv is
+missing, its installation must also use
+`python -m pip install --index-url https://packagefeedproxy.microsoft.io/pypi/simple uv==0.12.17`.
+Do not change the index or install unrelated tooling to work around a feed error.
+
+Supply these settings directly through the operator's environment/secret
+manager (the service does not load `.env` files):
+
+| Setting | Required value |
+| --- | --- |
+| `MCP_TENANT_ID` | Exact configured Entra tenant GUID, never `common`/`organizations` |
+| `MCP_CLIENT_ID` | Separate confidential MCP client/resource GUID |
+| `MCP_API_CLIENT_ID` | Existing API client GUID; must differ from MCP |
+| `MCP_API_ORIGIN` | One canonical HTTPS API origin, without path/query; exact loopback or single-label private HTTP service names support later internal Compose transport |
+| `MCP_PUBLIC_URL` | Exact canonical HTTPS resource, for example `https://mcp.example.test/mcp`, without query/trailing slash |
+| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | JSON array of 1–32 exact approved callbacks; HTTPS or exact HTTP loopback, never wildcards or permissive defaults |
+| `MCP_CLIENT_SECRET_FILE` | Owned regular0600 UTF-8 file containing only the MCP confidential credential |
+| `MCP_JWT_SIGNING_KEY_FILE` | Separate owned regular0600 file containing a canonical URL-safe base64 encoding of32 random bytes |
+| `MCP_OAUTH_ENCRYPTION_KEY_FILE` | Separate owned regular0600 file containing a JSON array of1–3 independent Fernet keys, newest first |
+| `MCP_OAUTH_STORAGE_PATH` | Absolute dedicated owned0700 persistent OAuth directory, e.g. `/var/lib/agent-control-mcp/oauth`, not the application data volume |
+
+This table's secret files describe local/direct/Compose execution. The
+[optional Azure profile](azure-production-deployment.md#optional-independent-mcp-app-service)
+uses explicit `MCP_SECRET_SOURCE=app-service-key-vault`, three resolved native
+Key Vault values and one prepared encrypted Blob object with an exact UAMI,
+HTTPS/private endpoint and server-enforced data-blob lease instead. It never
+automatically falls back between profiles. Missing object/lease, wrong binding,
+unknown storage outcomes or unresolved references fail closed; local protected
+file guards and maintained encryption are unchanged. See the Azure contract for
+exact Blob settings, quotas, finite network/lease bounds and recovery.
+
+Canonical URL spelling is enforced before readiness, including reserved endpoint
+paths and default-port/host normalization. Secret files must be distinct and
+signing/encryption/confidential material independent. No key or credential is
+generated or derived automatically. No API/provider/SQL credentials enter MCP.
+
+The MCP Entra resource exposes `api://<mcpClientId>/Mcp.Access`, requests v2
+access tokens, and uses the exact **origin-root** redirect
+`https://mcp.example.test/auth/callback`. The resource path `/mcp` is not appended
+to this callback. Discovery, `/authorize`, `/token`, `/register`, `/consent`
+and `/revoke` are on that origin root. Keep the API/browser callback separate.
+Request only the MCP resource scope plus `openid profile offline_access`.
+Administrator-managed API `AgentControl.Access` consent remains separate; no
+Graph scope is mixed into MCP login. Both downstream authorize and token
+requests must include the exact MCP resource; authorize requires S256 PKCE.
+Consent uses the SDK's interactive, CSRF-bound OAuth flow. It is never a
+release-acceptance file or runtime feature-enable ceremony.
+
+With approved configuration in place, start the source service using
+`uv run --frozen --no-sync agent-control-mcp`. It binds port8000; the configured
+external HTTPS host/resource remain exact. Reverse proxy/TLS, container image,
+mount lifecycle and deployment integration belong to08/10, not this source-only
+phase. `/health` and `/ready` return bounded non-secret status. `/diagnostics`
+requires bearer authorization on every call; protocol session IDs alone never
+authorize a request.
+
+Tests execute the actual pinned SDK against synthetic Entra/JWKS/API transports,
+including full discovery/consent/code/PKCE/refresh flow and real request-local
+metadata. The full Python suite also uses the checkout's existing Node/TypeScript
+development dependencies to inspect backend DTOs without importing their runtime;
+the Python service itself has no Node dependency. Tests open no provider/SQL
+connection or listener and do not establish
+live native/guest consent, client-host compatibility or deployment readiness.
+The phase06 local check passed **339 Python cases**, strict source mypy and Ruff,
+**176 existing API cases in seven suites**, and **473 browser cases in five
+suites**. Backend/frontend typechecks and Knip also passed. Exact commands, source/lock
+identities and unavailable live/SQL checks are in the
+[phase completion record](../plans/fastmcp-integration/completions/06-mcp-read-tools.md).
+Phase07's final local aggregate passed **501 Python cases**, **697 API cases
+in13 suites** and **536 frontend cases in6 suites**, with strict Python checks,
+both Node typechecks, Knip and offline lock validation. The
+[control completion record](../plans/fastmcp-integration/completions/07-mcp-agent-controls.md)
+separates those source/synthetic results from unavailable SQL-backed durability
+and unauthorized live/provider/deployment checks.
+The [security lifecycle](security-model.md#fastmcp-oauth-state-and-recovery)
+defines restart, retention, revocation, rotation and reconnect.
+
+## Optional local MCP container
+
+MCP is absent from `compose.yaml`. Ordinary projects build/start only API/web
+and PostgreSQL. The existing `deploy-local.ps1` owner includes
+`compose.mcp.yaml` **only** when the project's optional `mcp` settings are
+explicitly configured. There is no runtime enable/acceptance switch.
+Malformed supplied configuration fails; no tenant is selected implicitly.
+Do not apply these commands to an existing production project without its
+separate exact-target authorization.
+
+### Guided setup (recommended)
+
+Use the same deployment wizard as the API, with an explicit MCP setup request:
+
+```powershell
+# Configure an existing API project without starting containers:
+./deploy-local.ps1 edit-config -Project YOUR_PROJECT -ConfigureMcp
+# Or complete API setup (if needed), configure MCP and start:
+./deploy-local.ps1 start -Project YOUR_PROJECT -ConfigureMcp
+```
+
+The wizard lets you choose an existing API tenant profile, enter the **separate
+MCP Entra application ID**, exact public HTTPS resource, allowed client callback
+URLs and loopback port. It reads the MCP Entra **secret value** using hidden
+input; obtain that credential from the MCP registration, not the API's secret
+file. On first setup it generates independent cryptographically random signing
+and encryption keys and saves all three protected files itself. No manual key
+files or Python key-generation command are needed.
+
+It also saves the matching `integration` binding in both the protected API tenant
+registry and its non-secret metadata, preserving other profiles and refusing
+to overwrite a different integration. It does **not** create Entra registrations,
+permissions/consent, a public HTTPS endpoint or a reverse proxy. Complete the
+Entra prerequisites above; register the MCP origin's `/auth/callback` as its Web
+reply URL. Client callback URLs are different; see [client examples](mcp-clients.md).
+
+If setup adds an API integration binding, it changes the API's trusted application
+policy: `edit-config` drains the existing API, and the next `start` applies the
+binding and clears old sessions. Use `start -ConfigureMcp` to combine setup,
+build/preflight and application. Later MCP-only callback or credential edits do
+not drain the API during configuration; apply them with the next normal `start`.
+
+Running normally without MCP settings still does not ask for MCP credentials,
+generate MCP keys or create an MCP container. `-ConfigureMcp` is only a setup
+operation, not a runtime feature flag. Existing configured MCP starts normally
+without it. It is accepted only by `start` and `edit-config`, not pinned releases.
+
+### Settings file alternative
+
+Copy [the local server settings example](../mcp/examples/local-settings.example.json)
+to an operator-private location and replace the synthetic IDs and URL.
+`tenantId` and `apiClientId` must select an existing API tenant profile.
+`clientId` is the **MCP server's Entra registration**, not a downstream consumer
+ID: it must remain a real GUID, never `*`.
+
+Any compatible downstream MCP client may dynamically register; no vendor/client-ID
+allowlist is required. This is the requested "any client" behavior, not anonymous
+access: tenant, audience, delegated-user permissions, roles, PKCE and callback
+validation still apply. Add the exact callbacks for the clients you intend to
+use; accepting any client ID does not authorize arbitrary redirect URLs. An
+explicit root callback such as `http://127.0.0.1:53110/` is valid; its host,
+port and path still match exactly, without wildcard ports.
+
+```powershell
+# Import metadata and provide the MCP credential securely on first setup:
+./deploy-local.ps1 start -Project YOUR_PROJECT -McpConfig /absolute/private/mcp.json
+# Or use the file as defaults for the interactive MCP-only editor:
+./deploy-local.ps1 edit-config -Project YOUR_PROJECT -ConfigureMcp -McpConfig /absolute/private/mcp.json
+./deploy-local.ps1 start -Project YOUR_PROJECT
+./deploy-local.ps1 check -Project YOUR_PROJECT
+./deploy-local.ps1 stop -Project YOUR_PROJECT
+```
+
+### Why three protected files?
+
+The API wizard also persists credentials behind the scenes. The MCP wizard now
+does the same, but OAuth adds two independent internal keys:
+
+| Import field | Purpose | Wizard behavior |
+| --- | --- | --- |
+| `clientSecretFile` | MCP's confidential Entra credential for its OAuth/OBO exchanges; not the API application's credential | Hidden input, or Enter to keep the saved credential |
+| `signingKeyFile` | Signs the MCP OAuth reference tokens issued to downstream clients | Generated once at genuine first setup; retained thereafter |
+| `encryptionKeyFile` | Encrypts persisted OAuth credentials/state, including refresh credentials | Generated once at genuine first setup; retained thereafter |
+
+The wizard saves them as `.local/<project>/secrets/mcp-client`, `mcp-signing`
+and `mcp-encryption`, with protected directories and0600 files. Never put their
+contents into metadata JSON, environment variables, client examples or chat.
+On reconfiguration, Enter keeps existing values; missing/corrupt signing or
+encryption keys are **not regenerated**. Restore the original state. Existing
+OAuth volume/operation receipts also prohibit first-setup key generation even
+if metadata was lost. A missing/expired Entra credential can be resupplied with
+`-ConfigureMcp` while retaining the original keys and connections.
+
+For noninteractive imports or deliberate key rotation, the metadata file can
+add the three optional absolute paths `clientSecretFile`, `signingKeyFile` and
+`encryptionKeyFile`. These reference existing regular non-linked protected0600
+UTF-8 files of1–8192 bytes, not secret values. Signing material is32 independent
+random bytes in canonical URL-safe base64. Encryption is a JSON array of1–3
+independent Fernet keys, newest first; retain old keys while their records exist.
+All three values must be independent and must not reuse API/session credentials.
+Omitted paths retain saved files; keys are generated only for explicit first
+setup without existing MCP configuration, operation records or OAuth volume.
+
+Omitted optional MCP configuration keeps MCP absent; omitting `-McpConfig` does
+not disable previously saved MCP settings.
+`null`, partial and unknown fields are not an instruction to disable it.
+To retire an installed MCP service, stop the exact project first, preserve its
+protected backup, explicitly remove only its MCP container/settings/state, and
+restart API/web through the same owner. Never use orphan removal or prune.
+
+The current image uses Python3.14.6 with an immutable base digest, uv0.12.17
+and `mcp/uv.lock` (`uv sync --frozen --no-dev --no-editable` on the approved
+Python feed). The non-root production stage contains only the installed
+package/dependencies, not tests, source checkout, uv or secret files.
+`mcp/Dockerfile` also provides non-root `test` and synthetic-only `fixture`
+targets. Test-only OAuth/provider transports never enter production.
+All npm builds retain the approved npm feed; Python has no public/extra index
+or automatic interpreter-download fallback.
+
+The operator UID/GID is also the container UID/GID, never0; the image's direct
+default is10001:10001. The three secret files are mounted read-only, separately.
+MCP has no tenant registry, PostgreSQL, session or API credential mount.
+`<project>_mcp-oauth` is a dedicated named persistent volume with owned0700
+directories and0600 files, distinct from `<project>_data`. The existing owner
+labels it for that exact project/purpose and records its immutable creation
+identity in `mcp-storage.json`; missing/replaced recorded volumes require restore,
+not silent recreation. A one-shot network-free helper, with no secrets mounted,
+has only CHOWN/FOWNER to set an **empty root-owned** volume to the operator's
+non-root UID/GID and0700. Nonempty foreign-owned state is refused. The service
+itself always runs non-root with no capabilities.
+The existing strict `os.getuid()`/file-mode checks run inside the actual image
+before API drain. Docker Desktop/Windows file mapping must satisfy these same
+checks; startup refuses an incompatible mapping rather than relaxing security.
+Docker Desktop's exact `/host_mnt/Users/...` inspection spelling is recognized
+only against the same expected host path and verified local Desktop socket;
+foreign paths, remote daemons and environment-overridden Docker targets fail.
+
+The internal API origin is fixed at `http://app:3001`; it is never the public
+MCP identity or a browser callback. MCP publishes only
+`127.0.0.1:<port>:8000`. Its separate **HTTPS** identity above requires an
+already authorized reverse proxy preserving the exact Host and Origin.
+The Entra reply URL is `https://mcp.example.test/auth/callback`, at the origin
+root; client redirect URIs are separately exact-allowlisted. Uvicorn ignores
+forwarded headers, trusts no proxy-supplied identity and keeps Host/Origin/CSRF
+checks enabled. The deployment owner creates no ingress, tunnel, DNS or consent.
+
+MCP is bounded at0.5 CPU,512MiB memory,128 PIDs,32 HTTP connections,64 queued
+connections and two5MiB log files. Encrypted state retains the package's4096-file/
+64MiB/24-hour bounds. Readiness performs an encrypted write/read/delete, not
+an API/provider call. Local health is **not** live OAuth or tool-journey proof.
+SIGTERM allows65 seconds for in-flight work (individual invocation limit60s);
+Compose allows75 seconds. API/web has no MCP dependency and remains usable
+when MCP is stopped. These configured ceilings are not a measured capacity claim.
+
+Normal start builds the exact source snapshot, preflights current/empty SQL,
+then starts API/web and configured MCP. It never migrates/reset SQL for MCP.
+Immutable MCP image identities and keyed secret/configuration identities are
+recorded in `mcp-deployment.json`/`mcp-operation.json`. A failed MCP start can be
+retried with ordinary `start`; the API stays available, and the receipt is marked
+verified only after exact-image readiness. Atomic secret replacement forces only
+MCP recreation even when image bytes are unchanged. Pinned release candidates
+must include a source-bound `images.mcp` identity when MCP is configured.
+
 ## Prerequisites
 
 - PowerShell 7

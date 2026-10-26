@@ -756,7 +756,7 @@
   .copilot-users-header {
     display: grid;
     grid-template-columns: auto minmax(0, 1fr);
-    grid-template-rows: minmax(42px, auto) minmax(50px, auto);
+    grid-template-rows: minmax(48px, auto) minmax(50px, auto);
     gap: 12px;
   }
 

@@ -2,8 +2,9 @@
 
 The API owns provider collection, durable jobs, saved selections, report
 calculations, exports and administrative audit. The browser reads these API
-contracts; the future MCP service must use the same contracts rather than
-querying PostgreSQL or Microsoft providers itself.
+contracts; the implemented FastMCP service uses those same typed canonical
+routes rather than querying PostgreSQL or Microsoft providers itself. The API
+remains the business authority for both transports.
 
 ## Current schema
 

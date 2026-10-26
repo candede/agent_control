@@ -78,6 +78,18 @@ Add `-Project <name>` to keep separate installations.
 
 ## Documentation
 
+The optional [FastMCP foundation](docs/deployment-setup.md#local-fastmcp-foundation-phase-05)
+is implemented as a separately runnable Python package with OAuth, encrypted
+connection state and a canonical API adapter. Its [124 typed tools](docs/mcp-integration.md#implemented-typed-business-catalog-phase-06)
+cover saved inventory/people/reports/investigations plus explicit delegated
+collection, exact shared/package/Studio controls and bounded job recovery.
+Controls retain current API authority/receipts and client confirmation; uncertain
+writes are never replayed automatically. Optional local container/lifecycle
+support and [optional Azure source deployment tooling](docs/azure-production-deployment.md#optional-independent-mcp-app-service)
+are implemented. Actual Azure persistence/transport proof and release convergence
+remain external/roadmap work.
+The web app needs none of it.
+
 | Guide | Covers |
 | --- | --- |
 | [Setup](docs/deployment-setup.md) | Entra ID, permissions, local setup, and multiple tenants |
@@ -87,4 +99,5 @@ Add `-Project <name>` to keep separate installations.
 | [Saved data](docs/data-architecture.md) | Current schema, source publication, selections, and lifecycle |
 | [Provider contracts](docs/provider-contracts.md) | Supported Microsoft contracts, permissions, limits, and evidence |
 | [Security](docs/security-model.md) | Authentication, authorization, and data isolation |
+| [MCP clients](docs/mcp-clients.md) | Versioned client onboarding, ordinary workflows, exact callbacks and synthetic proof limits |
 | [Azure deployment](docs/azure-production-deployment.md) | Production requirements and deployment |

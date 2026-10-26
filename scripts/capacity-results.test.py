@@ -248,7 +248,7 @@ class CapacityContracts(unittest.TestCase):
         comparison, raw = [], []
         for count, peak in ((10000,20*results.MIB),(100000,30*results.MIB)):
             windows = []
-            for index in range(3):
+            for index in range(count // 100):
                 windows.append({"index": index,"startedAt": 123,"finishedAt": 456,
                                 "sampledHeapUsedMax": 10*results.MIB,"stageCheckpointHeapUsedMax": 12*results.MIB,
                                 "stages": ["sql.result","response.serialize"]})
@@ -267,6 +267,14 @@ class CapacityContracts(unittest.TestCase):
             "query-memory.jsonl": "\n".join(map(json.dumps,memory)),"probe-result.json": '{"status":"passed"}'}),"query")
         self.assertEqual(result["requestWorkingSetDelta"],10*results.MIB)
         self.assertEqual(result["gates"]["requestWorkingSet64MiB"],"passed")
+        partial = json.loads(json.dumps(comparison))
+        for cohort in partial:
+            cohort["requestWindows"] = cohort["requestWindows"][:3]
+        observed = results.summarize(Directory({"query-stdout.log": "\n".join(raw),
+            "query-result.json": json.dumps({"comparison": partial}),
+            "query-memory.jsonl": "\n".join(map(json.dumps, memory)),
+            "probe-result.json": '{"status":"passed"}'}), "query")
+        self.assertEqual(observed["gates"]["requestWorkingSet64MiB"], "inconclusive")
         for field, value in (("sampledHeapUsedMax", None), ("stageCheckpointHeapUsedMax", float("nan")),
                              ("finishedAt", -1), ("index", 2)):
             with self.subTest(field=field):

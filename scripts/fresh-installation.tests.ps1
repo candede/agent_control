@@ -112,6 +112,14 @@ Assert-Refused { Assert-FreshInstallationContainer $context (New-Container 'app'
 $context.VerifiedApp = New-Container 'app'
 Assert-FreshInstallationContainer $context (New-Container 'app')
 $script:checks++
+$verifiedApp = $context.VerifiedApp
+$context.SourceHash = 'e'*64
+Assert-FreshInstallationContainer $context $verifiedApp
+$script:checks++
+$changedApp = New-Container 'app'
+$changedApp.Id = 'f'*64
+Assert-Refused { Assert-FreshInstallationContainer $context $changedApp }
+$context.SourceHash = 'a'*64
 foreach ($mutation in @(
     {param($c) $c.Id=('c'*64)},
     {param($c) $c.Image=('sha256:'+'d'*64)},
@@ -154,7 +162,7 @@ Assert-True ($installation.Contains('CurrentSchemaOnly') -and
     $installation.Contains('$operational.mode -cne ''normal''')) 'Current-only fixture must resume normal operation and verify non-destructive start after reset.'
 Assert-True ([regex]::Matches($installation,[regex]::Escape('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset')).Count -eq 1) 'Fresh verification must request one reset, then use ordinary start to verify no replay.'
 Assert-True ($source.Contains("Invoke-FreshFirstSync `$context `$Directory 'collected'") -and
-    -not $source.Contains("Invoke-FreshFirstSync `$context `$Directory 'recollected'")) 'Current-only verification must not run live Microsoft requests.'
+    $source.Contains("Invoke-FreshFirstSync `$context `$Directory 'recollected'")) 'Current-only verification must exercise synthetic compiled collection before and after reset.'
 $compiledFixture = [IO.File]::ReadAllText((Join-Path $root 'backend/scripts/restart-runtime.mjs'))
 Assert-True ($compiledFixture.Contains('await loadOperationalState(pool)') -and
     $compiledFixture.Contains('return () => assertAccountSessionValidation(validation)') -and
@@ -162,7 +170,12 @@ Assert-True ($compiledFixture.Contains('await loadOperationalState(pool)') -and
 $persistence = $source.IndexOf('Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter')
 $collection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'collected'")
 $reset = $source.IndexOf('Invoke-LocalDeployment -Context $context -Action Deploy -DbReset')
-Assert-True ($persistence -ge 0 -and $persistence -lt $collection -and $collection -lt $reset -and $source.Contains("firstSyncAfterReset='not_run'")) 'Persistence/optional collection must precede reset; recollection remains closed after reset.'
+$recollection = $source.IndexOf("Invoke-FreshFirstSync `$context `$Directory 'recollected'")
+Assert-True ($persistence -ge 0 -and $persistence -lt $collection -and $collection -lt $reset -and
+    $reset -lt $recollection -and $source.Contains("firstSyncAfterReset='passed'")) 'Persistence and synthetic collection must precede reset; recollection must follow the verified non-destructive start.'
+Assert-True ($compiledFixture.Contains('new GraphPackagesClient(async input =>') -and
+    $compiledFixture.Contains('return Response.json({ value: records') -and
+    $compiledFixture.Contains('assert.equal(url.origin, "https://graph.microsoft.com")')) 'First-sync proof must replace only the exact provider transport with synthetic records, never call Microsoft.'
 Assert-True ($source.Contains('$peak -gt $container.HostConfig.Memory') -and
     $source.Contains('(max|oom|oom_kill) [1-9]')) 'Compiled runtime resource pressure must not be accepted as headroom.'
 Assert-True ($source.Contains('$limit -ne $container.HostConfig.Memory') -and

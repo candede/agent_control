@@ -1,8 +1,10 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup')]
+    [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup', 'Stop')]
     [string]$Action = 'Plan',
+    [ValidateSet('All', 'Application', 'Mcp')]
+    [string]$Component = 'All',
     [ValidateSet('Real', 'Mock')]
     [string]$ExecutionMode = 'Real',
     [string]$TargetFile,
@@ -209,10 +211,12 @@ try {
     $context = New-AzureDeploymentContext -Root $PSScriptRoot -Target $target -ExecutionMode $ExecutionMode `
         -MockFixturePath $MockFixturePath -ArtifactPath $ArtifactPath -ReceiptPath $ReceiptPath `
         -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action -AuthenticationSmokeReceiptPath $AuthenticationSmokeReceiptPath `
-        -QualificationTargets $(if ($QualificationTargetsFile) { Get-Content -LiteralPath ([IO.Path]::GetFullPath($QualificationTargetsFile)) -Raw | ConvertFrom-Json -Depth 20 } else { $null })
+        -QualificationTargets $(if ($QualificationTargetsFile) { Get-Content -LiteralPath ([IO.Path]::GetFullPath($QualificationTargetsFile)) -Raw | ConvertFrom-Json -Depth 20 } else { $null }) `
+        -Component $Component
     $receipt = Invoke-AzureDeployment -Context $context -Action $Action -RestorePoint $RestorePoint
     Write-Host "Azure deployment workflow status: $($receipt.status)"
     Write-Host "Redacted receipt: $ReceiptPath"
+    if ($receipt.status -like '*mcp_failed') { exit 1 }
 } catch {
     Write-Error "Azure deployment workflow failed closed: $($_.Exception.Message)"
     exit 1

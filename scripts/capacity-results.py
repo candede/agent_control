@@ -458,9 +458,11 @@ def summarize(directory, mode):
                                                     window["gcPreHeapUsedMax"] or 0)
         window_peaks[window["count"]] = max(window_peaks.get(window["count"],0),window["peakSensitiveHeapObservedMax"])
     delta = window_peaks[100000]-window_peaks[10000] if all(count in window_peaks for count in (10000,100000)) else None
-    gates["requestWorkingSet64MiB"] = ("inconclusive" if delta is None or len(windows)!=6
+    expected_windows = {count: set(range(count // 100)) for count in (10000, 100000)}
+    gates["requestWorkingSet64MiB"] = ("inconclusive" if delta is None or len(windows)!=sum(map(len, expected_windows.values()))
         or not all(window["closed"] and window["numericCoverage"] for window in windows)
-        or any({window["index"] for window in windows if window["count"] == count} != {0, 1, 2} for count in (10000, 100000))
+        or any({window["index"] for window in windows if window["count"] == count} != indices
+               for count, indices in expected_windows.items())
         or not identity or any(window.get("pid")!=identity["pid"] for window in windows)
         or any(not {"sql.result","response.serialize"}.issubset(window.get("stages",[])) for window in windows)
         or incomplete or not coverage["probePassed"] or not coverage["memorySamplesCovered"] or not coverage["workloadIdentityCovered"]

@@ -316,6 +316,61 @@ versioned secrets: runtime receives `TENANTS_JSON`, `SESSION_SECRET` and
 - Keep `.local/<project>/settings.json`, `.local/<project>/secrets/` and its
   PostgreSQL volume together when protecting configuration.
 
+### Optional MCP recovery and backup
+
+For the separate Azure profile, use the [Azure contract](azure-production-deployment.md#optional-independent-mcp-app-service)
+and [independent leased-Blob recovery](../infra/disaster-recovery.md#independent-azure-mcp-recovery).
+The named-volume steps below are **local Compose only**, not Azure POSIX or
+persistence evidence. Azure native Key Vault transport does not change the
+independent key, encrypted state, no-replay or API-owned recovery boundaries.
+
+Use the [local MCP setup contract](deployment-setup.md#optional-local-mcp-container)
+and the same project's `start`, `edit-config`, `check` and `stop` owner.
+API/web does not depend on MCP; a failed MCP restart must not be treated as an
+API/database reset request. Read `mcp-operation.json` and local bounded logs,
+repair the concrete file/identity/permission failure, then run normal `start`.
+Do not discard incompatible/undecryptable state silently.
+
+Stop the exact project before taking a coherent encrypted-state backup. Protect
+the whole `<project>_mcp-oauth` named volume plus its original three independent
+`secrets/mcp-*` files, `settings.json`, `compose.env`, `mcp-storage.json` and MCP receipts. Keep
+encryption keys separately protected from the encrypted backup; do not print
+them, archive them into source/images or upload them to test reports. Restore
+only to the same exact tenant/client/API/resource binding, owned UID/GID and
+0700/0600 permissions. API PostgreSQL backup/restore remains separately owned
+by the current-schema operator; OAuth files are not an application database.
+If an explicitly authorized disaster restore recreates the named volume, its
+creation identity necessarily changes. Restore and verify the protected backup's
+complete encrypted file inventory/digests, original binding and keys first.
+Preserve the old `mcp-storage.json` under a recovery-evidence name outside its
+active filename, then ordinary `start` validates ownership/encryption and records
+the restored volume's new creation identity. This is an explicit operator
+recovery decision, never an automatic response to a missing-volume error or a
+way to start with empty replacement state. Keep the original receipt and restore
+evidence with the backup.
+
+- **Encryption rotation:** import a protected ring with the new independent
+  key first and retained old key(s), then ordinary `start`. Reconnect/expire old
+  connections and rewrite required retained records before retiring their key;
+  no automatic bulk plaintext/decrypt/reset procedure exists.
+- **Signing rotation:** replace only the signing key and `start`; old reference
+  tokens fail and clients must reconnect. Encryption keys are unchanged.
+- **Confidential credential rotation:** import only the new MCP confidential
+  credential and `start`; it is not the API application's credential.
+- **Revocation:** the exact OAuth revocation endpoint and encrypted tombstones
+  survive MCP restart. Reconnect does not revive a revoked reference.
+- **API restart:** API/provider credentials are volatile, never restored from
+  MCP state, SQL jobs or browser caches. Saved jobs remain readable within their
+  principal scope; reacquire fresh same-account authority and explicitly resume
+  eligible unsent work. Sent-unknown writes require read-only reconciliation.
+
+For exact targeted retirement, stop the project, verify container project/
+working-directory/service labels and the four MCP mount identities, remove only
+that verified MCP container, then remove the `mcp` settings and (only with explicit
+data-loss authorization) its three secret files/dedicated named OAuth volume.
+Retain `<project>_data`, all PostgreSQL/API/session secrets and backups.
+No glob removal, Compose orphan cleanup, volume prune or reset is appropriate.
+
 ## Validation
 
 Use existing focused Node/Vitest and PowerShell tests for changed contracts.
@@ -333,10 +388,81 @@ Local source-only examples:
 ```powershell
 pwsh ./scripts/local-deployment.tests.ps1
 pwsh ./scripts/local-runtime.tests.ps1
+pwsh ./scripts/local-mcp.tests.ps1
 ```
 
 These do not prove a live deployment. Do not start infrastructure merely to
 validate documentation.
+
+When separately authorized for disposable local infrastructure, the existing
+fixture runner supports `-Suite mcp-container`. It requires the exact local
+`desktop-linux` Unix socket, rejects inherited PG/APP_PG/tenant/client/session/MCP
+authority, and uses only a fresh `ac-mcp-fixture-<24 hex>` project, synthetic
+configuration, internal network and exact protected mounts. The production
+image is checked first; synthetic authenticated calls use a distinct test-only
+image. Diagnostics, image/source identities and measured memory/CPU/storage/
+shutdown evidence remain in `artifacts/large-tenant-data-platform/<guid>`.
+Only exact owned containers/network/images/state are cleaned, with no prune.
+`deployment-current` and `fresh-installation-current` separately exercise real
+current/empty schema, incompatible refusal, API authentication/recovery and
+ordinary API/web operation without any MCP service. Node fixture dependency
+manifests must match the exact baseline; a mismatch is not permission to reuse
+old installed dependencies or weaken the guard.
+
+### Current release qualification for deployment testing
+
+Use the current [phase11 evidence and handoff](../plans/fastmcp-integration/completions/11-release-qualification.md)
+for source/image identities, actual counts, known capacity failures and cleanup.
+It is not a production approval, runtime prerequisite or request to deploy.
+The existing local snapshot owner freezes tracked and eligible untracked inputs,
+but excludes generated `tsx-<numeric uid>` cache directories even when tracked.
+Git/Docker exclusions and the Azure ZIP packager/inspector enforce the same
+boundary; ordinary TypeScript/TSX sources and nonnumeric source directories remain
+eligible. Do not delete or untrack pre-existing repository caches to make a
+snapshot match. A changed source manifest requires newly source-labelled images;
+retain superseded receipts as history, never relabel old images.
+Do not use a historical default operator image: the locked Azure SDK and current
+workspace manifests must be present in the baseline. With separately authorized
+disposable infrastructure, build the current operator through the approved feed:
+
+```powershell
+$operator = "agent-control-qualification-$([Guid]::NewGuid().ToString('N')):local"
+docker build --pull=false --provenance=false --target operator `
+  -t $operator .
+$baseline = (docker image inspect --format '{{.Id}}' $operator).Trim()
+./scripts/large-tenant-tests.ps1 -Suite mcp-end-to-end `
+  -BaselineImage $operator -BaselineImageId $baseline
+./scripts/large-tenant-tests.ps1 -Suite mcp-container `
+  -BaselineImage $operator -BaselineImageId $baseline
+./scripts/large-tenant-tests.ps1 -Suite fresh-installation-current `
+  -BaselineImage $operator -BaselineImageId $baseline
+./scripts/azure-oauth-fixture.ps1 -Full
+```
+
+Do not supply Docker host/context overrides or inherited database/tenant/client/
+session authority. The owners verify the exact existing Desktop socket, unique
+synthetic target, manifests and immutable image IDs. `mcp-end-to-end` extends the
+existing SQL runner with the current MCP test image: real SDK OAuth/tool calls
+reach the actual registered canonical HTTP handlers and SQL; only Entra/provider
+transports are synthetic. It must emit `mcp_sql_sdk_journey` receipts, not merely
+pass the ordinary SQL selector. No real identity/provider call is authorized.
+The fresh-installation fixture collects and recollects through compiled current
+API code and synthetic provider records; its reset is confined to its exact
+owned disposable database. The full Python command includes real Azurite lease/
+ETag failures; an ordinary pytest run with Azure skips is not equivalent.
+
+The MCP container owner separately checks production contents and runtime
+UID/mount/security/log/cgroup limits before synthetic authenticated load,
+restart, revocation, drain and rotations. Its offline image unit checks use
+64MiB of owner-only Linux tmpfs for scratch; durable OAuth restart/rotation
+journeys still use the actual verified persistent volume. These tests do not
+qualify App Service,
+managed identity, real client callbacks, native/guest Entra OBO or provider
+writes. The query capacity fixture now traverses all100/1000 pages of its fixed
+10k/100k cohorts and validates exact ordered identities; it is not a production
+capacity pass or evidence that an unfiltered100k-row export fits a workflow
+budget. Preserve unsuccessful and inconclusive capacity gates, never raise caps
+or replace complete evidence with a favorable first page.
 
 ## Production operations
 

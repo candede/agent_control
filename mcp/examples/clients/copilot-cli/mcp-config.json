@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agentControl": {
+      "type": "http",
+      "url": "https://mcp.example.test/mcp",
+      "tools": ["*"],
+      "auth": {
+        "redirectPort": 53110
+      }
+    }
+  }
+}

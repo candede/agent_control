@@ -7,6 +7,7 @@ import { reportPage, reportSelection, reports, source } from "../test/reportData
 import { PublicationContext } from "../publicationContext";
 import { parseUsersRoute, usersRouteSearch } from "../workbenchRouting";
 import { SavedQueryProvider } from "./SavedQueryProvider";
+import { deferred } from "../test/deferred";
 import { AdoptionView } from "./AdoptionView";
 import { CopilotUsersView } from "./CopilotUsersView";
 
@@ -23,25 +24,28 @@ const group: AdoptionGroup = {
   agents: [{ id: "agent:10000000-0000-4000-8000-000000000001", name: "Policy Assistant",
     description: "Answers employee policy questions.", type: "Microsoft 365 Copilot Agent Builder" }],
 };
-function page(value: AdoptionGroup[] = [group]): AdoptionPage {
-  return { ...reportPage(value), directory: source("directory"), inventoryAvailable: true,
+function page(value: AdoptionGroup[] = [group], number = 1, total = value.length): AdoptionPage {
+  const result = reportPage(value, { counts: { total, filtered: total } });
+  return { ...result, page: { ...result.page, limit: 5, number, offset: (number - 1) * 5, anchor: value[0]?.id }, directory: source("directory"), inventoryAvailable: true,
     summary: { people: value.reduce((sum, group) => sum + group.people.length, 0),
       champs: value.reduce((sum, group) => sum + group.people.filter(person => person.champion).length, 0),
       agents: new Set(value.flatMap(group => group.agents.map(agent => agent.id))).size } };
 }
 const route = { ...parseUsersRoute(""), section: "adoption" as const };
 const change = vi.fn(), onOpenAgent = vi.fn(), onOpenPerson = vi.fn();
+const pages = () => within(screen.getByRole("navigation", { name: "groups pages" }));
 function mount() {
   return render(<SavedQueryProvider><AdoptionView route={route} change={change} revision={0}
     reportContext={<span>Selected reports</span>} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} /></SavedQueryProvider>);
 }
 beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
   vi.mocked(api.readReportPage).mockResolvedValue(page());
   vi.mocked(api.readReportFacet).mockImplementation(async (_path, _selection, field) => ({
     ...reportPage([{ value: field === "company" ? "Contoso" : "HR", count: 1 }]),
   }));
 });
-afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); });
+afterEach(() => { Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView"); vi.restoreAllMocks(); vi.resetAllMocks(); vi.useRealTimers(); });
 
 describe("Adoption", () => {
   it("shows both independent lists without collapsed sections or creator details", async () => {
@@ -128,14 +132,161 @@ describe("Adoption", () => {
     expect(screen.getByRole("button", { name: "Remove company filter" })).toHaveTextContent("Contoso");
     expect(screen.getByRole("button", { name: "Remove copilot champs filter" })).toBeVisible();
   });
-  it("pages groups using the existing selected-read cursor", async () => {
-    const first = page();
+  it("pages groups with one numbered request pinned to the existing selection", async () => {
+    const first = page(undefined, 1, 6);
     first.page.nextCursor = "group-next";
     vi.mocked(api.readReportPage).mockResolvedValue(first);
     mount(); await screen.findByText("Maya");
-    fireEvent.click(screen.getByRole("button", { name: "Next groups" }));
+    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
-      expect.objectContaining({ limit: 5, selectionId: first.selection.id, cursor: "group-next" }), expect.any(AbortSignal)));
+      expect.objectContaining({ limit: 5, selectionId: first.selection.id, pageNumber: 2 }), expect.any(AbortSignal)));
+  });
+  it("keeps the current groups and summary mounted while the next page loads", async () => {
+    const first = page(undefined, 1, 6), pending = deferred<AdoptionPage>();
+    first.page.nextCursor = "group-next";
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockReturnValueOnce(pending.promise);
+    mount();
+    const region = await screen.findByRole("region", { name: "Contoso / HR" });
+    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("region", { name: "Contoso / HR" })).toBe(region);
+    expect(screen.getByRole("status", { name: "Matching groups" })).toHaveTextContent("6 matching groups");
+    expect(pages().getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Maya" }));
+    expect(onOpenPerson).not.toHaveBeenCalled();
+    const second = page([{ ...group, id: "group-it", department: "IT" }], 2, 6);
+    second.page.previousCursor = "group-previous";
+    await act(async () => pending.resolve(second));
+    expect(await screen.findByRole("region", { name: "Contoso / IT" })).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Contoso / HR" })).not.toBeInTheDocument();
+  });
+  it("jumps directly to page four in one request, focuses results, and synchronizes both controls", async () => {
+    const first = page(undefined, 1, 20), fourth = page([{ ...group, id: "group-finance", department: "Finance" }], 4, 20);
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(fourth);
+    mount();
+    await screen.findByText("Maya");
+    fireEvent.click(pages().getByRole("button", { name: "Page 4" }));
+    await screen.findByRole("region", { name: "Contoso / Finance" });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+      expect.objectContaining({ pageNumber: 4, selectionId: first.selection.id }), expect.any(AbortSignal));
+    expect(screen.getByRole("heading", { name: "Company & department adoption" })).toHaveFocus();
+    for (const name of ["groups pages", "groups pages (bottom)"]) {
+      expect(within(screen.getByRole("navigation", { name })).getByRole("button", { name: "Page 4" })).toHaveAttribute("aria-current", "page");
+    }
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "start" });
+  });
+  it.each(["publication", "revision", "expiry"] as const)(
+    "preserves the displayed group position when %s refreshes a later page", async boundary => {
+      const first = page(undefined, 1, 6), second = page([{ ...group, id: "group-it", department: "IT" }], 2, 6);
+      first.page.nextCursor = "group-next";
+      second.page.previousCursor = "group-previous";
+      const pending = deferred<AdoptionPage>();
+      vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(second).mockReturnValueOnce(pending.promise);
+      let revisions = first.selection.publicationRevisions;
+      const content = (revision = 0) => <SavedQueryProvider><PublicationContext value={{ admit: vi.fn(), revisions }}>
+        <AdoptionView route={route} change={change} revision={revision} reportContext={null} onOpenPerson={onOpenPerson} />
+      </PublicationContext></SavedQueryProvider>;
+      const view = render(content());
+      await screen.findByRole("region", { name: "Contoso / HR" });
+      fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+      const region = await screen.findByRole("region", { name: "Contoso / IT" });
+      if (boundary === "publication") {
+        revisions = { ...revisions, users: "4".repeat(64) };
+        view.rerender(content());
+      } else if (boundary === "revision") view.rerender(content(1));
+      else {
+        vi.spyOn(performance, "now").mockReturnValue(performance.now() + 600_001);
+        act(() => window.dispatchEvent(new Event("focus")));
+      }
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+      const request = vi.mocked(api.readReportPage).mock.lastCall?.[1];
+      expect(request).toEqual(expect.objectContaining({ anchor: second.value[0].id, limit: 5 }));
+      expect(request).not.toHaveProperty("selectionId");
+      expect(request).not.toHaveProperty("cursor");
+      expect(screen.getByRole("region", { name: "Contoso / IT" })).toBe(region);
+      fireEvent.click(screen.getByRole("button", { name: "Maya" }));
+      expect(onOpenPerson).not.toHaveBeenCalled();
+      const fresh = { ...page(second.value, 2, 6), selection: { ...reportSelection(3), publicationRevisions: revisions } };
+      fresh.page.previousCursor = "fresh-previous";
+      await act(async () => pending.resolve(fresh));
+      await waitFor(() => expect(pages().getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "false"));
+      expect(screen.getByRole("region", { name: "Contoso / IT" })).toBe(region);
+      expect(api.readReportPage).toHaveBeenCalledTimes(3);
+      vi.mocked(api.readReportPage).mockResolvedValue({ ...first, selection: fresh.selection });
+      fireEvent.click(pages().getByRole("button", { name: "Previous groups" }));
+      await screen.findByRole("region", { name: "Contoso / HR" });
+      expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+        expect.objectContaining({ pageNumber: 1, selectionId: fresh.selection.id }), expect.any(AbortSignal));
+      expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("anchor");
+    });
+  it("starts new filtered results at the beginning without showing or replaying the previous page", async () => {
+    const first = page(undefined, 1, 6), second = page([{ ...group, id: "group-it", department: "IT" }], 2, 6);
+    first.page.nextCursor = "group-next";
+    second.page.previousCursor = "group-previous";
+    const pending = deferred<AdoptionPage>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(second).mockReturnValueOnce(pending.promise);
+    const content = (company?: string) => <SavedQueryProvider><AdoptionView route={{ ...route, company }} change={change}
+      revision={company ? 1 : 0} reportContext={null} onOpenPerson={onOpenPerson} /></SavedQueryProvider>;
+    const view = render(content());
+    await screen.findByText("Maya");
+    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+    await screen.findByRole("region", { name: "Contoso / IT" });
+    view.rerender(content("Fabrikam"));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(screen.queryByRole("region", { name: "Contoso / IT" })).not.toBeInTheDocument();
+    const request = vi.mocked(api.readReportPage).mock.lastCall?.[1];
+    expect(request).toEqual(expect.objectContaining({ company: "Fabrikam" }));
+    expect(request).not.toHaveProperty("anchor");
+    expect(request).not.toHaveProperty("cursor");
+    expect(request).not.toHaveProperty("selectionId");
+    await act(async () => pending.resolve(page([{ ...group, id: "group-fabrikam", company: "Fabrikam" }])));
+    expect(await screen.findByRole("region", { name: "Fabrikam / HR" })).toBeVisible();
+    expect(pages().getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
+  });
+  it("carries the group anchor through overlapping refreshes and ignores a cancelled late response", async () => {
+    const first = page(undefined, 1, 6), second = page([{ ...group, id: "group-it", department: "IT" }], 2, 6);
+    first.page.nextCursor = "group-next";
+    second.page.previousCursor = "group-previous";
+    const superseded = deferred<AdoptionPage>(), latest = deferred<AdoptionPage>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+      .mockReturnValueOnce(superseded.promise).mockReturnValueOnce(latest.promise);
+    const content = (revision: number) => <SavedQueryProvider><AdoptionView route={route} change={change}
+      revision={revision} reportContext={null} onOpenPerson={onOpenPerson} /></SavedQueryProvider>;
+    const view = render(content(0));
+    await screen.findByText("Maya");
+    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+    const region = await screen.findByRole("region", { name: "Contoso / IT" });
+    view.rerender(content(1));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    const supersededSignal = vi.mocked(api.readReportPage).mock.lastCall?.[2];
+    view.rerender(content(2));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(4));
+    expect(supersededSignal?.aborted).toBe(true);
+    for (const call of vi.mocked(api.readReportPage).mock.calls.slice(2)) {
+      expect(call[1]).toEqual(expect.objectContaining({ anchor: second.value[0].id }));
+      expect(call[1]).not.toHaveProperty("selectionId");
+      expect(call[1]).not.toHaveProperty("cursor");
+    }
+    expect(screen.getByRole("region", { name: "Contoso / IT" })).toBe(region);
+    await act(async () => latest.resolve({ ...second, selection: reportSelection(4) }));
+    await waitFor(() => expect(pages().getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "false"));
+    await act(async () => superseded.resolve({ ...first, selection: reportSelection(3) }));
+    expect(screen.getByRole("region", { name: "Contoso / IT" })).toBe(region);
+    expect(api.readReportPage).toHaveBeenCalledTimes(4);
+  });
+  it.each([403, 409])("withdraws retained group evidence when a page read is rejected with %i", async status => {
+    const first = page(undefined, 1, 6), pending = deferred<AdoptionPage>();
+    first.page.nextCursor = "group-next";
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockReturnValueOnce(pending.promise);
+    mount();
+    await screen.findByText("Maya");
+    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+    expect(screen.getByRole("region", { name: "Contoso / HR" })).toBeVisible();
+    await act(async () => pending.reject(new ApiError(status, status === 403 ? "forbidden" : "selection_invalidated", "Saved access changed.")));
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Contoso / HR" })).not.toBeInTheDocument();
+    expect(pages().getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
   });
   it("shows empty groups and missing agent descriptions without inventing data", async () => {
     vi.mocked(api.readReportPage).mockResolvedValue(page([{ ...group, agents: [] }]));

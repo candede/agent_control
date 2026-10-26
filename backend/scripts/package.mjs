@@ -9,6 +9,7 @@ function collect(directory) {
   for (const entry of readdirSync(directory,{withFileTypes:true})) {
     const filename = join(directory,entry.name);
     if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory() && /^tsx-[0-9]+$/.test(entry.name)) continue;
     if (entry.isDirectory()) collect(filename);
     else files[relative("/release",filename)] = new Uint8Array(readFileSync(filename));
   }

@@ -22,7 +22,7 @@ $implemented = @('inventory-registry','inventory-native-source','inventory-contr
 $implemented += @('production-publication','production-gate-repairs','fresh-installation','production-counts','production-gate-cost','production-prerequisites','capacity-focused','capacity-core','capacity-retention','capacity-schema','capacity-cost','capacity-software','lifecycle-acceptance-related','lifecycle-acceptance','lifecycle-race','restore-inventory','restore','lifecycle','lifecycle-core','lifecycle-repair','browser','restart')
 $implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
 $implemented += @('production-frontend','auth-recovery','audit-origin','mcp-read-contracts','shared-agent-controls','webapp-regressions','webapp-qualification')
-$implemented += @('deployment-current','fresh-installation-current')
+$implemented += @('deployment-current','fresh-installation-current','mcp-container','mcp-end-to-end')
 if ($Suite -notin ($implemented + @('inventory-acceptance-repair','inventory-acceptance-recovery','inventory-controller-contract','report-source-scale','backend-shard-1','backend-shard-2','inventory-app-exports','inventory-http-contract','inventory-route-contract','inventory-integration','inventory-expiry','inventory-parity','inventory-verification','inventory-identity-proof','inventory-cleanup','inventory-identity','inventory-facets','inventory','inventory-cutover','inventory-usage-authority','inventory-native-evidence','inventory-staging','inventory-jobs','inventory-route','inventory-protocol','inventory-core','inventory-reconciliation','inventory-native-ui','inventory-groups','inventory-foundation')) -and -not $profile -and $Suite -ne 'cutover-compiled-restart') { throw "Suite '$Suite' is not yet implemented; no qualification claimed." }
 if ($Suite -in @('cutover-browser-contract','browser')) {
     if ($Suite -eq 'browser' -and -not $PSBoundParameters.ContainsKey('BrowserFiles')) { $BrowserFiles = 'largeTenantData.spec.ts' }
@@ -46,6 +46,12 @@ $baseline = $BaselineImage
 $baselineId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$baseline) -Capture
 if ($baselineId -cne $BaselineImageId) { throw 'Campaign baseline image identity changed.' }
 [IO.File]::WriteAllText((Join-Path $directory 'baseline.txt'),$baselineId)
+if ($Suite -eq 'mcp-container') {
+    # This suite builds only the separately locked Python image; it reuses no Node dependencies.
+    . (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
+    Invoke-LocalMcpFixture -Root $root -Directory $directory
+    exit 0
+}
 $hashes = (Invoke-DockerCommand @('run','--rm','--network','none','--entrypoint','node',$baseline,'-e',
     'const fs=require("node:fs"),crypto=require("node:crypto");console.log(JSON.stringify(Object.fromEntries(["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(f=>[f,crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")]))))') -Capture) | ConvertFrom-Json -AsHashtable
 foreach ($path in $hashes.Keys) {
@@ -66,6 +72,16 @@ if ($Suite -in @('browser','restart')) {
 # Reuse installed, approved dependencies; no installer or registry access.
 $dockerfile = Join-Path $directory 'Dockerfile'
 $base = "FROM $baseline`n"
+if ($Suite -eq 'mcp-end-to-end') {
+    . (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
+    Assert-LocalMcpFixtureEngine
+    $sdk = "$project-sdk:local"
+    Invoke-DockerCommand @('build','--provenance=false','--target','test','-f',(Join-Path $root 'mcp/Dockerfile'),
+        '--label',"io.agent-control.fixture=$project",'-t',$sdk,$root)
+    $sdkId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$sdk) -Capture
+    Write-LocalText (Join-Path $directory 'sdk-image.json') (@{tag=$sdk;id=$sdkId;purpose='synthetic SDK to canonical SQL HTTP fixture'} | ConvertTo-Json)
+    $base = "FROM $baseline AS installed`nFROM $sdk`nUSER root`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`nENV AGENT_CONTROL_MCP_SQL_JOURNEY=/opt/mcp/.venv/bin/python NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/`nRUN node --version && /opt/mcp/.venv/bin/python --version`n"
+}
 if ($Suite -eq 'cutover-browser-contract') {
     $browser = 'agent-control:permission-browser-test-phase06'
     $browserId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$browser) -Capture
@@ -76,7 +92,7 @@ if ($Suite -eq 'cutover-browser-contract') {
     [IO.File]::WriteAllText((Join-Path $directory 'browser-baseline.txt'),$browserId)
     $base = "FROM $baseline AS installed`nFROM $browser`nRUN rm -rf /app /browser`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`n"
 }
-[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY compose.yaml compose.large-tenant-test.yaml /app/`n")
+[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY Dockerfile compose.yaml compose.large-tenant-test.yaml /app/`n")
 if ($Suite -eq 'software-gate') { [IO.File]::AppendAllText($dockerfile,"RUN npm run build`n") }
 if ($Suite -eq 'gate-failure') {
     [IO.File]::AppendAllText($dockerfile, "RUN printf '%s\n' 'console.error(`"intentional owned gate failure`"); setTimeout(() => process.exit(17), 1200);' > /app/backend/scripts/test-all.ts`n")

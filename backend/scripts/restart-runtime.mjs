@@ -178,7 +178,7 @@ const beginOperationValidation=(_capability,actor)=>{
   const validation=beginAccountSessionValidation(actor.tenantId,actor.homeAccountId);
   return ()=>assertAccountSessionValidation(validation);
 };
-const purviewReadScope={tenantId:scope.tenantId,resultScopes:[{kind:"principal",scopeId:scope.principalId,configurationRevision:null}]};
+const purviewReadScope={tenantId:scope.tenantId,authorizationPrincipalId:scope.principalId,resultScopes:[{kind:"principal",scopeId:scope.principalId,configurationRevision:null}]};
 const defenderResultScope={kind:"principal",scopeId:scope.principalId,configurationRevision:null};
 const defenderAuthority={capabilityId:"defender.hunting.delegated",contractRevision:"d".repeat(64),permissionRevision:"e".repeat(64),configurationRevision:1};
 const defenderReadScope={tenantId:scope.tenantId,authorizationPrincipalId:scope.principalId,resultScopes:[defenderResultScope],qualifications:[{resultScope:defenderResultScope,authority:defenderAuthority}]};

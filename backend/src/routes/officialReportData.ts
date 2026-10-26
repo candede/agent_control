@@ -150,9 +150,19 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await reports.historyOptions(context.id, context.identity, pageOptions(request.query)));
   }));
   route("get", "/copilot-usage/adoption", "read", failSafe(async (request, response) => {
-    const context = await selected(request, "adoption");
+    const anchor = request.query.anchor === undefined ? undefined : scalar(request.query.anchor, 64);
+    const pageText = request.query.pageNumber === undefined ? undefined : scalar(request.query.pageNumber, 16);
+    const pageNumber = pageText === undefined ? undefined : Number(pageText);
+    if (pageText !== undefined && (!/^[1-9]\d*$/.test(pageText) || !Number.isSafeInteger(pageNumber))) {
+      throw new AppError(400, "invalid_usage_query", "Page number must be a positive safe integer.");
+    }
+    if (anchor !== undefined && !/^[a-f0-9]{64}$/.test(anchor)
+      || [anchor, pageNumber, request.query.cursor].filter(value => value !== undefined).length > 1) {
+      throw new AppError(400, "invalid_usage_query", "Use one position: a page number, group anchor, or selected cursor.");
+    }
+    const context = await selected(request, "adoption", false, false, false, false, ["anchor", "pageNumber"]);
     response.json(await reports.read(context.id, context.identity, (client, read) =>
-      readAdoptionGroups(client, reports, read, pageOptions(request.query))));
+      readAdoptionGroups(client, reports, read, { ...pageOptions(request.query), anchor, pageNumber })));
   }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));

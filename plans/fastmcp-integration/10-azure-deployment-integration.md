@@ -25,8 +25,15 @@ Read [05](05-fastmcp-service-and-auth.md), [08](08-local-container-integration.m
    access. Secrets stay out of parameters, arguments, logs and receipts.
    Additional plan/storage/network/registry resources need real authorization.
 4. Support dedicated access-restricted encrypted OAuth storage and independent
-   keys with single-writer ownership. Do not claim Azure persistence from Compose
-   restart or use ephemeral container storage as durable state.
+   keys with server-enforced single-writer ownership: one bounded encrypted Azure
+   Blob map, maintained Azure SDK, explicit exact UAMI/account/container/object,
+   TLS/private endpoint/DNS and exact object-conditioned RBAC. Lease the data
+   object itself; every mutation includes that lease and ETag. Lost/expired/
+   unknown lease or ambiguous mutation halts reads/issuance/publication without
+   cached success or automatic replay. Keep4096 records/64MiB/256KiB/24h limits,
+   bounded I/O/retry/memory and lifespan renewal/cleanup. Local protected
+   FileTree/Fernet stays unchanged. Remove the unreleased NFS candidate entirely.
+   Do not claim Azure persistence from Compose, SDK/emulator or source mocks.
 5. Validate forwarded-header trust, streaming/buffering/timeouts, callbacks,
    disconnects, request/resource bounds and authenticated API connectivity.
    Never widen audiences, callback wildcards or browser CSRF/Origin rules.
@@ -41,7 +48,10 @@ Read [05](05-fastmcp-service-and-auth.md), [08](08-local-container-integration.m
 
 Extend existing mocked Azure deployment tests; validate Bicep with available
 local tooling. Cover target mismatch, secret/network/image contracts,
-Plan/Deploy/resume, rotation/recovery and no-MCP behavior. Current data/audit/jobs
+Plan/Deploy/resume, rotation/recovery and no-MCP behavior. Real SDK/emulator
+tests must reject second holders and stale lease writes server-side, cover crash/
+expiry/replacement, renew/release/cancellation, binding/encryption/quotas/TTL,
+revocation and ambiguous mutation stopping issuance. Current data/audit/jobs
 must be preserved and uncertain writes non-replayable.
 
 Cloud what-if, registry, Key Vault, persistence and streaming proof require their

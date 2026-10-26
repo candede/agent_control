@@ -8,6 +8,7 @@ COPY package.json package-lock.json ./
 COPY backend/package.json backend/package.json
 COPY frontend/package.json frontend/package.json
 RUN --mount=type=secret,id=npmrc,target=/root/.npmrc if [ "$REUSE_INSTALLED_DEPENDENCIES" = 1 ]; then test -f node_modules/tsx/dist/cli.mjs && test -f node_modules/vitest/vitest.mjs; else npm ci; fi
+RUN mkdir -p backend/node_modules frontend/node_modules
 
 FROM dependencies AS application-base
 RUN rm -rf backend/src backend/scripts backend/dist frontend/src frontend/browser frontend/dist scripts docs infra plans
@@ -56,6 +57,8 @@ ENV TMPDIR=/app TSX_DISABLE_CACHE=1
 COPY --from=dependencies /usr/local /usr/local
 WORKDIR /app
 COPY --from=dependencies /app/node_modules node_modules
+COPY --from=dependencies /app/backend/node_modules backend/node_modules
+COPY --from=dependencies /app/frontend/node_modules frontend/node_modules
 COPY --from=dependencies /app/package.json /app/package-lock.json ./
 COPY --from=dependencies /app/frontend/package.json frontend/package.json
 COPY backend/package.json backend/package.json
@@ -71,7 +74,8 @@ COPY --from=build /app/backend/dist backend/dist
 COPY --from=build /app/frontend/dist frontend/dist
 
 FROM node:24-bookworm-slim AS runtime
-ENV NODE_ENV=production PORT=3001
+ENV NODE_ENV=production PORT=3001 \
+    NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
 WORKDIR /app
 COPY --from=production-dependencies /app/node_modules node_modules
 COPY --from=build /app/backend/dist backend/dist

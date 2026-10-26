@@ -209,10 +209,10 @@ describe("multi-tenant sign-in routes", () => {
   it("does not log submitted usernames or source credentials on login failure", async () => {
     const loggers = [vi.spyOn(console, "log"), vi.spyOn(console, "warn"), vi.spyOn(console, "error")];
     for (const logger of loggers) logger.mockImplementation(() => undefined);
-    await postLogin({ username: "private-person@unconfigured.invalid", clientSecret: "private-source-credential" }, true);
+    await postLogin({ username: "private-person@unconfigured.invalid", clientSecret: "synthetic-private-source-credential" }, true);
     const logged = JSON.stringify(loggers.flatMap(logger => logger.mock.calls));
     expect(logged).not.toContain("private-person");
-    expect(logged).not.toContain("private-source-credential");
+    expect(logged).not.toContain("synthetic-private-source-credential");
   });
 
   it("redirects an anonymous GET without a username to the frontend form", async () => {

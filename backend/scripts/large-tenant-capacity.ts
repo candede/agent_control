@@ -37,7 +37,8 @@ async function queryComparison(database: BoundedPool, telemetry: CapacityTelemet
     const selected = await queries.capture(identity, root.scopeId, query);
     const timings: number[] = [];
     const requestWindows: Array<{ index: number } & ReturnType<CapacityTelemetry["endRequestWindow"]>> = [];
-    let cursor: string | undefined, rows = 0;
+    let cursor: string | undefined, rows = 0, bytes = 0;
+    const cursors = new Set<string>();
     const observed = createHash("sha256"), expected = createHash("sha256");
     for (let i = 0; i < count; i++) expected.update(`package-${key(i)}\n`);
     const before = process.memoryUsage();
@@ -55,10 +56,11 @@ async function queryComparison(database: BoundedPool, telemetry: CapacityTelemet
         requestWindows.push({ index: windowIndex,...telemetry.endRequestWindow() });
         writeSync(1,`CAPACITY_REQUEST_WINDOW ${JSON.stringify({ state: "end",pid: process.pid,count,index: windowIndex })}\n`);
       });
-      assert.ok(Buffer.byteLength(serialized) <= MiB);
+      const pageBytes = Buffer.byteLength(serialized);
+      assert.ok(pageBytes <= MiB); bytes += pageBytes;
       assert.equal(page.counts.total, count); assert.ok(page.value.length <= 100);
       for (const row of page.value) { observed.update(`${row.nativeId}\n`); rows++; }
-      telemetry.write({ event: "query", count, rows, elapsedMs: timings.at(-1), heapUsed: process.memoryUsage().heapUsed });
+      telemetry.write({ event: "query", count, rows, bytes: pageBytes, elapsedMs: timings.at(-1), heapUsed: process.memoryUsage().heapUsed });
       if (timings.length === 1) {
         if (database.totalCount>=4 && database.idleCount) { const client = await database.connect();client.release(true); }
         const operator = new pg.Pool({ ...databaseSettings(), database: String(database.options.database), max: 1,
@@ -67,16 +69,19 @@ async function queryComparison(database: BoundedPool, telemetry: CapacityTelemet
         telemetry.write({ event: "analyzed", count, afterRequest: 1 });
       }
       cursor = page.page.nextCursor ?? undefined;
-      if (!cursor || timings.length === 3) break;
+      if (!cursor) break;
+      assert.ok(!cursors.has(cursor), "Inventory continuation repeated a cursor.");
+      cursors.add(cursor);
+      assert.ok(timings.length < Math.ceil(count / 100), "Inventory continuation exceeded the complete cohort.");
     }
-    const prefix = createHash("sha256");
-    for (let i = 0; i < rows; i++) prefix.update(`package-${key(i)}\n`);
-    assert.equal(rows, 300); assert.equal(observed.digest("hex"), prefix.digest("hex"));
+    assert.equal(rows, count); assert.equal(timings.length, Math.ceil(count / 100));
+    const identityHash = observed.digest("hex");
+    assert.equal(identityHash, expected.digest("hex"));
     const plan = await database.query(`EXPLAIN (ANALYZE,BUFFERS,WAL,SETTINGS,FORMAT JSON)
       SELECT identity,generation_id FROM inventory_memberships WHERE baseline_id=$1 AND valid_from_revision<=$2
       AND (valid_to_revision IS NULL OR valid_to_revision>$2) ORDER BY identity COLLATE "C" LIMIT 100`, [root.baselineId, root.revision]);
     await telemetry.capturePlans(database,{ count });
-    const result = { count, rows, query, before, after: process.memoryUsage(), latency: percentiles(timings), plan: plan.rows,requestWindows,
+    const result = { count, rows, pages: timings.length, bytes, identityHash, query, before, after: process.memoryUsage(), latency: percentiles(timings), plan: plan.rows,requestWindows,
       sampledHeapUsedMax: telemetry.sampledHeapUsedMax, stageCheckpointHeapUsedMax: telemetry.stageCheckpointHeapUsedMax };
     telemetry.write({ event: "comparison", ...result }); results.push(result);
   }
@@ -157,7 +162,7 @@ export async function runCapacity(mode: string) {
       outcome.functionalStatus = outcome.identityProbeError ? "failed" : "passed";
       outcome.status = (outcome.comparison as { latency: { p95: number; p99: number } }[])
         .every(value => value.latency.p95 <= 2000 && value.latency.p99 <= 5000) && !outcome.identityProbeError ? "inconclusive" : "failed";
-      outcome.qualificationNote = "Three diagnostic requests/cardinality are not the full request-count or coverage qualification.";
+      outcome.qualificationNote = "Complete fixed 10k/100k pagination, exact identities and latency are measured; this query diagnostic alone is not the full capacity-profile or production-tier qualification.";
       process.exitCode = outcome.status === "failed" ? 1 : 2;
     }
   } catch (error) {

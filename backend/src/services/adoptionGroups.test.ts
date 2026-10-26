@@ -26,18 +26,19 @@ describe("read-only adoption groups", () => {
   async function setup(users: CopilotDirectoryUser[]) {
     const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const stages = new UserSourceStages(fixture.runtime);
-    await stages.execute(generationInput({ scope: { ...generationInput().scope, ...identity } }), async lease => {
+    const saveUsers = (users: CopilotDirectoryUser[]) => stages.execute(generationInput({ scope: { ...generationInput().scope, ...identity } }), async lease => {
       const key = await stages.query(lease, "discovery", "synthetic:adoption");
       await stages.page(lease, key, "synthetic:adoption", users.length, users.length);
       for (let offset = 0; offset < users.length; offset += 250) await stages.directory(lease, key, users.slice(offset, offset + 250));
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
+    await saveUsers(users);
     const reader = new LargeTenantUsersReports(fixture.runtime, secret, 7);
     const read = async (query: ReportQuery = {}, limit = 5) => {
       const selection = await reader.capture(identity, "delegated", "adoption", query);
       return reader.read(selection.id, identity, (client, context) => readAdoptionGroups(client, reader, context, { limit }));
     };
-    return { identity, reader, read };
+    return { identity, reader, read, saveUsers };
   }
   async function publish(identity: typeof selectionIdentity, data: { users: string[]; agents: string[]; userAgents: string[] }) {
     const imports = new OfficialReportImports(fixture.runtime), bundleId = randomUUID();
@@ -112,6 +113,76 @@ describe("read-only adoption groups", () => {
       await expect(page(`${first.page.nextCursor}tampered`)).rejects.toThrow("invalid_cursor");
       await expect(reader.read(selected.id, { ...identity, principalId: "another-user" },
         (client, context) => readAdoptionGroups(client, reader, context, { limit: 2 }))).rejects.toThrow();
+    }
+  });
+  it.each(["asc", "desc"] as const)("resumes a fresh %s selection at the visible group after directory changes", async order => {
+    const users = [user(1, "B"), user(2, "C"), user(3, "D"), user(4, "E"), user(5, "F"), user(6, "G")];
+    const { identity, reader, saveUsers } = await setup(users);
+    const read = (id: string, options: { cursor?: string; anchor?: string } = {}) => reader.read(id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, ...options }));
+    const initial = await reader.capture(identity, "delegated", "adoption", { order });
+    const first = await read(initial.id), second = await read(initial.id, { cursor: first.page.nextCursor! });
+    expect(second.page.anchor).toBe(second.value[0].id);
+    await saveUsers([...users, user(7, order === "asc" ? "A" : "Z")]);
+    const fresh = await reader.capture(identity, "delegated", "adoption", { order });
+    await expect(read(fresh.id, { cursor: first.page.nextCursor! })).rejects.toThrow("invalid_cursor");
+    const resumed = await read(fresh.id, { anchor: second.page.anchor });
+    expect(resumed.value.map(group => group.company)).toEqual(order === "asc" ? ["C", "D"] : ["F", "E"]);
+    expect(resumed.value.some(group => group.id === second.page.anchor)).toBe(true);
+    expect(resumed.page).toMatchObject({ number: 2, offset: 2 });
+    expect(resumed.counts).toEqual({ total: 7, filtered: 7 });
+    expect(resumed.selection.id).toBe(fresh.id);
+    expect(resumed.page.previousCursor).not.toBeNull();
+    expect(resumed.page.nextCursor).not.toBeNull();
+    const previous = await read(fresh.id, { cursor: resumed.page.previousCursor! });
+    expect(previous.value.at(-1)?.company).toBe(order === "asc" ? "B" : "G");
+    const next = await read(fresh.id, { cursor: resumed.page.nextCursor! });
+    expect(next.value[0].company).toBe(order === "asc" ? "E" : "D");
+  });
+  it("resolves anchors only inside matching groups and handles missing groups without inventing rows", async () => {
+    const { identity, reader, read } = await setup([user(1, "A"), user(2, "B"), user(3, "C")]);
+    const all = await read();
+    const selected = await reader.capture(identity, "delegated", "adoption", { company: "B" });
+    const anchored = (anchor: string) => reader.read(selected.id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, anchor }));
+    for (const anchor of [all.value[0].id, "f".repeat(64)]) {
+      const result = await anchored(anchor);
+      expect(result.value.map(group => group.company)).toEqual(["B"]);
+      expect(result.page.previousCursor).toBeNull();
+      expect(result.page.nextCursor).toBeNull();
+    }
+    for (const anchor of ["invalid", "", "A".repeat(64)]) await expect(anchored(anchor)).rejects.toThrow("invalid_cursor");
+    await expect(reader.read(selected.id, identity, (client, context) =>
+      readAdoptionGroups(client, reader, context, { limit: 2, anchor: all.value[0].id, cursor: "cursor" }))).rejects.toThrow("invalid_cursor");
+  });
+  it.each(["asc", "desc"] as const)("jumps directly to numbered %s pages within one filtered selection", async order => {
+    const { identity, reader } = await setup(Array.from({ length: 12 }, (_, index) => user(index + 1, "Contoso", `Department ${String(index + 1).padStart(2, "0")}`)));
+    const selected = await reader.capture(identity, "delegated", "adoption", { order, search: "contoso" });
+    const read = (pageNumber: number) => reader.read(selected.id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 5, pageNumber }));
+    const last = await read(3);
+    expect(last.selection.id).toBe(selected.id);
+    expect(last.page).toMatchObject({ number: 3, offset: 10, limit: 5, nextCursor: null });
+    expect(last.value.map(group => group.department)).toEqual(order === "asc" ? ["Department 11", "Department 12"] : ["Department 02", "Department 01"]);
+    expect(last.counts).toEqual({ total: 12, filtered: 12 });
+    expect((await read(Number.MAX_SAFE_INTEGER)).value).toEqual(last.value);
+    expect((await read(1)).page).toMatchObject({ number: 1, offset: 0, previousCursor: null });
+    const filtered = await reader.capture(identity, "delegated", "adoption", { department: "Department 05" });
+    const only = await reader.read(filtered.id, identity, (client, context) =>
+      readAdoptionGroups(client, reader, context, { limit: 5, pageNumber: 3 }));
+    expect(only.value.map(group => group.department)).toEqual(["Department 05"]);
+    expect(only.page).toMatchObject({ number: 1, offset: 0 });
+  });
+  it("rejects invalid and ambiguous numbered page requests", async () => {
+    const { identity, reader } = await setup([user(1)]);
+    const selected = await reader.capture(identity, "delegated", "adoption", {});
+    for (const pageNumber of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(reader.read(selected.id, identity, (client, context) =>
+        readAdoptionGroups(client, reader, context, { limit: 5, pageNumber }))).rejects.toThrow("invalid_cursor");
+    }
+    for (const position of [{ cursor: "cursor" }, { anchor: "a".repeat(64) }]) {
+      await expect(reader.read(selected.id, identity, (client, context) =>
+        readAdoptionGroups(client, reader, context, { limit: 5, pageNumber: 1, ...position }))).rejects.toThrow("invalid_cursor");
     }
   });
   it("lists shared agents in each matching group, but never assigns ambiguous user identities", async () => {

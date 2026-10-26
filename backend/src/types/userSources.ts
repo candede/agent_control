@@ -42,7 +42,7 @@ export type UserSourceFacts = {
 };
 export type UserSourcePage<T> = {
   value: T[];
-  page: { limit: number; nextCursor: string | null; previousCursor: string | null };
+  page: { limit: number; nextCursor: string | null; previousCursor: string | null; anchor?: string; number?: number; offset?: number };
   selection: SelectedRead;
   counts: { total: number; filtered: number };
 };

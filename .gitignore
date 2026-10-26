@@ -8,3 +8,10 @@ backend/data/
 .local/
 artifacts/
 backups/
+mcp/.venv/
+mcp/.pytest_cache/
+mcp/.mypy_cache/
+mcp/.ruff_cache/
+__pycache__/
+tsx-[0-9]*/
+!tsx-[0-9]*[^0-9]*/

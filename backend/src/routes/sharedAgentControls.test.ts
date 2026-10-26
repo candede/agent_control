@@ -12,6 +12,7 @@ import { observeTransactionStart } from "../services/peakMemory.js";
 import type pg from "pg";
 import { copilotStudioQuarantineControl } from "../services/copilotStudioQuarantineControl.js";
 import { AppError } from "../errors.js";
+import { sdkJourney } from "./mcpSdkJourneyTestSupport.js";
 
 const canonical = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12,"0")}`;
 const environmentId = "40000000-0000-4000-8000-000000000001", botId = "50000000-0000-4000-8000-000000000001";
@@ -101,20 +102,28 @@ describe.sequential("shared exact agent controls on the actual registered browse
     for (const transport of ["webapp","mcp"] as const) {
       const f = await setupAuditOriginHttp(transport), provider = providers(action === "unblock");
       const inventory = await seed(f, action === "unblock");
-      const reviewed = await preview(f, inventory.selection.id, action, [`agent:${canonical(1)}`,`agent:${canonical(2)}`,`agent:${canonical(3)}`, "report:unmanaged"]);
+      const useSdk = process.env.AGENT_CONTROL_MCP_SQL_JOURNEY && transport === "mcp";
+      const recordIds = [`agent:${canonical(1)}`,`agent:${canonical(2)}`,`agent:${canonical(3)}`, "report:unmanaged"];
+      const reviewed = useSdk ? (await sdkJourney(f, [{ name: "preview_agent_control",
+        request: { selectionId: inventory.selection.id, action, recordIds } }]))[0] as AgentControlPreview
+        : await preview(f, inventory.selection.id, action, recordIds);
       expect(reviewed).toMatchObject({ eligibleCount: 2, ineligibleCount: 2, alreadyInStateCount: 0, providerAtomicity: false });
       expect(reviewed.targets.find(target => target.recordId === `agent:${canonical(2)}`)?.effects).toEqual([
         expect.objectContaining({ provider: "power_platform", action: action === "block" ? "quarantine" : "unquarantine", id: native.nativeId, botId, environmentId }),
       ]);
       expect(reviewed.targets.find(target => target.recordId === `agent:${canonical(3)}`)?.reason).toBe("missing_platform");
       expect(reviewed.targets.find(target => target.recordId.startsWith("report:"))?.reason).toBe("report_only");
-      const accepted = await execute(f, reviewed);
+      const accepted = useSdk
+        ? (await sdkJourney(f, [{ name: "execute_agent_control", request: { receiptId: reviewed.receiptId,
+          confirmationHash: reviewed.confirmationHash, idempotencyKey: "same-operation" } }]))[0] as AgentControlExecution
+        : await execute(f, reviewed);
       expect(accepted).toMatchObject({ accepted: true, outcome: "partial", final: false, verified: false, origin: { channel: transport } });
       expect(accepted.children).toHaveLength(2);
       const settled=await settle(f, accepted);
       const replay = await execute(f, reviewed);
       expect(replay.children.map(child => child.jobId)).toEqual(accepted.children.map(child => child.jobId));
       expect(replay,JSON.stringify(settled)).toMatchObject({ final: true, verified: true, origin: accepted.origin });
+      if (useSdk) await sdkJourney(f, [{ name: "get_agent_control", request: { receiptId: reviewed.receiptId }, expected: replay }]);
       expect(provider.writes).toHaveLength(2);
       expect(provider.writes.some(path => path.includes("Studio-package"))).toBe(false);
       expect(f.providerWork.requests).toBe(0);

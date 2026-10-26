@@ -52,7 +52,7 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
     if (target.hostname !== "login.microsoftonline.com" || !target.pathname.startsWith(`/${tenant.tenantId}/`)) {
       providerWork.requests++; throw new Error("Unexpected identity authority.");
     }
-    if (target.pathname.endsWith("/discovery/v2.0/keys")) return Response.json({ keys: [jwk] });
+    if (target.pathname.endsWith("/discovery/v2.0/keys")) return Response.json({ keys: [jwk, { ...jwk, kid: "sdk-api-fixture" }] });
     if (!target.pathname.endsWith("/oauth2/v2.0/token")) { providerWork.requests++; throw new Error("Unexpected identity operation."); }
     return sdkResponse({ oid: selected.localAccountId, uid: selected.homeAccountId.split(".")[0], utid: selected.homeAccountId.split(".")[1],
       claims: { roles } }, request);
@@ -71,7 +71,7 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
     headers: { ...(kind === "mcp"
       ? { authorization: `Bearer ${apiToken({ roles, oid: selected.localAccountId, azp: integrationClientId })}`, "X-Agent-Control-Mcp-Context": context }
       : { cookie, Origin: config.frontendOrigin, "X-CSRF-Token": "synthetic-csrf" }), ...options.headers } });
-  return { database: fixture.runtime, providerWork, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs };
+  return { base, integrationClientId, database: fixture.runtime, providerWork, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs };
 }
 
 export async function closeAuditOriginHttp() {

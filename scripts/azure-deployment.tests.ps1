@@ -115,7 +115,7 @@ function New-Target {
 
 function New-RegistryProfiles {
     param($Target)
-    return @(
+    $profiles = @(
         @{
             tenantId = $Target.tenantId; clientId = $Target.entraApplicationId
             clientSecret = 'synthetic-fixture-agent-control-client-secret-value-that-is-long-enough-0001'
@@ -126,6 +126,54 @@ function New-RegistryProfiles {
             clientSecret = 'synthetic-secondary-tenant-secret-never-log'; domains = @('fabrikam.com')
         }
     )
+    if ($Target.mcp) { $profiles[0].integration = @{clientId=$Target.mcp.clientId;audience=$Target.mcp.apiClientId;scope='AgentControl.Access'} }
+    return $profiles
+}
+
+function Add-McpTarget {
+    param($Target, [string]$Mode = 'fresh')
+    $prefix = "/subscriptions/$($Target.subscriptionId)/resourceGroups/$($Target.resourceGroup)/providers"
+    $storage = "$prefix/Microsoft.Storage/storageAccounts/fixtureoauth"
+    $mcp = [PSCustomObject]@{
+        contractVersion=1; installationMode=$Mode; appServiceName='fixture-mcp'; planName='fixture-mcp-plan'; planSku='S1'
+        appServiceResourceId="$prefix/Microsoft.Web/sites/fixture-mcp"; planResourceId="$prefix/Microsoft.Web/serverfarms/fixture-mcp-plan"
+        identityResourceId="$prefix/Microsoft.ManagedIdentity/userAssignedIdentities/fixture-mcp"
+        identityClientId='aaaa0000-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        registryResourceId="$prefix/Microsoft.ContainerRegistry/registries/fixtureacr"; registryLoginServer='fixtureacr.azurecr.io'
+        repository='agent-control/mcp'; imageDigest=('sha256:' + ('a' * 64))
+        existingImageDigest=$(if ($Mode -eq 'existing') { 'sha256:' + ('b' * 64) } else { '' })
+        tenantId=$Target.tenantId; clientId='bbbb0000-bbbb-4bbb-8bbb-bbbbbbbbbbbb'; apiClientId=$Target.entraApplicationId
+        apiOrigin=$Target.canonicalOrigin; publicUrl='https://fixture-mcp.azurewebsites.net/mcp'
+        callbackUri='https://fixture-mcp.azurewebsites.net/auth/callback'
+        redirectUris=@('https://client.example.invalid/callback','http://localhost:53109/callback')
+        storage=[PSCustomObject]@{
+            accountResourceId=$storage; accountUrl='https://fixtureoauth.blob.core.windows.net'
+            containerName='oauth'; containerResourceId="$storage/blobServices/default/containers/oauth"
+            blobName='oauth-state.v1.fernet'
+            privateEndpointResourceId="$prefix/Microsoft.Network/privateEndpoints/fixture-oauth"
+            subnetResourceId="$prefix/Microsoft.Network/virtualNetworks/fixture/subnets/mcp"
+            privateDnsZoneResourceId="$prefix/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"
+            privateDnsVnetLinkResourceId="$prefix/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net/virtualNetworkLinks/fixture"
+            identity='https://fixtureoauth.blob.core.windows.net/oauth/oauth-state.v1.fernet'
+            preparedReference='fixture-prepared-blob-dns-egress'
+        }
+        secrets=[PSCustomObject]@{}
+        network=[PSCustomObject]@{
+            inboundIpv4Cidrs=@('192.0.2.0/24'); outboundIpv4Addresses=@('192.0.2.30')
+            apiReachabilityReference='fixture-authenticated-route-network-reference'; forwardedHeaders='ignored'
+        }
+        operationsOwner='fixture-mcp-operator'; registrationApprovalReference='fixture-exact-registration-grants'
+        cost=[PSCustomObject]@{plan=1;storage=1;registry=1;network=1;monitoring=1;restoreDrill=1;monthlyTotal=6}
+    }
+    foreach ($key in @('client','signing','encryption')) {
+        $mcp.secrets | Add-Member -NotePropertyName $key -NotePropertyValue ([PSCustomObject]@{
+            name="agent-control-mcp-$key"; version='fixturemcp2'
+            currentVersion=$(if ($Mode -eq 'existing') { 'fixturemcp1' } else { '' })
+        })
+    }
+    $Target | Add-Member -NotePropertyName mcp -NotePropertyValue $mcp
+    $Target.approvedMonthlyBudget=20
+    return $Target
 }
 
 $script:OperationNames = @(
@@ -135,7 +183,8 @@ $script:OperationNames = @(
     'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
     'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
     'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
-    'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup'
+    'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup',
+    'mcp_preflight','mcp_what_if','mcp_stop','mcp_apply','mcp_start','mcp_verify','mcp_resume_verify'
 )
 
 function Add-Command {
@@ -208,8 +257,8 @@ function New-Fixture {
     Add-Az $fixture operator_identity @('account', 'show', '--subscription', $Target.subscriptionId) -Json @{
         id = $Target.subscriptionId; tenantId = $Target.tenantId; user = @{ type = 'user' }
     }
-    Add-Command $fixture bicep_build docker @('run', '--rm', '-v', '{{ROOT}}:/workspace:ro', '-w', '/workspace',
-        'mcr.microsoft.com/azure-cli:2.77.0', 'az', 'bicep', 'build', '--file', 'infra/main.bicep', '--stdout')
+    Add-Command $fixture bicep_build bicep @('build','{{ROOT}}/infra/main.bicep','--stdout')
+    if ($Target.mcp) { Add-Command $fixture bicep_build bicep @('build','{{ROOT}}/infra/mcp.bicep','--stdout') }
     Add-Az $fixture sku_pricing_preflight @('postgres', 'flexible-server', 'list-skus', '--location', $Target.region,
         '--subscription', $Target.subscriptionId) -Json @{
         supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{
@@ -401,7 +450,148 @@ function New-Fixture {
             '--resource-group', $Target.resourceGroup, '--name', "$($Target.resources.postgresFlexibleServer.name)-restore-{{RUN_ID_8}}") -Json @{}
         $fixture.commands.cleanup[-1] | Add-Member -NotePropertyName optional -NotePropertyValue $true
     }
+    if ($Target.mcp) { Add-McpFixture $fixture $Target }
     return $fixture
+}
+
+function Add-McpFixture {
+    param($Fixture, $Target)
+    $m=$Target.mcp
+    $s=$m.storage
+    Add-Az $Fixture mcp_preflight @('appservice','list-locations','--sku','S1','--linux-workers-enabled','--subscription',$Target.subscriptionId) -Json @(@{name=$Target.region})
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$m.identityResourceId) -Json @{
+        id=$m.identityResourceId; properties=@{clientId=$m.identityClientId;tenantId=$m.tenantId;principalId='dddddddd-dddd-4ddd-8ddd-dddddddddddd'}
+    }
+    $grants=@(@{roleDefinitionId='/roles/7f951dda-4ed3-4680-a7ca-43fe172d538d';scope=$m.registryResourceId},
+        @{roleDefinitionId='/roles/ba92f5b4-2d11-453d-a403-e96b0029c9fe';scope=$s.containerResourceId
+            conditionVersion='2.0';condition="@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringEquals '$($s.blobName)'"})
+    if ($m.installationMode -ceq 'existing') {
+        foreach ($key in @('client','signing','encryption')) {
+            $grants+=@{roleDefinitionId='/roles/4633458b-17de-408a-b874-0445c86b69e6';scope="$($Target.existingVaultResourceId)/secrets/$($m.secrets.$key.name)"}
+        }
+    }
+    Add-Az $Fixture mcp_preflight @('role','assignment','list','--assignee-object-id','dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        '--subscription',$Target.subscriptionId,'--all','--include-groups',
+        '--fill-principal-name','false','--fill-role-definition-name','false') -Json $grants
+    Add-Az $Fixture mcp_preflight @('role','assignment','list','--assignee-object-id','dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+        '--scope',"/subscriptions/$($Target.subscriptionId)",'--include-inherited','--include-groups',
+        '--fill-principal-name','false','--fill-role-definition-name','false') -Json @()
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$m.registryResourceId) -Json @{
+        id=$m.registryResourceId; properties=@{loginServer=$m.registryLoginServer;adminUserEnabled=$false}
+    }
+    Add-Az $Fixture mcp_preflight @('acr','manifest','show-metadata','--registry','fixtureacr','--name',"$($m.repository)@$($m.imageDigest)") -Json @{digest=$m.imageDigest}
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$s.accountResourceId) -Json @{
+        id=$s.accountResourceId; location=$Target.region; kind='StorageV2';sku=@{name='Standard_LRS'}
+        properties=@{supportsHttpsTrafficOnly=$true;minimumTlsVersion='TLS1_2';publicNetworkAccess='Disabled'
+            allowSharedKeyAccess=$false;allowBlobPublicAccess=$false}
+    }
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$s.containerResourceId) -Json @{
+        id=$s.containerResourceId; properties=@{publicAccess='None'}
+    }
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$s.subnetResourceId) -Json @{
+        id=$s.subnetResourceId; properties=@{delegations=@(@{properties=@{serviceName='Microsoft.Web/serverFarms'}})}
+    }
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$s.privateEndpointResourceId) -Json @{
+        id=$s.privateEndpointResourceId;properties=@{
+            subnet=@{id=($s.subnetResourceId -replace '/subnets/[^/]+$','/subnets/private-endpoints')}
+            privateLinkServiceConnections=@(@{properties=@{privateLinkServiceId=$s.accountResourceId;groupIds=@('blob')
+                privateLinkServiceConnectionState=@{status='Approved'}}})
+        }
+    }
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',"$($s.privateEndpointResourceId)/privateDnsZoneGroups/default") -Json @{
+        properties=@{privateDnsZoneConfigs=@(@{properties=@{privateDnsZoneId=$s.privateDnsZoneResourceId}})}
+    }
+    Add-Az $Fixture mcp_preflight @('resource','show','--ids',$s.privateDnsVnetLinkResourceId) -Json @{
+        id=$s.privateDnsVnetLinkResourceId;properties=@{virtualNetwork=@{id=($s.subnetResourceId -replace '/subnets/[^/]+$','')}
+            registrationEnabled=$false;virtualNetworkLinkState='Completed'}
+    }
+    foreach ($key in @('client','signing','encryption')) {
+        Add-Az $Fixture mcp_preflight @('keyvault','secret','list-versions','--vault-name','fixture-vault','--name',$m.secrets.$key.name) -Json @(@{
+            id="https://fixture-vault.vault.azure.net/secrets/$($m.secrets.$key.name)/$($m.secrets.$key.version)"
+            attributes=@{enabled=$true;expires=[DateTimeOffset]::UtcNow.AddDays(1).ToString('o')}
+        })
+    }
+    Add-Az $Fixture mcp_preflight @('resource','list','--resource-group',$Target.resourceGroup,'--subscription',$Target.subscriptionId) -Json $(
+        if ($m.installationMode -eq 'existing') { @(@{id=$m.appServiceResourceId},@{id=$m.planResourceId}) } else { @() }
+    )
+    if ($m.installationMode -eq 'existing') {
+        Add-Az $Fixture mcp_preflight @('resource','show','--ids',$m.planResourceId) -Json @{sku=@{name='S1';capacity=1}}
+        Add-Az $Fixture mcp_preflight @('webapp','show','--ids',$m.appServiceResourceId) -Json @{
+            id=$m.appServiceResourceId;serverFarmId=$m.planResourceId;tags=@{storageIdentity=$s.identity}
+        }
+        Add-Az $Fixture mcp_preflight @('webapp','config','show','--ids',$m.appServiceResourceId) -Json @{
+            linuxFxVersion="DOCKER|$($m.registryLoginServer)/$($m.repository)@$($m.existingImageDigest)";numberOfWorkers=1;autoHealEnabled=$false
+        }
+        Add-Az $Fixture mcp_preflight @('webapp','deployment','slot','list','--ids',$m.appServiceResourceId) -Json @()
+        Add-Az $Fixture mcp_preflight @('monitor','autoscale','list','--resource-group',$Target.resourceGroup,'--subscription',$Target.subscriptionId) -Json @()
+    }
+    Add-Command $Fixture mcp_what_if az @('deployment','group','what-if','--subscription',$Target.subscriptionId,
+        '--resource-group',$Target.resourceGroup,'--template-file','{{ROOT}}/infra/mcp.bicep','--parameters','@{{MCP_PARAMETER_FILE}}',
+        '--only-show-errors','--no-pretty-print')
+    foreach ($attempt in 1..2) {
+        Add-Az $Fixture mcp_stop @('webapp','stop','--ids',$m.appServiceResourceId) -Json @{}
+        Add-Az $Fixture mcp_stop @('webapp','show','--ids',$m.appServiceResourceId) -Json @{state='Stopped'}
+        if ($m.installationMode -eq 'fresh' -or $attempt -eq 2) {
+            $Fixture.commands.mcp_stop[-1] | Add-Member -NotePropertyName optional -NotePropertyValue $true
+            $Fixture.commands.mcp_stop[-2] | Add-Member -NotePropertyName optional -NotePropertyValue $true
+        }
+    }
+    Add-Az $Fixture mcp_apply @('deployment','group','create','--subscription',$Target.subscriptionId,'--resource-group',$Target.resourceGroup,
+        '--name','agent-control-mcp-{{RUN_ID}}','--template-file','{{ROOT}}/infra/mcp.bicep','--parameters','@{{MCP_PARAMETER_FILE}}') -Json @{}
+    Add-Az $Fixture mcp_start @('webapp','start','--ids',$m.appServiceResourceId) -Json @{}
+    Add-Az $Fixture mcp_verify @('webapp','show','--ids',$m.appServiceResourceId) -Json @{
+        id=$m.appServiceResourceId;serverFarmId=$m.planResourceId;state='Running';outboundIpAddresses='192.0.2.30'
+        keyVaultReferenceIdentity=$m.identityResourceId;virtualNetworkSubnetId=$s.subnetResourceId;httpsOnly=$true
+    }
+    Add-Az $Fixture mcp_verify @('webapp','config','show','--ids',$m.appServiceResourceId) -Json @{
+        linuxFxVersion="DOCKER|$($m.registryLoginServer)/$($m.repository)@$($m.imageDigest)";numberOfWorkers=1
+        autoHealEnabled=$false;vnetRouteAllEnabled=$true;acrUseManagedIdentityCreds=$true;acrUserManagedIdentityID=$m.identityClientId
+        healthCheckPath='/ready';minTlsVersion='1.2';ipSecurityRestrictionsDefaultAction='Deny'
+        scmIpSecurityRestrictionsDefaultAction='Deny'
+        ipSecurityRestrictions=@(@{action='Allow';ipAddress='192.0.2.0/24'})
+    }
+    Add-Az $Fixture mcp_verify @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/azurestorageaccounts/list?api-version=2024-11-01") -Json @{
+        properties=@{}
+    }
+    $references=@{}
+    foreach ($entry in @(@('client','CLIENT_SECRET'),@('signing','JWT_SIGNING_KEY'),@('encryption','OAUTH_ENCRYPTION_KEY'))) {
+        $references["MCP_AZURE_$($entry[1])"]=@{status='Resolved';secretName=$m.secrets.($entry[0]).name;secretVersion=$m.secrets.($entry[0]).version}
+    }
+    Add-Az $Fixture mcp_verify @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/configreferences/appsettings/list?api-version=2022-03-01") -Json @{properties=$references}
+    $settings=@{
+        MCP_TENANT_ID=$m.tenantId;MCP_CLIENT_ID=$m.clientId;MCP_API_CLIENT_ID=$m.apiClientId;MCP_API_ORIGIN=$m.apiOrigin
+        MCP_PUBLIC_URL=$m.publicUrl;MCP_SECRET_SOURCE='app-service-key-vault'
+        MCP_AZURE_BLOB_ACCOUNT_URL=$s.accountUrl;MCP_AZURE_BLOB_CONTAINER=$s.containerName
+        MCP_AZURE_BLOB_NAME=$s.blobName;MCP_AZURE_IDENTITY_CLIENT_ID=$m.identityClientId
+        WEBSITES_ENABLE_APP_SERVICE_STORAGE='false';WEBSITES_CONTAINER_STOP_TIME_LIMIT='75';WEBSITES_PORT='8000'
+        MCP_ALLOWED_CLIENT_REDIRECT_URIS=(ConvertTo-Json -InputObject @($m.redirectUris) -Compress)
+    }
+    Add-Az $Fixture mcp_verify @('webapp','config','appsettings','list','--ids',$m.appServiceResourceId) -Json @(
+        $settings.GetEnumerator() | ForEach-Object { @{name=$_.Key;value=$_.Value} }
+    )
+    Add-Az $Fixture mcp_verify @('monitor','diagnostic-settings','show','--resource',$m.appServiceResourceId,'--name','agent-control-mcp') -Json @{
+        logAnalyticsDestinationType='Dedicated';logs=@(@{enabled=$true;category='AppServiceConsoleLogs'})
+        workspaceId=(Get-TargetResourceId $Target 'Microsoft.OperationalInsights/workspaces' "$($Target.resources.appService.name)-logs")
+    }
+    $alerts=@(
+        @{name='http-5xx';metric='Http5xx';threshold=5;operator='GreaterThanOrEqual';aggregation='Total'},
+        @{name='health';metric='HealthCheckStatus';threshold=100;operator='LessThan';aggregation='Average'},
+        @{name='latency';metric='AverageResponseTime';threshold=2;operator='GreaterThan';aggregation='Average'},
+        @{name='memory';metric='MemoryWorkingSet';threshold=805306368;operator='GreaterThan';aggregation='Average'}
+    ) | ForEach-Object { @{
+        name="$($m.appServiceName)-$($_.name)";enabled=$true;scopes=@($m.appServiceResourceId)
+        actions=@(@{actionGroupId=$Target.resources.monitoring.actionGroupResourceId})
+        criteria=@{allOf=@(@{metricName=$_.metric;threshold=$_.threshold;operator=$_.operator;timeAggregation=$_.aggregation})}
+    } }
+    Add-Az $Fixture mcp_verify @('monitor','metrics','alert','list','--resource-group',$Target.resourceGroup,'--subscription',$Target.subscriptionId) -Json @($alerts)
+    Add-Command $Fixture mcp_verify __http_get__ @('https://fixture-mcp.azurewebsites.net/ready') -ExitCode 200 -Output '{"status":"ready"}'
+    Add-Command $Fixture mcp_verify __http_get__ @('https://fixture-mcp.azurewebsites.net/.well-known/oauth-authorization-server') -ExitCode 200 -Output '{"issuer":"https://fixture-mcp.azurewebsites.net/"}'
+    if ($m.installationMode -eq 'existing') {
+        $mountCommand=Copy-Object $Fixture.commands.mcp_verify[2]
+        $referenceCommand=Copy-Object $Fixture.commands.mcp_verify[3]
+        foreach ($property in $referenceCommand.json.properties.PSObject.Properties) { $property.Value.secretVersion='fixturemcp1' }
+        $Fixture.commands.mcp_preflight += @($mountCommand,$referenceCommand)
+    }
 }
 
 function New-SmokeReceipt {
@@ -439,16 +629,20 @@ function Set-SyntheticBootstrapSecrets {
     }
 }
 function New-Context {
-    param($Target, $Fixture, [string]$Name, [string]$Action = 'Deploy', [string]$ResumeReceiptPath)
+    param($Target, $Fixture, [string]$Name, [string]$Action = 'Deploy', [string]$ResumeReceiptPath, [string]$Component='All')
     $targetPath = Save-Json $Target "$Name-target.json"
+    if ($Component -eq 'Mcp') {
+        $Fixture.commands.prerequisites=@()
+        $Fixture.commands.bicep_build=@($Fixture.commands.bicep_build | Where-Object { $_.arguments[1] -ceq '{{ROOT}}/infra/mcp.bicep' })
+    }
     $fixturePath = Save-Json $Fixture "$Name-fixture.json"
     $validated = Read-ApprovedAzureTarget $targetPath Mock
     $context = New-AzureDeploymentContext -Root $root -Target $validated -ExecutionMode Mock -MockFixturePath $fixturePath `
         -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') `
         -ReceiptPath $(if ($ResumeReceiptPath) { $ResumeReceiptPath } else { Join-Path $scratch "$Name-receipt.json" }) `
-        -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action -QualificationTargets $null
+        -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action -QualificationTargets $null -Component $Component
     $script:Contexts.Add($context)
-    if ($Action -in @('Deploy', 'Recover')) { New-SmokeReceipt $context "$Name-auth-smoke.json" | Out-Null }
+    if ($Action -in @('Deploy', 'Recover') -and $Component -ne 'Mcp') { New-SmokeReceipt $context "$Name-auth-smoke.json" | Out-Null }
     return $context
 }
 
@@ -471,6 +665,26 @@ try {
         Assert-True ($requiredArtifact -cin $operatorSourceFiles) "Operator stage must copy $requiredArtifact into backend/scripts/; later stages and host files are not runtime inputs."
         Assert-True (Test-Path -LiteralPath (Join-Path $root $requiredArtifact) -PathType Leaf) "Required operator artifact $requiredArtifact is missing from the build context."
     }
+    $zipContract = @'
+const assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
+const {zipSync}=require("fflate"),{spawnSync}=require("node:child_process");
+const [root,scratch]=process.argv.slice(1),file=path.join(scratch,"agent-control-linux-x64.zip");
+const base={"backend/dist/server.js":"server","frontend/dist/index.html":"web","package.json":"{}",
+"release-manifest.json":JSON.stringify({version:2,revision:"synthetic-source-filter",platform:"linux",architecture:"x64",runtime:{name:"node",major:24}})};
+let cases=0;
+for(const [extra,accepted] of [[null,true],["backend/tsx-501/cache",false],["node_modules/nested/tsx-10001/cache",false],
+["backend/tsx-source/input.ts",true],["frontend/dist/tsx-123-source/input.tsx",true],["backend/tsx-123.ts/input.ts",true]]) {
+ const files={...base};if(extra)files[extra]="synthetic";
+ const zip=zipSync(Object.fromEntries(Object.entries(files).map(([p,v])=>[p,Buffer.from(v)])));
+ fs.writeFileSync(file,zip);fs.writeFileSync(file+".sha256",crypto.createHash("sha256").update(zip).digest("hex")+"  agent-control-linux-x64.zip\n");
+ const result=spawnSync(process.execPath,[path.join(root,"backend/scripts/release-inspect.mjs"),file],{encoding:"utf8"});
+ assert.equal(result.status===0,accepted,`ZIP cache boundary: ${extra}: ${result.stderr}`);cases++;
+}
+console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cases}));
+'@
+    $zipResult = & node -e $zipContract $root $scratch
+    Assert-True ($LASTEXITCODE -eq 0) 'Actual Azure ZIP inspector did not enforce numeric-cache/ordinary-source boundaries.'
+    Assert-True (($zipResult | ConvertFrom-Json).cases -eq 6) 'Azure ZIP cache regression did not execute every case.'
     $vaultAccess = Get-Content -LiteralPath (Join-Path $root 'infra/key-vault-access.bicep') -Raw
     Assert-True ($vaultAccess -cmatch '(?m)^[ \t]*@minLength\(3\)[ \t]*\r?\n[ \t]*@maxLength\(3\)[ \t]*\r?\n[ \t]*param runtimeSecretNames array[ \t]*$') `
         'Key Vault access module must require exactly three runtime secret names.'
@@ -1032,6 +1246,222 @@ try {
         -not $bicep.Contains("'CLIENT_SECRET'") -and -not $bicep.Contains("'TENANT_DOMAINS'") -and -not $bicep.Contains("'TENANT_DISPLAY_NAME'") -and
         $bicep.Contains('runtimeSecretNames: [for secret in runtimeSecrets: secret.name]')) `
         'Registry-only secret references or least-privilege runtime secret scope are missing.'
+    Assert-True ($null -eq (Get-AzureMcpTarget $target)) 'Omitted MCP must remain absent.'
+    Assert-True (-not ((Get-Content -LiteralPath (New-AzureParameterFile $registryContext) -Raw | ConvertFrom-Json).parameters.PSObject.Properties.Name -ccontains 'mcp')) `
+        'Application ARM parameters unexpectedly provision MCP.'
+    foreach ($value in @($null,$false,'',@{},@{enabled=$true})) {
+        $invalid=New-Target
+        $invalid | Add-Member -NotePropertyName mcp -NotePropertyValue $value
+        Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } 'mcp must|supported fields'
+    }
+    $mcpTarget=Add-McpTarget (New-Target)
+    Assert-True ((Test-ApprovedAzureTarget $mcpTarget Mock).mcp.storage.blobName -ceq 'oauth-state.v1.fernet') 'Exact leased Blob MCP target was rejected.'
+    foreach ($callback in @('http://127.0.0.1:53110/','http://127.0.0.1:19876/mcp/oauth/callback','https://client.example.invalid/')) {
+        $native=Copy-Object $mcpTarget
+        $native.mcp.redirectUris=@($callback)
+        Assert-True ((Test-ApprovedAzureTarget $native Mock).mcp.redirectUris[0] -ceq $callback) 'Exact native OAuth callback was rejected or rewritten.'
+    }
+    $wrongCase=New-Target
+    $wrongCase | Add-Member -NotePropertyName MCP -NotePropertyValue @{}
+    Assert-Fails { Test-ApprovedAzureTarget $wrongCase Mock } 'unsupported fields|exact lowercase mcp'
+    foreach ($case in @(
+        @{change={param($m) $m.imageDigest='latest'};pattern='digest'},
+        @{change={param($m) $m.identityClientId=$m.identityClientId.ToUpperInvariant()};pattern='canonical lowercase'},
+        @{change={param($m) $m.apiClientId=$m.clientId};pattern='tenant/API'},
+        @{change={param($m) $m.tenantId='99999999-9999-4999-8999-999999999999'};pattern='tenant/API'},
+        @{change={param($m) $m.registryLoginServer='other.azurecr.io'};pattern='registry|ACR'},
+        @{change={param($m) $m.publicUrl='https://fixture-mcp.azurewebsites.net/*'};pattern='public resource'},
+        @{change={param($m) $m.callbackUri='https://fixture-mcp.azurewebsites.net/callback'};pattern='callback'},
+        @{change={param($m) $m.redirectUris=@('https://*.example.invalid/callback')};pattern='redirects'},
+        @{change={param($m) $m.redirectUris='https://client.example.test/callback'};pattern='redirects'},
+        @{change={param($m) $m.redirectUris=@('http://client.example.test/')};pattern='redirects'},
+        @{change={param($m) $m.redirectUris=@('http://127.0.0.1:53110')};pattern='redirects'},
+        @{change={param($m) $m.storage.accountUrl='http://fixtureoauth.blob.core.windows.net'};pattern='TLS Blob'},
+        @{change={param($m) $m.storage.blobName='another'};pattern='TLS Blob'},
+        @{change={param($m) $m.storage.containerResourceId='/other'};pattern='TLS Blob'},
+        @{change={param($m) $m.storage.privateDnsZoneResourceId='/other'};pattern='TLS Blob'},
+        @{change={param($m) $m.storage.preparedReference=''};pattern='Blob preparation'},
+        @{change={param($m) $m.secrets.client.version=''};pattern='immutable versions'},
+        @{change={param($m) $m.secrets.client | Add-Member -NotePropertyName value -NotePropertyValue 'synthetic-never-log'};pattern='supported fields'},
+        @{change={param($m) $m.network.inboundIpv4Cidrs=@('0.0.0.0/0')};pattern='CIDRs'},
+        @{change={param($m) $m.network.inboundIpv4Cidrs='192.0.2.0/24'};pattern='ingress'},
+        @{change={param($m) $m.network.forwardedHeaders='all'};pattern='forwarded'},
+        @{change={param($m) $m.cost.monthlyTotal=7};pattern='cost'}
+    )) {
+        $invalid=Copy-Object $mcpTarget
+        & $case.change $invalid.mcp
+        Assert-Fails { Test-ApprovedAzureTarget $invalid Mock } $case.pattern
+    }
+    $noMcp=New-Context $target (New-Fixture $target) 'no-mcp-component' 'Plan'
+    Assert-Fails { New-Context $target (New-Fixture $target) 'no-mcp-explicit-component' 'Plan' -Component Mcp } 'requires explicit MCP'
+    Assert-Fails { New-Context $mcpTarget (New-Fixture $mcpTarget) 'ignored-mcp' 'Plan' -Component Application } 'rather than silently'
+    $mcpPlan=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-plan' 'Plan' -Component Mcp
+    $mcpPlanReceipt=Invoke-AzureDeployment $mcpPlan Plan
+    Assert-True ($mcpPlanReceipt.status -ceq 'previewed_not_deployed' -and
+        $null -eq $mcpPlanReceipt.artifact -and 'mcp_apply' -notin @($mcpPlan.Calls) -and 'vault_preflight' -notin @($mcpPlan.Calls)) 'MCP-only Plan wrote resources/read API secrets/artifact.'
+    $mcpDeploy=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-deploy' 'Deploy' -Component Mcp
+    $mcpReceipt=Invoke-AzureDeployment $mcpDeploy Deploy
+    Assert-True ($mcpReceipt.status -ceq 'deployed_mcp' -and $mcpReceipt.mcp.contract.imageDigest -ceq $mcpTarget.mcp.imageDigest -and
+        $mcpReceipt.evidence.mcp_verify.authenticatedApiConnectivity -ceq 'not_proven') 'MCP deployment receipt lost immutable identity or overclaimed API proof.'
+    Assert-True (-not @($mcpDeploy.Calls | Where-Object { $_ -in @('resource_deploy','network_reconcile','enter_maintenance','database_initialize','package_deploy') }).Count) `
+        'MCP-only touched API/PostgreSQL.'
+    $mcpAll=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-all'
+    Assert-True ((Invoke-AzureDeployment $mcpAll Deploy).status -ceq 'deployed') 'Combined independent application/MCP deployment failed.'
+    Assert-True ([array]::IndexOf(@($mcpAll.Calls),'open_and_verify') -lt [array]::IndexOf(@($mcpAll.Calls),'mcp_apply')) `
+        'MCP was deployed before independent API/web recovered.'
+    $receiptFailure=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-receipt-failure'
+    $receiptBlocker=Join-Path $scratch 'mcp-receipt-blocker'
+    [IO.File]::WriteAllText($receiptBlocker,'synthetic')
+    $receiptFailure.ReceiptPath=Join-Path $receiptBlocker 'receipt.json'
+    Assert-Fails { Invoke-AzureDeployment $receiptFailure Deploy } 'API/web remains online'
+    Assert-True ('open_and_verify' -in @($receiptFailure.Completed) -and
+        'contain_runtime' -notin @($receiptFailure.Calls)) 'An independent MCP receipt failure disabled the verified API/web.'
+    $rotation=Add-McpTarget (New-Target) existing
+    foreach ($key in @('client','signing','encryption')) {
+        $rotated=Copy-Object $rotation
+        foreach ($other in @('client','signing','encryption') | Where-Object { $_ -cne $key }) { $rotated.mcp.secrets.$other.version='fixturemcp1' }
+        $rotationContext=New-Context $rotated (New-Fixture $rotated) "mcp-rotate-$key" 'Deploy' -Component Mcp
+        Assert-True ((Invoke-AzureDeployment $rotationContext Deploy).status -ceq 'deployed_mcp') "Independent $key rotation failed."
+        Assert-True ([array]::IndexOf(@($rotationContext.Calls),'mcp_stop') -lt [array]::IndexOf(@($rotationContext.Calls),'mcp_apply') -and
+            'vault_preflight' -notin @($rotationContext.Calls)) 'Rotation failed stop-before-update or read API credentials.'
+    }
+    $recoverMcp=New-Context $rotation (New-Fixture $rotation) 'mcp-recover' 'Recover' -Component Mcp
+    Assert-True ((Invoke-AzureDeployment $recoverMcp Recover).status -ceq 'recovered_mcp' -and
+        'pitr_restore' -notin @($recoverMcp.Calls)) 'MCP-only recovery restored API business data.'
+    $stopMcp=New-Context $rotation (New-Fixture $rotation) 'mcp-stop' 'Stop' -Component Mcp
+    Assert-True ((Invoke-AzureDeployment $stopMcp Stop).status -ceq 'mcp_stopped' -and
+        (@($stopMcp.Calls) -join ',') -ceq 'operator_identity,mcp_stop') 'Exact backup stop read API secrets, deployed or stopped the application.'
+    $cliMcpFixture=Save-Json $mcpDeploy.MockFixture 'mcp-cli-fixture.json'
+    $cliMcpTarget=Save-Json $mcpTarget 'mcp-cli-target.json'
+    $cliMcpReceipt=Join-Path $scratch 'mcp-cli-receipt.json'
+    & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+        -Action Deploy -Component Mcp -ExecutionMode Mock -TargetFile $cliMcpTarget -MockFixturePath $cliMcpFixture `
+        -ArtifactPath (Join-Path $scratch 'no-api-artifact.zip') -ReceiptPath $cliMcpReceipt | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0 -and (Get-Content -LiteralPath $cliMcpReceipt -Raw | ConvertFrom-Json).status -ceq 'deployed_mcp') `
+        'Real CLI binding of mocked MCP-only deployment required API artifacts/authentication smoke or diverged.'
+    foreach ($case in @(
+        @{index=1;change={param($c) $c.json.properties.clientId='wrong'};pattern='managed identity'},
+        @{index=2;change={param($c) $c.json[0].scope='/subscriptions/wrong'};pattern='broad/custom/inherited'},
+        @{index=2;change={param($c) $c.json[0].roleDefinitionId='/roles/8e3af657-a8ff-443c-a75c-2fe8c4bcb635'};pattern='broad/custom/inherited'},
+        @{index=2;change={param($c) $c.json=@(@{roleDefinitionId='/roles/4633458b-17de-408a-b874-0445c86b69e6';scope='/subscriptions/wrong/vault'})};pattern='broad/custom/inherited'},
+        @{index=2;change={param($c) $c.json=@()};pattern='AcrPull grant'},
+        @{index=3;change={param($c) $c.json=@(@{roleDefinitionId='/roles/8e3af657-a8ff-443c-a75c-2fe8c4bcb635';scope='/providers/Microsoft.Management/managementGroups/synthetic'})};pattern='broad/custom/inherited'},
+        @{index=4;change={param($c) $c.json.properties.roleAssignmentMode='AbacRepositoryPermissions'};pattern='legacy AcrPull'},
+        @{index=5;change={param($c) $c.json.digest='sha256:wrong'};pattern='digest mismatch'},
+        @{index=6;change={param($c) $c.json.properties.publicNetworkAccess='Enabled'};pattern='TLS Blob'},
+        @{index=6;change={param($c) $c.json.properties.supportsHttpsTrafficOnly=$false};pattern='TLS Blob'},
+        @{index=6;change={param($c) $c.json.properties.allowSharedKeyAccess=$true};pattern='TLS Blob'},
+        @{index=7;change={param($c) $c.json.properties.publicAccess='Blob'};pattern='TLS Blob'},
+        @{index=8;change={param($c) $c.json.id='other-subnet'};pattern='TLS Blob'},
+        @{index=9;change={param($c) $c.json.properties.privateLinkServiceConnections[0].properties.privateLinkServiceConnectionState.status='Pending'};pattern='private endpoint'},
+        @{index=10;change={param($c) $c.json.properties.privateDnsZoneConfigs[0].properties.privateDnsZoneId='/other'};pattern='DNS'},
+        @{index=11;change={param($c) $c.json.properties.virtualNetwork.id='/other'};pattern='DNS'},
+        @{index=12;change={param($c) $c.json[0].attributes.enabled=$false};pattern='secret version'},
+        @{index=2;change={param($c) $c.json[1].condition='true'};pattern='broad/custom/inherited'},
+        @{index=2;change={param($c) $c.json[1].scope='/subscriptions/wrong'};pattern='broad/custom/inherited'}
+    )) {
+        $fixture=New-Fixture $mcpTarget
+        & $case.change $fixture.commands.mcp_preflight[$case.index]
+        $context=New-Context $mcpTarget $fixture "mcp-preflight-$($case.index)" 'Plan' -Component Mcp
+        Assert-Fails { Invoke-DeploymentOperation $context mcp_preflight } $case.pattern
+        Assert-True ('mcp_apply' -notin @($context.Calls)) 'Failed preflight reached a write.'
+    }
+    foreach ($case in @(
+        @{index=0;change={param($c) $c.json.outboundIpAddresses='192.0.2.99'};pattern='identity mismatch'},
+        @{index=1;change={param($c) $c.json.ipSecurityRestrictionsDefaultAction='Allow'};pattern='identity mismatch'},
+        @{index=2;change={param($c) $c.json.properties=@{unexpected=@{}}};pattern='identity mismatch'},
+        @{index=1;change={param($c) $c.json.vnetRouteAllEnabled=$false};pattern='identity mismatch'},
+        @{index=3;change={param($c) $c.json.properties.MCP_AZURE_CLIENT_SECRET.secretVersion='other'};pattern='Key Vault'},
+        @{index=4;change={param($c) @($c.json | Where-Object name -CEQ MCP_API_ORIGIN)[0].value='https://other.invalid'};pattern='configuration mismatch'},
+        @{index=5;change={param($c) $c.json.logs[0].category='AppServiceHTTPLogs'};pattern='diagnostics'},
+        @{index=6;change={param($c) $c.json[0].criteria.allOf[0].threshold=999};pattern='alert'}
+    )) {
+        $fixture=New-Fixture $mcpTarget
+        & $case.change $fixture.commands.mcp_verify[$case.index]
+        $context=New-Context $mcpTarget $fixture "mcp-runtime-$($case.index)" 'Plan' -Component Mcp
+        Assert-Fails { Invoke-DeploymentOperation $context mcp_verify } $case.pattern
+    }
+    $applyFailedFixture=New-Fixture $mcpTarget
+    $applyFailedFixture.commands.mcp_apply[0].exitCode=9
+    $applyFailed=New-Context $mcpTarget $applyFailedFixture 'mcp-apply-failed' 'Deploy' -Component Mcp
+    $applyFailedReceipt=Invoke-AzureDeployment $applyFailed Deploy
+    Assert-True ($applyFailedReceipt.status -ceq 'mcp_failed' -and $applyFailedReceipt.failedStep -ceq 'mcp_apply' -and
+        $applyFailedReceipt.evidence.mcpContainment.stopped -eq $true -and 'mcp_start' -notin @($applyFailed.Calls)) `
+        'Uncertain fresh MCP apply was retried/started or failed to attempt MCP-only containment.'
+    $failedFixture=New-Fixture $mcpTarget
+    $failedFixture.commands.mcp_verify[1].json.linuxFxVersion='DOCKER|different'
+    $failedMcp=New-Context $mcpTarget $failedFixture 'mcp-runtime-failure'
+    $failedMcpReceipt=Invoke-AzureDeployment $failedMcp Deploy
+    Assert-True ($failedMcpReceipt.status -ceq 'deployed_mcp_failed' -and
+        'contain_runtime' -notin @($failedMcp.Calls) -and $failedMcpReceipt.evidence.mcpContainment.apiWrites -eq 0) `
+        'MCP runtime failure disabled the independent API/web.'
+    foreach ($binding in @('container','identity','image','secret')) {
+        $changed = Copy-Object $mcpTarget
+        switch ($binding) {
+            container {
+                $changed.mcp.storage.containerName='different'
+                $changed.mcp.storage.containerResourceId="$($changed.mcp.storage.accountResourceId)/blobServices/default/containers/different"
+                $changed.mcp.storage.identity="$($changed.mcp.storage.accountUrl)/different/$($changed.mcp.storage.blobName)"
+            }
+            identity { $changed.mcp.identityClientId='cccc0000-cccc-4ccc-8ccc-cccccccccccc' }
+            image { $changed.mcp.imageDigest='sha256:' + ('d' * 64) }
+            secret { $changed.mcp.secrets.encryption.version='differentversion' }
+        }
+        Assert-Fails { New-Context $changed (New-Fixture $changed) "mcp-resume-mismatch-$binding" 'Deploy' $failedMcp.ReceiptPath } `
+            'exact approved target and execution boundary'
+    }
+    $resumeFixture=New-Fixture $mcpTarget
+    $resumeFixture.commands.mcp_preflight=@()
+    $existingFixture=New-Fixture $rotation
+    $resumeFixture.commands.mcp_preflight=@($existingFixture.commands.mcp_preflight)
+    $resumeFixture.commands.mcp_preflight[17].json.tags=@{storageIdentity=$mcpTarget.mcp.storage.identity;wizardRunId='{{RUN_ID}}'}
+    $resumeFixture.commands.mcp_preflight[18].json.linuxFxVersion="DOCKER|$($mcpTarget.mcp.registryLoginServer)/$($mcpTarget.mcp.repository)@$($mcpTarget.mcp.imageDigest)"
+    foreach ($property in $resumeFixture.commands.mcp_preflight[-1].json.properties.PSObject.Properties) { $property.Value.secretVersion='fixturemcp2' }
+    $retryPath=Save-Json $failedMcpReceipt 'mcp-repeated-resume.json'
+    foreach ($attempt in 1..2) {
+        $retryFixture=Copy-Object $resumeFixture
+        $retryFixture.commands.mcp_verify[1].json.linuxFxVersion='DOCKER|different'
+        $retry=New-Context $mcpTarget $retryFixture "mcp-repeat-$attempt" 'Deploy' $retryPath
+        $retried=Invoke-AzureDeployment $retry Deploy
+        Assert-True ($retried.status -ceq 'deployed_mcp_failed' -and
+            'contain_runtime' -notin @($retry.Calls) -and 'enter_maintenance' -notin @($retry.Calls) -and
+            'vault_preflight' -notin @($retry.Calls) -and 'package_deploy' -notin @($retry.Calls)) `
+            'Repeated partial MCP resume lost API-success status, read API secrets or disabled API/web.'
+    }
+    $retrySuccess=New-Context $mcpTarget (Copy-Object $resumeFixture) 'mcp-repeat-success' 'Deploy' $retryPath
+    Assert-True ((Invoke-AzureDeployment $retrySuccess Deploy).status -ceq 'deployed' -and
+        'mcp_start' -in @($retrySuccess.Calls) -and 'enter_maintenance' -notin @($retrySuccess.Calls)) `
+        'Successful repeated partial resume did not preserve full-deployment identity/API independence.'
+    $resumeMcp=New-Context $mcpTarget $resumeFixture 'mcp-runtime-resume' 'Deploy' $failedMcp.ReceiptPath
+    $resumedMcpReceipt=Invoke-AzureDeployment $resumeMcp Deploy
+    Assert-True ($resumedMcpReceipt.status -ceq 'deployed' -and 'resume-skip:mcp_apply' -in @($resumeMcp.Calls) -and
+        'enter_maintenance' -notin @($resumeMcp.Calls) -and 'mcp_start' -in @($resumeMcp.Calls)) 'MCP-only failure resume redeployed API, replayed apply or failed to restart stopped MCP.'
+    $uncertain=Copy-Object $failedMcpReceipt
+    $uncertain.failedStep='mcp_apply'
+    $uncertain.completedSteps=@($uncertain.completedSteps | Where-Object { $_ -cne 'mcp_apply' })
+    $uncertainPath=Save-Json $uncertain 'mcp-uncertain.json'
+    $uncertainContext=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-uncertain' 'Deploy' $uncertainPath
+    Assert-Fails { Invoke-DeploymentOperation $uncertainContext mcp_resume_verify } 'outcome is uncertain'
+    $uncertainResume=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-uncertain-full' 'Deploy' $uncertainPath
+    Assert-Fails { Invoke-AzureDeployment $uncertainResume Deploy } 'MCP preflight/recovery stopped'
+    $stillUncertain=Get-Content -LiteralPath $uncertainPath -Raw | ConvertFrom-Json
+    Assert-True ($stillUncertain.failedStep -ceq 'mcp_apply' -and $uncertainResume.CommandOffsets.Count -eq 0) `
+        'Uncertain resume lost its original outcome or reached external writes.'
+    $againUncertain=New-Context $mcpTarget (New-Fixture $mcpTarget) 'mcp-uncertain-again' 'Deploy' $uncertainPath
+    Assert-Fails { Invoke-AzureDeployment $againUncertain Deploy } 'MCP preflight/recovery stopped'
+    Assert-True ($againUncertain.CommandOffsets.Count -eq 0 -and
+        (Get-Content -LiteralPath $uncertainPath -Raw | ConvertFrom-Json).status -ceq 'deployed_mcp_failed') `
+        'Repeated uncertain apply resume reached API containment or cleared partial-success identity.'
+    $mcpBicep=Get-Content -LiteralPath (Join-Path $root 'infra/mcp.bicep') -Raw
+    Assert-True ($mcpBicep.Contains('MCP_AZURE_BLOB_NAME') -and -not $mcpBicep.Contains('azurestorageaccounts') -and
+        -not $mcpBicep.Contains('accessKey:') -and $mcpBicep.Contains('vnetRouteAllEnabled: true') -and
+        $mcpBicep.Contains('acrUseManagedIdentityCreds: true') -and $mcpBicep.Contains("value: 'app-service-key-vault'") -and
+        $mcpBicep.Contains("WEBSITES_CONTAINER_STOP_TIME_LIMIT") -and $mcpBicep.Contains('numberOfWorkers: 1')) `
+        'MCP Bicep lost leased Blob/native identity/private egress/drain boundaries.'
+    $sample=Get-Content -LiteralPath (Join-Path $root 'infra/mcp-target.example.json') -Raw | ConvertFrom-Json
+    Assert-AzureMcpObject $sample @($mcpTarget.mcp.PSObject.Properties.Name) 'MCP example'
+    Assert-True ($sample.cost.monthlyTotal -eq $null -and $sample.storage.preparedReference -ceq '') `
+        'MCP example became price evidence or private-network authorization.'
     Write-Host "Passed $script:Checks Azure deployment command-level assertions."
 } catch {
     Get-ChildItem -LiteralPath $scratch -Filter '*receipt.json' -ErrorAction SilentlyContinue | ForEach-Object {

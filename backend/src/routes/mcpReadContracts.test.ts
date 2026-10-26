@@ -6,6 +6,7 @@ import { UserSourceStages } from "../db/userSourceStages.js";
 import { OfficialReportImports } from "../db/officialReportImports.js";
 import { schemaRegistry } from "../services/officialReportFields.js";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
 import type { AgentAboutPage, SavedRelationshipPage, ChampionAgentPage, UserResolution } from "../types/savedReadContracts.js";
 import type { CandidateAgentUsageHistory } from "../types/officialReportApi.js";
@@ -22,6 +23,7 @@ import type { UnifiedAgentInventoryPage } from "../types/unifiedAgents.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import type { AdoptionPage } from "../types/adoption.js";
 import type { ReportPage, ReportAgent } from "../types/officialReportData.js";
+import { sdkJourney, type SdkCall } from "./mcpSdkJourneyTestSupport.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -29,10 +31,11 @@ vi.hoisted(() => {
     clientId: "22222222-2222-2222-2222-222222222222", clientSecret: "synthetic-only", domains: ["example.invalid"],
     integration: { clientId: "33333333-3333-3333-3333-333333333333", audience: "22222222-2222-2222-2222-222222222222", scope: "AgentControl.Access" } }]);
 });
-const alex = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-const canonical = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-const person = (n: number) => `20000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-const reportSet = (n: number) => `30000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+const corpus = JSON.parse(readFileSync(new URL("../../scripts/fixtures/mcp-workflows.json", import.meta.url), "utf8"));
+const alex: string = corpus.ids.nativePerson;
+const canonical = (n: number) => `${corpus.ids.canonicalPrefix}${String(n).padStart(12, "0")}`;
+const person = (n: number) => `${corpus.ids.personPrefix}${String(n).padStart(12, "0")}`;
+const reportSet = (n: number) => `${corpus.ids.reportPrefix}${String(n).padStart(12, "0")}`;
 const setupAuditOriginHttp = (transport: "webapp" | "mcp", selected = account()) =>
   sharedHttpSetup(transport, selected, "44444444-4444-4444-4444-444444444444");
 function user(id: string, username: string, name = "Same name"): CopilotDirectoryUser {
@@ -105,17 +108,20 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
     const outcomes: unknown[] = [];
     for (const transport of ["webapp", "mcp"] as const) {
       const fixture = await setupAuditOriginHttp(transport), { database, scope, request } = fixture;
+      const sdkCalls: SdkCall[] = [];
       const identity = await usageIdentity(database, scope);
       await directory(database, identity, [user(alex, "alex@example.invalid"), user(person(1), "duplicate@example.invalid"),
         user(person(2), "DUPLICATE@example.invalid")]);
-      const fullText = "Full Unicode 🧭 long About.\n".repeat(1200);
+      const fullText = corpus.caseA.longAbout.unit.repeat(corpus.caseA.longAbout.repeat) + corpus.caseA.adversarialSuffix;
+      const nativeTextExpected = corpus.caseA.nativeAbout.unit.repeat(corpus.caseA.nativeAbout.repeat) + corpus.caseA.adversarialSuffix;
       await saveUsageInventory(database, scope, Array.from({ length: 103 }, (_, index) => {
         const n = index + 1;
         return { canonicalId: canonical(n), packages: [`P${n}`], packageFields: { type: "custom", displayName: "Shared name",
+          ...n <= corpus.platforms.length ? { platform: corpus.platforms[n - 1] } : {},
           ...n === 101 ? { longDescription: fullText } : {} },
         ...n <= 5 || n === 102 ? { native: { nativeId: `native-${n}`, environmentId: "environment",
           ...n <= 3 ? { createdBy: alex } : {}, ...n === 4 || n === 5 ? { ownerId: alex } : {},
-          ...n === 5 ? { lastModifiedBy: alex } : {}, ...n === 102 ? { description: "Saved native About 🧭".repeat(2000) } : {} } } : {} };
+          ...n === 5 ? { lastModifiedBy: alex } : {}, ...n === 102 ? { description: nativeTextExpected } : {} } } : {} };
       }));
       await reports(database, identity, { agents: Array.from({ length: 103 }, (_, i) => `P${i + 1},Shared name,Your org,1,0,1,2026-01-30`),
         userAgents: [...Array.from({ length: 98 }, (_, i) => `P${i + 6},Shared name,Your org,alex@example.invalid,1,2026-01-30`),
@@ -140,6 +146,7 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
       expect(await incomplete.json()).toMatchObject({ code: "relationship_inventory_scope" });
       const resolved = await json<UserResolution>(request, `/copilot-usage/users/resolve?${new URLSearchParams({ username: "alex@example.invalid", selectionId: pins.selectionId })}`);
       expect(resolved).toMatchObject({ state: "resolved", objectId: alex, reportedUsername: "alex@example.invalid" });
+      sdkCalls.push({ name: "resolve_user", request: { username: "alex@example.invalid", selectionId: pins.selectionId }, expected: resolved });
       expect(await json<UserResolution>(request, `/copilot-usage/users/resolve?${new URLSearchParams({ username: "duplicate@example.invalid", selectionId: pins.selectionId })}`))
         .toMatchObject({ state: "ambiguous", objectId: null, directoryMatches: 2 });
       expect(await json<UserResolution>(request, `/copilot-usage/users/resolve?${new URLSearchParams({ username: "Same name", selectionId: pins.selectionId })}`))
@@ -155,18 +162,48 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
           const page = await json<SavedRelationshipPage>(request, `/copilot-usage/users/${alex}/agent-relationships?${new URLSearchParams({
             selectionId: pins.selectionId, inventorySelectionId: pins.inventorySelectionId, relationship, limit: "50", ...cursor ? { cursor } : {},
           })}`);
+          sdkCalls.push({ name: "list_user_agent_relationships", request: { objectId: alex,
+            selectionId: pins.selectionId, inventorySelectionId: pins.inventorySelectionId, relationship, limit: 50,
+            ...cursor ? { cursor } : {} }, expected: page });
           rows.push(...page.value); cursor = page.page.nextCursor ?? undefined;
-          expect(page.counts.total).toBe({ used: 99, created: 3, owned: 2, modified: 1 }[relationship]);
+          expect(page.counts.total).toBe(corpus.caseA.counts[relationship]);
+          expect(page.value.every(row => row.personId === alex && row.relationship === relationship)).toBe(true);
+          for (const row of page.value) {
+            if (row.identityState === "report_only") {
+              expect(row.canonicalId).toBeNull(); expect(row.sourceReferences).toBeNull();
+            } else {
+              expect(row.sourceReferences?.selectionId).toBe(pins.inventorySelectionId);
+              expect(row.sourceReferences?.path).toBe(`/api/agent-inventory/${row.id}/members`);
+            }
+          }
         } while (cursor);
         edges[relationship] = rows.map(row => row.id).sort();
       }
-      expect(edges.created).toEqual([1, 2, 3].map(n => `agent:${canonical(n)}`));
-      expect(edges.owned).toEqual([4, 5].map(n => `agent:${canonical(n)}`));
-      expect(edges.used).toEqual([...Array.from({ length: 98 }, (_, i) => `agent:${canonical(i + 6)}`), "report:P_report_only"].sort());
-      const page = await pins.inventory.page(pins.inventorySelectionId, pins.identity, { limit: 100 });
-      const second = await pins.inventory.page(pins.inventorySelectionId, pins.identity, { limit: 100, cursor: page.page.nextCursor ?? undefined });
-      expect(page.value.length + second.value.length).toBe(103);
-      expect(new Set([...page.value, ...second.value].map(row => row.id))).toHaveProperty("size", 103);
+      expect(edges.created).toEqual(corpus.caseA.created.map((n: number) => `agent:${canonical(n)}`));
+      expect(edges.owned).toEqual(corpus.caseA.owned.map((n: number) => `agent:${canonical(n)}`));
+      expect(edges.modified).toEqual(corpus.caseA.modified.map((n: number) => `agent:${canonical(n)}`));
+      expect(edges.used).toEqual([...corpus.caseA.usedCanonicalNumbers.map((n: number) => `agent:${canonical(n)}`), corpus.caseA.usedReportOnlyId].sort());
+      const inventoryRows: UnifiedAgentInventoryPage["value"] = [], inventoryCursors = new Set<string>();
+      let inventoryCursor: string | undefined, inventoryPages = 0;
+      do {
+        const page = await json<UnifiedAgentInventoryPage>(request, `/agent-inventory?${new URLSearchParams({
+          selectionId: pins.inventorySelectionId, limit: "25", ...inventoryCursor ? { cursor: inventoryCursor } : {},
+        })}`);
+        sdkCalls.push({ name: "list_agents", request: { selectionId: pins.inventorySelectionId, limit: 25,
+          ...inventoryCursor ? { cursor: inventoryCursor } : {} }, expected: page });
+        inventoryRows.push(...page.value); inventoryPages++;
+        expect(page.value.length).toBeLessThanOrEqual(25);
+        expect(inventoryRows.length).toBeLessThanOrEqual(103);
+        inventoryCursor = page.page.nextCursor ?? undefined;
+        if (inventoryCursor) {
+          expect(inventoryCursors.has(inventoryCursor)).toBe(false);
+          inventoryCursors.add(inventoryCursor);
+        }
+      } while (inventoryCursor);
+      expect(inventoryPages).toBe(5);
+      expect(inventoryRows.map(row => row.id).sort()).toEqual(Array.from({ length: 103 }, (_, index) => `agent:${canonical(index + 1)}`).sort());
+      expect(inventoryRows.flatMap(row => row.packages.map(pkg => pkg.platform)).filter(Boolean).sort())
+        .toEqual([...corpus.platforms].sort());
       const members = await pins.inventory.members(pins.inventorySelectionId, pins.identity, canonical(101), { limit: 50 });
       const source = members.value[0];
       let cursor: string | undefined, staleAboutCursor: string | undefined, text = "", bytes = 0;
@@ -175,6 +212,9 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
           selectionId: pins.inventorySelectionId, sourceScopeId: source.source_scope_id, sourceIdentity: source.source_identity, field: "long",
           ...cursor ? { cursor } : {},
         })}`);
+        sdkCalls.push({ name: "read_agent_about", request: { recordId: `agent:${canonical(101)}`,
+          selectionId: pins.inventorySelectionId, sourceScopeId: source.source_scope_id, sourceIdentity: source.source_identity, field: "long",
+          ...cursor ? { cursor } : {} }, expected: about });
         expect(about.totalBytes).toBe(Buffer.byteLength(fullText));
         expect(Buffer.byteLength(JSON.stringify(about))).toBeLessThan(524288);
         staleAboutCursor ??= about.nextCursor ?? undefined;
@@ -189,9 +229,12 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
           selectionId: pins.inventorySelectionId, sourceScopeId: native.source_scope_id, sourceIdentity: native.source_identity, field: "native",
           ...cursor ? { cursor } : {},
         })}`);
+        sdkCalls.push({ name: "read_agent_about", request: { recordId: `agent:${canonical(102)}`,
+          selectionId: pins.inventorySelectionId, sourceScopeId: native.source_scope_id, sourceIdentity: native.source_identity, field: "native",
+          ...cursor ? { cursor } : {} }, expected: about });
         nativeText += about.text; cursor = about.nextCursor ?? undefined;
       } while (cursor);
-      expect(nativeText).toBe("Saved native About 🧭".repeat(2000));
+      expect(nativeText).toBe(nativeTextExpected);
       const missingMembers = await pins.inventory.members(pins.inventorySelectionId, pins.identity, canonical(103), { limit: 50 });
       expect(await json<AgentAboutPage>(request, `/agent-inventory/agent:${canonical(103)}/about?${new URLSearchParams({
         selectionId: pins.inventorySelectionId, sourceScopeId: missingMembers.value[0].source_scope_id,
@@ -207,6 +250,7 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
         sourceScopeId: source.source_scope_id, sourceIdentity: source.source_identity, field: "long",
       })).rejects.toMatchObject({ code: "selection_invalidated" });
       outcomes.push({ edges, text, resolution: [resolved.state, resolved.objectId, resolved.reportedUsername] });
+      if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY) await sdkJourney(fixture, sdkCalls);
       const continuation = await json<SavedRelationshipPage>(request, `/copilot-usage/users/${alex}/agent-relationships?${new URLSearchParams({
         selectionId: pins.selectionId, inventorySelectionId: pins.inventorySelectionId, relationship: "used", limit: "50",
       })}`);
@@ -292,13 +336,18 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
         selectionId: pins.selectionId, inventorySelectionId: pins.inventorySelectionId, limit: "2", ...cursor ? { cursor } : {},
       })}`);
       expect(page).toMatchObject({ company: "Example Company", department: "Research" });
-      expect(page.champions.map(row => row.objectId)).toEqual([person(1), person(2), person(3)]);
+      expect(page.champions.map(row => row.objectId)).toEqual(corpus.caseB.claims.championIds);
       expect(page.champions.map(({ created, responses, agents }) => ({ created, responses, agents }))).toEqual([
         { created: 3, responses: 10, agents: 4 }, { created: 2, responses: 50, agents: 3 }, { created: 2, responses: 20, agents: 8 },
       ]);
       values.push(...page.value); cursor = page.page.nextCursor ?? undefined;
     } while (cursor);
-    expect(values).toHaveLength(19);
+    expect(values).toHaveLength(corpus.caseB.associationCount);
+    expect(values.map(row => [row.personId, row.id, row.relationship].join("|")).sort()).toEqual([
+      ...corpus.caseB.createdEdges.map(([p, n]: [number, number]) => [person(p), `agent:${canonical(n)}`, "created"].join("|")),
+      ...corpus.caseB.usedEdges.map(([p, n]: [number, number]) => [person(p), `agent:${canonical(n)}`, "used"].join("|")),
+      [person(corpus.caseB.reportOnlyEdge.person), corpus.caseB.reportOnlyEdge.id, "used"].join("|"),
+    ].sort());
     expect(values.some(row => row.reportAgentId === "P_nonchampion")).toBe(false);
     expect(values.some(row => row.id === `agent:${canonical(8)}`)).toBe(false);
     expect(values).toContainEqual(expect.objectContaining({ id: "report:P_extra", relationship: "used" }));
@@ -318,7 +367,9 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
 
   it("compares only equal nonoverlapping actual windows and measures constant selected query work on a large directory", async () => {
     for (const transport of ["webapp", "mcp"] as const) {
-    const { database, scope, request, actor, providerWork } = await setupAuditOriginHttp(transport), identity = await usageIdentity(database, scope);
+    const fixture = await setupAuditOriginHttp(transport);
+    const { database, scope, request, actor, providerWork } = fixture, identity = await usageIdentity(database, scope);
+    const sdkCalls: SdkCall[] = [];
     await directory(database, identity, [user(alex, "alex@example.invalid"),
       ...Array.from({ length: 5000 }, (_, i) => user(`80000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `large${i}@example.invalid`))]);
     await saveUsageInventory(database, scope, Array.from({ length: 103 }, (_, i) => ({
@@ -336,6 +387,10 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
       userAgents: Array.from({ length: 103 }, (_, i) => `P${i + 1},A,Your org,alex@example.invalid,${i ? 0 : 1},2026-05-01`),
       users: ["alex@example.invalid,Alex,1,1,2026-05-01"] }, undefined, reportSet(5))).setId);
     const pins = await selections(database, scope, actor, request);
+    const resolvedApi = await json<UserResolution>(request, `/copilot-usage/users/resolve?${new URLSearchParams({
+      username: "alex@example.invalid", selectionId: pins.selectionId,
+    })}`);
+    sdkCalls.push({ name: "resolve_user", request: { username: "alex@example.invalid", selectionId: pins.selectionId }, expected: resolvedApi });
     const work: { milliseconds: number; rows: number; failed: boolean }[] = [];
     const stop = observeQueryWork(query => work.push({ milliseconds: query.milliseconds, rows: query.rows, failed: query.failed }));
     const stopTransactions = observeTransactionStart(async client => checkpointQueries(client));
@@ -357,12 +412,14 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
     const stopChampionTransactions = observeTransactionStart(async client => checkpointQueries(client));
     const championStart = performance.now();
     const all = [];
+    const championPages: { cursor?: string; page: ChampionAgentPage }[] = [];
     try {
       let cursor: string | undefined;
       do {
         const page = await new SavedReadContracts(adoption.reports, adoption.inventory).champions(
           adoption.selectionId, adoption.identity, adoption.inventorySelectionId, { limit: 50, cursor });
         expect(page.champions.map(champion => champion.objectId)).toEqual([alex]);
+        championPages.push({ cursor, page });
         all.push(...page.value); cursor = page.page.nextCursor ?? undefined;
       } while (cursor);
     } finally { stopChampionTransactions(); stopChampionQueries(); }
@@ -375,9 +432,24 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
     expect(work.reduce((n, query) => n + query.rows, 0)).toBeLessThanOrEqual(1024);
     expect(work.some(query => query.failed)).toBe(false);
     expect(championElapsed).toBeLessThan(15000);
-    const get = (to: string) => json<CandidateAgentUsageHistory>(request, `/agent-inventory/agent:${canonical(1)}/usage-history?${new URLSearchParams({
-      inventorySelectionId: pins.inventorySelectionId, compareFromSetId: ids[0], compareToSetId: to, limit: "1",
-    })}`);
+    for (const { cursor, page } of championPages) {
+      const query = { selectionId: adoption.selectionId, inventorySelectionId: adoption.inventorySelectionId,
+        limit: 50, ...cursor ? { cursor } : {} };
+      const actual = await json<ChampionAgentPage>(request, `/copilot-usage/adoption/champions?${new URLSearchParams({
+        ...query, limit: String(query.limit),
+      })}`);
+      expect(actual.value).toEqual(page.value); expect(actual.champions).toEqual(page.champions);
+      sdkCalls.push({ name: "list_champion_agents", request: query, expected: actual });
+    }
+    const get = async (to: string) => {
+      const query = { selectionId: pins.inventorySelectionId, inventorySelectionId: pins.inventorySelectionId,
+        compareFromSetId: ids[0], compareToSetId: to, limit: 1 };
+      const actual = await json<CandidateAgentUsageHistory>(request, `/agent-inventory/agent:${canonical(1)}/usage-history?${new URLSearchParams({
+        ...query, limit: String(query.limit),
+      })}`);
+      sdkCalls.push({ name: "list_agent_usage_history", request: { recordId: `agent:${canonical(1)}`, ...query }, expected: actual });
+      return actual;
+    };
     expect((await get(ids[2])).comparison).toMatchObject({ state: "comparable", responsesDelta: 50, responseGrowthPercent: 50 });
     expect((await get(ids[1])).comparison).toMatchObject({ state: "incomparable", responseGrowthPercent: null, reasons: ["overlapping_or_out_of_order_windows"] });
     expect((await get(ids[3])).comparison).toMatchObject({ state: "incomparable", responseGrowthPercent: null, reasons: ["unequal_reporting_windows"] });
@@ -386,6 +458,7 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
     expect((await request(`/agent-inventory/agent:${canonical(1)}/usage-history?${new URLSearchParams({
       inventorySelectionId: pins.inventorySelectionId, compareFromSetId: ids[0],
     })}`)).status).toBe(400);
+    if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY) await sdkJourney(fixture, sdkCalls);
     expect(providerWork.requests).toBe(0);
     await closeAuditOriginHttp();
     }
@@ -393,13 +466,14 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
 
   it("proves frozen caseC exact creation cutoff, native-only inventory and unchanged relative evaluation across 100+1 pages", async () => {
     for (const transport of ["webapp", "mcp"] as const) {
-      const { database, scope, request, providerWork } = await setupAuditOriginHttp(transport);
+      const fixture = await setupAuditOriginHttp(transport);
+      const { database, scope, request, providerWork } = fixture;
       await saveUsageInventory(database, scope, Array.from({ length: 103 }, (_, i) => ({
         canonicalId: canonical(i + 1), packages: [], native: { nativeId: `caseC-native-${i + 1}`, environmentId: null,
-          createdAt: i === 100 ? "2026-01-01T00:00:00.000Z" : i === 101 ? "2025-12-31T23:59:59.999Z"
-            : i === 102 ? null : "2026-01-15T00:00:00.000Z" },
+          createdAt: i === 100 ? corpus.caseC.cutoff : i === 101 ? corpus.caseC.beforeCutoff
+            : i === 102 ? null : corpus.caseC.withinWindow },
       })));
-      let clock = "2026-01-31T00:00:00.000Z";
+      let clock: string = corpus.caseC.clock;
       const originals = new Map<pg.PoolClient, pg.PoolClient["query"]>();
       const stop = observeTransactionStart(async client => {
         if (originals.has(client)) return;
@@ -417,7 +491,7 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
         expect(first.counts).toMatchObject({ total: 103, filtered: 101 });
         expect(first.value.map(row => row.id)).toEqual(Array.from({ length: 100 }, (_, i) => `agent:${canonical(i + 1)}`));
         expect(first.page.nextCursor).not.toBeNull();
-        clock = "2026-01-31T00:00:30.000Z";
+        clock = corpus.caseC.laterClock;
         const second = await json<UnifiedAgentInventoryPage>(request, `/agent-inventory?${new URLSearchParams({
           selectionId: first.selection.id, cursor: first.page.nextCursor!, limit: "100",
         })}`);
@@ -425,6 +499,10 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
         expect(second.value.map(row => row.id)).toEqual([`agent:${canonical(101)}`]);
         expect(second.page.nextCursor).toBeNull();
         expect(second.counts.filtered).toBe(101);
+        if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY) await sdkJourney(fixture, [
+          { name: "list_agents", request: { selectionId: first.selection.id, limit: 100 }, expected: first },
+          { name: "list_agents", request: { selectionId: first.selection.id, cursor: first.page.nextCursor!, limit: 100 }, expected: second },
+        ]);
         const all = await json<UnifiedAgentInventoryPage>(request, "/agent-inventory?inventoryScope=power_platform_only&view=all&limit=100");
         const rest = await json<UnifiedAgentInventoryPage>(request, `/agent-inventory?${new URLSearchParams({
           selectionId: all.selection.id, cursor: all.page.nextCursor!, limit: "100",

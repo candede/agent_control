@@ -1,6 +1,7 @@
 . (Join-Path $PSScriptRoot 'tenant-deployment.ps1')
 . (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1')
 . (Join-Path $PSScriptRoot 'local-runtime.ps1')
+. (Join-Path $PSScriptRoot 'local-mcp.ps1')
 
 function Invoke-DockerCommand {
     param([string[]]$Arguments, [switch]$Capture, [switch]$CaptureError)
@@ -8,7 +9,7 @@ function Invoke-DockerCommand {
     try {
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS')) {
+            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS') + @([Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -cmatch '^MCP_' })) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
@@ -36,6 +37,17 @@ function Invoke-DockerCommand {
     }
 }
 
+function Test-LocalBindSource {
+    param([string]$Source,[string]$Expected)
+    if ($Source -ceq $Expected) { return $true }
+    if (-not $IsMacOS -or -not $Expected.StartsWith('/Users/',[StringComparison]::Ordinal) -or
+        $Source -cne "/host_mnt$Expected") { return $false }
+    # Docker Desktop may expose its exact host-file mapping instead of the macOS source.
+    return ((Invoke-DockerCommand @('context','show') -Capture) -ceq 'desktop-linux' -and
+        (Invoke-DockerCommand @('context','inspect','--format','{{.Endpoints.docker.Host}}') -Capture) -ceq "unix://$HOME/.docker/run/docker.sock" -and
+        -not [Environment]::GetEnvironmentVariable('DOCKER_HOST') -and -not [Environment]::GetEnvironmentVariable('DOCKER_CONTEXT'))
+}
+
 function New-LocalContext {
     param([string]$Root,[string]$Project='agent-control',[switch]$SkipSettings)
     if ($Project -cnotmatch '^[a-zA-Z][a-zA-Z0-9-]{2,39}$') { throw 'Project must be 3-40 letters, digits or hyphens, starting with a letter.' }
@@ -46,13 +58,15 @@ function New-LocalContext {
     $settings = if ($SkipSettings) { [ordered]@{} } else { Read-LocalSettings $state }
     $port = if ($settings.Contains('port')) { $settings.port } else { 0 }
     $url = if ($port) { "http://localhost:$port" } else { '' }
-    return @{
+    $context = @{
         Root=$rootPath; State=$state; Project=$Project; Port=$port; Url=$url
         PublicUrl=$(if ($settings.publicUrl) { $settings.publicUrl } else { $url })
         Volume="${Project}_data"; Network="${Project}_default"; Image="${Project}-app:local"; Operator="${Project}-operator:local"
         Checks="${Project}-checks:local"
         Compose=@('compose','--project-directory',$rootPath,'--env-file',(Join-Path $state 'compose.env'),'-f',(Join-Path $rootPath 'compose.yaml'),'-p',$Project)
     }
+    Sync-LocalMcpContext $context $settings
+    return $context
 }
 
 function Read-LocalSettings {
@@ -77,8 +91,8 @@ function Read-LocalSettings {
         }
     } catch { throw 'Project settings must be a valid JSON object. Restore settings.json before continuing.' }
     finally { if ($document) { $document.Dispose() } }
-    if (@($settings.Keys | Where-Object { $_ -cnotin @('port','publicUrl','tenants') }).Count) {
-        throw 'Project settings contain unsupported fields. Use only port, publicUrl and tenants.'
+    if (@($settings.Keys | Where-Object { $_ -cnotin @('port','publicUrl','tenants','mcp') }).Count) {
+        throw 'Project settings contain unsupported fields. Use only port, publicUrl, tenants and optional mcp.'
     }
     if ($settings.Contains('port') -and ($settings.port -isnot [long] -and $settings.port -isnot [int] -or $settings.port -lt 1024 -or $settings.port -gt 65535)) {
         throw 'Saved project port must be an integer from 1024 to 65535. Repair settings.json before continuing.'
@@ -86,6 +100,7 @@ function Read-LocalSettings {
     if ($settings.Contains('publicUrl') -and ($settings.publicUrl -isnot [string] -or ($settings.publicUrl -ne '' -and -not (Test-LocalPublicUrl $settings.publicUrl)))) {
         throw 'Saved publicUrl must be empty or a canonical HTTPS origin without a trailing slash, path, query or fragment. Repair settings.json before continuing.'
     }
+    if ($settings.Contains('mcp')) { Assert-LocalMcpSettings $settings.mcp $settings.port }
     return $settings
 }
 
@@ -236,8 +251,8 @@ function Read-LocalIdentifier {
 }
 
 function Read-LocalClientSecret {
-    param([string]$Current,[switch]$AllowEmpty)
-    $prompt = 'Entra client secret value (hidden input, not the secret ID)'
+    param([string]$Current,[switch]$AllowEmpty,[string]$Label='Entra client secret value (hidden input, not the secret ID)')
+    $prompt = $Label
     if ($Current) { $prompt += ' [Enter to keep saved secret]' }
     elseif ($AllowEmpty) { $prompt += ' [not configured; Enter to leave unset]' }
     $secure = Read-Host $prompt -AsSecureString
@@ -309,10 +324,10 @@ function Get-LocalTenantMetadata {
 }
 
 function Read-LocalPort {
-    param([int]$Current)
+    param([int]$Current,[string]$Label='Local port')
     $default = if ($Current) { $Current } else { 3001 }
     while ($true) {
-        $value = [string](Read-Host "Local port [$default; Enter to keep]")
+        $value = [string](Read-Host "$Label [$default; Enter to keep]")
         if ([string]::IsNullOrWhiteSpace($value)) { return $default }
         $port = 0
         if ([int]::TryParse($value.Trim(),[ref]$port) -and $port -ge 1024 -and $port -le 65535) { return $port }
@@ -367,13 +382,14 @@ function Read-LocalConfiguration {
     }
     $previousProfiles = ConvertTo-Json -InputObject $profiles -Depth 20 -Compress
     $previousMetadata = Get-LocalTenantMetadata $profiles
-    if ($Edit -or ($Onboard -and (-not $hasRegistry -or -not $port))) {
+    $editApplication = $Edit -and -not $Context.ConfigureMcp
+    if ($editApplication -or ($Onboard -and (-not $hasRegistry -or -not $port))) {
         Write-Host "Configure local project '$($Context.Project)'. Press Enter to keep saved values; secret input is hidden."
         Show-LocalRegistrationGuidance
         $profiles = @(foreach ($profile in $profiles) {
-            Read-LocalTenantProfile $profile -Edit:$Edit -AllowIncomplete:($Edit -and -not $hasRegistry)
+            Read-LocalTenantProfile $profile -Edit:$editApplication -AllowIncomplete:($editApplication -and -not $hasRegistry)
         })
-        if ($Edit) {
+        if ($editApplication) {
             while ($true) {
                 $add = [string](Read-Host 'Add another tenant? [y/N]')
                 if ([string]::IsNullOrWhiteSpace($add) -or $add.Trim() -ieq 'n') { break }
@@ -381,8 +397,8 @@ function Read-LocalConfiguration {
                 $profiles += Read-LocalTenantProfile @{ domains = @() } -Edit
             }
         }
-        if ($Edit -or -not $port) { $port = Read-LocalPort $port }
-        if ($Edit) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
+        if ($editApplication -or -not $port) { $port = Read-LocalPort $port }
+        if ($editApplication) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
         $origin = if ($publicUrl) { $publicUrl } else { "http://localhost:$port" }
         Write-Host "Register $origin/api/auth/callback as every configured application's Web reply URL. Begin sign-in at $origin."
     }
@@ -399,6 +415,15 @@ function Read-LocalConfiguration {
         throw 'Complete every tenant profile, including accepted domains, or leave all identity fields unset. Partial credentials are not saved; TENANTS_JSON must contain complete profiles.'
     }
     if ($complete -or $Onboard -or $hasRegistry -or $profiles.Count -gt 1) { Assert-DeploymentTenantProfiles $profiles }
+    $applicationSettingsChanged = $settings.port -ne $port -or [string]$settings.publicUrl -cne $publicUrl
+    if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
+    $settings.port = $port
+    if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
+    $mcpPlan = Get-LocalMcpPlan $Context $settings $profiles
+    if ($mcpPlan) {
+        $settings.mcp = $mcpPlan.Settings
+        Assert-DeploymentTenantProfiles $profiles
+    }
     $metadata = Get-LocalTenantMetadata $profiles
     $registryChanged = $complete -and (-not $hasRegistry -or (ConvertTo-Json -InputObject $profiles -Depth 20 -Compress) -cne $previousProfiles)
     $identityChanged = $false
@@ -408,14 +433,12 @@ function Read-LocalConfiguration {
         $identityChanged = $oldIdentity -ine $newIdentity
         $settings.tenants = $metadata
     }
-    if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
-    $settings.port = $port
-    if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
     $settingsChanged = ($settings | ConvertTo-Json -Depth 20 -Compress) -cne $originalSettings
     return @{
         Settings=$settings; Profiles=$profiles; Port=$port; PublicUrl=$publicUrl; ExistingVolume=$ExistingVolume; Edit=[bool]$Edit
         Complete=$complete; HasRegistry=$hasRegistry; RegistryChanged=$registryChanged; SettingsChanged=$settingsChanged
-        IdentityChanged=$identityChanged
+        IdentityChanged=$identityChanged; ApplicationSettingsChanged=$applicationSettingsChanged
+        McpPlan=$mcpPlan
     }
 }
 
@@ -431,7 +454,7 @@ function Save-LocalConfiguration {
     $complete = $Plan.Complete; $hasRegistry = $Plan.HasRegistry
     $registryChanged = $Plan.RegistryChanged; $settingsChanged = $Plan.SettingsChanged
     $identityChanged = $Plan.IdentityChanged
-    if ($Edit -and ($settingsChanged -or $registryChanged) -and $ExistingVolume) {
+    if ($Edit -and ($Plan.ApplicationSettingsChanged -or $registryChanged) -and $ExistingVolume) {
         if (-not (Test-Path -LiteralPath (Join-Path $state 'compose.env'))) { throw 'Existing project compose.env is missing. Run start to recover it before editing configuration.' }
         $controlDirectory = Join-Path $state 'control'
         [IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
@@ -448,6 +471,7 @@ function Save-LocalConfiguration {
         if (-not (Test-Path -LiteralPath $file)) { [IO.File]::WriteAllText($file,[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))) }
         Protect-LocalPath $file
     }
+    Save-LocalMcpConfiguration $Context $Plan.McpPlan
     if ($registryChanged) { Write-LocalText $registryFile (ConvertTo-Json -InputObject $profiles -Depth 20) }
     if ($hasRegistry -or $registryChanged) { Protect-LocalPath $registryFile }
     if ($ExistingVolume -and $identityChanged) {
@@ -460,11 +484,12 @@ function Save-LocalConfiguration {
     $Context.Port = $port
     $Context.Url = "http://localhost:$port"
     $Context.PublicUrl = if ($publicUrl) { $publicUrl } else { $Context.Url }
+    Sync-LocalMcpContext $Context $settings
     Write-LocalComposeEnvironment $Context
     Protect-LocalPath $settingsFile
     Protect-LocalPath (Join-Path $state 'compose.env')
     if ($Edit) {
-        if ($settingsChanged -or $registryChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
+        if ($settingsChanged -or $registryChanged -or $Plan.McpPlan.SecretsChanged) { Write-Host "Configuration saved. Run deploy-local.ps1 start -Project $($Context.Project) to apply it." }
         else { Write-Host 'Configuration unchanged.' }
         if (-not $complete) {
             Write-Host 'Identity configuration is incomplete. start will ask for missing credentials and accepted domains before launching the app.'
@@ -487,6 +512,13 @@ function Write-LocalComposeEnvironment {
     $diagnostics = if ($Context.AgentSharingDiagnostics) { '1' } else { '0' }
     $lines = @("LOCAL_STATE_DIR='$($Context.State)'","APP_PORT=$($Context.Port)","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$image",
         "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy","AGENT_SHARING_DIAGNOSTICS=$diagnostics")
+    if ($Context.Mcp) {
+        if ($userId -eq '0') { throw 'MCP cannot run as root; use the owner of its protected files.' }
+        $mcpImage = if ($Context.McpImageId) { $Context.McpImageId } else { $Context.McpImage }
+        $lines += @("MCP_IMAGE=$mcpImage","MCP_PORT=$($Context.Mcp.port)","MCP_TENANT_ID=$($Context.Mcp.tenantId)",
+            "MCP_CLIENT_ID=$($Context.Mcp.clientId)","MCP_API_CLIENT_ID=$($Context.Mcp.apiClientId)","MCP_PUBLIC_URL=$($Context.Mcp.publicUrl)",
+            "MCP_ALLOWED_CLIENT_REDIRECT_URIS='$(ConvertTo-Json -InputObject @($Context.Mcp.redirectUris) -Compress)'")
+    }
     Write-LocalText (Join-Path $Context.State 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 

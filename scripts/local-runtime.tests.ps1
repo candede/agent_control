@@ -24,6 +24,7 @@ $script:healthCalls = 0
 $script:ready = $true
 $script:mutateSource = $false
 $script:changeDuringCapture = $false
+$script:addDuringCapture = $false
 $script:enumerations = 0
 $script:wrongOwner = $false
 $script:candidateInputs = @()
@@ -47,6 +48,10 @@ function git {
     $script:enumerations++
     if ($script:changeDuringCapture -and $script:enumerations -eq 2) {
         [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'changed-during-capture')
+    }
+    if ($script:addDuringCapture -and $script:enumerations -eq 2) {
+        [IO.File]::WriteAllText((Join-Path $root 'backend/added.ts'),'added-during-capture')
+        return ((@('Dockerfile','compose.yaml','backend/input.ts','backend/added.ts')) -join "`0") + "`0"
     }
     return ((@('Dockerfile','.dockerignore','compose.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
 }
@@ -151,6 +156,44 @@ function Run-Deploy {
 }
 try {
     $context = New-LocalContext $root 'runtime-test'
+    & {
+        $gitPath = (Microsoft.PowerShell.Core\Get-Command git -CommandType Application).Source
+        function git { & $gitPath @args }
+        $filterRoot = Join-Path $root 'source-filter'
+        [IO.Directory]::CreateDirectory($filterRoot) | Out-Null
+        & $gitPath -C $filterRoot init --quiet
+        if ($LASTEXITCODE -ne 0) { throw 'Could not initialize isolated source-filter fixture.' }
+        $ordinary = @('backend/input.ts','frontend/view.tsx','backend/tsx-source/input.ts',
+            'backend/tsx-123-source/input.ts','backend/tsx-123.ts/input.ts')
+        $caches = @('backend/tsx-0/tracked','backend/tsx-501/untracked',
+            'frontend/nested/tsx-10001/cache','backend/tsx-501/tsx-123-source/cache',
+            'backend/tsx-4294967295/cache')
+        foreach ($path in $ordinary + $caches) {
+            $file = Join-Path $filterRoot $path
+            [IO.Directory]::CreateDirectory((Split-Path $file -Parent)) | Out-Null
+            [IO.File]::WriteAllText($file,'synthetic-source-filter')
+        }
+        & $gitPath -C $filterRoot add --force -- $caches[0]
+        if ($LASTEXITCODE -ne 0) { throw 'Could not track the synthetic cache fixture.' }
+        $paths = @(Get-LocalSourceFiles $filterRoot)
+        foreach ($path in $ordinary) { Assert ($path -cin $paths) "Ordinary source was excluded: $path" }
+        foreach ($path in $caches) { Assert ($path -cnotin $paths) "Generated tracked/untracked cache was included: $path" }
+        Copy-Item -LiteralPath (Join-Path $repository '.gitignore') -Destination (Join-Path $filterRoot '.gitignore')
+        foreach ($path in $caches[1..($caches.Count-1)]) {
+            & $gitPath -C $filterRoot check-ignore --quiet -- $path
+            Assert ($LASTEXITCODE -eq 0) "Generated cache escaped Git exclusions: $path"
+        }
+        foreach ($path in $ordinary) {
+            & $gitPath -C $filterRoot check-ignore --quiet -- $path
+            Assert ($LASTEXITCODE -eq 1) "Git exclusions swallowed ordinary source: $path"
+        }
+        Assert ((& $gitPath -C $filterRoot ls-files --cached) -ceq $caches[0]) 'Filtering removed pre-existing tracked cache content.'
+        Assert ([IO.File]::ReadAllText((Join-Path $filterRoot $caches[0])) -ceq 'synthetic-source-filter') 'Filtering changed tracked cache bytes.'
+        $dockerIgnore = [IO.File]::ReadAllLines((Join-Path $repository '.dockerignore'))
+        foreach ($width in 1..10) {
+            Assert (('**/tsx-' + ('[0-9]' * $width)) -cin $dockerIgnore) "Docker context is missing the exact $width-digit OS UID cache exclusion."
+        }
+    }
     $manifestRoot=Join-Path $root 'manifest-validation'
     $hashes=@{}
     foreach ($manifest in @('package.json','package-lock.json','backend/package.json','frontend/package.json')) {
@@ -167,6 +210,12 @@ try {
     Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Failed source capture leaked its snapshot.'
     $script:changeDuringCapture=$false
     [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'snapshot-v1')
+    $script:enumerations=0
+    $script:addDuringCapture=$true
+    Fails { New-LocalBuildSnapshot $context } 'Source files changed while preparing'
+    Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Changed source inventory leaked its snapshot.'
+    $script:addDuringCapture=$false
+    Remove-Item -LiteralPath (Join-Path $root 'backend/added.ts')
     foreach ($value in @('11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222','synthetic-runtime-test-client-secret','example.invalid','14399')) { $script:answers.Enqueue($value) }
     $script:mutateSource=$true
     $messages=Run-Deploy
@@ -299,7 +348,7 @@ try {
     Assert (-not (($script:calls -join "`n") -match '\|--target\|runtime\||\|stop\|')) 'Failed preflight reached runtime compilation or shutdown.'
     $script:failure=''
     # Real candidate consumer with mocked immutable images and the existing executor.
-    $script:candidateInputs=@('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','backend/scripts/database.ts')
+    $script:candidateInputs=@('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','backend/scripts/database.ts')
     foreach ($path in $script:candidateInputs) {
         $destination=Join-Path $root $path
         [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null

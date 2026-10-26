@@ -23,7 +23,7 @@ assert.match(manifest.revision, /^[a-zA-Z0-9._+-]{1,128}$/);
 const paths = Object.keys(files);
 assert.ok(files["backend/dist/server.js"] && files["frontend/dist/index.html"] && files["package.json"]);
 assert.ok(!paths.includes("frontend/dist/staticwebapp.config.json"));
-assert.ok(!paths.some(path => /(^|\/)(\.env[^/]*|\.npmrc|secrets|test|tests|__tests__)(\/|$)|\.sqlite|backend\/scripts|\.test\.[jt]s$/.test(path)));
+assert.ok(!paths.some(path => /(^|\/)(\.env[^/]*|\.npmrc|secrets|test|tests|__tests__|tsx-[0-9]+)(\/|$)|\.sqlite|backend\/scripts|\.test\.[jt]s$/.test(path)));
 assert.ok(!paths.some(path => path.endsWith(".node")));
 console.log(JSON.stringify({
   event: "release_metadata",

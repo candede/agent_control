@@ -71,12 +71,15 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const liveKey = hashKey([scope, path, query]);
   const key = hashKey([scope, path, query, query.selectionId ? undefined : revision]);
   const [highestRevision, setHighestRevision] = useState(revision);
-  const [navigation, setNavigation] = useState<{ key: string; cursor?: string; selectionId?: string; restart: number; shared?: boolean; publication?: string; renewal?: string }>({ key, restart: 0, shared: !freshCaptureOnMount });
-  const [captured, setCaptured] = useState<{ key: string; restart: number; id: string; data: Page; live: boolean }>();
+  const [navigation, setNavigation] = useState<{ key: string; liveKey: string; cursor?: string; anchor?: string; pageNumber?: number; selectionId?: string; restart: number; shared?: boolean; publication?: string; renewal?: string }>({ key, liveKey, restart: 0, shared: !freshCaptureOnMount });
+  const [captured, setCaptured] = useState<{ key: string; restart: number; id: string; data: Page; live: boolean; pageNumber?: number }>();
   const [rejected, setRejected] = useState<{ key: string; restart: number }>();
   const [manualRetry, setManualRetry] = useState<{ key: string; token: object }>();
   const reusablePage = retainedPagePaths.has(path) && !query.selectionId;
-  const current = navigation.key === key ? navigation : { key, restart: navigation.restart + 1, shared: reusablePage || revision > highestRevision };
+  const pendingPageNumber = navigation.pageNumber !== captured?.pageNumber ? navigation.pageNumber : undefined;
+  const current = navigation.key === key ? navigation : { key, liveKey, restart: navigation.restart + 1, shared: reusablePage || revision > highestRevision,
+    ...(!query.selectionId && navigation.liveKey === liveKey
+      ? pendingPageNumber !== undefined ? { pageNumber: pendingPageNumber } : { anchor: captured?.data.page.anchor ?? navigation.anchor } : {}) };
   if (revision > highestRevision) setHighestRevision(revision);
   if (navigation.key !== key) {
     setNavigation(current);
@@ -85,9 +88,10 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const locallyInvalidated = rejected?.key === key && rejected.restart === current.restart;
   const selectionId = current.selectionId ?? (captured?.key === key && captured.restart === current.restart ? captured.id : undefined);
   const request = { ...query, ...(selectionId ? { selectionId } : {}),
-    ...(current.cursor ? { cursor: current.cursor } : {}) };
+    ...(current.cursor ? { cursor: current.cursor } : {}), ...(current.anchor ? { anchor: current.anchor } : {}),
+    ...(current.pageNumber ? { pageNumber: current.pageNumber } : {}) };
   // Recent top-level reads can be reused; explicit restarts and details stay observer-owned.
-  const sharedKey = ["saved", "record-page", key, revision, 0, current.selectionId ?? query.selectionId, current.cursor, enabled];
+  const sharedKey = ["saved", "record-page", key, revision, 0, current.selectionId ?? query.selectionId, current.cursor, enabled, current.anchor, current.pageNumber];
   let sharedQuery = client.getQueryCache().find({ queryKey: sharedKey, exact: true });
   if (sharedQuery && retiredCaptures.has(sharedQuery.queryKey) && sharedQuery.getObserversCount() === 0) {
     client.removeQueries({ queryKey: sharedKey, exact: true });
@@ -99,7 +103,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const restartKey = current.renewal ? `renewal:${current.renewal}`
     : current.publication ? `publication:${current.publication}` : current.shared && !retiredShared ? 0 : `${owner}:${current.restart}`;
   const retain = enabled && restartKey === 0 && reusablePage && !current.cursor;
-  const queryKey = ["saved", "record-page", key, revision, restartKey, current.selectionId ?? query.selectionId, current.cursor, enabled];
+  const queryKey = ["saved", "record-page", key, revision, restartKey, current.selectionId ?? query.selectionId, current.cursor, enabled, current.anchor, current.pageNumber];
   const retryKey = JSON.stringify(queryKey);
   // Child invalidation follows the selection; navigation and retry belong to one committed page.
   const actionKey = JSON.stringify([key, revision, current.restart, enabled]);
@@ -128,7 +132,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
     placeholderData: (previous, previousQuery) => previousQuery?.meta?.liveReportKey === liveKey
       && (previousQuery.queryKey[3] !== revision && current.shared || current.renewal !== undefined || current.publication !== undefined
-        || previousQuery.queryKey[4] === restartKey && previousQuery.queryKey[6] === current.cursor)
+        || previousQuery.queryKey[4] === restartKey && (previousQuery.queryKey[6] === current.cursor || Boolean(previous?.page.anchor)))
       && previousQuery.queryKey[7] === enabled ? previous : undefined,
     staleTime: Infinity,
     refetchOnMount: cached => retain && (retiredCaptures.has(cached.queryKey)
@@ -168,7 +172,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   }, [cachedKey, client, enabled, selected, externallyInvalidated, refetch, revalidateOnFocus]);
   const retiredCapture = awaitingCapture && Boolean(retirement);
   if (read.data && !read.isError && !read.isFetching && !retiredCapture && (awaitingCapture || captured?.data !== read.data)) {
-    setCaptured({ key, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data,
+    setCaptured({ key, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data, pageNumber: current.pageNumber,
       live: leaseActive || captured?.key === key && captured.restart === current.restart
         && captured.id === read.data.selection.id.toLowerCase() && captured.live });
   }
@@ -207,8 +211,9 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     if (publicationRevision) observedPublication.current = { key, revision: publicationRevision };
     // Independent operation inputs remain valid while the view captures fresh data.
     invalidateReportPages(client, key, revision, { excludeRestartKey: `renewal:${data.selection.id.toLowerCase()}` });
-    setNavigation({ key, restart: current.restart + 1, renewal: data.selection.id.toLowerCase() });
-  }, [available, client, current.restart, data, key, publicationRevision, read.isFetching, renewalDue, revision]);
+    setNavigation({ key, liveKey, restart: current.restart + 1, renewal: data.selection.id.toLowerCase(),
+      ...(pendingPageNumber !== undefined ? { pageNumber: pendingPageNumber } : { anchor: data.page.anchor }) });
+  }, [available, client, current.restart, data, key, liveKey, pendingPageNumber, publicationRevision, read.isFetching, renewalDue, revision]);
   const expiredChild = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!enabled || !available || !expired || !query.selectionId || !restartParent
@@ -222,7 +227,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const capturePublication = useEffectEvent((publicationRevision: string) => {
     observedPublication.current = { key, revision: publicationRevision };
     invalidateReportPages(client, key, revision);
-    setNavigation({ key, restart: current.restart + 1, publication: publicationRevision });
+    setNavigation({ key, liveKey, restart: current.restart + 1, publication: publicationRevision, anchor: data?.page.anchor });
   });
   useEffect(() => {
     if (!data || !publicationRevision || read.isFetching || read.isError) return;
@@ -260,7 +265,15 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     if (!data || !cursor || cursor === current.cursor || !isCurrentData() || !actions.current
       || !selectedReadRemaining(data.selection)) return;
     actions.current.moved = true;
-    setNavigation({ ...current, key, cursor, selectionId: data.selection.id.toLowerCase() });
+    setNavigation({ ...current, key, cursor, anchor: undefined, pageNumber: undefined, selectionId: data.selection.id.toLowerCase() });
+  }
+  function goToPage(pageNumber: number) {
+    if (!data || data.page.number === undefined || !Number.isSafeInteger(pageNumber) || pageNumber < 1
+      || pageNumber > Math.max(1, Math.ceil(data.counts.filtered / data.page.limit))
+      || pageNumber === data.page.number || !isCurrentData() || !actions.current) return false;
+    actions.current.moved = true;
+    setNavigation({ ...current, key, cursor: undefined, anchor: undefined, pageNumber, selectionId: data.selection.id.toLowerCase() });
+    return true;
   }
   return {
     data, selectedData, renewing, loading: enabled && !externallyInvalidated && !invalidated && (read.isFetching || renewalDue && available),
@@ -283,7 +296,9 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       if (read.isPlaceholderData && read.isFetching) return;
       setRejected({ key, restart: current.restart });
     },
-    next: () => move(data?.page.nextCursor), previous: () => move(data?.page.previousCursor),
+    next: () => data?.page.number !== undefined ? goToPage(data.page.number + 1) : move(data?.page.nextCursor),
+    previous: () => data?.page.number !== undefined ? goToPage(data.page.number - 1) : move(data?.page.previousCursor),
+    goToPage: path === "copilot-usage/adoption" ? goToPage : undefined,
     restartable: !query.selectionId || Boolean(restartParent),
     restart: () => {
       if (renewing) return;
@@ -295,7 +310,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
         finally { queueMicrotask(() => { action.restarted = false; }); }
       } else {
         invalidateReportPages(client, key, revision);
-        setNavigation({ key, restart: current.restart + 1 });
+        setNavigation({ key, liveKey, restart: current.restart + 1 });
       }
     },
     retry: () => {

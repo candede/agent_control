@@ -336,13 +336,14 @@ try {
     Assert-True ($guidance.Contains('the current app requests these read scopes separately.')) 'Registration guidance must preserve separately requested read scopes.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     $publicParameters=@($entry.ScriptBlock.Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
+    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
     Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
     Assert-True ($entry.Parameters['DbReset'].Aliases.Count -eq 0) 'DbReset must have one canonical parameter name.'
     Assert-True ($entry.Parameters['ForceChecks'].ParameterType -eq [Management.Automation.SwitchParameter]) 'ForceChecks must be an opt-in switch.'
     Assert-True ($entry.Parameters['AgentSharingDiagnostics'].ParameterType -eq [Management.Automation.SwitchParameter]) 'Temporary sharing diagnostics must be an opt-in switch.'
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 9) 'Entry point release parameters differ from the bounded start contract.'
+    Assert-True ($entry.Parameters['ConfigureMcp'].ParameterType -eq [Management.Automation.SwitchParameter]) 'MCP setup must be explicit, not an ordinary startup gate.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 11) 'Entry point release parameters differ from the bounded start contract.'
     foreach ($parameter in @('Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')) {
         Assert-True ($entry.Parameters.ContainsKey($parameter)) "Missing release parameter $parameter."
     }
@@ -878,6 +879,7 @@ try {
     Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $entryRoot 'deploy-local.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/local-deployment.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-runtime.ps1') -Destination (Join-Path $entryRoot 'scripts/local-runtime.ps1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-mcp.ps1') -Destination (Join-Path $entryRoot 'scripts/local-mcp.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'tenant-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/tenant-deployment.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1') -Destination (Join-Path $entryRoot 'scripts/fixture-diagnostics.ps1')
     $entryPath=Join-Path $entryRoot 'deploy-local.ps1'

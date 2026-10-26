@@ -1,11 +1,11 @@
 function Get-LocalSourceFiles {
     param([string]$Root)
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required to snapshot tracked and untracked build inputs without copying local secrets or installed dependencies.' }
-    $output = @(& git -C $Root ls-files -z --cached --others --exclude-standard -- backend frontend scripts docs infra Dockerfile .dockerignore compose.yaml compose.large-tenant-test.yaml package.json package-lock.json knip.json deploy-local.ps1 deploy-azure.ps1 README.md)
+    $output = @(& git -C $Root ls-files -z --cached --others --exclude-standard -- backend frontend mcp scripts docs infra Dockerfile .dockerignore compose.yaml compose.mcp.yaml compose.large-tenant-test.yaml package.json package-lock.json knip.json deploy-local.ps1 deploy-azure.ps1 README.md)
     if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate deployment source files.' }
     foreach ($path in (($output -join "`n") -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
         if ($path -match '[\\\r\n]' -or [IO.Path]::IsPathRooted($path) -or $path -match '(^|/)\.\.(/|$)') { throw 'Build input paths must remain inside the repository.' }
-        if ($path -match '(^|/)(node_modules|dist|coverage|artifacts|backups|\.git|\.local|\.azure)(/|$)|(^|/)\.env[^/]*$|(^|/)\.npmrc$|\.(pem|pfx|key|csv|db|sqlite[^/]*)$') { continue }
+        if ($path -match '(^|/)(node_modules|dist|coverage|artifacts|backups|\.git|\.local|\.azure|\.venv|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|tsx-[0-9]+)(/|$)|(^|/)\.env[^/]*$|(^|/)\.npmrc$|\.(pem|pfx|key|csv|pyc|db|sqlite[^/]*)$') { continue }
         $file = Join-Path $Root $path
         if (-not (Test-Path -LiteralPath $file)) { continue }
         if ((Get-Item -LiteralPath $file -Force).LinkType) { throw "Symbolic build input is not supported: $path." }
@@ -41,7 +41,7 @@ function New-LocalBuildSnapshot {
         for ($index = 0; $index -lt $compose.Count - 1; $index++) {
             if ($compose[$index] -ne '-f') { continue }
             $original = $compose[$index+1]
-            $copy = if ([IO.Path]::GetFullPath($original) -ceq (Join-Path $Context.Root 'compose.yaml')) { Join-Path $source 'compose.yaml' }
+            $copy = if ([IO.Path]::GetFullPath($original) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'))) { Join-Path $source ([IO.Path]::GetFileName($original)) }
                 else { Join-Path $source "local-compose-$($composeFiles.Count).yaml" }
             if (-not (Test-Path -LiteralPath $copy)) { [IO.File]::Copy($original,$copy) }
             if ((Get-FileHash -LiteralPath $copy).Hash -cne (Get-FileHash -LiteralPath $original).Hash) { throw 'Compose inputs changed while preparing the deployment snapshot.' }
@@ -108,7 +108,7 @@ function Read-LocalCandidate {
         [IO.Path]::GetRelativePath($candidate.sourceRoot,$_.FullName)
     } | Sort-Object)
     if (($actual -join "`n") -cne (@($manifest.Keys | Sort-Object) -join "`n")) { throw 'Candidate source file inventory changed.' }
-    foreach ($path in @('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','compose.yaml')) {
+    foreach ($path in @('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','compose.yaml') + $(if ($Context.Mcp) { @('compose.mcp.yaml','mcp/Dockerfile') })) {
         if ((Get-FileHash -LiteralPath (Join-Path $Context.Root $path)).Hash.ToLowerInvariant() -cne ([string]$manifest[$path]).ToLowerInvariant()) {
             throw 'Invoking deployment tooling differs from the qualified candidate.'
         }
@@ -141,6 +141,13 @@ console.log(JSON.stringify({hash:sha(JSON.stringify(files)),count:Object.keys(fi
     }
     $Context.RuntimeImageId = $candidate.images.runtime.id
     $Context.OperatorImageId = $candidate.images.operator.id
+    if ($Context.Mcp) {
+        $image = $candidate.images.mcp
+        if ($image.id -cnotmatch '^sha256:[a-f0-9]{64}$' -or $image.sourceManifestHash -cne $candidate.sourceManifestHash -or
+            (Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$image.id) -Capture) -cne $image.id -or
+            (Invoke-DockerCommand @('image','inspect','--format','{{index .Config.Labels "io.agent-control.source-sha256"}}',$image.id) -Capture) -cne $candidate.sourceManifestHash) { throw 'Candidate MCP image/content identity differs.' }
+        $Context.McpImageId = $image.id
+    }
     $Context.SourceHash = $candidate.sourceManifestHash
     $Context.SchemaFingerprint = $candidate.schemaFingerprint
     return $candidate
@@ -149,7 +156,9 @@ console.log(JSON.stringify({hash:sha(JSON.stringify(files)),count:Object.keys(fi
 function Get-LocalReleaseTarget {
     param($Context)
     $containers = @(Get-OwnedLocalContainers $Context)
-    if ($containers.Count -ne 2 -or @($containers | Where-Object Service -eq 'app').Count -ne 1 -or
+    if ($containers.Count -notin @(2,3) -or @($containers | Where-Object Service -eq 'app').Count -ne 1 -or
+        @($containers | Where-Object Service -eq 'mcp').Count -gt 1 -or
+        (@($containers | Where-Object Service -eq 'mcp').Count -and -not $Context.Mcp) -or
         @($containers | Where-Object Service -eq 'postgres').Count -ne 1) { throw 'Pinned release requires the existing exact app/postgres installation.' }
     $identities = @()
     foreach ($container in @($containers | Sort-Object Service)) {
@@ -159,6 +168,11 @@ function Get-LocalReleaseTarget {
             $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network)) { throw 'Release container network/name mismatch.' }
         $expected = if ($container.Service -eq 'postgres') {
             @{ '/var/lib/postgresql/data'=$Context.Volume; '/run/secrets/postgres-admin'=(Join-Path $Context.State 'secrets/postgres-admin') }
+        } elseif ($container.Service -eq 'mcp') {
+            @{ '/run/secrets/mcp-client'=(Join-Path $Context.State 'secrets/mcp-client')
+                '/run/secrets/mcp-signing'=(Join-Path $Context.State 'secrets/mcp-signing')
+                '/run/secrets/mcp-encryption'=(Join-Path $Context.State 'secrets/mcp-encryption')
+                '/var/lib/agent-control-mcp/oauth'=$Context.McpVolume }
         } else {
             @{ '/run/control'=(Join-Path $Context.State 'control'); '/run/agent-sharing-diagnostics'=(Join-Path $Context.State 'agent-sharing-diagnostics')
                 '/run/secrets/tenants.json'=(Join-Path $Context.State 'secrets/tenants.json'); '/run/secrets/session'=(Join-Path $Context.State 'secrets/session')
@@ -167,13 +181,15 @@ function Get-LocalReleaseTarget {
         if ($details.mounts.Count -ne $expected.Count) { throw 'Release mount inventory differs.' }
         foreach ($mount in $details.mounts) {
             if (-not $expected.ContainsKey($mount.Destination)) { throw 'Unexpected release mount.' }
-            if ($mount.Destination -eq '/var/lib/postgresql/data') {
-                if ($mount.Type -cne 'volume' -or $mount.Name -cne $Context.Volume) { throw 'Retained PGDATA identity mismatch.' }
-            } elseif ($mount.Type -cne 'bind' -or $mount.Source -cne $expected[$mount.Destination] -or
-                $mount.RW -ne ($mount.Destination -ceq '/run/agent-sharing-diagnostics')) { throw 'Release bind identity/access mismatch.' }
+            if ($mount.Destination -cin @('/var/lib/postgresql/data','/var/lib/agent-control-mcp/oauth')) {
+                if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination]) { throw 'Retained state volume identity mismatch.' }
+            } elseif ($mount.Type -cne 'bind' -or -not (Test-LocalBindSource $mount.Source $expected[$mount.Destination]) -or
+                $mount.RW -ne ($mount.Destination -cin @('/run/agent-sharing-diagnostics','/var/lib/agent-control-mcp/oauth'))) { throw 'Release bind identity/access mismatch.' }
         }
         if ($container.Service -eq 'postgres') {
             if ($details.ports -and $details.ports.Count) { throw 'Production database must not publish a port.' }
+        } elseif ($container.Service -eq 'mcp') {
+            Assert-LocalMcpContainer $Context $container.Id
         } elseif ($Context.IsolatedHealthContainer) {
             if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or $Context.IsolatedHealthContainer -cne "$($Context.Project)-app-1" -or
                 $Context.Port -in @(3001,3002) -or ($details.ports -and $details.ports.Count)) { throw 'Isolated release cannot publish ports or target a retained installation.' }
@@ -214,6 +230,14 @@ function Get-LocalReleaseTarget {
             [ordered]@{path=$path;sha256=(Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant()}
         }
     })
+    $mcpSecrets = if ($Context.Mcp) {
+        $key = [Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $Context.State 'secrets/session')))
+        $hmac = [Security.Cryptography.HMACSHA256]::new($key)
+        try {
+            $hashes = @('mcp-client','mcp-signing','mcp-encryption') | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $Context.State "secrets/$_")).Hash }
+            [Convert]::ToHexString($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($hashes -join "`n")))
+        } finally { $hmac.Dispose(); [Array]::Clear($key,0,$key.Length) }
+    } else { $null }
     return [ordered]@{
         version=1; project=$Context.Project; root=$Context.Root; state=$Context.State
         dockerContext=(Invoke-DockerCommand @('context','show') -Capture)
@@ -223,6 +247,7 @@ function Get-LocalReleaseTarget {
         configuration=$files; tenantRegistryHash=(Get-LocalSha256 (ConvertTo-Json -InputObject @($metadata) -Depth 20 -Compress))
         composeInputs=$composeInputs
         secretBinding=(Get-LocalDeploymentIdentity $Context @((Join-Path $Context.Root 'compose.yaml'))).secretConfiguration
+        mcpSecretBinding=$mcpSecrets
         schema=$schema; candidate=$Context.CandidateSha256; databaseAction=$Context.DatabaseAction
     }
 }
@@ -258,11 +283,12 @@ function Get-OwnedLocalContainers {
         $labels = Invoke-DockerCommand @('inspect','--format','{{json .Config.Labels}}',$id) -Capture | ConvertFrom-Json
         if ($labels.'com.docker.compose.project' -cne $Context.Project -or
             $labels.'com.docker.compose.project.working_dir' -cne $Context.Root -or
-            $labels.'com.docker.compose.service' -notin @('app','postgres')) {
+            $labels.'com.docker.compose.service' -notin @('app','postgres','mcp')) {
             throw 'Local container ownership mismatch; operation refused.'
         }
         $state = Invoke-DockerCommand @('inspect','--format','{{json .State}}',$id) -Capture | ConvertFrom-Json
         $image = Invoke-DockerCommand @('inspect','--format','{{.Image}}',$id) -Capture
+        if ($labels.'com.docker.compose.service' -ceq 'mcp') { Assert-LocalMcpContainer $Context $id }
         @{ Id=$id; Service=$labels.'com.docker.compose.service'; State=$state; Image=$image }
     }
 }
@@ -274,7 +300,7 @@ function Stop-LocalProject {
     [IO.Directory]::CreateDirectory($control) | Out-Null
     Protect-LocalPath $control -Directory
     Write-LocalText (Join-Path $control 'maintenance') 'maintenance'
-    foreach ($service in @('app','postgres')) {
+    foreach ($service in @('mcp','app','postgres')) {
         foreach ($container in @($containers | Where-Object { $_.Service -eq $service -and $_.State.Running })) {
             Invoke-DockerCommand @('stop','--time','130',$container.Id)
         }
@@ -383,7 +409,7 @@ function Invoke-LocalApplication {
                 if ($progress.version -ne 2 -or $progress.databaseAction -cne $Context.DatabaseAction -or
                     $progress.candidate -cne $Context.CandidateSha256 -or $progress.preflight -cne $Context.ExpectedPreflight) { throw 'Pending deployment belongs to a different approved action/content identity.' }
                 $before = $progress.target
-                foreach ($key in @('project','root','state','dockerContext','engine','endpoint','origin','port','tenantRegistryHash','secretBinding')) {
+                foreach ($key in @('project','root','state','dockerContext','engine','endpoint','origin','port','tenantRegistryHash','secretBinding','mcpSecretBinding')) {
                     if ($before[$key] -cne $target[$key]) { throw "Resumed deployment target changed: $key." }
                 }
                 if (($before.resources | ConvertTo-Json -Compress) -cne ($target.resources | ConvertTo-Json -Compress)) { throw 'Resumed volume/network identity changed.' }
@@ -394,6 +420,7 @@ function Invoke-LocalApplication {
                     $previous = @($before.containers | Where-Object service -eq $container.service)[0]
                     if ($container.service -eq 'postgres' -and ($container.id -cne $previous.id -or $container.image -cne $previous.image)) { throw 'Resumed PostgreSQL identity changed.' }
                     if ($container.service -eq 'app' -and $container.id -cne $previous.id -and $container.image -cne $candidate.images.runtime.id) { throw 'Resumed app is neither the original nor exact candidate.' }
+                    if ($container.service -eq 'mcp' -and $container.id -cne $previous.id -and $container.image -cne $candidate.images.mcp.id) { throw 'Resumed MCP is neither the original nor exact candidate.' }
                 }
                 if ($target.schema.fingerprint -cnotin @($before.schema.fingerprint,$candidate.schemaFingerprint) -and
                     -not ($DbReset -and $progress.resetStatus -eq 'completed' -and $null -eq $target.schema.fingerprint)) { throw 'Resumed schema is outside the approved current/reset operation.' }
@@ -406,6 +433,7 @@ function Invoke-LocalApplication {
             $volumes = Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture
             $existing = $Context.Volume -in ($volumes -split "`n")
             $plan = Read-LocalConfiguration $Context $existing -Onboard
+            Sync-LocalMcpContext $Context $plan.Settings
             $receipt = Read-LocalDeploymentReceipt $Context
             @(Get-OwnedLocalContainers $Context) | Out-Null
         }
@@ -422,8 +450,8 @@ function Invoke-LocalApplication {
         if ($candidate) {
             $compose = @($Context.Compose)
             for ($index=0; $index -lt $compose.Count-1; $index++) {
-                if ($compose[$index] -eq '-f' -and [IO.Path]::GetFullPath($compose[$index+1]) -ceq (Join-Path $Context.Root 'compose.yaml')) {
-                    $compose[$index+1] = Join-Path $candidate.sourceRoot 'compose.yaml'
+                if ($compose[$index] -eq '-f' -and [IO.Path]::GetFullPath($compose[$index+1]) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'))) {
+                    $compose[$index+1] = Join-Path $candidate.sourceRoot ([IO.Path]::GetFileName($compose[$index+1]))
                 }
             }
             $files = @(for ($index=0; $index -lt $compose.Count-1; $index++) { if ($compose[$index] -eq '-f') { $compose[$index+1] } })
@@ -436,6 +464,7 @@ function Invoke-LocalApplication {
             Write-Host '[BUILD] Building the qualification image and production outputs once from a fixed source snapshot.'
             $checkImage = Build-LocalArtifact $Context $snapshot 'qualification' $Context.Checks $buildArguments
             Invoke-LocalSoftwareChecks $Context -Image $checkImage -SourceRoot $snapshot.Root
+            Invoke-LocalMcpChecks $Context $snapshot
             Write-Host '[AUTOMATED CHECKS] PASSED. No application configuration, services or database were changed.'
             return
         }
@@ -444,7 +473,7 @@ function Invoke-LocalApplication {
             $Context.OperatorImageId = Build-LocalArtifact $Context $snapshot 'operator' $Context.Operator $buildArguments
             $Context.RuntimeImageId = if ($receipt) { $receipt.runtimeImage } else { '' }
             if (-not $existing) { Save-LocalConfiguration $Context $plan }
-        } elseif ($plan.RegistryChanged -or $plan.SettingsChanged -or $plan.IdentityChanged) { throw 'Pinned release cannot change saved identity/settings.' }
+        } elseif ($plan.RegistryChanged -or $plan.SettingsChanged -or $plan.IdentityChanged -or $plan.McpPlan.SecretsChanged) { throw 'Pinned release cannot change saved identity/settings or MCP credentials.' }
         $marker = Join-Path $Context.State 'control/maintenance'
         $reauthenticate = Join-Path $Context.State 'control/reauthenticate'
         $initializing = Join-Path $Context.State 'control/database-initializing'
@@ -468,12 +497,15 @@ function Invoke-LocalApplication {
             ($schema.currentFingerprint -cne $target.schema.fingerprint -or $schema.targetFingerprint -cne $candidate.schemaFingerprint)) { throw 'Candidate schema preflight changed.' }
         Write-Host '[BUILD] Building the runtime once; the existing application remains available.'
         if (-not $candidate) { $Context.RuntimeImageId = Build-LocalArtifact $Context $snapshot 'runtime' $Context.Image $buildArguments }
+        if ($Context.Mcp -and -not $candidate) { $Context.McpImageId = Build-LocalMcpArtifact $Context $snapshot }
         if ($ForceChecks) {
             $checkImage = Build-LocalArtifact $Context $snapshot 'qualification' $Context.Checks $buildArguments
             Invoke-LocalSoftwareChecks $Context -Image $checkImage -SourceRoot $snapshot.Root
+            Invoke-LocalMcpChecks $Context $snapshot
         }
         if (-not $candidate) { Save-LocalConfiguration $Context $plan }
         Write-LocalComposeEnvironment $Context
+        Test-LocalMcpConfiguration $Context
         $identity = Get-LocalDeploymentIdentity $Context $snapshot.ComposeFiles
         if ($progress -and -not $candidate -and $progress.databaseIdentity -and $progress.databaseIdentity -cne $identity.database) {
             throw 'Pending reset database/credential/operator identity changed; review before recovery.'
@@ -502,6 +534,7 @@ function Invoke-LocalApplication {
             Write-Host '[DEPLOYMENT] ALREADY RUNNING: image, configuration and database contract are unchanged. No restart or database initialization was needed.'
             if ($originalAppliedComposeFiles) { $Context.AppliedComposeFiles = $originalAppliedComposeFiles }
             Show-LocalDeploymentSummary $Context -Checked:$ForceChecks
+            Start-LocalMcp $Context
             return
         }
         $initialize = ($DbReset -and -not $resetComplete) -or -not $databaseCurrent -or ($app -and $app.State.Running -and $app.State.Health.Status -ne 'healthy')
@@ -595,6 +628,7 @@ function Invoke-LocalApplication {
         }
         Write-Host '[DEPLOYMENT] Applied the required changes successfully.'
         Show-LocalDeploymentSummary $Context -Checked:$ForceChecks
+        Start-LocalMcp $Context
     } catch { $errors.Add($_.Exception) }
     finally {
         $Context.Compose = $originalCompose

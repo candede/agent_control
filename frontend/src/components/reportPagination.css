@@ -1,0 +1,43 @@
+.copilot-users-pagination.report-pagination-numbered {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) auto;
+  align-items: center;
+  gap: 16px 24px;
+  padding: 16px 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  font-size: 13px;
+}
+.report-pagination-summary { display: grid; gap: 3px; min-width: 0; color: var(--muted); }
+.report-pagination-summary strong { color: var(--text-h); font-weight: 600; }
+.report-pagination-summary small { font-size: 12px; }
+.report-pagination-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+.report-page-numbers { display: flex; align-items: center; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.report-pagination-numbered button { min-height: 40px; border-radius: 7px; font-size: 13px; font-weight: 550; }
+.report-pagination-numbered .report-page-number { min-width: 40px; padding: 0 8px; border-color: transparent; font-variant-numeric: tabular-nums; }
+.report-pagination-numbered .report-page-number:hover { border-color: var(--border); background: #f5f4fd; color: var(--ink); }
+.report-pagination-numbered .report-page-number[aria-current="page"] { color: #fff; background: var(--ink); border-color: var(--ink); opacity: 1; cursor: default; }
+.report-page-gap { display: grid; place-items: center; min-width: 20px; height: 40px; color: var(--muted); }
+.report-pagination-numbered .report-page-direction { padding-inline: 10px; gap: 6px; color: var(--text); }
+.report-pagination-numbered button[aria-disabled="true"]:not([aria-current="page"]):hover { background: var(--surface); color: var(--muted); }
+.report-page-jump { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin: 0; padding-top: 12px; border-top: 1px solid var(--border); }
+.report-page-jump label { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.report-page-jump input { flex: 0 0 76px; width: 76px; min-height: 40px; padding: 6px 10px; font-size: 13px; }
+.report-page-jump button { padding-inline: 14px; }
+
+@media (max-width: 1100px) {
+  .copilot-users-pagination.report-pagination-numbered { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .report-pagination-summary { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+  .report-pagination-actions { justify-content: center; }
+}
+@media (max-width: 600px) {
+  .copilot-users-pagination.report-pagination-numbered { padding: 14px 12px; }
+  .report-pagination-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .report-page-numbers { grid-column: 1 / -1; grid-row: 1; justify-content: center; gap: 3px; }
+  .report-pagination-numbered .report-page-number { min-width: 34px; min-height: 42px; padding-inline: 6px; }
+  .report-page-gap { min-width: 15px; }
+  .report-page-direction { grid-row: 2; }
+  .report-pagination-numbered .report-page-direction { min-height: 44px; }
+  .report-page-jump { justify-content: center; }
+}

@@ -33,6 +33,56 @@ beforeEach(() => { vi.mocked(api.readReportPage).mockResolvedValue(page("initial
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
 describe("report page selection lifetimes", () => {
+  it("admits one direct adoption page jump and rejects stale, duplicate, or out-of-range actions", async () => {
+    const initial = { ...page("initial"), counts: { total: 25, filtered: 25 },
+      page: { limit: 5, number: 1, offset: 0, anchor: "group-1", nextCursor: "next", previousCursor: null } };
+    const third = { ...initial, page: { ...initial.page, number: 3, offset: 10, anchor: "group-11", previousCursor: "previous" } };
+    const pending = deferred<typeof third>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise);
+    const { result } = renderHook(() => useReportPage<string>("copilot-usage/adoption", { limit: 5 }), { wrapper: sharedQueries() });
+    await waitFor(() => expect(result.current.data).toBe(initial));
+    const jump = result.current.goToPage!;
+    act(() => {
+      for (const invalid of [0, -1, 1.5, 6, NaN, 1]) expect(jump(invalid)).toBe(false);
+      expect(jump(3)).toBe(true);
+      expect(jump(5)).toBe(false);
+    });
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+      { limit: 5, selectionId: "initial", pageNumber: 3 }, expect.any(AbortSignal));
+    expect(result.current.data).toBe(initial);
+    await act(async () => pending.resolve(third));
+    await waitFor(() => expect(result.current.data).toBe(third));
+    act(() => expect(jump(5)).toBe(false));
+    expect(result.current.goToPage).not.toBe(jump);
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it.each(["revision", "expiry"] as const)("preserves an in-flight page jump when %s requires a fresh selection", async boundary => {
+    const initial = { ...page("initial"), counts: { total: 25, filtered: 25 },
+      page: { limit: 5, number: 1, offset: 0, anchor: "group-1", nextCursor: "next", previousCursor: null } };
+    const third = { ...initial, selection: reportSelection(5),
+      page: { ...initial.page, number: 3, offset: 10, anchor: "group-11", previousCursor: "previous" } };
+    const pending = deferred<typeof initial>(), fresh = deferred<typeof third>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise).mockReturnValueOnce(fresh.promise);
+    const { result, rerender } = renderHook(({ revision }) => useReportPage<string>("copilot-usage/adoption", { limit: 5 }, revision),
+      { wrapper: sharedQueries(), initialProps: { revision: 0 } });
+    await waitFor(() => expect(result.current.data).toBe(initial));
+    act(() => { expect(result.current.goToPage?.(3)).toBe(true); });
+    if (boundary === "revision") rerender({ revision: 1 });
+    else {
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 600_001);
+      act(() => window.dispatchEvent(new Event("focus")));
+      await act(async () => pending.reject(new ApiError(409, "selection_invalidated", "Selection expired.", { details: { reason: "expired" } })));
+    }
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption", { limit: 5, pageNumber: 3 }, expect.any(AbortSignal));
+    expect(result.current.data).toBe(initial);
+    await act(async () => fresh.resolve(third));
+    await waitFor(() => expect(result.current.data).toBe(third));
+    if (boundary === "revision") await act(async () => pending.resolve(initial));
+    expect(result.current.data?.page.number).toBe(3);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+  });
   it("does not reject a pending fresh capture when an old detail or export rejects the displayed placeholder", async () => {
     const initial = page("initial"), fresh = { ...page("fresh"), selection: reportSelection(9) };
     const replacement = deferred<typeof initial>();

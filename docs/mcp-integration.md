@@ -1,15 +1,24 @@
 # MCP integration v1: canonical API contract
 
 The canonical API, browser and worker contracts are implemented in current
-source. The Python MCP service/tools remain roadmap work; this document claims
-no MCP deployment or live provider result.
+source. Phases 05–07 implement the Python FastMCP authentication/storage/API
+adapter and typed saved-read, collection, investigation and exact control catalog.
+This document claims no MCP
+deployment, live Entra consent or live provider result.
 See the [remaining roadmap](../plans/fastmcp-integration/README.md).
 Update this operation/feature map when current contracts change.
+
+The [phase11 release record](../plans/fastmcp-integration/completions/11-release-qualification.md)
+separates current local SDK/canonical-HTTP/SQL, compiled-browser, production-image
+and real Azurite evidence. It does not establish real client, Entra/provider or
+App Service compatibility. Reproduce it through the
+[existing guarded owners](operations.md#current-release-qualification-for-deployment-testing),
+not an approval file or a second API/domain implementation.
 
 ## Authority and activation
 
 Browser -> session -> canonical API -> saved SQL / explicit Microsoft work ->
-existing jobs/audit -> browser remains supported. Later: signed-in external
+existing jobs/audit -> browser remains supported. The implemented MCP path is: signed-in external
 client -> FastMCP OAuth -> delegated API token -> **the same method/route** ->
 the same API authority -> typed bounded result -> client reasoning. Web never
 calls MCP. API owns queries, joins, metrics, controls, workers and audit.
@@ -114,10 +123,10 @@ prior portal login; the existing private key is unchanged.
 
 ## Registrations, token audiences and consent
 
-Primary evidence is dated below. Feasibility pin: FastMCP **4.1.0**, release
+Primary evidence is dated below. Implemented pin: FastMCP **4.1.0**, release
 2026-10-08, tag commit `51b618f7d5970d2870dc351081e16600f371291f`.
-05 must pin its actual package/lock version and recheck this contract on drift;
-01 installs no future package.
+`mcp/pyproject.toml` and `mcp/uv.lock` pin the actual approved-feed distribution
+and transitive dependencies; recheck this contract on drift.
 
 1. Existing API registration remains browser confidential/OIDC client, owns
    Viewer/Admin user roles and Graph/Power Platform delegated permissions.
@@ -144,6 +153,10 @@ Primary evidence is dated below. Feasibility pin: FastMCP **4.1.0**, release
    verified token swap is the upstream Entra access token. Missing context,
    alternate identity-assertion grants, wrong audience or ID-token mode fail
    closed; do not read private `_upstream_token_store` or pass client JWTs to API.
+   The local `TenantAzureProvider` narrows the verified
+   upstream claims to an exact v2 GUID audience, tenant, delegated scope, user,
+   integration `azp` and finite issuance/expiry. ID tokens and app credentials
+   are rejected. The signed reference's original user must match after refresh.
 5. MCP exchanges that assertion at the fixed tenant endpoint, using **MCP**
    confidential credentials and API delegated scope (`requested_token_use=
    on_behalf_of`). API accepts only its own exact v2 audience, verified tenant,
@@ -165,6 +178,20 @@ scope. Set `forward_resource=false` for Entra's scope-based upstream request;
 the downstream FastMCP resource binding still applies. Clients must supply
 resource indicators to FastMCP and authorization on every HTTP request.
 
+The actual SDK defaults are not the application security policy:
+`AzureProvider.authorize` clears the resource before the parent checks it,
+default JWT audience validation also accepts `api://` and audience arrays,
+default revocation leaves access mappings alive, and the SDK encryption wrapper
+accepts plaintext input. Public-method/ASGI boundary guards enforce exact
+resource indicators on authorize **and** token requests, S256, exact redirects,
+strict verified claims and durable encrypted exact-token revocation. A public
+storage wrapper rejects plaintext before SDK decryption. No private token store
+is read and no application cryptography is implemented. The maintained file
+store's public sanitization hook hashes lookup filenames; SDK authentication
+logs retain only safe event metadata, not rejected OAuth codes. Single-process
+code-consumption serialization and post-await revocation checks prevent
+concurrent code reuse or renewal after an in-flight disconnect.
+
 API app roles are revalidated at most five minutes after the last verified
 authority. An immutable bearer token cannot be called refreshed evidence; expiry
 or stale role evidence requires a fresh API assertion with newer issuance/
@@ -185,13 +212,182 @@ in tools/chat. Scheduled clients must handle reauthorization explicitly.
 Existing browser sessions expire after eight hours and MSAL cache is process-local.
 API assertions/provider tokens never outlive their verified issuer/SDK expiry;
 worker leases end at the earlier assertion/provider deadline and authorization
-fence. 05 sets FastMCP reference access lifetime900s, refresh-expiry fallback86400s
+fence. The service sets FastMCP reference access lifetime900s, refresh-expiry fallback86400s
 (never overriding a shorter known expiry), and renewal threshold60s. An expired
 or revoked upstream connection cannot be renewed with a locally signed JWT.
 These are explicit SDK constructor limits, not additional configuration names.
 Role freshness may require a new API token before its nominal expiry; MCP forces
 an OBO exchange rather than relabeling an old `iat` as refreshed evidence.
 An Entra denial/challenge pauses authority and never retries a provider write.
+
+### Implemented local service foundation (phase 05)
+
+`mcp/src/agent_control_mcp` is an installable Python 3.14 package. It uses
+FastMCP4.1.0, MCP SDK2.3.0, the maintained JWT verifier, HTTPX2, and
+`py-key-value-aio` **0.4.6** FileTreeStore/Fernet wrapper with
+cryptography48.0.1 (the exact versions/hashes are in `uv.lock`).
+There is one tenant, one configured API origin and one confidential MCP client.
+Discovery/OAuth endpoints are rooted at the configured public origin; the
+Streamable HTTP resource is the exact `MCP_PUBLIC_URL` path. No caller can choose
+a tenant, upstream endpoint or resource origin. CIMD/alternate assertion grants
+are disabled; DCR accepts only exact configured client redirects. The SDK's
+interactive OAuth consent/CSRF binding is retained; it is not an application
+release/business-approval gate.
+
+Every HTTP request authenticates independently, including an existing protocol
+session. The service recovers the upstream JWT using public `get_access_token()`
+and obtains an API token at the exact tenant endpoint with fixed MCP confidential
+credentials, `requested_token_use=on_behalf_of` and only
+`api://<apiClientId>/AgentControl.Access`. SDK signature verification plus exact
+claims checks reject another user/audience, app/ID tokens and role evidence
+older than five minutes. No API assertion or provider token is persisted.
+
+The shared `CanonicalApi.invocation(ctx)` owns one60s deadline, four concurrent
+requests, eight physical requests, two OBO exchanges and524288 aggregate output
+bytes. Requests are <=30s; exchanges are <=10s. Only a safe GET can retry once
+on429/503 with a bounded honored `Retry-After`; otherwise cooldown is returned.
+API requests require identity encoding; unsolicited compressed bodies fail
+before decoding rather than bypassing the byte bound. Refresh/OBO upstream503
+and transport deadlines remain safe503/504 errors rather than forcing an
+invalid-grant reset. OAuth endpoints have a30s handling deadline; callback
+errors are normalized/non-cacheable and never forward provider diagnostic text.
+Cancellation propagates, and expiry/revocation is checked after awaited work.
+No cookies, redirects, proxy environment or caller-supplied URL/auth headers
+enter API dispatch. The adapter's named calls use the finite catalog in
+`mcp/src/agent_control_mcp/tools.py`; caller-selected endpoints/methods are
+unreachable, not hidden tools. The catalog follows the canonical map below;
+there is no second API authorization-policy map or domain query implementation.
+Successful API request UUIDs are retained in the invocation; bounded errors
+preserve status/code/correlation/cooldown and sanitized details, not raw
+provider responses. POST/PATCH/DELETE submissions are never automatically replayed,
+and MCP introduces no provider writer.
+OBO claims challenges use the same bounded `access_token` claim-name, field and
+value allowlist as the API; ID-token requests and arbitrary nested diagnostics
+are never forwarded as reauthorization data.
+
+Public `/health` reports process health. `/ready` verifies protected encrypted
+storage and its tenant/client/API/resource binding, not provider permission or
+database readiness. Expected storage failures return503 and emit a safe operator
+error without secret-bearing exception text; unexpected defects are not hidden
+by a catch-all. `/diagnostics` requires a fresh verified MCP credential
+and returns non-secret protocol/build/storage metadata plus the authenticated
+downstream OAuth client ID. It does not expose tokens, connection handles,
+session IDs, user names or provider/SQL details. It reports the actual registered
+business-tool count and bounded OAuth file/byte usage, not inferred readiness
+or provider permission. Storage inspection failures return a redacted503.
+See [setup](deployment-setup.md#local-fastmcp-foundation-phase-05) and
+[storage lifecycle](security-model.md#fastmcp-oauth-state-and-recovery).
+
+### Implemented typed business catalog (phase 06)
+
+Ordinary configured service construction registers **124 named tools**, with no
+extra enable flag or approval ceremony. Each tool takes one concrete `request`
+object and publishes an explicit nested output schema. Empty-input tools use
+`{"request": {}}`. `tools.py` owns names/methods/routes/input/output bindings;
+`inputs.py`, `control_inputs.py` and the inventory/report/job/control DTO modules
+carry the wire contracts. Phase06's96 operations are retained; phase07 adds28
+control operations and reuses the existing two directory-principal adapters.
+The real SDK `tools/list` and authenticated `tools/call` are tested against
+synthetic Entra/JWKS/API transports and current TypeScript source-derived
+fixtures, including optional nested evidence. This is local source evidence,
+not live SQL, Entra consent, provider or external-client qualification.
+
+The catalog covers saved capabilities/workspace jobs; inventory selections,
+facets, detail, members, sections, children and About; exact saved users,
+licensing, responsibility and relationships; adoption/champions; official
+reports, history, analytics, usage and explicit comparisons; saved
+investigations/audit; and explicit delegated collection, directory enrichment,
+identity resolution, capability checks, Audit Search/hunts and their bounded
+job/results/recovery operations, plus the exact controls below.
+Local Purview/Defender cache deletion requires confirmation of the exact job ID
+and is marked destructive. No CSV import, capability configuration, binary
+download, automatic browser
+refresh, arbitrary HTTP/SQL/KQL or application-identity fallback is registered.
+Browser application-mode investigation behavior is unchanged; MCP provider
+submission inputs remain delegated-only, matching bearer policy.
+
+### Implemented exact controls (phase 07)
+
+The normal catalog includes the three generic control tools and all supported
+package/Studio control preview, execution, saved job/status/item, cancel,
+explicit resume, GET-only provider reconciliation and audit adapters in the
+canonical map below. Existing `search_access_principals` and
+`resolve_access_principals` serve access editing; search is bounded and is not
+exhaustive discovery. No canary, release receipt, enable switch or MCP approval
+state gates ordinary supported controls.
+
+Controls require current API-owned **Admin** authority and the actual delegated
+provider permission: Graph `CopilotPackages.ReadWrite.All` or Power Platform
+`CopilotStudio.AdminActions.Invoke`. Saved package/Studio job reads retain their
+Viewer policy; private generic receipt reads require Admin. Python forwards exact
+canonical, selection, native, source/environment and opaque package identities,
+not names or inferred associations. Generic Studio block/unblock means
+quarantine/unquarantine; explicit package-only controls stay package-only even
+for a Studio-linked package. Access uses exact typed directory UUIDs,
+availability/installation, add/replace and specific/none; single-package access
+uses the canonical **PATCH** and replace only. All-users writes remain
+unsupported by the provider, not enabled through MCP.
+
+Every submission requires a caller-retained stable `idempotencyKey`, forwarded
+only as `Idempotency-Key`, plus the exact current confirmation hash/receipt.
+Generic receipt keys are printable ASCII within the API's200-character
+non-whitespace bound (no unsupported Unicode HTTP-header encoding);
+package/Studio submissions use1–128 ASCII alphanumeric/underscore/hyphen keys.
+The SDK's readOnly/destructive/idempotent/openWorld annotations distinguish saved
+reads, live provider work, potentially disruptive changes and exact-key
+idempotent submissions. An idempotent annotation is **not** permission to retry
+a mutation automatically: POST/PATCH are single-attempt, including503, timeout
+or response loss. A sent-unknown effect is inspected through existing saved
+job/item routes and explicit read-only reconciliation, never replayed by MCP.
+There is no Python scheduler, polling loop, receipt store, child-job writer,
+provider client or domain outcome projection.
+
+Clients must display the exact preview, including names/IDs, provider effects,
+prestates, counts, already-state/ineligible reasons and expiry where returned.
+Package previews disclose at most20 targets plus `additionalTargetCount`;
+do not claim that bounded summary enumerates omitted targets. Generic receipts
+expire at the earlier current-source expiry and ten minutes; package stages
+are at most ten minutes, and Studio validity stays provider/source-owned.
+Never extend validity, recapture/substitute targets after an error or convert
+unknown identity/date/readback into an empty or successful result.
+Interactive clients ask for **current confirmation after that preview**.
+Externally scheduled clients obtain the same current receipt without a human
+pause. MCP cannot prove human intent and accepts no fabricated human-confirmed,
+scheduled bypass or client-confirmation-proof field. The existing resume
+`confirmed:true` is only the canonical unsent-work contract.
+
+API acceptance fixes the initiator/origin once. Every later request forwards
+its own SDK request-local origin automatically for lifecycle attribution,
+without replacing that accepted initiator. Accepted, final, verified,
+authorization-wait, partial children, not-applied/conflict and unknown readback
+remain separate nested API evidence. Mixed providers are never atomic.
+Job pages retain exact revision/cursors; no implicit all-pages discovery,
+status polling, replay or restart authorization is added. API owns provider
+effects, authority, jobs, audit and the existing browser-only CSV export.
+Synthetic SDK/browser capture tests verify identical canonical methods, bodies,
+defaults, errors and returned audit/outcome DTOs; they are not live provider,
+database durability or human-confirmation proof.
+
+Unspecified API defaults stay unspecified. Null facet values are encoded
+distinctly from literal `"~null"` strings; unrelated optional inputs must be
+omitted rather than null. Source/report/package identities retain exact case;
+directory/selection/job UUIDs normalize to lowercase. API errors retain safe
+status/code, correlation, cooldown and structured details. Unknown/partial/
+missing states and incomparable report windows never become successful empty
+arrays, zeros or inferred authority. API joins, rankings and calculations
+remain authoritative.
+
+Every result is one bounded page. Continue only the returned cursor with the
+same selection/source/revision; expired or cross-principal cursors fail without
+recapture. `read_agent_about` returns up to16384 Unicode characters per explicit
+call; repeat the exact field/source until `nextCursor` is null to obtain all
+available saved text. No truncation, fallback or hidden loop occurs. The524288
+output-byte ceiling includes the final SDK text/structured result envelope;
+oversized results fail explicitly rather than being shortened. Returned source
+text is untrusted inert data. GET saved reads are annotated read-only; selection
+captures, live lookups and collection/investigation submissions are not.
+Authenticated attribution is forwarded automatically by the existing
+request-local invocation owner, never accepted as caller-selected authority.
 
 ### Principal authority and worker propagation
 
@@ -561,15 +757,16 @@ MCP tool / no bearer admission**, not missing implementation. `V` includes
 Admin, `A` means Admin, `S` means any validated session, `P` public. Authenticated
 non-GETs retain CSRF and same-Origin for browser transport. Capabilities are
 exact IDs from `capabilityRegistry`; where dynamic, the service rechecks them.
-Tool names are the future server allowlist; **all are dormant now**. No new
-allowlisted tool may invoke a route omitted here. Application-mode options,
+Tool names are the finite server allowlist. Phase06 read/collection/investigation
+and phase07 exact-control tools below are registered now.
+No allowlisted tool may invoke a route omitted here. Application-mode options,
 canaries, import/shared-selection writes, binary downloads and browser automation
-are deliberately omitted. 05 must reject direct calls to disabled/omitted tools,
+are deliberately omitted. The SDK rejects direct calls to unregistered/omitted tools,
 not merely hide `tools/list` results.
 
 ### Public, authentication, setup and Permissions
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/health` | none -> `{ok:true}` | deployment liveness | — | P |
 | `GET /api/ready` | none -> `{ok:boolean}`,503 on schema/maintenance | deployment readiness | — | P |
@@ -591,7 +788,7 @@ not merely hide `tools/list` results.
 
 ### Inventory, About, configuration and responsibility
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agent-inventory/selections` | `{query:I}` ->201 selection or200 availability state | getUnifiedAgents capture, all five category views | capture_agent_inventory | V |
 | `GET /api/agent-inventory` | I + selected paging ->UnifiedAgentInventoryPage | getUnifiedAgents/Agents table | list_agents | V |
@@ -616,7 +813,7 @@ not merely hide `tools/list` results.
 `R` is endpoint-specific above. These are saved reads; no provider call or CSV
 reparse. `reportData.readReportPage/readReportDetail` also serve lazy children.
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/copilot-usage/users` | R(copilot_users) ->ReportPage<CombinedUser> | reportPages.users/paid roster/licensing | list_users | V |
 | `GET /api/copilot-usage/users/facets` | R(copilot_users),field company/department/creatorType,search? ->facets | readReportFacet/Users filters | list_user_facets | V |
@@ -666,7 +863,7 @@ bounded metadata fields; admission is four global/two tenant streams, deadline
 30min. Tenant retained staging is separately quota-bound. Preserve these server
 limits and bounded SQL stream batches; no MCP file/blob/download tool.
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/official-usage/staging` | multipart file + optional operator reportingStart/End,periodProvenance,sourceAsOf/Provenance,downloadedAt; query bundleId,correctionOfSetId?,rejectDuplicateKind? ->preview | stageReport/Add CSV reports | — | A |
 | `GET /api/official-usage/staging/:id` | exact UUID ->OfficialReportPreview | readReportStage/resume explicit draft | — | A |
@@ -697,7 +894,7 @@ MCP refresh tools are explicit calls; none run from ordinary saved read handlers
 Existing signed-in browser visibility/initial/check/due behaviors stay unchanged.
 `data-sync/auto-refresh` is browser automation, not an application scheduler.
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/data-sync/state` | no query ->DataSyncState | getDataSyncState/Sync history | get_sync_state | V |
 | `POST /api/data-sync/auto-refresh` | absent/empty object,no query ->AutomaticRefreshResult | checkAutomaticRefresh/visible signed-in workbench | — | V |
@@ -734,7 +931,7 @@ Existing package effects remain package effects even for a Studio-linked package
 Generic Studio routing is a **distinct operation** below. API enforces
 target/receipt/current authorization, not a claim of human/scheduled intent.
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agents/mutation-selection` | T with selectionId ->selected counts | countPackageMutationSelection/bulk counts | count_package_targets | A |
 | `POST /api/agents/mutation-preview` | P ->bound hash/summary/prestates/eligibility | previewPackageMutation/confirmation | preview_package_control | A; dynamic capability |
@@ -786,7 +983,7 @@ Provider source metadata is not origin. Retain source/data-scope/privacy notices
 All live investigations are explicit; saved lists/catalog/status/records are not
 silent provider refreshes.
 
-| Method route | Exact input/default -> output | Browser consumer / feature | Future tool | Policy |
+| Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/agent-inventory/investigations/context` | recordId only ->saved AgentInvestigationContext | getAgentInvestigationContext/Activity | get_agent_investigation | V |
 | `POST /api/agent-inventory/investigations/resolve` | `{recordId}` only ->verified saved identity context | resolveAgentInvestigationIdentity | resolve_agent_identity | V; graph.agentIdentity.read |
@@ -840,7 +1037,7 @@ above remain distinct and unchanged; no UI button was reinterpreted.
 Saved-read composition routes support canonical browser/bearer authority, with
 static `/resolve` and `/champions` preceding parameterized handlers.
 
-| Method route | Frozen v1 input/output | Web impact and owner | Future tool | Policy |
+| Method route | Frozen v1 input/output | Web impact and owner | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agent-controls/preview` | Admin+CSRF; `{selectionId,recordIds:[1..100 exact canonical/report IDs],action:block\|unblock}` ->immutable exact provider effects, eligible/ineligible/already counts, child receipts and expiry, no new business approval | API-only generic operation; explicit package/Studio UI unchanged | preview_agent_control | A; dynamic provider capability |
 | `POST /api/agent-controls/execute` | Admin+CSRF; `{receiptId,confirmationHash}`,required `Idempotency-Key` ->202 non-secret correlation with existing package/Studio child references; each child's existing status/items/cancel/resume/reconcile routes are sole outcome authority | API-only generic execution; no parent outcome store | execute_agent_control | A; dynamic provider capability |
@@ -1046,15 +1243,19 @@ labels/IDs and validates size/grammar. 05 uses only allowlisted initialize
 for optional caller labels and actual request ID. Missing agent identity remains
 unknown. Client context is not an authorization/target/receipt input.
 
-FastMCP 4.1.0 default AzureProvider's verified `get_access_token().client_id`
-comes from Entra `azp` (integration app), not the downstream OAuth/DCR client:
-OAuthProxy returns the upstream JWTVerifier result. `Context.client_id` is
-request meta, thus **reported**, and MCP initialization `clientInfo` is
-self-reported. Do not falsely authenticate DCR vendor names or equate this ID
-with Claude/Copilot/cowork. No SDK-supported authenticated calling-agent
-identity is established here. 05 may mark a field authenticated only after
-proving an independent exact credential binding in its pinned SDK, otherwise
-this contract deliberately retains reported/unknown, not a new registry.
+FastMCP4.1.0's **default** AzureProvider returns the upstream verifier's
+`client_id` (Entra `azp`, the integration app). The implemented provider also
+verifies the reference JWT using public `jwt_issuer.verify_token`, preserves
+its verified downstream OAuth/DCR `client_id` as the SDK transport owner, and
+retains the original upstream JWT/claims unchanged for OBO. SDK session ownership
+therefore binds both signed-in user and downstream credential, including when
+two clients use the same user. This opaque authenticated client ID is separate
+from optional reported vendor/agent labels; it does not prove Claude/Copilot/
+cowork identity or a calling agent. `Context.client_id` remains reported meta,
+not authority. `origin_header` reads public request-local `Context.request_context`
+and `Context.session.client_params.client_info`; it never uses last-caller state.
+The API still assigns **reported** to every forwarded descriptor label/ID.
+No new authenticated-origin header, identity registry or trust widening exists.
 
 Provenance captures the first **accepted execution submission**, transactionally
 with job/stage handoff, not the preview generator. A web preview followed by MCP
@@ -1201,11 +1402,18 @@ request remains provider-free.
 
 ## Synthetic workflow corpus and test isolation
 
-Fixture namespace `mcp-v1-synthetic` only, domains `example.invalid`, no customer
+Phase 09 executes the shared
+[`mcp-workflows.json`](../backend/scripts/fixtures/mcp-workflows.json) corpus
+through SDK HTTP/OAuth clients, actual browser adapters and canonical SQL/web/
+bearer owner tests. See [client-specific onboarding, complete recipes and proof
+boundaries](mcp-clients.md) and the [current completion evidence](../plans/fastmcp-integration/completions/09-client-workflows-and-evaluation.md).
+This is not a production workflow engine or a vendor/model certification.
+
+Fixture domains `example.invalid` only, no customer
 data. Tenant T=`11111111-1111-1111-1111-111111111111`; other tenant
-`33333333-3333-3333-3333-333333333333`; API app
+`44444444-4444-4444-4444-444444444444`; API app
 `22222222-2222-2222-2222-222222222222`; MCP app
-`44444444-4444-4444-4444-444444444444`. Native user local/home UID
+`33333333-3333-3333-3333-333333333333`. Native user local/home UID
 `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`, home tenant T; guest local
 `bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb`, home UID
 `cccccccc-cccc-cccc-cccc-cccccccccccc`, home tenant
@@ -1215,13 +1423,17 @@ Names deliberately duplicate; report-only usernames are not directory keys.
 
 | Case | Exact data and expected useful result |
 | --- | --- |
-| A | `alex@example.invalid`, exact objectId `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`, 103 agents `agent:10000000-0000-4000-8000-000000000001` through suffix`000000000103`, duplicate label `Shared name`. Page100 then3, unique full103 IDs; created=001..003, owned=004..005, used=006..103 including exact report-only `P_report_only` separately. Unknown About for103,101 has long Unicode text,102 Studio saved configuration; no guessed UPN/report linkage. Supported mapping fixture native/guest retains distinct keys. |
-| B | company`Example Company`,department`Research`; five people p1..p5 (`20000000-0000-4000-8000-000000000001`..005). (created,responses,associated): p1=(3,10,4),p2=(2,50,3),p3=(2,20,8),p4=(0,100,1),p5=(0,null,0). Champions p1,p2,p3 in that order; p4's `P_nonchampion` excluded from champions-only result, not the department list. Report sets `30000000-0000-4000-8000-000000000001`..005: Jan1-30 responses100; Jan16-Feb14 responses120 (overlap); Mar1-30 responses150; Apr1-7 responses40 (unequal); undated null. All operator_asserted except undated unknown; Jan->Mar comparable50% snapshot increase, Jan->overlap/Mar->Apr/undated not growth. Separate Agents/bridge totals100/97 stay discrepant; licensed/unlicensed7/3 not total10. |
+| A | `alex@example.invalid`, exact objectId `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`, 103 agents `agent:10000000-0000-4000-8000-000000000001` through suffix`000000000103`, duplicate label `Shared name`. SQL inventory pages100+3; SDK used-relationship pages50+49 (98 canonical006..103 plus report-only `report:P_report_only`), created=001..003, owned=004..005, modified=005. All source associations and Unicode long101/native102 About continuations are exact; About103 stays missing. No guessed UPN/report linkage; native/guest private home-account keys remain distinct. |
+| B | company`Example Company`,department`Research`; five people p1..p5 (`20000000-0000-4000-8000-000000000001`..005). (created,responses,associated): p1=(3,10,4),p2=(2,50,3),p3=(2,20,8),p4=(0,100,1),p5=(0,null,0). Champions p1,p2,p3 in that order; p4's `P_nonchampion` excluded from champions-only result, not the department list. Report sets `30000000-0000-4000-8000-000000000001`..005: Jan1-30 responses100; Jan16-Feb14 responses120 (overlap); Mar1-30 responses150; Apr1-7 responses40 (unequal); undated null. All operator_asserted except undated unknown; Jan->Mar comparable50% snapshot increase, Jan->overlap/Jan->Apr/undated not growth. Separate Agents/bridge totals100/97 stay discrepant; licensed/unlicensed7/3 not total10. |
 | C | selected evaluatedAt`2026-01-31T00:00:00.000Z`,createdWithinDays30 ->cutoff`2026-01-01T00:00:00.000Z`. 101 eligible exact records across100+1 pages; created at boundary included,1ms before excluded even modified/collected/imported Jan31; unknown creation excluded. Existing any-source semantics preserved. Both explicit package and generic Studio actions tested in both directions in04A: package ID`T_pkg_001`; Studio native`studio-agent-001`,environment`40000000-0000-4000-8000-000000000001`,bot`50000000-0000-4000-8000-000000000001`. Interactive waits after exact preview; externally scheduled execution does not. Expired hash, changed membership/prestate, revoked authority, duplicate key, one failed child and sent-unknown outcomes remain explicit, no blind retry. |
 
-Fixtures exercise bounded corpus/SDK/parser/projection/cursor behavior,
-not live controls. Future client evaluation uses the same synthetic cases;
-current API HTTP/SQL parity remains authoritative. No production fixture-auth route, synthetic
+Fixtures execute bounded corpus/SDK/parser/projection/cursor behavior, direct
+interactive confirmation/reconfirmation pauses, an external scheduled receipt
+without a human pause, attribution isolation, explicit provider-work submission,
+denial/challenge/refresh/revocation/reconnect, not live vendor controls. Actual
+tool traces measure complete-page calls/bytes/time; client/server descriptions
+are not consent proof. Current API HTTP/SQL parity remains authoritative.
+No production fixture-auth route, synthetic
 import into customer reports, latest/shared selection change, broad sync, real
 bulk canary or production reset.
 
@@ -1231,6 +1443,7 @@ Commands from repository root:
 npm run test --workspace backend -- src/routes/mcpContractFeasibility.test.ts
 npm run typecheck --workspace backend
 npm run check:unused
+cd mcp && .venv/bin/pytest tests/test_onboarding.py tests/test_workflows.py
 ```
 
 Existing DB/browser contracts (only for changed DB/UI owners):
@@ -1253,8 +1466,9 @@ The contract-feasibility Node fixture opens no DB, listener or provider transpor
 
 ## Configuration and secret ownership
 
-Tenant integration binding is current API configuration. The `MCP_*` names below
-are proposed future service configuration, not implemented runtime settings.
+Tenant integration binding remains API configuration. The `MCP_*` names below
+are implemented service configuration. Phase08's optional Compose lifecycle and
+phase10's Azure source tooling do not establish a live deployment.
 
 | Name | Owner / contract |
 | --- | --- |
@@ -1262,22 +1476,31 @@ are proposed future service configuration, not implemented runtime settings.
 | `MCP_TENANT_ID`, `MCP_CLIENT_ID`, `MCP_API_CLIENT_ID` | 05 exact GUIDs, separate registrations, no email/argument tenant routing |
 | `MCP_API_ORIGIN` | 05 one exact allowlisted API origin, no caller URL; Compose internal transport still binds external identity correctly |
 | `MCP_PUBLIC_URL` | 05/08/10 approved canonical HTTPS resource URL/mount and callback; no guessed loopback origin for remote clients |
+| `MCP_SECRET_SOURCE` | `files` by default; explicit `app-service-key-vault` accepts only resolved native references and the leased encrypted Blob profile, never a fallback |
 | `MCP_CLIENT_SECRET_FILE` | MCP confidential/OBO credential, operator-owned mounted secret; never API/provider credential |
 | `MCP_JWT_SIGNING_KEY_FILE` | independent MCP signing key, operator-owned; do not derive from client secret |
 | `MCP_OAUTH_ENCRYPTION_KEY_FILE` | independent MCP storage-encryption key, operator-owned; rotation/restart proof05/08/11 |
-| `MCP_OAUTH_STORAGE_PATH` | dedicated non-root0700 mount `/var/lib/agent-control-mcp/oauth`; file backend plus authenticated encryption for **all** persisted OAuth connection/token material; never app DB/data volume |
-| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | JSON exact approved callbacks/controlled loopback patterns; empty denies; no AzureProvider permissive `None` default |
+| `MCP_OAUTH_STORAGE_PATH` | Local/direct/Compose only: dedicated non-root0700 directory `/var/lib/agent-control-mcp/oauth`; protected FileTree plus authenticated encryption for all OAuth state; forbidden in Azure profile, never app DB/data volume |
+| `MCP_AZURE_CLIENT_SECRET`, `MCP_AZURE_JWT_SIGNING_KEY`, `MCP_AZURE_OAUTH_ENCRYPTION_KEY` | Azure-only native Key Vault reference outputs in memory; independent values/versions, no simultaneous `*_FILE` inputs or raw CLI parameters |
+| `MCP_AZURE_BLOB_ACCOUNT_URL`, `MCP_AZURE_BLOB_CONTAINER`, `MCP_AZURE_BLOB_NAME` | Azure-only exact HTTPS `*.blob.core.windows.net` account, dedicated private container and prepared `oauth-state.v1.fernet` object; all writes require its lease plus ETag |
+| `MCP_AZURE_IDENTITY_CLIENT_ID` | Azure-only exact UAMI client ID; explicit ManagedIdentityCredential, no default/user/environment chain or storage keys |
+| `MCP_ALLOWED_CLIENT_REDIRECT_URIS` | JSON exact approved callbacks including exact loopback port/path; no wildcard/port-agnostic patterns; empty denies; no AzureProvider permissive `None` default |
 | Existing `TENANTS_JSON_FILE`, `SESSION_SECRET_FILE`, PostgreSQL secrets | remain API-only, unchanged; MCP receives no DB/provider secret/cache/access |
 
 No standalone API provider secret or token cache persistence. File storage alone
 is plaintext, so 05 supplies the SDK-supported encrypted store using the
 independent encryption key, not default auto-derived signing/encryption.
-One MCP instance. Compose later adds only service/image and dedicated
-`seha_mcp_oauth` volume; current `app/postgres/seha_data` preserved.
-Azure10 retains Node24 App Service and adds a separate Linux container App
-Service with immutable image digest, single worker and durable access-restricted
-Azure Files/storage mount; `/tmp`/ephemeral root is not OAuth persistence.
-No Redis/autoscale/second application DB/queue. Mount/key rotation/backups/
+One MCP instance. Optional Compose uses a dedicated OAuth volume while retaining
+current `app/postgres/seha_data`. The three `*_FILE` settings are local-file-mode
+inputs, not Azure native-reference inputs.
+Azure10 retains Node24 App Service and supports a separate Linux container App
+Service with immutable image digest and one bounded encrypted state Blob.
+One worker is capacity policy, not exclusivity: the maintained Azure SDK leases
+the exact data object, every mutation carries that lease and ETag, and lost/
+unknown ownership fails closed for reads, issuance and publication. No stale
+cache, unfenced separate key/object or auto-reacquisition/replay exists. See the
+[Azure contract and remaining cloud proof](azure-production-deployment.md#prepared-identities-storage-and-network).
+No Redis/autoscale/second application DB/queue. Lease/key rotation/backups/
 callbacks/streaming are executable/live obligations, not proof from this table.
 
 Current-host target is `compose.yaml` via `deploy-local.ps1 -Project seha`,

@@ -1,0 +1,8 @@
+{
+  "tenantId": "11111111-1111-1111-1111-111111111111",
+  "apiClientId": "22222222-2222-2222-2222-222222222222",
+  "clientId": "33333333-3333-3333-3333-333333333333",
+  "publicUrl": "https://mcp.example.test/mcp",
+  "redirectUris": ["https://claude.ai/api/mcp/auth_callback"],
+  "port": 8001
+}

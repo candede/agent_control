@@ -19,6 +19,7 @@ import type { AppRole } from "../types/capability.js";
 import { declaredRoutePolicies } from "./policy.js";
 import { InventoryQueries } from "../db/inventoryQueries.js";
 import { DataExports } from "../services/dataExports.js";
+import type { AdoptionPage } from "../types/adoption.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -179,6 +180,32 @@ describe("users/report route-to-client boundary", () => {
       const response = await api(`/official-usage/overview${query}`);
       expect(response.status).toBe(400); expect(await response.json()).toMatchObject({ code: "invalid_usage_query" });
       expect(capture).not.toHaveBeenCalled();
+    } finally { capture.mockRestore(); }
+  });
+  it("accepts adoption position hints outside immutable filters and rejects invalid hints before capture", async () => {
+    const capture = vi.spyOn(reports, "capture");
+    try {
+      for (const query of ["anchor=invalid", "anchor[]=value", `anchor=${"a".repeat(65)}`,
+        `anchor=${"a".repeat(64)}&cursor=cursor`, "pageNumber=0", "pageNumber=-1", "pageNumber=2.5",
+        "pageNumber=9007199254740992", "pageNumber[]=2", "pageNumber=1&pageNumber=2",
+        "pageNumber=1&cursor=cursor", `pageNumber=1&anchor=${"a".repeat(64)}`]) {
+        const response = await api(`/copilot-usage/adoption?${query}`);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ code: "invalid_usage_query" });
+      }
+      expect(capture).not.toHaveBeenCalled();
+      const response = await api(`/copilot-usage/adoption?anchor=${"a".repeat(64)}&limit=2`);
+      expect(response.status, await response.clone().text()).toBe(200);
+      const result = await response.json() as AdoptionPage;
+      expect(result.selection.id).toBeTruthy();
+      expect(result.page).toMatchObject({ number: 1, offset: 0 });
+      expect(capture).toHaveBeenCalledWith(identity, "delegated", "adoption", expect.not.objectContaining({ anchor: expect.anything() }));
+      const pinned = await api(`/copilot-usage/adoption?selectionId=${result.selection.id}&anchor=${"a".repeat(64)}&limit=2`);
+      expect(pinned.status, await pinned.clone().text()).toBe(200);
+      expect((await pinned.json() as AdoptionPage).selection.id).toBe(result.selection.id);
+      const numbered = await api(`/copilot-usage/adoption?selectionId=${result.selection.id}&pageNumber=3&limit=2`);
+      expect(numbered.status, await numbered.clone().text()).toBe(200);
+      expect((await numbered.json() as AdoptionPage).selection.id).toBe(result.selection.id);
     } finally { capture.mockRestore(); }
   });
   it.each([

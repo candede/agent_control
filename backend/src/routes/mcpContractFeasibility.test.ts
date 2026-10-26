@@ -356,7 +356,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(expectedChampionAgents).not.toContain("P_nonchampion");
     expect(document).toContain("p1=(3,10,4),p2=(2,50,3),p3=(2,20,8)");
     expect(document).toContain("Jan->Mar comparable50%");
-    expect(document).toContain("Jan->overlap/Mar->Apr/undated not growth");
+    expect(document).toContain("Jan->overlap/Jan->Apr/undated not growth");
   });
 
   it("keeps report defaults, exact identities and meaningful-filter rejection in the current API parser", () => {
@@ -428,9 +428,13 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(unknown.facts.filter(fact => fact.kind === "created" || fact.kind === "control:quarantine")).toEqual([]);
   });
 
-  it("freezes no MCP implementation and no credential-bearing origin/session audit fields", () => {
+  it("preserves implemented MCP origin trust and excludes credential-bearing audit fields", () => {
     expect(document).toContain("Context.client_id");
-    expect(document).toContain("request meta, thus **reported**");
+    expect(document).toContain("remains reported meta");
+    expect(document).toContain("The API still assigns **reported**");
+    expect(document).toContain("124 named tools");
+    expect(document).toContain("request-local invocation owner");
+    expect(document).toContain("POST/PATCH/DELETE submissions are never automatically replayed");
     expect(document).toContain("Do not retain protocol session IDs");
     expect(document).toContain("first **accepted execution submission**");
     expect(document).toContain("Same idempotency key returns original origin");

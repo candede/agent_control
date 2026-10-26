@@ -3,7 +3,7 @@ import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 
 const root="/app";
-const forbiddenPath=/(^|\/)(?:backend\/scripts|uploads?|fixtures?|tests?|__tests__|\.env[^/]*|\.npmrc)(\/|$)|\.(?:sqlite|sqlite3|db|csv)$/i;
+const forbiddenPath=/(^|\/)(?:backend\/scripts|uploads?|fixtures?|tests?|__tests__|tsx-[0-9]+|\.env[^/]*|\.npmrc)(\/|$)|\.(?:sqlite|sqlite3|db|csv)$/i;
 const textExtensions=new Set([".js",".json",".html",".css"]);
 const secrets=(process.env.SECRET_SCAN_FILES ?? "").split(":").filter(Boolean).map(file=>readFileSync(file,"utf8").trim()).filter(Boolean);
 let files=0;

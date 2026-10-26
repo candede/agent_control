@@ -1,8 +1,10 @@
 import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import type { AdoptionGroup, AdoptionPage } from "../../backend/src/types/adoption";
-import { reportPage, source } from "../src/test/reportDataFixture";
+import { reportPage, reportSelection, source } from "../src/test/reportDataFixture";
 import { mockLayoutApi, unifiedAgents } from "./layoutFixtures";
+import { deferred } from "../src/test/deferred";
+import { automaticRefreshFixture } from "./automaticRefreshFixtures";
 
 test("Adoption keeps all group content visible, searches groups, and opens existing agent details", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
@@ -33,6 +35,7 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
       && (!params.has("adoptionChamps") || group.people.some(person => person.champion) === (params.get("adoptionChamps") === "with"))
       && (!params.has("adoptionAgents") || Boolean(group.agents.length) === (params.get("adoptionAgents") === "with")));
     const result: AdoptionPage = { ...reportPage(value, { counts: { total: groups.length, filtered: value.length } }),
+      page: { limit: 5, number: 1, offset: 0, anchor: value[0]?.id, nextCursor: null, previousCursor: null },
       directory: source("directory"), inventoryAvailable: true,
       summary: { people: value.reduce((sum, group) => sum + group.people.length, 0),
         champs: value.reduce((sum, group) => sum + group.people.filter(person => person.champion).length, 0),
@@ -122,5 +125,155 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
   await expect(hr).toBeVisible();
   await page.getByRole("button", { name: "Users view", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "User cohort" })).toBeVisible();
+  expect(unexpected).toEqual([]);
+});
+
+for (const boundary of ["publication", "expiry"] as const) {
+  test(`Adoption keeps later groups mounted and resumes their position after ${boundary}`, async ({ page }) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.clock.install({ time: new Date() });
+    const groups: AdoptionGroup[] = Array.from({ length: 15 }, (_, index) => ({
+      id: (index + 1).toString(16).padStart(64, "0"), company: "Contoso", department: `Department ${index + 1}`,
+      people: Array.from({ length: 12 }, (_, person) => ({
+        id: `person-${index}-${person}`, name: `Colleague ${index + 1}-${person + 1}`, agents: 0, responses: 0, champion: false,
+      })), agents: [],
+    }));
+    const initial = reportSelection(2, Date.now()), fresh = reportSelection(3, Date.now() + 600_001);
+    let published = initial.publicationRevisions;
+    const nextPage = deferred<void>(), refresh = deferred<void>();
+    const requests: URLSearchParams[] = [];
+    await page.route(url => url.pathname === "/api/data-sync/auto-refresh", route =>
+      route.fulfill({ json: automaticRefreshFixture(published) }));
+    await page.route(url => url.pathname === "/api/copilot-usage/adoption", async route => {
+      const params = new URL(route.request().url()).searchParams;
+      requests.push(params);
+      const pageNumber = Number(params.get("pageNumber") ?? 1), anchor = params.get("anchor");
+      const refreshing = Boolean(anchor);
+      if (pageNumber === 2 && params.get("selectionId") === initial.id) await nextPage.promise;
+      if (refreshing) await refresh.promise;
+      const selection = refreshing || params.get("selectionId") === fresh.id ? fresh : initial;
+      const start = anchor ? Math.floor(groups.findIndex(group => group.id === anchor) / 5) * 5 : (pageNumber - 1) * 5;
+      const result: AdoptionPage = { ...reportPage(groups.slice(start, start + 5)),
+        counts: { total: 15, filtered: 15 }, selection,
+        page: { limit: 5, number: start / 5 + 1, offset: start, anchor: groups[start].id,
+          previousCursor: start ? "fresh-previous" : null,
+          nextCursor: start < 10 ? selection.id === initial.id ? "old-next" : "fresh-next" : null },
+        directory: source("directory"), inventoryAvailable: true, summary: { people: 180, champs: 0, agents: 0 } };
+      await route.fulfill({ json: result });
+    });
+    await page.goto("/users?section=adoption");
+    const first = page.getByRole("region", { name: "Contoso / Department 1", exact: true });
+    await expect(first).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "groups pages", exact: true })).toHaveAttribute("aria-busy", "false");
+    const initialRequests = requests.length;
+    const pages = page.getByRole("navigation", { name: "groups pages", exact: true });
+    await pages.getByRole("button", { name: "Next groups", exact: true }).click();
+    await expect.poll(() => requests.length).toBe(initialRequests + 1);
+    expect(requests.at(-1)?.get("pageNumber")).toBe("2");
+    expect(requests.at(-1)?.has("cursor")).toBe(false);
+    await expect(first).toBeVisible();
+    await expect(page.getByRole("status", { name: "Matching groups" })).toHaveText("15 matching groups");
+    nextPage.resolve(undefined);
+    const later = page.getByRole("region", { name: "Contoso / Department 6", exact: true });
+    await expect(later).toBeVisible();
+    await later.evaluate(element => { element.setAttribute("data-retained-group", "true"); });
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    if (boundary === "publication") published = { ...published, users: "4".repeat(64) };
+    fresh.publicationRevisions = published;
+    await page.clock.fastForward(boundary === "publication" ? 60_001 : 600_001);
+    await expect.poll(() => requests.length).toBe(initialRequests + 2);
+    expect(requests.at(-1)?.get("anchor")).toBe(groups[5].id);
+    expect(requests.at(-1)?.has("selectionId")).toBe(false);
+    expect(requests.at(-1)?.has("cursor")).toBe(false);
+    await expect(later).toHaveAttribute("data-retained-group", "true");
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
+    refresh.resolve(undefined);
+    await expect(pages.getByRole("button", { name: "Previous groups", exact: true })).toHaveAttribute("aria-disabled", "false");
+    await expect(later).toHaveAttribute("data-retained-group", "true");
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
+    expect(requests).toHaveLength(initialRequests + 2);
+    await pages.getByRole("button", { name: "Next groups", exact: true }).click();
+    await expect(page.getByRole("region", { name: "Contoso / Department 11", exact: true })).toBeVisible();
+    expect(requests.at(-1)?.get("selectionId")).toBe(fresh.id);
+    expect(requests.at(-1)?.get("pageNumber")).toBe("3");
+    expect(requests.at(-1)?.has("anchor")).toBe(false);
+    expect(unexpected).toEqual([]);
+  });
+}
+
+test("numbered adoption pages jump directly, stay accessible, and fit enterprise desktop and mobile layouts", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  const groups: AdoptionGroup[] = Array.from({ length: 80 }, (_, index) => ({
+    id: (index + 1).toString(16).padStart(64, "0"), company: index % 2 ? "Contoso" : "Fabrikam",
+    department: `Department ${String(index + 1).padStart(2, "0")}`,
+    people: [
+      { id: `person-${index}-1`, name: "Maya Chen", agents: 8, responses: 214, champion: true },
+      { id: `person-${index}-2`, name: "Alex Morgan", agents: 5, responses: 128, champion: true },
+      { id: `person-${index}-3`, name: "Jordan Taylor", agents: 2, responses: 46, champion: false },
+    ],
+    agents: [{ id: unifiedAgents.value[2].id, name: "Knowledge Assistant",
+      description: "Find policies, discover resources, and get answers to everyday questions.", type: "Copilot Studio" }],
+  }));
+  const selection = reportSelection(2, Date.now()), requests: URLSearchParams[] = [];
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption", route => {
+    const params = new URL(route.request().url()).searchParams;
+    requests.push(params);
+    const filtered = groups.filter(group => `${group.company} ${group.department}`.toLowerCase().includes(params.get("search") ?? ""));
+    const number = Math.min(Number(params.get("pageNumber") ?? 1), Math.max(1, Math.ceil(filtered.length / 5)));
+    const offset = (number - 1) * 5, value = filtered.slice(offset, offset + 5);
+    const result: AdoptionPage = {
+      ...reportPage(value), selection, counts: { total: groups.length, filtered: filtered.length },
+      page: { limit: 5, number, offset, anchor: value[0]?.id,
+        previousCursor: number > 1 ? "previous" : null, nextCursor: offset + value.length < filtered.length ? "next" : null },
+      directory: source("directory"), inventoryAvailable: true,
+      summary: { people: filtered.length * 3, champs: filtered.length * 2, agents: 1 },
+    };
+    return route.fulfill({ json: result });
+  });
+  await page.goto("/users?section=adoption");
+  const top = page.getByRole("navigation", { name: "groups pages", exact: true });
+  const bottom = page.getByRole("navigation", { name: "groups pages (bottom)", exact: true });
+  await expect(top.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  const initialRequests = requests.length;
+  await top.getByRole("button", { name: "Page 4", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Contoso / Department 16", exact: true })).toBeVisible();
+  expect(requests).toHaveLength(initialRequests + 1);
+  expect(requests.at(-1)?.get("pageNumber")).toBe("4");
+  expect(requests.at(-1)?.get("selectionId")).toBe(selection.id);
+  expect(requests.at(-1)?.has("cursor")).toBe(false);
+  for (const navigation of [top, bottom]) {
+    await expect(navigation.getByRole("button", { name: "Page 4", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(navigation).toContainText("Showing 16–20 of 80 groups");
+  }
+  await expect(page.getByRole("heading", { name: "Company & department adoption" })).toBeFocused();
+  expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  if (info.project.name === "desktop") {
+    const viewport = page.viewportSize()!;
+    for (const width of [320, 768, 1024]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      const navigation = (await top.boundingBox())!, numbers = (await top.getByRole("list", { name: "Page numbers" }).boundingBox())!;
+      expect(numbers.x).toBeGreaterThanOrEqual(navigation.x);
+      expect(numbers.x + numbers.width).toBeLessThanOrEqual(navigation.x + navigation.width);
+    }
+    await page.setViewportSize(viewport);
+  }
+  await page.screenshot({ path: info.outputPath(`numbered-adoption-${info.project.name}.png`), fullPage: true });
+  await top.getByRole("spinbutton", { name: "Go to page" }).fill("16");
+  await top.getByRole("spinbutton", { name: "Go to page" }).press("Enter");
+  await expect(page.getByRole("region", { name: "Contoso / Department 76", exact: true })).toBeVisible();
+  expect(requests).toHaveLength(initialRequests + 2);
+  await expect(top.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+  await expect(top).toContainText("Showing 76–80 of 80 groups");
+  await bottom.getByRole("button", { name: "Page 1", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Fabrikam / Department 01", exact: true })).toBeVisible();
+  expect(requests).toHaveLength(initialRequests + 3);
+  await expect(top.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
+  await page.getByRole("searchbox", { name: "Search groups" }).fill("department 01");
+  await expect(top).toContainText("Showing 1–1 of 1 groups");
+  await expect(top.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  expect(requests.at(-1)?.has("pageNumber")).toBe(false);
+  expect(requests.at(-1)?.has("selectionId")).toBe(false);
   expect(unexpected).toEqual([]);
 });

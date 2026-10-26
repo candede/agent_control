@@ -1,0 +1,50 @@
+{
+  "contractVersion": 1,
+  "installationMode": "fresh",
+  "appServiceName": "approved-agent-control-mcp",
+  "planName": "approved-agent-control-mcp-plan",
+  "planSku": "S1",
+  "appServiceResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Web/sites/approved-agent-control-mcp",
+  "planResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Web/serverfarms/approved-agent-control-mcp-plan",
+  "identityResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.ManagedIdentity/userAssignedIdentities/approved-mcp",
+  "identityClientId": "00000000-0000-0000-0000-000000000000",
+  "registryResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.ContainerRegistry/registries/approvedregistry",
+  "registryLoginServer": "approvedregistry.azurecr.io",
+  "repository": "agent-control/mcp",
+  "imageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "existingImageDigest": "",
+  "tenantId": "00000000-0000-0000-0000-000000000000",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "apiClientId": "00000000-0000-0000-0000-000000000000",
+  "apiOrigin": "https://approved-agent-control-app.azurewebsites.net",
+  "publicUrl": "https://approved-agent-control-mcp.azurewebsites.net/mcp",
+  "callbackUri": "https://approved-agent-control-mcp.azurewebsites.net/auth/callback",
+  "redirectUris": ["https://approved-client.example.invalid/callback"],
+  "storage": {
+    "accountResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Storage/storageAccounts/approvedoauth",
+    "accountUrl": "https://approvedoauth.blob.core.windows.net",
+    "containerName": "mcp-oauth",
+    "containerResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Storage/storageAccounts/approvedoauth/blobServices/default/containers/mcp-oauth",
+    "blobName": "oauth-state.v1.fernet",
+    "privateEndpointResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Network/privateEndpoints/approved-oauth",
+    "subnetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Network/virtualNetworks/approved-mcp/subnets/integration",
+    "privateDnsZoneResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net",
+    "privateDnsVnetLinkResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-group/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net/virtualNetworkLinks/approved-mcp",
+    "identity": "https://approvedoauth.blob.core.windows.net/mcp-oauth/oauth-state.v1.fernet",
+    "preparedReference": ""
+  },
+  "secrets": {
+    "client": {"name": "agent-control-mcp-client", "version": "", "currentVersion": ""},
+    "signing": {"name": "agent-control-mcp-signing", "version": "", "currentVersion": ""},
+    "encryption": {"name": "agent-control-mcp-encryption", "version": "", "currentVersion": ""}
+  },
+  "network": {
+    "inboundIpv4Cidrs": ["192.0.2.10/32"],
+    "outboundIpv4Addresses": ["192.0.2.30"],
+    "apiReachabilityReference": "",
+    "forwardedHeaders": "ignored"
+  },
+  "operationsOwner": "",
+  "registrationApprovalReference": "",
+  "cost": {"plan": null, "storage": null, "registry": null, "network": null, "monitoring": null, "restoreDrill": null, "monthlyTotal": null}
+}

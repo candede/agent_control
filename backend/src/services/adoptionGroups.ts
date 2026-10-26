@@ -101,8 +101,11 @@ export function adoptionDataset(reports: LargeTenantUsersReports, context: Repor
 }
 
 export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTenantUsersReports,
-  context: ReportReadContext, options: { limit: number; cursor?: string }): Promise<AdoptionPage> {
-  if (context.endpoint !== "adoption" || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100) {
+  context: ReportReadContext, options: { limit: number; cursor?: string; anchor?: string; pageNumber?: number }): Promise<AdoptionPage> {
+  if (context.endpoint !== "adoption" || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 100
+    || options.anchor !== undefined && !/^[a-f0-9]{64}$/.test(options.anchor)
+    || options.pageNumber !== undefined && (!Number.isSafeInteger(options.pageNumber) || options.pageNumber < 1)
+    || [options.anchor, options.pageNumber, options.cursor].filter(value => value !== undefined).length > 1) {
     throw new SelectionError("invalid_cursor");
   }
   const limit = Math.min(options.limit, 10);
@@ -110,15 +113,7 @@ export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTe
   const expected = { identity: context.identity, endpoint: "adoption", selectionId: context.selection.id,
     revision: context.selection.revision, queryHash: digest(JSON.stringify([context.queryHash, limit])) };
   const cursor = options.cursor ? reports.codec.decode(options.cursor, expected) : undefined;
-  const reverse = cursor?.direction === "previous";
-  const order = Boolean(reverse) !== (context.query.order === "desc") ? "DESC" : "ASC";
-  let boundary = "";
-  if (cursor) {
-    if (cursor.boundary.key === null) throw new SelectionError("invalid_cursor");
-    values.push(cursor.boundary.key, cursor.boundary.id);
-    boundary = `WHERE (sort_key COLLATE "C",identity COLLATE "C") ${order === "DESC" ? "<" : ">"}
-      ($10::text COLLATE "C",$11::text COLLATE "C")`;
-  }
+  const order = context.query.order === "desc" ? "DESC" : "ASC";
   const counts = (await client.query(`${sql} SELECT
     (SELECT count(*)::text FROM adoption_groups) AS total,
     (SELECT count(*)::text FROM matching_groups) AS filtered,
@@ -128,12 +123,29 @@ export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTe
       WHERE coalesce(u.responses,u.bridge_responses,0)>0 OR EXISTS(SELECT 1 FROM creators c WHERE c.user_id=u.identity)
       GROUP BY u.group_id) candidates) AS champs,
     (SELECT count(DISTINCT a.agent_id)::text FROM adoption_users u JOIN matching_groups g ON g.identity=u.group_id
-      JOIN user_agents a ON a.user_id=u.identity) AS agents`, values.slice(0, 9))).rows[0];
-  const rows = (await client.query(`${sql} SELECT * FROM matching_groups ${boundary}
-    ORDER BY sort_key COLLATE "C" ${order},identity COLLATE "C" ${order} LIMIT ${limit + 1}`, values)).rows;
-  const more = rows.length > limit;
-  const headers = rows.slice(0, limit);
-  if (reverse) headers.reverse();
+      JOIN user_agents a ON a.user_id=u.identity) AS agents`, values)).rows[0];
+  let pageNumber = options.pageNumber ?? 1;
+  if (options.anchor) {
+    // Resolve the visible group to its containing page in the freshly selected results.
+    const position = (await client.query(`${sql} SELECT
+      (SELECT count(*)::text FROM matching_groups preceding WHERE
+        (preceding.sort_key COLLATE "C",preceding.identity COLLATE "C") ${order === "DESC" ? ">" : "<"}
+        (g.sort_key COLLATE "C",g.identity COLLATE "C")) AS preceding
+      FROM matching_groups g WHERE g.identity=$10::text`, [...values, options.anchor])).rows[0];
+    if (position) pageNumber = Math.floor(exactCount(position.preceding) / limit) + 1;
+  } else if (cursor) {
+    if (cursor.boundary.key === null) throw new SelectionError("invalid_cursor");
+    const position = (await client.query(`${sql} SELECT count(*)::text AS preceding FROM matching_groups
+      WHERE (sort_key COLLATE "C",identity COLLATE "C") ${order === "DESC" ? ">" : "<"}${cursor.direction === "next" ? "=" : ""}
+        ($10::text COLLATE "C",$11::text COLLATE "C")`, [...values, cursor.boundary.key, cursor.boundary.id])).rows[0];
+    const preceding = exactCount(position.preceding);
+    pageNumber = Math.floor(Math.max(0, preceding - (cursor.direction === "previous" ? limit : 0)) / limit) + 1;
+  }
+  const filtered = exactCount(counts.filtered);
+  pageNumber = Math.min(pageNumber, Math.max(1, Math.ceil(filtered / limit)));
+  const offset = (pageNumber - 1) * limit;
+  const headers = (await client.query(`${sql} SELECT * FROM matching_groups
+    ORDER BY sort_key COLLATE "C" ${order},identity COLLATE "C" ${order} LIMIT ${limit} OFFSET ${offset}`, values)).rows;
   const groupIds = headers.map(row => String(row.identity));
   const detailValues = [...values.slice(0, 9), groupIds];
   const inventoryAvailable = Boolean((await client.query(`${sql}
@@ -206,9 +218,10 @@ export async function readAdoptionGroups(client: pg.PoolClient, reports: LargeTe
       boundary: { key: row.sort_key, id: row.identity, nullRank: 0 } }) : null;
   const value: AdoptionGroup[] = headers.map(row => ({ id: row.identity, company: row.company ?? "Company not provided", department: row.department ?? "Department not provided",
     people: people.get(row.identity) ?? [], agents: agents.get(row.identity) ?? [] }));
-  const result: AdoptionPage = { value, counts: { total: exactCount(counts.total), filtered: exactCount(counts.filtered) },
-    page: { limit, nextCursor: encode(headers.at(-1), "next", reverse ? Boolean(cursor) : more),
-      previousCursor: encode(headers[0], "previous", reverse ? more : Boolean(cursor)) },
+  const result: AdoptionPage = { value, counts: { total: exactCount(counts.total), filtered },
+    page: { limit, number: pageNumber, offset, nextCursor: encode(headers.at(-1), "next", offset + headers.length < filtered),
+      previousCursor: encode(headers[0], "previous", offset > 0),
+      ...(headers.length ? { anchor: String(headers[0].identity) } : {}) },
     selection: context.selection, reports: context.report, directory: context.metadata.directory, inventoryAvailable,
     summary: { people: exactCount(counts.people), champs: exactCount(counts.champs), agents: exactCount(counts.agents) } };
   const bytes = Buffer.byteLength(JSON.stringify(result));

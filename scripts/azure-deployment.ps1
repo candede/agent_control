@@ -74,6 +74,146 @@ function Get-TargetResourceId {
     return "/subscriptions/$($Target.subscriptionId)/resourceGroups/$($Target.resourceGroup)/providers/$ProviderType/$Name"
 }
 
+function Assert-AzureMcpObject {
+    param($Value, [string[]]$Keys, [string]$Label)
+    if ($null -eq $Value -or $Value -isnot [Collections.IDictionary] -and $Value -isnot [PSCustomObject]) {
+        throw "$Label must be an explicit object."
+    }
+    $actual = if ($Value -is [Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+    if ($actual.Count -ne $Keys.Count -or @(Compare-Object $actual $Keys -CaseSensitive).Count) {
+        throw "$Label requires exactly its supported fields."
+    }
+}
+
+function Get-AzureMcpTarget {
+    param($Target)
+    $keys = if ($Target -is [Collections.IDictionary]) { @($Target.Keys) } else { @($Target.PSObject.Properties.Name) }
+    if ('mcp' -cnotin $keys) {
+        if ('mcp' -iin $keys) { throw 'Optional MCP configuration must use the exact lowercase mcp property.' }
+        return $null
+    }
+    $m = $Target.mcp
+    Assert-AzureMcpObject $m @('contractVersion','installationMode','appServiceName','planName','planSku',
+        'appServiceResourceId','planResourceId','identityResourceId','identityClientId','registryResourceId','registryLoginServer',
+        'repository','imageDigest','existingImageDigest','tenantId','clientId','apiClientId','apiOrigin','publicUrl',
+        'callbackUri','redirectUris','storage','secrets','network','operationsOwner','registrationApprovalReference','cost') 'mcp'
+    if ($m.contractVersion -ne 1 -or $m.installationMode -cnotin @('fresh','existing') -or $m.planSku -cne 'S1') {
+        throw 'MCP requires contract 1, fresh/existing, and a separate single-instance Linux S1 plan.'
+    }
+    Assert-ResourceName $m.appServiceName 'MCP App Service name' 60
+    Assert-ResourceName $m.planName 'MCP plan name' 40
+    if ($m.appServiceName -cnotmatch '^[a-z0-9-]+$') { throw 'MCP public App Service name must use canonical lowercase.' }
+    if ($m.appServiceName -ieq $Target.resources.appService.name -or $m.planName -ieq $Target.resources.appServicePlan.name -or
+        $m.appServiceResourceId -ine (Get-TargetResourceId $Target 'Microsoft.Web/sites' $m.appServiceName) -or
+        $m.planResourceId -ine (Get-TargetResourceId $Target 'Microsoft.Web/serverfarms' $m.planName)) {
+        throw 'MCP requires separate exact App Service/plan resource identities.'
+    }
+    foreach ($entry in @(
+        @{ value=$m.identityResourceId; kind='Microsoft.ManagedIdentity/userAssignedIdentities' },
+        @{ value=$m.registryResourceId; kind='Microsoft.ContainerRegistry/registries' },
+        @{ value=$m.storage.accountResourceId; kind='Microsoft.Storage/storageAccounts' },
+        @{ value=$m.storage.privateEndpointResourceId; kind='Microsoft.Network/privateEndpoints' }
+    )) {
+        if ($entry.value -notmatch "^/subscriptions/$([regex]::Escape($Target.subscriptionId))/resourceGroups/[^/]+/providers/$([regex]::Escape($entry.kind))/[a-zA-Z0-9-]+$") {
+            throw 'MCP prepared resource identity must be exact and in the approved subscription.'
+        }
+    }
+    Assert-GuidValue $m.identityClientId 'MCP managed identity client'
+    if ($m.identityClientId -cne ([string]$m.identityClientId).ToLowerInvariant()) {
+        throw 'MCP managed identity client must use canonical lowercase.'
+    }
+    Assert-GuidValue $m.clientId 'MCP client'
+    if ($m.tenantId -ine $Target.tenantId -or $m.apiClientId -ine $Target.entraApplicationId -or
+        $m.clientId -ieq $m.apiClientId -or $m.apiOrigin -cne $Target.canonicalOrigin.TrimEnd('/')) {
+        throw 'MCP tenant/API integration binding differs from the approved application.'
+    }
+    if ($m.registryLoginServer -cne "$(($m.registryResourceId -split '/')[-1]).azurecr.io" -or
+        $m.repository -cnotmatch '^[a-z0-9]+(?:[._/-][a-z0-9]+)*$' -or
+        $m.imageDigest -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+        ($m.installationMode -ceq 'existing' -and $m.existingImageDigest -cnotmatch '^sha256:[a-f0-9]{64}$') -or
+        ($m.installationMode -ceq 'fresh' -and $m.existingImageDigest)) {
+        throw 'MCP requires an exact approved ACR repository and immutable current/selected digest.'
+    }
+    $origin = "https://$($m.appServiceName).azurewebsites.net"
+    if ($m.publicUrl -cne "$origin/mcp" -or $m.callbackUri -cne "$origin/auth/callback" -or
+        $m.redirectUris -isnot [array] -or @($m.redirectUris).Count -lt 1 -or @($m.redirectUris).Count -gt 32 -or
+        @($m.redirectUris | Select-Object -Unique).Count -ne @($m.redirectUris).Count) {
+        throw 'MCP requires an exact public resource, Entra callback and bounded distinct client redirects.'
+    }
+    foreach ($redirect in @($m.redirectUris)) {
+        $uri = $null
+        if ($redirect -isnot [string] -or -not [Uri]::TryCreate($redirect, [UriKind]::Absolute, [ref]$uri) -or
+            $redirect -match '[\s\\%*]' -or $uri.AbsoluteUri -cne $redirect -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+            ($uri.Scheme -cne 'https' -and -not ($uri.Scheme -ceq 'http' -and $uri.Host -cin @('localhost','127.0.0.1','[::1]')))) {
+            throw 'MCP client redirects must be exact HTTPS or exact HTTP loopback callbacks.'
+        }
+    }
+    $s = $m.storage
+    Assert-AzureMcpObject $s @('accountResourceId','accountUrl','containerName','containerResourceId','blobName',
+        'privateEndpointResourceId','subnetResourceId','privateDnsZoneResourceId','privateDnsVnetLinkResourceId',
+        'identity','preparedReference') 'MCP storage'
+    $account = ($s.accountResourceId -split '/')[-1]
+    if ($account -cnotmatch '^[a-z0-9]{3,24}$' -or $s.containerName -cnotmatch '^[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]$' -or
+        $s.containerResourceId -cne "$($s.accountResourceId)/blobServices/default/containers/$($s.containerName)" -or
+        $s.subnetResourceId -notmatch "^/subscriptions/$([regex]::Escape($Target.subscriptionId))/resourceGroups/[^/]+/providers/Microsoft.Network/virtualNetworks/[^/]+/subnets/[^/]+$" -or
+        $s.privateDnsZoneResourceId -notmatch "^/subscriptions/$([regex]::Escape($Target.subscriptionId))/resourceGroups/[^/]+/providers/Microsoft.Network/privateDnsZones/privatelink\.blob\.core\.windows\.net$" -or
+        $s.privateDnsVnetLinkResourceId -notmatch "^$([regex]::Escape($s.privateDnsZoneResourceId))/virtualNetworkLinks/[a-zA-Z0-9-]+$" -or
+        $s.accountUrl -cne "https://${account}.blob.core.windows.net" -or
+        $s.blobName -cne 'oauth-state.v1.fernet') {
+        throw 'MCP requires one exact prepared private TLS Blob account/container/object and private DNS/VNet binding.'
+    }
+    if ($s.identity -cne "$($s.accountUrl)/$($s.containerName)/$($s.blobName)") {
+        throw 'MCP durable storage identity must be the exact leased data object URL.'
+    }
+    foreach ($reference in @($s.preparedReference,$m.operationsOwner,$m.registrationApprovalReference)) {
+        if ([string]::IsNullOrWhiteSpace([string]$reference) -or [string]$reference -match '[\x00-\x1f\x7f]') {
+            throw 'MCP requires explicit Blob preparation, registration and operations ownership.'
+        }
+    }
+    Assert-AzureMcpObject $m.secrets @('client','signing','encryption') 'MCP secret references'
+    foreach ($key in @('client','signing','encryption')) {
+        $secret = $m.secrets.$key
+        Assert-AzureMcpObject $secret @('name','version','currentVersion') 'MCP secret version'
+        $expected = @{client='agent-control-mcp-client';signing='agent-control-mcp-signing';encryption='agent-control-mcp-encryption'}[$key]
+        if ($secret.name -cne $expected -or $secret.version -cnotmatch '^[a-zA-Z0-9]{1,64}$' -or
+            ($m.installationMode -ceq 'existing' -and $secret.currentVersion -cnotmatch '^[a-zA-Z0-9]{1,64}$') -or
+            ($m.installationMode -ceq 'fresh' -and $secret.currentVersion)) {
+            throw 'MCP secrets require independent exact native Key Vault names and immutable versions, never raw values.'
+        }
+    }
+    Assert-AzureMcpObject $m.network @('inboundIpv4Cidrs','outboundIpv4Addresses','apiReachabilityReference','forwardedHeaders') 'MCP network'
+    if ($m.network.forwardedHeaders -cne 'ignored' -or -not $m.network.apiReachabilityReference -or
+        $m.network.inboundIpv4Cidrs -isnot [array] -or $m.network.outboundIpv4Addresses -isnot [array] -or
+        -not @($m.network.inboundIpv4Cidrs).Count -or @($m.network.inboundIpv4Cidrs).Count -gt 32 -or
+        -not @($m.network.outboundIpv4Addresses).Count) {
+        throw 'MCP requires exact ingress/egress/API reachability and no forwarded-header trust.'
+    }
+    foreach ($cidr in @($m.network.inboundIpv4Cidrs)) {
+        $parts = [string]$cidr -split '/'
+        $ip = $null
+        if ($parts.Count -ne 2 -or -not [Net.IPAddress]::TryParse($parts[0], [ref]$ip) -or
+            $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or $ip.ToString() -cne $parts[0] -or $parts[1] -notmatch '^(?:[1-9]|[12][0-9]|3[0-2])$') {
+            throw 'MCP ingress requires explicit IPv4 CIDRs, never wildcard or 0.0.0.0/0.'
+        }
+    }
+    foreach ($address in @($m.network.outboundIpv4Addresses)) {
+        $ip = $null
+        if (-not [Net.IPAddress]::TryParse([string]$address, [ref]$ip) -or
+            $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'MCP egress requires exact IPv4 addresses.' }
+    }
+    Assert-AzureMcpObject $m.cost @('plan','storage','registry','network','monitoring','restoreDrill','monthlyTotal') 'MCP cost'
+    $sum = [decimal]0
+    foreach ($key in @('plan','storage','registry','network','monitoring','restoreDrill')) {
+        if ($null -eq $m.cost.$key -or [decimal]$m.cost.$key -lt 0) { throw 'MCP cost items must be explicit nonnegative amounts.' }
+        $sum += [decimal]$m.cost.$key
+    }
+    if ($sum -ne [decimal]$m.cost.monthlyTotal -or $sum -le 0 -or
+        [decimal]$Target.estimate.monthlyTotal + $sum -gt [decimal]$Target.approvedMonthlyBudget) {
+        throw 'MCP itemized additional monthly cost must be exact and inside the total approved budget.'
+    }
+    return $m
+}
+
 function ConvertTo-CanonicalJson {
     param($Value)
     if ($null -eq $Value) { return 'null' }
@@ -147,10 +287,11 @@ function Test-ApprovedAzureTarget {
     $allowedTargetKeys = @('approvedMonthlyBudget','callbackUri','canonicalOrigin','contractVersion','entraApplicationId',
         'estimate','existingVaultResourceId','expectedDatabaseName','expectedResourceIds','firstInstallApproved','installationMode',
         'isApproval','maintenanceApproval','operatorApproval','preparedVaultContract','region','resourceGroup','resources',
-        'riskAcceptance','runnerIpv4Address','subscriptionId','tenantId','tenantRegistryRegistrationApprovalReference','tenantRegistrySecretName')
+        'riskAcceptance','runnerIpv4Address','subscriptionId','tenantId','tenantRegistryRegistrationApprovalReference','tenantRegistrySecretName','mcp')
     if (@($targetKeys | Where-Object { $_ -cnotin $allowedTargetKeys }).Count) {
         throw 'Target contains unsupported fields.'
     }
+    Get-AzureMcpTarget $Target | Out-Null
     if ($Target.installationMode -cnotin @('fresh', 'existing')) {
         throw 'installationMode supports only fresh or existing.'
     }
@@ -365,10 +506,14 @@ function New-AzureDeploymentContext {
         [string]$ArtifactPath,
         [string]$ReceiptPath,
         [string]$ResumeReceiptPath,
-        [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup')][string]$RequestedAction,
+        [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup', 'Stop')][string]$RequestedAction,
         [string]$AuthenticationSmokeReceiptPath,
-        $QualificationTargets
+        $QualificationTargets,
+        [ValidateSet('All','Application','Mcp')][string]$Component = 'All'
     )
+    $mcp = Get-AzureMcpTarget $Target
+    if ($Component -eq 'Mcp' -and -not $mcp) { throw 'Mcp component requires explicit MCP configuration.' }
+    if ($mcp -and $Component -eq 'Application') { throw 'Application-only target must omit MCP configuration rather than silently ignoring it.' }
     $fixture = $null
     if ($ExecutionMode -eq 'Mock') {
         if (-not $MockFixturePath -or -not (Test-Path -LiteralPath $MockFixturePath -PathType Leaf)) { throw 'Mock execution requires an explicit fixture.' }
@@ -403,6 +548,7 @@ function New-AzureDeploymentContext {
         ResumeStatus = $null
         RequestedAction = $RequestedAction
         ReceiptAction = $RequestedAction
+        Component = $Component
     }
     if ($ResumeReceiptPath) {
         Import-AzureDeploymentReceipt $context ([IO.Path]::GetFullPath($ResumeReceiptPath)) $RequestedAction
@@ -422,6 +568,7 @@ function Resolve-CommandFixtureToken {
         Replace('{{RUN_ID_8}}', $Context.RunId.Substring(0, 8)).
         Replace('{{ARTIFACT}}', $Context.ArtifactPath).
         Replace('{{PARAMETER_FILE}}', $parameterFile).
+        Replace('{{MCP_PARAMETER_FILE}}', (Join-Path $Context.Root "artifacts/azure-parameters/$($Context.RunId)/mcp.json")).
         Replace('{{ORIGIN}}', [string]$Context.Target.canonicalOrigin).
         Replace('{{BACKUP_COMPLETED_AT}}', [DateTimeOffset]::UtcNow.ToString('o')).
         Replace('{{POSTGRES_SERVER}}', [string]$Context.Target.resources.postgresFlexibleServer.name)
@@ -455,7 +602,7 @@ function Invoke-CommandFixture {
         Add-Content -LiteralPath $logPath -Value (@{ operation = $operation; executable = $FilePath; arguments = @($Arguments) } | ConvertTo-Json -Compress)
     }
     $output = if ($expected.PSObject.Properties['json']) {
-        Resolve-CommandFixtureToken $Context ($expected.json | ConvertTo-Json -Depth 30 -Compress)
+        Resolve-CommandFixtureToken $Context (ConvertTo-Json -InputObject $expected.json -Depth 30 -Compress)
     } else {
         [string]$expected.output
     }
@@ -511,7 +658,7 @@ function Import-AzureDeploymentReceipt {
     $receipt = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 30
     if ($receipt.receiptVersion -ne 2 -or $receipt.runId -notmatch '^[a-f0-9]{32}$' -or
         $receipt.approvalDigest -cne (Get-TargetApprovalDigest $Context.Target) -or
-        $receipt.executionMode -cne $Context.ExecutionMode -or
+        $receipt.executionMode -cne $Context.ExecutionMode -or $receipt.component -cne $Context.Component -or
         $receipt.target.tenantId -ine $Context.Target.tenantId -or
         $receipt.target.subscriptionId -ine $Context.Target.subscriptionId -or
         $receipt.target.resourceGroup -cne $Context.Target.resourceGroup -or
@@ -520,9 +667,14 @@ function Import-AzureDeploymentReceipt {
         $receipt.target.database -cne $Context.Target.expectedDatabaseName) {
         throw 'Resume receipt does not match the exact approved target and execution boundary.'
     }
+    if ($Context.Component -ne 'Mcp' -and $receipt.artifact -and
+        (Test-ReleaseArtifact $Context.ArtifactPath).checksum -cne $receipt.artifact.sha256) {
+        throw 'Resume artifact differs from the exact recorded application release.'
+    }
     if ($RequestedAction -eq 'Cleanup') {
         if ($receipt.status -notin @('failed', 'cleanup_failed', 'awaiting_authentication_smoke')) { throw 'Cleanup accepts only an exact failed or contained-pause receipt.' }
-    } elseif ($receipt.action -cne $RequestedAction -or $receipt.status -notin @('failed', 'cleanup_succeeded', 'awaiting_authentication_smoke')) {
+    } elseif ($receipt.action -cne $RequestedAction -or $receipt.status -notin @('failed', 'cleanup_succeeded', 'awaiting_authentication_smoke',
+        'mcp_failed','deployed_mcp_failed','recovered_mcp_failed')) {
         throw 'Resume action must match the failed receipt action.'
     }
     $knownSteps = @(
@@ -532,7 +684,8 @@ function Import-AzureDeploymentReceipt {
         'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
         'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
         'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
-        'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup'
+        'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup',
+        'mcp_preflight','mcp_what_if','mcp_stop','mcp_apply','mcp_start','mcp_verify','mcp_resume_verify'
     )
     if (@($receipt.completedSteps | Where-Object { $_ -notin $knownSteps }).Count) {
         throw 'Resume receipt contains an unknown completed step.'
@@ -575,16 +728,18 @@ function Import-AzureDeploymentReceipt {
 function Invoke-RealAzureOperation {
     param($Context, [string]$Name, $OperationInput)
     $target = $Context.Target
+    if ($Name -like 'mcp_*') { return Invoke-AzureMcpOperation $Context $Name }
     switch ($Name) {
         'prerequisites' {
             if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'PowerShell 7 is required.' }
             if ($Context.ExecutionMode -eq 'Real') {
-                foreach ($command in @('docker', 'az')) {
+                $commands = if ($Context.Component -eq 'Mcp') { @('az','bicep') } else { @('docker','az','bicep') }
+                foreach ($command in $commands) {
                     if (-not (Microsoft.PowerShell.Core\Get-Command $command -ErrorAction SilentlyContinue)) { throw "Required command $command was not found." }
                 }
             }
-            Invoke-ExternalCommand docker @('info') | Out-Null
-            return @{ powerShell = $PSVersionTable.PSVersion.ToString(); docker = 'available'; azureCli = 'available' }
+            if ($Context.Component -ne 'Mcp') { Invoke-ExternalCommand docker @('info') | Out-Null }
+            return @{ powerShell = $PSVersionTable.PSVersion.ToString(); docker = $(if ($Context.Component -eq 'Mcp') { 'not_required' } else { 'available' }); azureCli = 'available'; bicep='available' }
         }
         'operator_identity' {
             $account = Get-AzJson @('account', 'show', '--subscription', $target.subscriptionId)
@@ -592,9 +747,11 @@ function Invoke-RealAzureOperation {
             return @{ subscriptionId = $account.id; tenantId = $account.tenantId; principalType = $account.user.type }
         }
         'bicep_build' {
-            Invoke-ExternalCommand docker @('run', '--rm', '-v', "$($Context.Root):/workspace:ro", '-w', '/workspace',
-                'mcr.microsoft.com/azure-cli:2.77.0', 'az', 'bicep', 'build', '--file', 'infra/main.bicep', '--stdout') | Out-Null
-            return @{ template = 'infra/main.bicep'; localContainerBuild = $true }
+            $templates = if ($Context.Component -eq 'Mcp') { @('infra/mcp.bicep') } elseif (Get-AzureMcpTarget $target) { @('infra/main.bicep','infra/mcp.bicep') } else { @('infra/main.bicep') }
+            foreach ($template in $templates) {
+                Invoke-ExternalCommand bicep @('build', (Join-Path $Context.Root $template), '--stdout') | Out-Null
+            }
+            return @{ templates=$templates; localCompiler=$true; cloudAccess=$false }
         }
         'sku_pricing_preflight' {
             $postgresCapabilities = Get-AzJson @('postgres', 'flexible-server', 'list-skus', '--location', $target.region, '--subscription', $target.subscriptionId)
@@ -648,6 +805,11 @@ function Invoke-RealAzureOperation {
             $profiles = ConvertFrom-DeploymentTenantRegistry $values[$target.tenantRegistrySecretName]
             $primary = @($profiles | Where-Object { $_.tenantId -ieq $target.tenantId -and $_.clientId -ieq $target.entraApplicationId })
             if ($primary.Count -ne 1) { throw 'Tenant registry must contain the approved primary tenant/application; no tenant may be silently replaced.' }
+            $mcp = Get-AzureMcpTarget $target
+            if ($mcp -and ($primary[0].integration.clientId -ine $mcp.clientId -or
+                $primary[0].integration.audience -ine $mcp.apiClientId -or $primary[0].integration.scope -cne 'AgentControl.Access')) {
+                throw 'Prepared API tenant registry does not bind this exact MCP integration client/audience/scope.'
+            }
             $profileCount = $profiles.Count
             $Context.TenantProfileCount = $profileCount
             $Context.SecretValues = $values
@@ -1086,7 +1248,8 @@ function Invoke-DeploymentOperation {
     $safeResumeRechecks = @('prerequisites', 'operator_identity', 'bicep_build', 'sku_pricing_preflight', 'vault_preflight',
         'registration_verify', 'qualification_preflight', 'target_inventory', 'release_inspection', 'bicep_what_if',
         'approval_checkpoint', 'resume_verify', 'drain_verify', 'backup_health_verify', 'runtime_access_verify',
-        'contained_smoke', 'authentication_smoke_verify', 'contain_runtime')
+        'contained_smoke', 'authentication_smoke_verify', 'contain_runtime',
+        'mcp_preflight','mcp_what_if','mcp_stop','mcp_start','mcp_verify','mcp_resume_verify')
     if ($Context.Resuming -and $Context.Completed.Contains($Name) -and $Name -notin $safeResumeRechecks) {
         $Context.Calls.Add("resume-skip:$Name")
         $prior = $Context.ResumeEvidence.PSObject.Properties[$Name]
@@ -1237,11 +1400,12 @@ function Invoke-AzureDatabaseContainer {
 
 function Write-AzureDeploymentReceipt {
     param($Context, [string]$Status, [string]$FailedStep, $Evidence)
-    $artifact = if (Test-Path -LiteralPath $Context.ArtifactPath) { Test-ReleaseArtifact $Context.ArtifactPath } else { $null }
+    $artifact = if ($Context.Component -ne 'Mcp' -and (Test-Path -LiteralPath $Context.ArtifactPath)) { Test-ReleaseArtifact $Context.ArtifactPath } else { $null }
     $receipt = [ordered]@{
         receiptVersion = 2
         runId = $Context.RunId
         action = $Context.ReceiptAction
+        component = $Context.Component
         executionMode = $Context.ExecutionMode
         status = $Status
         recordedAt = [DateTimeOffset]::UtcNow.ToString('o')
@@ -1269,6 +1433,13 @@ function Write-AzureDeploymentReceipt {
             }
         } else { $null }
         secretVersionReferences = @($Context.Target.preparedVaultContract.versions)
+        mcp = $(if (Get-AzureMcpTarget $Context.Target) {
+            @{
+                contract = $Context.Target.mcp
+                authenticatedApiConnectivity = 'not_proven_by_deployment_health'
+                azurePersistenceStreamingAndClientJourneys = 'requires_exact_authorized_target_proof'
+            }
+        } else { $null })
         completedSteps = @($Context.Completed)
         attemptedSteps = @($Context.Calls)
         failedStep = $FailedStep
@@ -1284,18 +1455,378 @@ function Write-AzureDeploymentReceipt {
     return $receipt
 }
 
+function New-AzureMcpParameterFile {
+    param($Context)
+    $m = Get-AzureMcpTarget $Context.Target
+    if (-not $m) { throw 'MCP parameter construction requires explicit configuration.' }
+    $directory = Join-Path $Context.Root "artifacts/azure-parameters/$($Context.RunId)"
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    Protect-AzureBootstrapPath $directory -Directory
+    $parameters = @{
+        mcp = @{ value = $m }
+        location = @{ value = $Context.Target.region }
+        vaultResourceId = @{ value = $Context.Target.existingVaultResourceId }
+        logAnalyticsResourceId = @{ value = (Get-TargetResourceId $Context.Target 'Microsoft.OperationalInsights/workspaces' "$($Context.Target.resources.appService.name)-logs") }
+        actionGroupResourceId = @{ value = $Context.Target.resources.monitoring.actionGroupResourceId }
+        tags = @{ value = @{ wizardRunId = $Context.RunId; app = 'agent-control-mcp' } }
+    }
+    $path = Join-Path $directory 'mcp.json'
+    [IO.File]::WriteAllText($path, (@{ parameters = $parameters } | ConvertTo-Json -Depth 30))
+    Protect-AzureBootstrapPath $path
+    $Context.ParameterDirectory = $directory
+    return $path
+}
+
+function Assert-AzureMcpIsolation {
+    param($Context, $Identity)
+    $m = $Context.Target.mcp
+    $secretScopes = @('client','signing','encryption' | ForEach-Object {
+        "$($Context.Target.existingVaultResourceId)/secrets/$($m.secrets.$_.name)"
+    })
+    # --all covers descendants, not management-group inheritance.
+    $assignments = @(Get-AzJson @('role','assignment','list','--assignee-object-id',$Identity.properties.principalId,
+        '--subscription',$Context.Target.subscriptionId,'--all','--include-groups',
+        '--fill-principal-name','false','--fill-role-definition-name','false'))
+    $assignments += @(Get-AzJson @('role','assignment','list','--assignee-object-id',$Identity.properties.principalId,
+        '--scope',"/subscriptions/$($Context.Target.subscriptionId)",'--include-inherited','--include-groups',
+        '--fill-principal-name','false','--fill-role-definition-name','false'))
+    $pull = $false
+    $blob = $false
+    $blobCondition = "@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringEquals '$($m.storage.blobName)'"
+    foreach ($assignment in @($assignments | Where-Object { $null -ne $_ })) {
+        if ($assignment.roleDefinitionId -like '*/7f951dda-4ed3-4680-a7ca-43fe172d538d' -and
+            $assignment.scope -ieq $m.registryResourceId) {
+            $pull = $true
+        } elseif ($assignment.roleDefinitionId -like '*/ba92f5b4-2d11-453d-a403-e96b0029c9fe' -and
+            $assignment.scope -ieq $m.storage.containerResourceId -and
+            $assignment.conditionVersion -ceq '2.0' -and $assignment.condition -ceq $blobCondition) {
+            $blob = $true
+        } elseif ($assignment.roleDefinitionId -notlike '*/4633458b-17de-408a-b874-0445c86b69e6' -or
+            $assignment.scope -inotin $secretScopes) {
+            throw 'MCP identity supports only exact registry AcrPull, object-conditioned container Blob Data Contributor and three per-secret Key Vault grants; broad/custom/inherited API access is forbidden.'
+        }
+    }
+    if (-not $pull) { throw 'MCP requires an already prepared exact AcrPull grant; the deployer never creates it.' }
+    if (-not $blob) { throw 'MCP requires its prepared exact object-conditioned Blob grant; the deployer never creates it.' }
+}
+
+function Invoke-AzureMcpOperation {
+    param($Context, [string]$Name)
+    $target = $Context.Target
+    $m = Get-AzureMcpTarget $target
+    if (-not $m) { throw 'MCP operation requires explicit configuration.' }
+    $s = $m.storage
+    switch ($Name) {
+        'mcp_preflight' {
+            $locations = @(Get-AzJson @('appservice','list-locations','--sku','S1','--linux-workers-enabled','--subscription',$target.subscriptionId))
+            if (-not @($locations | Where-Object { $_.name -ieq $target.region }).Count) { throw 'Regional Linux S1 MCP capacity is unavailable.' }
+            $identity = Get-AzJson @('resource','show','--ids',$m.identityResourceId)
+            if ($identity.id -ine $m.identityResourceId -or $identity.properties.clientId -ine $m.identityClientId -or
+                $identity.properties.tenantId -ine $m.tenantId -or -not $identity.properties.principalId) {
+                throw 'MCP managed identity tenant/client/resource mismatch.'
+            }
+            Assert-AzureMcpIsolation $Context $identity
+            $registry = Get-AzJson @('resource','show','--ids',$m.registryResourceId)
+            if ($registry.id -ine $m.registryResourceId -or $registry.properties.loginServer -cne $m.registryLoginServer -or
+                $registry.properties.adminUserEnabled -ne $false -or
+                ($registry.properties.roleAssignmentMode -and $registry.properties.roleAssignmentMode -cne 'LegacyRegistryPermissions')) {
+                throw 'MCP registry identity/admin/legacy AcrPull credential contract failed.'
+            }
+            $manifest = Get-AzJson @('acr','manifest','show-metadata','--registry',(($m.registryResourceId -split '/')[-1]),
+                '--name',"$($m.repository)@$($m.imageDigest)")
+            if ($manifest.digest -cne $m.imageDigest) { throw 'MCP immutable registry digest mismatch.' }
+            $account = Get-AzJson @('resource','show','--ids',$s.accountResourceId)
+            $container = Get-AzJson @('resource','show','--ids',$s.containerResourceId)
+            $subnet = Get-AzJson @('resource','show','--ids',$s.subnetResourceId)
+            $endpoint = Get-AzJson @('resource','show','--ids',$s.privateEndpointResourceId)
+            $vnet = $s.subnetResourceId -replace '/subnets/[^/]+$',''
+            if ($account.id -ine $s.accountResourceId -or $account.location -ine $target.region -or
+                $account.kind -cne 'StorageV2' -or $account.sku.name -cnotin @('Standard_LRS','Standard_ZRS') -or
+                $account.properties.supportsHttpsTrafficOnly -ne $true -or $account.properties.minimumTlsVersion -cne 'TLS1_2' -or
+                $account.properties.allowSharedKeyAccess -ne $false -or $account.properties.allowBlobPublicAccess -ne $false -or
+                $account.properties.publicNetworkAccess -cne 'Disabled' -or
+                $container.id -ine $s.containerResourceId -or $container.properties.publicAccess -cne 'None' -or
+                $subnet.id -ine $s.subnetResourceId -or
+                -not @($subnet.properties.delegations | Where-Object { $_.properties.serviceName -ceq 'Microsoft.Web/serverFarms' }).Count -or
+                $endpoint.id -ine $s.privateEndpointResourceId -or $endpoint.properties.subnet.id -notlike "$vnet/subnets/*") {
+                throw 'MCP private TLS Blob storage, same-region/VNet or delegated subnet contract failed.'
+            }
+            $connections = @($endpoint.properties.privateLinkServiceConnections | Where-Object {
+                $_.properties.privateLinkServiceId -ieq $s.accountResourceId -and
+                $_.properties.privateLinkServiceConnectionState.status -ceq 'Approved' -and
+                @($_.properties.groupIds).Count -eq 1 -and 'blob' -cin @($_.properties.groupIds)
+            })
+            if ($connections.Count -ne 1) { throw 'MCP exact approved blob private endpoint is missing.' }
+            $dns = Get-AzJson @('resource','show','--ids',"$($s.privateEndpointResourceId)/privateDnsZoneGroups/default")
+            $link = Get-AzJson @('resource','show','--ids',$s.privateDnsVnetLinkResourceId)
+            if (@($dns.properties.privateDnsZoneConfigs).Count -ne 1 -or
+                $dns.properties.privateDnsZoneConfigs[0].properties.privateDnsZoneId -ine $s.privateDnsZoneResourceId -or
+                $link.id -ine $s.privateDnsVnetLinkResourceId -or $link.properties.virtualNetwork.id -ine $vnet -or
+                $link.properties.registrationEnabled -ne $false -or $link.properties.virtualNetworkLinkState -cne 'Completed') {
+                throw 'MCP exact private Blob DNS zone group/VNet link mismatch.'
+            }
+            $vault = ($target.existingVaultResourceId -split '/')[-1]
+            foreach ($key in @('client','signing','encryption')) {
+                $secret = $m.secrets.$key
+                $versions = @(Get-AzJson @('keyvault','secret','list-versions','--vault-name',$vault,'--name',$secret.name))
+                $selected = @($versions | Where-Object { $_.id -ceq "https://$vault.vault.azure.net/secrets/$($secret.name)/$($secret.version)" })
+                if ($selected.Count -ne 1 -or $selected[0].attributes.enabled -ne $true -or
+                    ($selected[0].attributes.expires -and [DateTimeOffset]$selected[0].attributes.expires -le [DateTimeOffset]::UtcNow)) {
+                    throw 'MCP selected secret version is missing, disabled or expired.'
+                }
+            }
+            $inventory = @(Get-AzJson @('resource','list','--resource-group',$target.resourceGroup,'--subscription',$target.subscriptionId))
+            $existing = @($inventory | Where-Object { $_.id -ieq $m.appServiceResourceId })
+            $plan = @($inventory | Where-Object { $_.id -ieq $m.planResourceId })
+            $created = $Context.Resuming -and $Context.Completed.Contains('mcp_apply')
+            if ($m.installationMode -ceq 'fresh' -and -not $created) {
+                if ($existing.Count -or $plan.Count) { throw 'Fresh MCP target already exists; replacement is forbidden.' }
+            } else {
+                if ($existing.Count -ne 1 -or $plan.Count -ne 1) { throw 'Exact existing MCP app/plan is missing.' }
+                $actualPlan = Get-AzJson @('resource','show','--ids',$m.planResourceId)
+                $app = Get-AzJson @('webapp','show','--ids',$m.appServiceResourceId)
+                $configuration = Get-AzJson @('webapp','config','show','--ids',$m.appServiceResourceId)
+                $slots = @(Get-AzJson @('webapp','deployment','slot','list','--ids',$m.appServiceResourceId))
+                $autoscale = @(Get-AzJson @('monitor','autoscale','list','--resource-group',$target.resourceGroup,'--subscription',$target.subscriptionId))
+                $mount = Get-AzJson @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/azurestorageaccounts/list?api-version=2024-11-01") -SensitiveOutput
+                $references = Get-AzJson @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/configreferences/appsettings/list?api-version=2022-03-01")
+                $settings = @('MCP_AZURE_CLIENT_SECRET','MCP_AZURE_JWT_SIGNING_KEY','MCP_AZURE_OAUTH_ENCRYPTION_KEY')
+                $index=0
+                foreach ($key in @('client','signing','encryption')) {
+                    $reference=$references.properties.($settings[$index++])
+                    $version=if ($created) { $m.secrets.$key.version } else { $m.secrets.$key.currentVersion }
+                    if ($reference.status -cne 'Resolved' -or $reference.secretName -cne $m.secrets.$key.name -or
+                        $reference.secretVersion -cne $version) { throw 'MCP currently deployed secret version mismatch; independent rotation cannot guess prior versions.' }
+                }
+                $expectedDigest = if ($created) { $m.imageDigest } else { $m.existingImageDigest }
+                if ($actualPlan.sku.name -cne 'S1' -or $actualPlan.sku.capacity -ne 1 -or
+                    $app.id -ine $m.appServiceResourceId -or $app.serverFarmId -ine $m.planResourceId -or
+                    $app.tags.storageIdentity -cne $s.identity -or
+                    @($mount.properties.PSObject.Properties).Count -ne 0 -or
+                    $configuration.numberOfWorkers -ne 1 -or $configuration.autoHealEnabled -ne $false -or $slots.Count -or
+                    $configuration.linuxFxVersion -cne "DOCKER|$($m.registryLoginServer)/$($m.repository)@$expectedDigest" -or
+                    @($autoscale | Where-Object { $_.targetResourceUri -iin @($m.planResourceId,$m.appServiceResourceId) }).Count -or
+                    ($created -and $app.tags.wizardRunId -cne $Context.RunId)) {
+                    throw 'MCP existing digest/single-writer plan/slot/autoscale identity mismatch.'
+                }
+            }
+            return @{ imageDigest=$m.imageDigest; storageIdentity=$s.identity; managedIdentity=$m.identityResourceId
+                network='private-tls-blob'; blob="$($s.accountUrl)/$($s.containerName)/$($s.blobName)"
+                fencing='exact-data-blob-lease'; instances=1; secretValuesRead=0; effectiveDnsAndEgress='runtime_verification_required' }
+        }
+        'mcp_what_if' {
+            $path = New-AzureMcpParameterFile $Context
+            Invoke-ExternalCommand az @('deployment','group','what-if','--subscription',$target.subscriptionId,
+                '--resource-group',$target.resourceGroup,'--template-file',(Join-Path $Context.Root 'infra/mcp.bicep'),
+                '--parameters',"@$path",'--only-show-errors','--no-pretty-print') | Out-Null
+            return @{ previewed=$true; imageDigest=$m.imageDigest; extraMonthlyCost=$m.cost.monthlyTotal }
+        }
+        'mcp_resume_verify' {
+            if ($Context.PreviousFailedStep -ceq 'mcp_apply') {
+                throw 'MCP apply outcome is uncertain; reconcile the exact app/digest/blob/secret references before replay.'
+            }
+            return @{ runId=$Context.RunId; approvalDigest=(Get-TargetApprovalDigest $target); apiWrites=0 }
+        }
+        'mcp_stop' {
+            if ($m.installationMode -ceq 'existing' -or $Context.Calls.Contains('mcp_apply') -or $Context.Completed.Contains('mcp_apply')) {
+                Get-AzJson @('webapp','stop','--ids',$m.appServiceResourceId) | Out-Null
+                $app = Get-AzJson @('webapp','show','--ids',$m.appServiceResourceId)
+                if ($app.state -cne 'Stopped') { throw 'MCP stop did not converge; a second writer is forbidden.' }
+                if ($Context.ExecutionMode -eq 'Real') { Start-Sleep -Seconds 75 }
+            }
+            return @{ stopped=$true; maximumDrainSeconds=75; apiWrites=0 }
+        }
+        'mcp_apply' {
+            $path = New-AzureMcpParameterFile $Context
+            Get-AzJson @('deployment','group','create','--subscription',$target.subscriptionId,'--resource-group',$target.resourceGroup,
+                '--name',"agent-control-mcp-$($Context.RunId)",'--template-file',(Join-Path $Context.Root 'infra/mcp.bicep'),
+                '--parameters',"@$path") | Out-Null
+            return @{ imageDigest=$m.imageDigest; storageIdentity=$s.identity; apiWrites=0 }
+        }
+        'mcp_start' {
+            Get-AzJson @('webapp','start','--ids',$m.appServiceResourceId) | Out-Null
+            return @{ started=$true; apiWrites=0 }
+        }
+        'mcp_verify' {
+            $app = Get-AzJson @('webapp','show','--ids',$m.appServiceResourceId)
+            $configuration = Get-AzJson @('webapp','config','show','--ids',$m.appServiceResourceId)
+            $mount = Get-AzJson @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/azurestorageaccounts/list?api-version=2024-11-01") -SensitiveOutput
+            $references = Get-AzJson @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/configreferences/appsettings/list?api-version=2022-03-01")
+            if ($app.id -ine $m.appServiceResourceId -or $app.serverFarmId -ine $m.planResourceId -or $app.state -cne 'Running' -or
+                $app.keyVaultReferenceIdentity -ine $m.identityResourceId -or
+                $app.virtualNetworkSubnetId -ine $s.subnetResourceId -or $app.httpsOnly -ne $true -or
+                $configuration.linuxFxVersion -cne "DOCKER|$($m.registryLoginServer)/$($m.repository)@$($m.imageDigest)" -or
+                $configuration.numberOfWorkers -ne 1 -or $configuration.autoHealEnabled -ne $false -or
+                $configuration.vnetRouteAllEnabled -ne $true -or
+                $configuration.acrUseManagedIdentityCreds -ne $true -or
+                $configuration.acrUserManagedIdentityID -ine $m.identityClientId -or
+                $configuration.healthCheckPath -cne '/ready' -or $configuration.minTlsVersion -cne '1.2' -or
+                $configuration.ipSecurityRestrictionsDefaultAction -cne 'Deny' -or
+                $configuration.scmIpSecurityRestrictionsDefaultAction -cne 'Deny' -or
+                @(Compare-Object @($m.network.inboundIpv4Cidrs | Sort-Object -Unique) @($configuration.ipSecurityRestrictions | Where-Object action -CEQ 'Allow' | ForEach-Object ipAddress | Sort-Object -Unique)).Count -or
+                @($mount.properties.PSObject.Properties).Count -ne 0 -or
+                @(Compare-Object @($m.network.outboundIpv4Addresses | Sort-Object -Unique) @(([string]$app.outboundIpAddresses -split ',') | Sort-Object -Unique)).Count) {
+                throw 'MCP runtime image/blob/egress/single-instance identity mismatch.'
+            }
+            $settings = @('MCP_AZURE_CLIENT_SECRET','MCP_AZURE_JWT_SIGNING_KEY','MCP_AZURE_OAUTH_ENCRYPTION_KEY')
+            $index = 0
+            foreach ($key in @('client','signing','encryption')) {
+                $reference = $references.properties.($settings[$index++])
+                if ($reference.status -cne 'Resolved' -or $reference.secretName -cne $m.secrets.$key.name -or
+                    $reference.secretVersion -cne $m.secrets.$key.version) { throw 'MCP native immutable Key Vault reference was not resolved.' }
+            }
+            $runtimeSettings = @(Get-AzJson @('webapp','config','appsettings','list','--ids',$m.appServiceResourceId) -SensitiveOutput)
+            $expectedSettings = @{
+                MCP_TENANT_ID=$m.tenantId; MCP_CLIENT_ID=$m.clientId; MCP_API_CLIENT_ID=$m.apiClientId
+                MCP_API_ORIGIN=$m.apiOrigin; MCP_PUBLIC_URL=$m.publicUrl; MCP_SECRET_SOURCE='app-service-key-vault'
+                MCP_AZURE_BLOB_ACCOUNT_URL=$s.accountUrl; MCP_AZURE_BLOB_CONTAINER=$s.containerName
+                MCP_AZURE_BLOB_NAME=$s.blobName; MCP_AZURE_IDENTITY_CLIENT_ID=$m.identityClientId
+                WEBSITES_ENABLE_APP_SERVICE_STORAGE='false'; WEBSITES_CONTAINER_STOP_TIME_LIMIT='75'; WEBSITES_PORT='8000'
+            }
+            if (@($runtimeSettings | Where-Object { $_.name -ceq 'MCP_OAUTH_STORAGE_PATH' -or
+                $_.name -like 'MCP_*_FILE' -or $_.name -cin @('AZURE_STORAGE_CONNECTION_STRING','AZURE_STORAGE_KEY') }).Count) {
+                throw 'MCP runtime cannot mix Blob managed identity with local files or storage keys.'
+            }
+            foreach ($key in $expectedSettings.Keys) {
+                $actual = @($runtimeSettings | Where-Object name -CEQ $key)
+                if ($actual.Count -ne 1 -or $actual[0].value -cne $expectedSettings[$key]) { throw 'MCP exact runtime resource/API/storage/drain configuration mismatch.' }
+            }
+            $redirects = @($runtimeSettings | Where-Object name -CEQ 'MCP_ALLOWED_CLIENT_REDIRECT_URIS')
+            if ($redirects.Count -ne 1 -or @(Compare-Object @($m.redirectUris) @($redirects[0].value | ConvertFrom-Json) -CaseSensitive).Count) {
+                throw 'MCP exact runtime redirect allowlist mismatch.'
+            }
+            $diagnostics = Get-AzJson @('monitor','diagnostic-settings','show','--resource',$m.appServiceResourceId,'--name','agent-control-mcp')
+            if ($diagnostics.logAnalyticsDestinationType -cne 'Dedicated' -or
+                @($diagnostics.logs | Where-Object enabled).Count -ne 1 -or
+                @($diagnostics.logs | Where-Object { $_.enabled -and $_.category -ceq 'AppServiceConsoleLogs' }).Count -ne 1 -or
+                $diagnostics.workspaceId -ine (Get-TargetResourceId $target 'Microsoft.OperationalInsights/workspaces' "$($target.resources.appService.name)-logs")) {
+                throw 'MCP diagnostics must use only the existing bounded workspace and redacted console logs.'
+            }
+            $alerts = @(Get-AzJson @('monitor','metrics','alert','list','--resource-group',$target.resourceGroup,'--subscription',$target.subscriptionId))
+            foreach ($spec in @(
+                @{name='http-5xx';metric='Http5xx';threshold=5;operator='GreaterThanOrEqual';aggregation='Total'},
+                @{name='health';metric='HealthCheckStatus';threshold=100;operator='LessThan';aggregation='Average'},
+                @{name='latency';metric='AverageResponseTime';threshold=2;operator='GreaterThan';aggregation='Average'},
+                @{name='memory';metric='MemoryWorkingSet';threshold=805306368;operator='GreaterThan';aggregation='Average'}
+            )) {
+                $alert = @($alerts | Where-Object { $_.name -ceq "$($m.appServiceName)-$($spec.name)" -and $_.enabled })
+                $criterion = @($alert[0].criteria.allOf)[0]
+                if ($alert.Count -ne 1 -or $criterion.metricName -cne $spec.metric -or $criterion.operator -cne $spec.operator -or
+                    $criterion.timeAggregation -cne $spec.aggregation -or $criterion.threshold -ne $spec.threshold -or
+                    @($alert[0].scopes).Count -ne 1 -or $alert[0].scopes[0] -ine $m.appServiceResourceId -or
+                    $alert[0].actions[0].actionGroupId -ine $target.resources.monitoring.actionGroupResourceId) {
+                    throw 'MCP independent alert scope/threshold/action group mismatch.'
+                }
+            }
+            $origin = $m.publicUrl -replace '/mcp$',''
+            $healthy = $false
+            foreach ($attempt in 1..20) {
+                $ready = Invoke-DeploymentHttpGet $Context "$origin/ready"
+                if ($ready.statusCode -eq 200 -and ($ready.body | ConvertFrom-Json).status -ceq 'ready') { $healthy=$true; break }
+                if ($Context.ExecutionMode -eq 'Real') { Start-Sleep -Seconds 10 }
+            }
+            if (-not $healthy) { throw 'MCP encrypted leased Blob readiness failed; API/web must remain online.' }
+            $discovery = Invoke-DeploymentHttpGet $Context "$origin/.well-known/oauth-authorization-server"
+            if ($discovery.statusCode -ne 200 -or ($discovery.body | ConvertFrom-Json).issuer -cne "$origin/") {
+                throw 'MCP public OAuth discovery/resource binding failed.'
+            }
+            return @{ ready=$true; encryptedStorageProbe=$true; nativeReferencesResolved=$true
+                authenticatedApiConnectivity='not_proven'; persistenceAcrossAzureRestart='not_proven'; streaming='not_proven'; apiWrites=0 }
+        }
+        default { throw 'MCP operation is not registered.' }
+    }
+}
+
+function Invoke-AzureMcpWorkflow {
+    param($Context, $Evidence)
+    try {
+        if ($Context.Resuming) {
+            $Context.McpFailedStep=if ($Context.PreviousFailedStep -ceq 'mcp_apply') { 'mcp_apply' } else { 'mcp_resume_verify' }
+            $Evidence.mcp_resume_verify = Invoke-DeploymentOperation $Context 'mcp_resume_verify'
+        }
+        foreach ($step in @('mcp_stop','mcp_apply','mcp_start','mcp_verify')) {
+            $Context.McpFailedStep = $step
+            $Evidence[$step] = Invoke-DeploymentOperation $Context $step
+        }
+        $Context.McpFailedStep = $null
+        return $true
+    } catch {
+        $Evidence.mcpFailure = @{ code='mcp_deployment_failed'; step=$Context.McpFailedStep; apiContainment='not_requested' }
+        if ($Context.Calls.Contains('mcp_apply') -or $Context.Completed.Contains('mcp_apply') -or $Context.Calls.Contains('mcp_start')) {
+            try {
+                $Evidence.mcpContainment = Invoke-DeploymentOperation $Context 'mcp_stop'
+            } catch { $Evidence.mcpContainment = @{ code='mcp_stop_failed'; owner=$Context.Target.mcp.operationsOwner } }
+        }
+        return $false
+    }
+}
+
 function Invoke-AzureDeployment {
     param(
         $Context,
-        [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup')][string]$Action,
+        [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup', 'Stop')][string]$Action,
         [string]$RestorePoint
     )
+    Test-ApprovedAzureTarget $Context.Target $Context.ExecutionMode | Out-Null
+    $mcp = Get-AzureMcpTarget $Context.Target
     $evidence = [ordered]@{}
     if ($Context.Resuming -and $Context.ResumeEvidence) {
         foreach ($property in $Context.ResumeEvidence.PSObject.Properties) { $evidence[$property.Name] = $property.Value }
     }
     $failedStep = $null
+    $independentMcpStarted = $false
     $approvalDigest = Get-TargetApprovalDigest $Context.Target
+    if ($Action -eq 'Stop') {
+        if ($Context.Component -ne 'Mcp' -or $mcp.installationMode -cne 'existing') {
+            throw 'Stop requires the exact existing MCP component; it never stops the application.'
+        }
+        if ([DateTimeOffset]::UtcNow -lt [DateTimeOffset]$Context.Target.maintenanceApproval.windowStartsAt -or
+            [DateTimeOffset]::UtcNow -gt [DateTimeOffset]$Context.Target.maintenanceApproval.windowEndsAt) {
+            throw 'The approved MCP stop/backup window is not active.'
+        }
+        try {
+            $evidence.operator_identity=Invoke-DeploymentOperation $Context 'operator_identity'
+            $evidence.mcp_stop=Invoke-DeploymentOperation $Context 'mcp_stop'
+            return Write-AzureDeploymentReceipt $Context 'mcp_stopped' $null $evidence
+        } catch {
+            Write-AzureDeploymentReceipt $Context 'mcp_failed' 'mcp_stop' $evidence | Out-Null
+            throw 'MCP stop did not converge; API/web was not changed.'
+        }
+    }
+    $mcpResume = $mcp -and $Context.Resuming -and $Context.Completed.Contains('open_and_verify') -and
+        $Context.ResumeStatus -in @('deployed_mcp_failed','recovered_mcp_failed')
+    if ($Context.Component -eq 'Mcp' -or $mcpResume) {
+        if ($Action -notin @('Plan','Deploy','Recover')) { throw 'MCP-only supports Plan, Deploy and exact prepared-state Recover; no PostgreSQL restore/cleanup.' }
+        if ($RestorePoint) { throw 'MCP-only recovery never restores or switches PostgreSQL; use exact prepared OAuth state.' }
+        $failureStatus = if ($mcpResume) { $Context.ResumeStatus } else { 'mcp_failed' }
+        $successStatus = if ($mcpResume) {
+            if ($Context.ResumeStatus -ceq 'recovered_mcp_failed') { 'recovered' } else { 'deployed' }
+        } elseif ($Action -eq 'Recover') { 'recovered_mcp' } else { 'deployed_mcp' }
+        try {
+            if ($Context.Resuming -and $Context.PreviousFailedStep -ceq 'mcp_apply') {
+                $failedStep='mcp_apply'
+                Invoke-DeploymentOperation $Context 'mcp_resume_verify' | Out-Null
+            }
+            foreach ($step in @('prerequisites','operator_identity','bicep_build','mcp_preflight','mcp_what_if')) {
+                $failedStep=$step
+                $evidence[$step] = Invoke-DeploymentOperation $Context $step
+            }
+            if ($Action -eq 'Plan') { return Write-AzureDeploymentReceipt $Context 'previewed_not_deployed' $null $evidence }
+            if ([DateTimeOffset]::UtcNow -lt [DateTimeOffset]$Context.Target.maintenanceApproval.windowStartsAt -or
+                [DateTimeOffset]::UtcNow -gt [DateTimeOffset]$Context.Target.maintenanceApproval.windowEndsAt) {
+                throw 'The approved MCP maintenance window is not active; no write was attempted.'
+            }
+            $ok = Invoke-AzureMcpWorkflow $Context $evidence
+            return Write-AzureDeploymentReceipt $Context $(if ($ok) { $successStatus } else { $failureStatus }) $Context.McpFailedStep $evidence
+        } catch {
+            $evidence.mcpFailure = @{ code='mcp_preflight_failed'; step=$failedStep; apiContainment='not_requested' }
+            Write-AzureDeploymentReceipt $Context $failureStatus $failedStep $evidence | Out-Null
+            throw [InvalidOperationException]::new(
+                'MCP preflight/recovery stopped; API/web was not changed. See the redacted receipt.', $_.Exception)
+        } finally {
+            Remove-AzureSensitiveDirectories $Context
+        }
+    }
     try {
         if ($Action -eq 'Cleanup') {
             $failedStep = 'cleanup'
@@ -1312,6 +1843,12 @@ function Invoke-AzureDeployment {
         foreach ($step in @('prerequisites', 'operator_identity', 'bicep_build', 'sku_pricing_preflight', 'vault_preflight', 'registration_verify', 'qualification_preflight', 'target_inventory', 'release_inspection', 'bicep_what_if')) {
             $failedStep = $step
             $evidence[$step] = Invoke-DeploymentOperation $Context $step
+        }
+        if ($mcp) {
+            foreach ($step in @('mcp_preflight','mcp_what_if')) {
+                $failedStep=$step
+                $evidence[$step]=Invoke-DeploymentOperation $Context $step
+            }
         }
         $failedStep = 'approval_checkpoint'
         $evidence.approval_checkpoint = Invoke-DeploymentOperation $Context 'approval_checkpoint' @{ ApprovalDigest = $approvalDigest }
@@ -1375,7 +1912,9 @@ function Invoke-AzureDeployment {
             $evidence.open_and_verify = Invoke-DeploymentOperation $Context 'open_and_verify'
             $failedStep = 'cleanup'
             $evidence.cleanup = Invoke-DeploymentOperation $Context 'cleanup'
-            return Write-AzureDeploymentReceipt $Context 'recovered' $null $evidence
+            $independentMcpStarted = [bool]$mcp
+            $mcpOk = -not $mcp -or (Invoke-AzureMcpWorkflow $Context $evidence)
+            return Write-AzureDeploymentReceipt $Context $(if ($mcpOk) { 'recovered' } else { 'recovered_mcp_failed' }) $Context.McpFailedStep $evidence
         }
         if ($Context.Target.installationMode -ne 'fresh') {
             foreach ($step in @('network_reconcile', 'enter_maintenance', 'drain_verify', 'managed_backup', 'backup_health_verify')) {
@@ -1423,8 +1962,14 @@ function Invoke-AzureDeployment {
         $evidence.open_and_verify = Invoke-DeploymentOperation $Context 'open_and_verify'
         $failedStep = 'cleanup'
         $evidence.cleanup = Invoke-DeploymentOperation $Context 'cleanup'
-        return Write-AzureDeploymentReceipt $Context 'deployed' $null $evidence
+        $independentMcpStarted = [bool]$mcp
+        $mcpOk = -not $mcp -or (Invoke-AzureMcpWorkflow $Context $evidence)
+        return Write-AzureDeploymentReceipt $Context $(if ($mcpOk) { 'deployed' } else { 'deployed_mcp_failed' }) $Context.McpFailedStep $evidence
     } catch {
+        if ($independentMcpStarted) {
+            throw [InvalidOperationException]::new(
+                'Independent MCP outcome/receipt could not be persisted; API/web remains online. Reconcile the exact MCP outcome before retry.', $_.Exception)
+        }
         $errorCode = "deployment_$($failedStep ?? 'validation')_failed"
         $containmentFailed = $false
         if ($Action -notin @('Plan', 'PointInTimeRestore', 'Cleanup') -and

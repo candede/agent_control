@@ -8,6 +8,8 @@ param(
     [switch]$DbReset,
     [switch]$ForceChecks,
     [switch]$AgentSharingDiagnostics,
+    [string]$McpConfig,
+    [switch]$ConfigureMcp,
     [string]$Candidate,
     [string]$CandidateSha256,
     [string]$ExpectedPreflight,
@@ -20,8 +22,13 @@ try {
     if ($DbReset -and $Command -ne 'start') { throw '-DbReset is supported only with start.' }
     if ($ForceChecks -and $Command -ne 'start') { throw '-ForceChecks is supported only with start.' }
     if ($AgentSharingDiagnostics -and $Command -ne 'start') { throw '-AgentSharingDiagnostics is supported only with start.' }
+    if ($McpConfig -and $Command -notin @('start','edit-config')) { throw '-McpConfig is supported only with start or edit-config.' }
+    if ($ConfigureMcp -and $Command -notin @('start','edit-config')) { throw '-ConfigureMcp is supported only with start or edit-config.' }
+    if ($ConfigureMcp -and ($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly)) { throw 'Configure MCP before preparing a pinned release; -ConfigureMcp cannot change pinned configuration.' }
     if (($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly) -and $Command -ne 'start') { throw 'Release parameters are supported only with start.' }
-    $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -in @('stop','check'))
+    $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -eq 'stop')
+    $context.McpConfigInput = $McpConfig
+    $context.ConfigureMcp = [bool]$ConfigureMcp
     $context.AgentSharingDiagnostics = [bool]$AgentSharingDiagnostics
     $context.Candidate = $Candidate
     $context.CandidateSha256 = $CandidateSha256

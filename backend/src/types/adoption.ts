@@ -26,6 +26,7 @@ export type AdoptionGroup = {
 };
 
 export type AdoptionPage = ReportListPage<AdoptionGroup> & {
+  page: ReportListPage<AdoptionGroup>["page"] & { number: number; offset: number };
   directory: UserSourceMetadata;
   inventoryAvailable: boolean;
   summary: { people: number; champs: number; agents: number };

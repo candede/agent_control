@@ -152,6 +152,31 @@ Partial app-report coverage does not invalidate uniquely matched, fresh rows: th
 
 ## Users: paid users and active users without paid Copilot
 
+The **Adoption** tab groups saved users and organization-built agents by company
+and department, with five groups per page. Paging keeps the current groups and
+summary visible while the requested page loads. Numbered controls above and below
+the groups show the current range, total, and page, with first/last pages and
+ellipses for larger result sets. **Go to page** jumps directly to any valid page
+without fetching intermediate pages. Explicit navigation focuses the results
+heading; background refresh never moves focus or scroll. Automatic source
+publications
+and saved-selection renewal keep the first visible group as the page anchor
+instead of returning to page one. Search and filter changes intentionally start
+at the beginning of the new results.
+
+`GET /api/copilot-usage/adoption` returns the first group's identity in
+`page.anchor`, and its one-based page and zero-based group offset in `page.number`
+and `page.offset`. `pageNumber` requests a numbered page within the same selection.
+Positive page numbers beyond the available results resolve to the last page,
+including when refreshed results shrink. A fresh read can send the group identity
+as `anchor` to resume at the page containing that group with a newly validated
+selection and newly signed previous/next cursors. An anchor is a position hint,
+not authorization or an immutable filter; only one of `anchor`, `pageNumber`,
+and `cursor` may be supplied. It is resolved only within the current principal's
+matching groups. If that group no longer exists in the results,
+the read starts at the first matching group. Expired or rejected evidence never
+becomes actionable merely because its content remains visible during loading.
+
 A view dropdown defaults to **Paid M365 Copilot users** and also offers **Active users without paid Copilot**. The default view shows users with verified active paid features, including grace-period and partially active users and those with zero or unavailable activity. **Using agents**, **Needs attention**, **No reported agent activity**, and their adoption cohorts use that same licensed population. The API's `measuredActivityUsers`, `needsAttentionUsers` and `unknownMetricsUsers` also exclude inactive/unverified candidates. Measured activity includes positive evidence from either agent report or recent Office-app activity; unknown metrics covers uncertain agent activity or missing app evidence. The **All checked users** and **Unlinked report identities** sections are not shown, and the checked-directory-count/scope banner is removed.
 
 The paid view shares the non-paid view's search, matching count, **Filters** popup, removable chips, and table layout. Its popup contains **Company**, **Department**, **Activity**, **Low-response threshold**, and **Sort**. Organization dropdowns use all effectively licensed users in the saved snapshot and combine as exact, trimmed matches before 50-row paging. The Activity dropdown and summary cards select the same cohort. Clear and Reset preserve sorting; invalid thresholds show an error and retain the last valid filter.

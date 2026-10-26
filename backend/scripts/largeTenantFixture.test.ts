@@ -14,6 +14,21 @@ import { schemaFingerprint } from "../src/db/schema.js";
 import { testSchemaTemplateIdentity } from "./testDatabaseTemplate.js";
 
 describe("large tenant fixture and frozen semantic seeds", () => {
+  it("keeps the approved registry in the production runtime, not only dependency stages", () => {
+    const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
+    const runtime = dockerfile.split("FROM node:24-bookworm-slim AS runtime\n")[1].split("\nFROM runtime AS runtime-inspection")[0];
+    expect(runtime).toContain("NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/");
+    expect(runtime).toContain("USER node");
+  });
+  it("runs connected SDK reads and exact control jobs on the existing isolated SQL owner", () => {
+    expect(fixtureCommands("mcp-end-to-end")).toEqual([
+      ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/sharedAgentControls.test.ts", "--silent=false"],
+      ["run", "typecheck", "--workspace", "backend"],
+    ]);
+    const runner = readFileSync(new URL("./largeTenantFixture.ts", import.meta.url), "utf8");
+    expect(runner).toContain('if (process.argv[2] === "mcp-end-to-end")');
+    expect(runner).toContain('process.env.AGENT_CONTROL_MCP_SQL_JOURNEY !== "/opt/mcp/.venv/bin/python"');
+  });
   it("bounds deployment preparation to current schema, reset, backup and authority contracts", () => {
     const commands=fixtureCommands("deployment-current");
     expect(commands).toHaveLength(2);

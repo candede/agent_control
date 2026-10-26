@@ -65,7 +65,7 @@ function Assert-FreshInstallationContainer {
             if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination]) { throw 'Fresh installation requires its exact owned disk-backed data volume.' }
         } elseif ($mount.Type -cne 'bind' -or
             $mount.RW -ne ($service -ceq 'app' -and $mount.Destination -ceq '/run/agent-sharing-diagnostics') -or
-            $mount.Source -cne $expected[$mount.Destination]) {
+            -not (Test-LocalBindSource $mount.Source $expected[$mount.Destination])) {
             throw 'Fresh installation has an unexpected configuration mount; cleanup refused.'
         }
     }
@@ -74,8 +74,9 @@ function Assert-FreshInstallationContainer {
         throw 'Fresh installation cannot publish a host port.'
     }
     if ($service -eq 'app') {
+        $sourceHash = if ($retainedContainer) { $verified.Config.Labels.'io.agent-control.source-sha256' } else { $Context.SourceHash }
         if ($labels.'io.agent-control.fixture' -cne $Context.Project -or
-            $labels.'io.agent-control.source-sha256' -cne $Context.SourceHash) { throw 'Fresh runtime source identity differs.' }
+            $labels.'io.agent-control.source-sha256' -cne $sourceHash) { throw 'Fresh runtime source identity differs.' }
         if ($Container.HostConfig.Memory -ne 1610612736 -or $Container.HostConfig.NanoCpus -ne 1500000000) {
             throw 'Fresh application fixed resource budget differs.'
         }
@@ -306,7 +307,29 @@ networks:
         Copy-Item -LiteralPath "$afterBackup.json" -Destination (Join-Path $Directory 'backup-restarted.json')
         Write-LocalText (Join-Path $Directory 'restart-progress.json') (@{before=$progressBefore;after=$progressAfter;interpretation='Only scheduled lifecycle metadata may advance within existing 1000-row/1-MiB slice bounds; all other table fingerprints and all row counts must match.'} | ConvertTo-Json -Depth 5)
         Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter
-        if (-not $CurrentSchemaOnly) { Invoke-FreshFirstSync $context $Directory 'collected' }
+        Invoke-FreshFirstSync $context $Directory 'collected'
+        if ($CurrentSchemaOnly) {
+            $receiptHash = (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
+            $prior = @(Get-OwnedLocalContainers $context | Where-Object Service -eq 'app')[0]
+            Invoke-LocalOperator $context @('--input-type=module','--eval',
+                'import pg from "pg";import {databaseSettings} from "./backend/src/db/pool.ts";const db=new pg.Pool(databaseSettings());try{await db.query("UPDATE app_schema SET fingerprint=repeat(''f'',64) WHERE singleton");}finally{await db.end();}')
+            $refused = $false
+            try { Invoke-LocalDeployment -Context $context -Action Deploy }
+            catch {
+                if ($_.Exception.ToString() -notmatch 'Database preflight failed') { throw }
+                $refused = $true
+            }
+            $retained = @(Get-OwnedLocalContainers $context | Where-Object Service -eq 'app')[0]
+            if (-not $refused -or $retained.Id -cne $prior.Id -or -not $retained.State.Running -or
+                (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance')) -or
+                (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash -cne $receiptHash) {
+                throw 'Incompatible schema did not refuse before application drain/reset or changed the deployment receipt.'
+            }
+            # This exact disposable fixture deliberately restores only its injected marker.
+            Invoke-LocalOperator $context @('--input-type=module','--eval',
+                "import pg from 'pg';import {databaseSettings} from './backend/src/db/pool.ts';const db=new pg.Pool(databaseSettings());try{await db.query(`"UPDATE app_schema SET fingerprint='$($schema.targetFingerprint)' WHERE singleton`");}finally{await db.end();}")
+            Write-LocalText (Join-Path $Directory 'incompatible-refusal.json') (@{refused=$true;implicitReset=$false;appContainerPreserved=$true;deploymentReceiptPreserved=$true;injectedMarkerRestored=$true} | ConvertTo-Json)
+        }
         $restore = 'agentcontrol_restore_' + ($project -replace '^ac-ltdp-install-','')
         Invoke-LocalDeployment -Context $context -Action Restore -BackupFile $backup -RestoreDatabase $restore
         $retained = @{}
@@ -335,7 +358,8 @@ networks:
         Invoke-LocalDeployment -Context $context -Action Deploy
         if ((Get-FileHash -LiteralPath (Join-Path $context.State 'deployment-operation.json')).Hash -cne $operationHash -or
             @((Get-FreshInstallationResources $context $Directory).containers | Where-Object {$_.Config.Labels.'com.docker.compose.service' -eq 'postgres'})[0].Id -cne $postgresId) { throw 'Ordinary start after reset replayed work or replaced PostgreSQL.' }
-        Write-LocalText (Join-Path $Directory 'result.json') (@{suite=$(if ($CurrentSchemaOnly) {'fresh-installation-current'} else {'fresh-installation'});project=$project;deploy='passed';reset='passed';firstSync=$(if ($CurrentSchemaOnly) {'not_run'} else {'passed'})        ;firstSyncAfterReset='not_run';providerWorkEnabled=($operational.mode -ceq 'normal');savedSessionsAndEpochsDeleted=$true;verifiedStartAfterResetNoReplay=$true;postgresContainerPreserved=$true;retainedConfigurationAndBackups='unchanged';schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
+        Invoke-FreshFirstSync $context $Directory 'recollected'
+        Write-LocalText (Join-Path $Directory 'result.json') (@{suite=$(if ($CurrentSchemaOnly) {'fresh-installation-current'} else {'fresh-installation'});project=$project;deploy='passed';reset='passed';firstSync='passed';firstSyncAfterReset='passed';providerTransport='synthetic fixture only';providerWorkEnabled=($operational.mode -ceq 'normal');savedSessionsAndEpochsDeleted=$true;verifiedStartAfterResetNoReplay=$true;postgresContainerPreserved=$true;retainedConfigurationAndBackups='unchanged';schemaFingerprint=$schema.targetFingerprint;tables=@($before.tables.PSObject.Properties).Count;restartFingerprints='passed';restore=$restore;at=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json)
     } catch { $failures.Add($_.Exception) }
     finally {
         foreach ($tag in @($context.Operator,$context.Image,$context.Checks)) {

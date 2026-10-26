@@ -5,6 +5,26 @@ identity, bounded credentials, audit attribution, and browser/bearer boundaries.
 Its feasibility fixtures are synthetic; unproven bearer identity remains closed,
 and the existing browser authentication and source isolation stay authoritative.
 
+The implemented phases06–07 MCP catalog forwards each named operation through the
+authenticated, request-local canonical API owner. Saved reads do not initiate
+provider work; explicit collection/investigation tools remain delegated-only.
+Exact control adapters use the same current Admin/provider authority, receipts,
+prestate/readback and jobs as the browser. No app-identity fallback, arbitrary
+endpoint or SQL/KQL input is registered. Returned source text is inert untrusted data.
+Selection/source/revision continuations are explicit, and API errors never
+trigger automatic recapture or POST/PATCH/DELETE replay. Tool annotations distinguish
+saved reads from live lookups, submissions and exact confirmed local-cache
+deletion. The60s/four-concurrent/eight-request/two-OBO/524288-output-byte ceilings
+also cover cancellation and the final serialized result. Browser application
+investigations keep their existing authorized configuration/shared-scope flow.
+Stable idempotency keys never authorize automatic mutation retries. Uncertain
+writes require saved status/items and explicit GET-only provider reconciliation.
+Interactive clients must show the exact preview and ask current confirmation;
+scheduled clients use the same current receipt without a human pause. MCP does
+not attest to human intent or accept an approval/bypass flag. Accepted initiator
+is immutable; each lifecycle request carries separate current attribution.
+No optional canary or release/test artifact gates supported controls.
+
 Agent Control uses Microsoft Entra ID for authentication, app roles for product
 authorization, and provider permissions for Microsoft operations.
 
@@ -144,6 +164,119 @@ partial files cannot be published. Uncertain sent provider writes retain their
 existing reconciliation-before-resend gates. See the
 [canonical integration contract](mcp-integration.md#current-canonical-integration).
 
+## FastMCP OAuth state and recovery
+
+The local phase05 Python service uses FastMCP4.1.0's AzureProvider/OAuthProxy
+and verified public token context. A narrow provider validates exact tenant,
+v2 GUID audience, delegated `Mcp.Access`, MCP `azp`, user identity and finite
+times after SDK signature verification. It rejects raw upstream/API/ID tokens
+as downstream credentials, app-only tokens and alternate assertion grants.
+The fixed-tenant API OBO exchange uses only the recovered upstream MCP-audience
+access token; the reference JWT never becomes an API assertion. API roles and
+the existing private native/guest identity proof remain API-owned.
+
+The public SDK reference-JWT verifier establishes an opaque downstream OAuth
+client ID independently of reported labels. It binds SDK transport sessions to
+that client and verified upstream user, while preserving the upstream assertion
+unchanged. Original signed `oid/tid/sub/azp` must remain identical after automatic
+or explicit refresh; a changed identity requires reconnect. This is not a
+vendor/agent identity claim. Reported initialize names/versions and namespaced
+request labels remain untrusted API attribution, not authority.
+
+Only OAuth connection material is stored. The SDK's FileTreeStore supplies
+atomic writes/TTL/culling; its FernetEncryptionWrapper with maintained
+cryptography MultiFernet supplies authenticated encryption. A public wrapper
+rejects the SDK's plaintext-read fallback. All OAuth values, including DCR,
+consent, code, tokens, binding and revocation state, pass through encryption.
+The FileTreeStore's public key-sanitization extension hashes lookup names with
+standard SHA256: OAuth codes must not appear as plaintext filenames. Non-secret
+collection names, hashed lookup filenames and TTL metadata are not a
+customer-data warehouse. MCP stores no SQL connection, provider token cache,
+API assertions, jobs, audit warehouse, scheduler or application records.
+
+Signing and encryption keys are independent protected files, never derived from
+the confidential client credential. The dedicated storage root and descendants
+must be owned by the service UID, directories0700/files0600, without symlinks;
+startup sets umask0077 before the SDK creates files. Run one service instance/
+worker with this volume, not shared multi-worker storage. The bounded store
+admits at most4096 files/64MiB, with conservative write headroom and256KiB per
+plaintext record. Use a dedicated OS/filesystem quota as an additional deployment
+control. OAuth writes stop explicitly at capacity; do not redirect state to an
+ephemeral directory or add Redis/SQL as a fallback.
+Authorization-code consumption is serialized within that one process because
+the file backend's individual atomic writes are not atomic get-and-consume.
+Concurrent redemption still issues exactly one credential pair.
+
+Reference access lifetime is900s. Refresh fallback and **every persisted entry**
+are capped at86400s; known shorter expiries remain shorter. The SDK renews
+upstream tokens within60s of expiry and checks upstream validity on requests.
+Unrefreshed DCR registrations also expire within24h, requiring registration/
+reconnect rather than indefinite forgotten state. Expired state is inaccessible
+and culled on startup/readiness; no background scheduler is added. Back up only
+the protected encrypted OAuth directory and independently escrowed keys, never
+the API data volume into MCP. The encrypted binding sentinel detects a wrong
+key ring or tenant/client/API/resource reuse before readiness. Invalid/corrupt
+state does not become plaintext, an anonymous identity or an empty business
+result.
+
+Restart with the same binding, keys and persistent directory retains supported
+OAuth connections and SDK refresh. An API assertion is reacquired per invocation
+and never recovered from disk. Restart does not resurrect API worker authority.
+To rotate encryption, stop/restart with `[new, previous]` (at most3 keys);
+new writes use the first key and existing records remain readable. Keep the old
+key through the maximum24h retained-entry lifetime and cull expired state before
+removing it. There is no implicit decryption fallback or bulk re-encryption.
+Signing-key rotation intentionally invalidates reference access/refresh JWTs;
+clients reconnect using the same approved OAuth flow. Emergency encryption-key
+replacement also requires reconnect and operator-controlled disposal of the old
+dedicated OAuth state; no automated application-data reset is performed.
+
+OAuth `/revoke` durably tombstones the exact presented reference and the SDK
+removes refresh metadata. A client disconnect must revoke **both access and
+refresh** credentials: each revoked reference fails immediately, including after
+restart, and in-flight adapter work rechecks revocation after awaits. A refresh
+revoked during its upstream await cannot publish newly issued credentials. Revoking
+only refresh prevents renewal but does not revoke an independent outstanding
+access reference; it expires within900s. Unreachable encrypted backing state is
+retained only until its TTL/cull. Entra has no configured RFC7009 revocation
+endpoint here; this does not revoke the tenant's consent or another connection.
+Already accepted API work retains its own ephemeral expiry/internal epoch
+fences; OAuth disconnect does not fabricate account-wide API logout.
+Actual account-wide revocation remains the existing API epoch authority.
+The provider explicitly enables the SDK's public revocation option (it is off
+by default). A small form-boundary normalization supplies an empty optional
+`client_secret` for public clients because MCP SDK2.3.0's revocation model
+otherwise incorrectly requires the field's presence; the maintained SDK still
+owns client authentication, token ownership and RFC7009 handling.
+
+Public health/readiness expose status only; authenticated diagnostics expose
+non-secret service/protocol/storage metadata and the opaque authenticated OAuth
+client ID. Problems are bounded and redact credential fields/JWTs; OBO errors
+expose only bounded standards-defined claims challenges or safe cooldown.
+Challenges accept only the API's `access_token` object and the same bounded
+claim-name/`essential`/`value`/`values` grammar; ID-token or arbitrary diagnostic
+objects are discarded while the reauthorization error remains explicit.
+Expected readiness storage errors emit a non-secret operator error and503;
+unexpected implementation errors are not silently converted into storage status.
+Token-refresh and API-OBO outages remain503/504, not a destructive invalid-grant
+classification; a valid refresh can recover after the outage. Callback failures
+preserve the SDK's error status but replace provider diagnostic text with a safe
+restart instruction; error redirects contain only normalized OAuth errors.
+OAuth endpoint handling has a30s wall deadline, separate from request-body limits.
+Callback responses are non-cacheable. API requests
+explicitly request identity encoding and reject compressed bodies before
+decoding, preserving the finite response budget.
+Secrets, raw provider bodies, prompts and protocol session/connection handles
+must not enter audit labels or diagnostic output. Local tests are synthetic SDK
+proof, not live consent, external revocation timing or real client compatibility.
+The package disables SDK dotenv discovery and native telemetry through its
+supported environment switches before importing FastMCP.
+The pinned SDK logs rejected OAuth codes verbatim at ERROR. A standard Python
+log-record factory therefore normalizes SDK authentication messages/tracebacks
+before any handler sees them, retaining severity, module and source location
+without credential-bearing text. Uvicorn access logging is disabled so callback
+query credentials are not logged.
+
 ## Provider credentials and permissions
 
 Delegated tokens are acquired for the signed-in account and requested only for
@@ -200,6 +333,18 @@ selection never grants permission to dispatch.
 - All authenticated state-changing API requests require a session-bound CSRF token in `X-CSRF-Token`.
 - The backend also requires the request `Origin` to equal the configured application origin. Missing or mismatched `Origin` is rejected; there is no `Referer` fallback.
 - App Service trusts exactly one reverse-proxy hop. Local deployments do not trust forwarding headers unless an operator explicitly sets `TRUST_PROXY=1` for a controlled proxy. The application origin is canonical and singular; wildcard origins and cross-origin API use are unsupported. Client-supplied identity headers never authenticate a caller.
+- That hop policy belongs to the Node API, not the independent MCP container.
+  MCP ignores forwarded headers and retains exact SDK Host/Origin/resource
+  binding. The [Azure MCP profile](azure-production-deployment.md#optional-independent-mcp-app-service)
+  uses a distinct exact user-assigned managed identity, versioned native Key
+  Vault references and one encrypted HTTPS/private-endpoint Blob object. Every
+  mutation is server-fenced by a lease on that exact data blob plus ETag; expired,
+  lost or unknown ownership permanently stops issuance/publication and readiness.
+  There is no separate guard-blob/unfenced-key writer, cached authorization
+  fallback, default credential chain or automatic uncertain-write replay.
+  Exact object-conditioned container RBAC and DNS/egress remain mandatory.
+  Local protected-file ownership/mode guards remain unchanged. MCP failure never
+  disables the independent Node/PostgreSQL path.
 
 ### Permission Center
 

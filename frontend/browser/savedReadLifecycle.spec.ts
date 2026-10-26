@@ -74,7 +74,7 @@ for (const mode of ["active", "idle"] as const) {
   test(`retains saved rows for an accelerated 45-minute ${mode} session with bounded requests`, async ({ page }, info) => {
     await page.clock.install({ time: new Date(layoutTime) });
     await page.clock.pauseAt(new Date(layoutTime));
-    const unexpected = await mockLayoutApi(page);
+    const unexpected = await mockLayoutApi(page, { metadataAfterPermissionCatalog: true });
     const selection = { ...unifiedAgents.selection, evaluatedAt: layoutTime, validatedAt: layoutTime,
       expiresAt: new Date(Date.parse(layoutTime) + 600_000).toISOString() };
     let captures = 0, pages = 0, observers = 0;

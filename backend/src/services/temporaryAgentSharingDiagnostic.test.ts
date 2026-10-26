@@ -110,7 +110,7 @@ describe("temporary two-agent sharing diagnostic", () => {
   it("redacts credential fields inside stringified provider definitions without discarding sharing evidence", async () => {
     const f = await fixture();
     const definition = JSON.stringify({ sharing: { orgWide: false }, authentication: { apiKey: "private embedded credential" },
-      nested: JSON.stringify({ clientSecret: "private nested credential", mode: "chat" }) });
+      nested: JSON.stringify({ clientSecret: "synthetic private nested credential", mode: "chat" }) });
     f.graph.getDiagnosticPackageDetails.mockResolvedValueOnce({ id: "target", futureChatSetting: false, recipients: [],
       optional: null, instructions: definition, access_token: "secret" });
     await expect(f.service.run(f.user, f.context)).resolves.toBe("succeeded");

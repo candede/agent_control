@@ -1,0 +1,52 @@
+services:
+  mcp:
+    image: ${MCP_IMAGE:?MCP image must be explicitly configured}
+    user: "${APP_UID:?MCP requires an owned non-root UID}:${APP_GID:?MCP requires an owned GID}"
+    environment:
+      MCP_TENANT_ID: ${MCP_TENANT_ID:?MCP tenant is required}
+      MCP_CLIENT_ID: ${MCP_CLIENT_ID:?MCP client is required}
+      MCP_API_CLIENT_ID: ${MCP_API_CLIENT_ID:?MCP API client is required}
+      MCP_API_ORIGIN: http://app:3001
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:?MCP public resource is required}
+      MCP_ALLOWED_CLIENT_REDIRECT_URIS: ${MCP_ALLOWED_CLIENT_REDIRECT_URIS:?Exact client callbacks are required}
+      MCP_CLIENT_SECRET_FILE: /run/secrets/mcp-client
+      MCP_JWT_SIGNING_KEY_FILE: /run/secrets/mcp-signing
+      MCP_OAUTH_ENCRYPTION_KEY_FILE: /run/secrets/mcp-encryption
+      MCP_OAUTH_STORAGE_PATH: /var/lib/agent-control-mcp/oauth
+    volumes:
+      - type: bind
+        source: ${LOCAL_STATE_DIR}/secrets/mcp-client
+        target: /run/secrets/mcp-client
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${LOCAL_STATE_DIR}/secrets/mcp-signing
+        target: /run/secrets/mcp-signing
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${LOCAL_STATE_DIR}/secrets/mcp-encryption
+        target: /run/secrets/mcp-encryption
+        read_only: true
+        bind: {create_host_path: false}
+      - type: volume
+        source: mcp-oauth
+        target: /var/lib/agent-control-mcp/oauth
+        volume: {nocopy: true}
+    ports:
+      - "127.0.0.1:${MCP_PORT:?MCP loopback port is required}:8000"
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 75s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  mcp-oauth:

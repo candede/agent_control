@@ -5,6 +5,10 @@ import { browserFixtureTestFiles } from "./fixtureSupport.js";
 const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
 
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "mcp-end-to-end") return [
+    ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/sharedAgentControls.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
   if (suite === "deployment-current") return [
     ["run", "test", "--workspace", "backend", "--", "scripts/databasePreflight.test.ts", "scripts/database.test.ts",
       "scripts/databaseReset.test.ts", "scripts/backup.test.ts", "src/db/auditOriginSchema.test.ts", "src/db/agentControlReceiptsSchema.test.ts",
@@ -27,7 +31,7 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "typecheck", "--workspace", "backend"],
     ["run", "test", "--workspace", "frontend", "--", "src/api/client.test.ts", "src/components/PackageManagement.test.tsx",
       "src/components/BulkActions.test.tsx", "src/components/CopilotStudioQuarantineControls.test.tsx",
-      "src/components/BulkJobItems.test.tsx"],
+      "src/components/PowerPlatformSourceJob.test.tsx"],
     ["run", "build", "--workspace", "frontend"],
     ["run", "lint", "--workspace", "frontend"],
   ];
@@ -643,6 +647,10 @@ export function runFixtureCommand(args: string[], environment: NodeJS.ProcessEnv
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const environment = fixtureEnvironment();
+  if (process.argv[2] === "mcp-end-to-end") {
+    if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY !== "/opt/mcp/.venv/bin/python") throw new Error("SDK fixture image required.");
+    environment.AGENT_CONTROL_MCP_SQL_JOURNEY = "/opt/mcp/.venv/bin/python";
+  }
   if (process.argv[2] === "cutover-browser-contract") Object.assign(environment, {
     AGENT_CONTROL_FIXTURE_MODE: "browser", PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
     PLAYWRIGHT_EVIDENCE_DIR: "/evidence", AGENT_CONTROL_BROWSER_TEST_FILES: browserFixtureTestFiles(process.argv[3] ?? "reportSets.spec.ts").join(","),

@@ -21,6 +21,8 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
 }) {
   const search = useRef<HTMLInputElement>(null);
   const searchId = useId();
+  const resultsHeading = useRef<HTMLHeadingElement>(null);
+  const resultsId = useId();
   const trigger = useRef<HTMLButtonElement>(null);
   const normalizedSearch = normalizeReportSearch(route.search);
   const [settledSearch, setSettledSearch] = useState(normalizedSearch);
@@ -54,6 +56,17 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
   }, revision, !searchPending);
   const loading = searchPending || read.loading;
   const data = read.data;
+  function goToPage(page: number) {
+    if (!read.goToPage?.(page)) return false;
+    resultsHeading.current?.focus({ preventScroll: true });
+    resultsHeading.current?.scrollIntoView({ block: "start" });
+    return true;
+  }
+  const navigation = {
+    ...read, loading, label: "groups", goToPage,
+    previous: () => goToPage((data?.page.number ?? 1) - 1),
+    next: () => goToPage((data?.page.number ?? 1) + 1),
+  };
   return <div className="adoption-view">
     <div className="agent-overview-metrics" role="group" aria-label="Adoption summary" aria-busy={loading}>
       {([
@@ -77,7 +90,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
         </div>
         <div className="agent-query-summary">
           <span className="agent-match-count" role="status" aria-label="Matching groups" aria-atomic="true">
-            <strong>{loading ? "Updating..." : data ? data.counts.filtered.toLocaleString() : "Unavailable"}</strong>{" "}
+            <strong>{data ? data.counts.filtered.toLocaleString() : loading ? "Updating..." : "Unavailable"}</strong>{" "}
             <span>{data?.counts.filtered === 1 ? "matching group" : "matching groups"}</span>
           </span>
           {hasFilters ? <button type="button" className="clear-filters-button" onClick={clearFilters}>Clear filters</button> : null}
@@ -114,11 +127,17 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
     {data && data.reports.availability !== "active" ? <p role="status" className="reported-users-note">
       {data.reports.setId ? "Usage is from a stale saved report." : "Usage is unavailable. Import usage reports in Sync."}
     </p> : null}
+    <div className="adoption-results-heading">
+      <h3 ref={resultsHeading} id={resultsId} tabIndex={-1}>Company &amp; department adoption</h3>
+      <p>Explore people, Copilot Champs, and organization-built agents in each group.</p>
+    </div>
+    <ReportPageControls {...navigation} />
+    <section className="adoption-groups" aria-labelledby={resultsId} aria-busy={loading}>
     {data?.value.map(group => <section className="adoption-group" key={group.id} aria-label={`${group.company} / ${group.department}`}>
-      <header><h3>{group.company} <span>/</span> {group.department}</h3>
+      <header><div className="adoption-group-heading"><span>{group.company}</span><h4>{group.department}</h4></div>
         <small>{group.people.length} {group.people.length === 1 ? "user" : "users"} · {group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</small></header>
       <div className="adoption-group-columns">
-        <div className="adoption-people"><h4>People <small>Agents / responses</small></h4>
+        <div className="adoption-people"><h5>People <small>Agents / responses</small></h5>
           <ul>{group.people.map(person => <li key={person.id}>
             <div><button type="button" className="adoption-name" onClick={() => {
               if (read.isCurrentData(true)) onOpenPerson(person.id);
@@ -129,7 +148,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
             </span>
           </li>)}</ul>
         </div>
-        <div className="adoption-agents"><h4>Agents</h4>
+        <div className="adoption-agents"><h5>Agents</h5>
           <ul>{group.agents.map(agent => <li key={agent.id}>
             <div className="adoption-agent-heading">{onOpenAgent ? <button type="button" className="adoption-name" onClick={() => {
               if (read.isCurrentData(true)) onOpenAgent(agent.id);
@@ -143,6 +162,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
     </section>)}
     {data && !data.value.length ? <p className="reported-users-empty">{data.counts.total
       ? "No groups match your search and filters." : "No saved users to group. Refresh Users in Sync."}</p> : null}
-    <ReportPageControls {...read} label="groups" />
+    </section>
+    <ReportPageControls {...navigation} placement="bottom" />
   </div>;
 }

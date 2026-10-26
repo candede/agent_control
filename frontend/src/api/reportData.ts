@@ -5,7 +5,7 @@ import type { OfficialReportDetail, OfficialReportExportRequest, OfficialReportE
   OfficialReportConfirmation, OfficialReportConfirmed,
   CandidateAgentUsageSummary, CandidateAgentUsageHistory, CandidateAgentUsageAssociations, CandidateAgentUsageMutation, CandidateAgentUsageContext } from "../../../backend/src/types/officialReportApi";
 
-export type ReportPageRequest = ReportQuery & { selectionId?: string; inventorySelectionId?: string; cursor?: string; limit?: number };
+export type ReportPageRequest = ReportQuery & { selectionId?: string; inventorySelectionId?: string; cursor?: string; limit?: number; anchor?: string; pageNumber?: number };
 export function normalizeReportSearch(value: string): string {
   // Match the server's reportSearch so equivalent edits retain selections and facet cursors.
   return value.normalize("NFKC").toLowerCase().normalize("NFKC").trim();

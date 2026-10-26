@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { parse as parseCsv } from "csv-parse/sync";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "../config.js";
 import { activateAccountSession, clearAccountSessionMutationsForTest } from "../db/sessions.js";
 import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
 import { createBearerCredentials } from "../auth/delegatedCredentials.js";
 import { account, browserSession, epochAuthority, oboFetcher, tenant, verifiedBearer } from "../auth/authFoundationTestSupport.js";
-import { deriveActionOrigin, parseStoredOrigin, unknownOrigin, withActionOrigin, currentActionOrigin, parseOriginFilters } from "../services/actionOrigin.js";
+import { deriveActionOrigin, parseStoredOrigin, unknownOrigin, withActionOrigin, currentActionOrigin, parseOriginFilters, originCsv } from "../services/actionOrigin.js";
+import { buildBoundedCsv } from "../services/csvEncoding.js";
 
 const originalTenants = config.tenants;
 let web: Awaited<ReturnType<typeof browserRequestPrincipal>>, bearer: Awaited<ReturnType<typeof createBearerCredentials>>;
@@ -62,5 +64,27 @@ describe("frozen origin v1", () => {
     expect(parseOriginFilters({ originChannel: "unknown", originClientId: "literal_%", originCallingAgentId: "agent" }))
       .toEqual({ originChannel: "unknown", originClientId: "literal_%", originCallingAgentId: "agent" });
     expect(() => parseOriginFilters({ originChannel: ["mcp"] })).toThrow();
+  });
+  it("preserves matched control audit facts and origin evidence through browser/MCP CSV projection", () => {
+    const origins = [
+      deriveActionOrigin(web, randomUUID()),
+      deriveActionOrigin(bearer.principal, randomUUID(), encode({ version: 1,
+        client: { name: "=Reported" }, callingAgent: { id: "caller", name: "<script>inert</script>" } })),
+      unknownOrigin,
+    ];
+    const event = { action: "reconcile-control", agentId: "Studio/Package", status: "inconclusive",
+      actorUsername: "operator@example.invalid", message: "=Unknown readback, never replay" };
+    const rows = origins.map(origin => ({ ...event, ...originCsv(origin) }));
+    const csv = buildBoundedCsv(Object.keys(rows[0]), rows, {
+      maximumRows: 3, maximumBytes: 10000, deadlineAt: Date.now() + 5000,
+    });
+    const parsed = parseCsv(csv.buffer, { columns: true, bom: true });
+    for (const row of parsed) expect(row).toMatchObject({
+      ...event, message: "'" + event.message,
+    });
+    expect(parsed.map((row: Record<string, string>) => row.originChannel)).toEqual(["webapp", "mcp", "unknown"]);
+    expect(parsed[1]).toMatchObject({ originClientName: "'=Reported", originClientNameEvidence: "reported",
+      originCallingAgentName: "<script>inert</script>", originCallingAgentNameEvidence: "reported" });
+    expect(parsed[2]).toMatchObject({ originIntegrationClientId: "", originClientNameEvidence: "unknown" });
   });
 });

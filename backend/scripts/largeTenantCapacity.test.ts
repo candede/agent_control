@@ -28,6 +28,15 @@ import type pg from "pg";
 import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
 
 describe("fixed-budget capacity instrumentation and workload", () => {
+  it("qualifies every page and exact ordered identity of both fixed query cohorts", () => {
+    const runtime = readFileSync(new URL("./large-tenant-capacity.ts", import.meta.url), "utf8");
+    expect(runtime).toContain("assert.equal(rows, count)");
+    expect(runtime).toContain("assert.equal(identityHash, expected.digest");
+    expect(runtime).toContain("assert.equal(timings.length, Math.ceil(count / 100))");
+    expect(runtime).toContain("!cursors.has(cursor)");
+    expect(runtime).not.toContain("timings.length === 3");
+    expect(runtime).toContain("bytes: pageBytes");
+  });
   it("loads real operational state and keeps synthetic session issuance immutable across role renewals", () => {
     const runtime = readFileSync(new URL("./large-tenant-capacity.ts", import.meta.url), "utf8");
     const http = readFileSync(new URL("./capacityHttp.ts", import.meta.url), "utf8");

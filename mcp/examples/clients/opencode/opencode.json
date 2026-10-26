@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "agentControl": {
+      "type": "remote",
+      "url": "https://mcp.example.test/mcp",
+      "oauth": {
+        "scope": "Mcp.Access",
+        "callbackPort": 19876
+      }
+    }
+  }
+}

@@ -11,8 +11,8 @@ const forbiddenSecrets=[
   /\bAKIA[0-9A-Z]{16}\b/,
 ];
 const assignedSecret=/\b(?:client[_-]?secret|password)\s*[:=]\s*["']([^"']{24,})["']/ig;
-const syntheticAssignmentPath=/(^|\/)(?:test|tests|__tests__|frontend\/browser)(\/|$)|\.test\.|backend\/scripts\/(?:testDatabase|cache-load|package-smoke|zip-runtime-smoke|restart-fixture)\.[^/]+$|scripts\/[^/]*(?:test|fixture|smoke)[^/]*\.[^/]+$/i;
-const syntheticValue=/^[A-Za-z0-9_.:@/ +-]*(?:fixture|synthetic|example|never|test|smoke)[A-Za-z0-9_.:@/ +-]*$/i;
+const syntheticAssignmentPath=/(^|\/)(?:test|tests|__tests__|frontend\/browser)(\/|$)|\.test\.|TestSupport\.ts$|backend\/scripts\/(?:testDatabase|cache-load|package-smoke|zip-runtime-smoke|restart-fixture)\.[^/]+$|scripts\/fresh-installation\.ps1$|scripts\/[^/]*(?:test|fixture|smoke)[^/]*\.[^/]+$/i;
+const syntheticValue=/^(?:[A-Za-z0-9_.:@/ +-]|`[nrt]|\\[nrt])*(?:fixture|synthetic|example|never|test|smoke)(?:[A-Za-z0-9_.:@/ +-]|`[nrt]|\\[nrt])*$/i;
 const allowedLicenses=new Set(["0BSD","Apache-2.0","BSD-2-Clause","BSD-3-Clause","CC0-1.0","CC-BY-4.0","ISC","MIT","MIT-0","MPL-2.0","Python-2.0","BlueOak-1.0.0"]);
 const allowedExceptions=new Set();
 
@@ -96,7 +96,7 @@ export function inspectDependencies(directory) {
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      if (entry.name===".bin") continue;
+      if ([".bin",".cache",".vite",".vite-temp"].includes(entry.name)) continue;
       if (entry.name.startsWith("@")) {
         inspect(join(current,entry.name));
         continue;
@@ -154,7 +154,7 @@ function main() {
 
   const target=JSON.parse(readFileSync(join(root,"infra","production-target.example.json"),"utf8"));
   const expectedSecrets=[
-    "agent-control-tenant-id","agent-control-client-id","agent-control-client-secret",
+    "agent-control-tenants-json",
     "agent-control-session-secret","agent-control-postgres-admin-password","agent-control-postgres-app-password",
   ];
   assert.equal(target.contractVersion,2);

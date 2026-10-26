@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agentControl": {
+      "type": "http",
+      "url": "https://mcp.example.test/mcp",
+      "tools": ["list_capabilities"],
+      "headers": {
+        "Authorization": "Bearer $COPILOT_MCP_AGENT_CONTROL_ACCESS_TOKEN"
+      }
+    }
+  }
+}
