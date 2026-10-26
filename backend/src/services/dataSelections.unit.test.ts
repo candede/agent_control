@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { InventoryQueries, type InventoryQuery } from "../db/inventoryQueries.js";
 import { getAgents, getUnifiedAgents } from "../../../frontend/src/api/client.js";
 import { lockInventorySelection } from "../db/inventoryAuthority.js";
+import * as inventorySelections from "../db/inventorySelections.js";
 import { OfficialReportHistory } from "../db/officialReportHistory.js";
 import type { UserSourceMetadata } from "../types/userSources.js";
 import { CursorCodec, DataSelections, canonicalQuery, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
@@ -68,6 +69,92 @@ function fixture() {
   const selections = new DataSelections(database, validate);
   return { database, client, selections, events, validate, query };
 }
+
+describe("inventory selection dependency capacity", () => {
+  it.each([
+    { sortBy: "displayName", directoryAvailable: false, pinCount: 18 },
+    { sortBy: "displayName", directoryAvailable: true, pinCount: 19 },
+    { sortBy: "owner", directoryAvailable: true, pinCount: 20 },
+  ] as const)("captures and continues $pinCount dependencies for 16 inventory sources", async ({ sortBy, directoryAvailable, pinCount }) => {
+    const { database, query } = fixture();
+    const inventory = new InventoryQueries(database, "synthetic-selection-unit-cursor-secret");
+    const inputs = Array.from({ length: 16 }, (_, index) => ({
+      scopeId: `source-${String(index).padStart(2, "0")}`, tenantId: identity.tenantId,
+      baselineId: `source-baseline-${index}`, revision: "1", epoch: "1",
+    }));
+    const source: UserSourceMetadata = {
+      source: "directory", generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
+      attemptedAt: null, attemptStatus: null, attemptObservedCount: null, errorCode: null, message: null,
+      rowCount: null, state: "unavailable", reportRefreshDate: null, period: null, reportVersion: null,
+    };
+    vi.spyOn(inventory.reports.sources, "ensureScope").mockResolvedValue("people");
+    vi.spyOn(inventory.reports.sources, "validateRoot").mockResolvedValue();
+    vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("history");
+    vi.spyOn(inventory.reports.history, "root").mockResolvedValue({
+      kind: "tenant_history", scopeId: "history", revision: "1", expiresAt,
+    });
+    vi.spyOn(inventory.reports.history, "validateRoot").mockResolvedValue();
+    vi.spyOn(inventory.reports, "currentInventoryData").mockResolvedValue({
+      identity, evaluatedAt: at, query: { lowResponseThreshold: 5 },
+      metadata: {
+        directory: directoryAvailable
+          ? { ...source, generationId: "directory-generation", scopeId: "directory", revision: "1", state: "available" }
+          : source,
+        app_activity: { ...source, source: "app_activity" },
+      },
+      report: { setId: null, activeSetId: null, activeRevision: "1", historyRevision: "0", historyEpoch: "0",
+        availability: "never_imported", staleAfterDays: 7, periodAgeDays: null, acceptedAgeDays: null,
+        reportingPeriod: null, acceptedAt: null, expiresAt: null, lineages: [] },
+    });
+    const pins: pg.QueryResultRow[] = [];
+    let rootCount = 0;
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      if (typeof statement !== "string") throw new Error("Unexpected query shape");
+      if (statement.startsWith("SELECT r.scope_id,r.baseline_id,r.revision::text,v.inputs")) {
+        return result([{ scope_id: "canonical", baseline_id: "canonical-baseline", revision: "1", inputs }]);
+      }
+      if (statement.startsWith("SELECT epoch FROM data_scope_epochs")) return result([{ epoch: "1" }]);
+      if (statement.startsWith("SELECT min(expires_at)")) return result([{ expires_at: null }]);
+      if (statement.startsWith("SELECT g.id")) return result([{ id: values?.[0] }]);
+      if (statement.startsWith("SELECT 1 FROM inventory_revisions")) return result([{}]);
+      if (statement.includes("inventory_association_revision")) return result([{ revision: "0" }]);
+      if (statement.startsWith("INSERT INTO inventory_read_contexts")) return result();
+      if (statement.startsWith("INSERT INTO data_read_selections")) rootCount = Number(values?.[11]);
+      if (statement.startsWith("INSERT INTO data_generation_pins")) {
+        if (!values) throw new Error("Missing pin parameters");
+        pins.push({
+          ordinal: values[2], scope_id: values[3], scope_epoch: values[4], session_epoch: values[5],
+          root_kind: values[6], generation_id: values[7], revision: values[8], expires_at: values[9], expired: false,
+        });
+      }
+      if (statement.startsWith("SELECT *,expires_at<=clock_timestamp()")) return result(pins);
+      if (statement.startsWith("SELECT *,clock_timestamp() AS validated_at")) return result([{
+        root_count: rootCount, expires_at: expiresAt, validated_at: at, expired: false, dependencies_expired: false,
+      }]);
+      return original(statement, values);
+    });
+
+    const captured = await inventory.capture(identity, "canonical", { sortBy });
+    expect(rootCount).toBe(pinCount);
+    expect(pins.filter(pin => pin.root_kind === "inventory_delta")).toHaveLength(17);
+    expect(pins.map(pin => pin.ordinal)).toEqual(Array.from({ length: pinCount }, (_, index) => index));
+    await expect(inventory.selections.read(captured.id, identity, async (_client, selected) => selected.pins))
+      .resolves.toEqual(pins);
+  });
+
+  it("rejects more than 20 selection dependencies before taking source fences or saving pins", async () => {
+    const { selections, query, events } = fixture();
+    const oversized: DependencyRoot[] = Array.from({ length: 21 }, (_, index) => ({
+      kind: "tenant_history", scopeId: `scope-${index}`, revision: "1", expiresAt,
+    }));
+    await expect(selections.capture(identity, "inventory", { values: {}, allowed: [] }, oversized))
+      .rejects.toThrow("data_selection_roots");
+    expect(events).toEqual([]);
+    expect(query.mock.calls.some(([statement]) => typeof statement === "string"
+      && statement.startsWith("INSERT INTO data_generation_pins"))).toBe(false);
+  });
+});
 
 describe("selection scope-before-domain lock order", () => {
   it("captures every scope in sorted order before taking any domain revision lock", async () => {
@@ -156,17 +243,17 @@ describe("selection scope-before-domain lock order", () => {
       return original(statement, values);
     });
     const inventory = new InventoryQueries(database, "synthetic-selection-unit-cursor-secret");
-    const validate = vi.spyOn(inventory, "validateRoot").mockRejectedValue(new Error("Unexpected inventory association fence"));
+    const validate = vi.spyOn(inventorySelections, "validateInventoryRoot").mockRejectedValue(new Error("Unexpected inventory association fence"));
     await inventory.selections.connections.run(client => inventory.selections.assert(client, selection.id, identity, "export"));
     expect(validate).not.toHaveBeenCalled();
   });
 
   it.each([
-    { initialSort: "displayName", mutatedSort: null, sourceExpired: false },
-    { initialSort: "displayName", mutatedSort: "owner", sourceExpired: false },
-    { initialSort: "owner", mutatedSort: "responses", sourceExpired: false },
-    { initialSort: "displayName", mutatedSort: null, sourceExpired: true },
-  ] as const)("captures immutable inventory intent and dependencies ($initialSort to $mutatedSort, sourceExpired=$sourceExpired)", async ({ initialSort, mutatedSort, sourceExpired }) => {
+    { initialSort: "displayName", mutatedSort: null, inputExpired: false },
+    { initialSort: "displayName", mutatedSort: "owner", inputExpired: false },
+    { initialSort: "owner", mutatedSort: "responses", inputExpired: false },
+    { initialSort: "displayName", mutatedSort: null, inputExpired: true },
+  ] as const)("captures immutable inventory intent and dependencies ($initialSort to $mutatedSort, inputExpired=$inputExpired)", async ({ initialSort, mutatedSort, inputExpired }) => {
     const { database, client, query, events } = fixture();
     const inventory = new InventoryQueries(database, "synthetic-selection-unit-cursor-secret");
     const suppliedIdentity = { ...identity };
@@ -198,12 +285,14 @@ describe("selection scope-before-domain lock order", () => {
     });
     query.mockImplementation(async (statement: unknown) => {
       if (typeof statement !== "string") throw new Error("Unexpected query shape");
-      if (statement.startsWith("SELECT r.*,g.expires_at")) return result([{ baseline_id: "baseline", revision: "1",
-        expires_at: sourceExpired ? new Date(at.getTime() - 1) : expiresAt }]);
+      if (statement.startsWith("SELECT r.scope_id,r.baseline_id,r.revision::text,v.inputs")) return result([{
+        scope_id: "a", baseline_id: "baseline", revision: "1",
+        inputs: [{ scopeId: "b", tenantId: identity.tenantId, baselineId: "source-baseline", revision: "2", epoch: "1",
+          expiresAt: (inputExpired ? new Date(at.getTime() - 1) : expiresAt).toISOString() }],
+      }]);
       if (statement.startsWith("SELECT epoch FROM data_scope_epochs")) return result([{ epoch: "1" }]);
-      if (statement.startsWith("SELECT inputs FROM inventory_revisions")) return result([{ inputs: [] }]);
       if (statement.startsWith("SELECT min(expires_at)")) return result([{ expires_at: null }]);
-      if (statement === "SELECT inventory_association_revision($1)::text AS revision") {
+      if (statement === "SELECT coalesce(inventory_association_revision($1),0)::text AS revision") {
         events.push("association");
         return result([{ revision: "7" }]);
       }
@@ -213,7 +302,12 @@ describe("selection scope-before-domain lock order", () => {
     vi.spyOn(inventory.selections, "captureWith").mockImplementation(async (_identity, _endpoint, _query, prepare) => {
       const prepared = await prepare(client, at);
       expect(prepared.roots.some(root => root.kind === "user_sources")).toBe(initialSort === "owner");
-      expect(prepared.roots.find(root => root.scopeId === "a")?.expiresAt).toEqual(new Date(at.getTime() + 30 * 60_000));
+      expect(prepared.roots.filter(root => root.kind === "inventory_delta")).toEqual([
+        { kind: "inventory_delta", scopeId: "a", generationId: "baseline", revision: "1",
+          expiresAt: new Date(at.getTime() + 30 * 60_000) },
+        { kind: "inventory_delta", scopeId: "b", generationId: "source-baseline", revision: "2",
+          expiresAt: new Date(at.getTime() + 30 * 60_000) },
+      ]);
       events.push("scopes");
       await prepared.persist?.(client, selection);
       return selection;
@@ -225,6 +319,8 @@ describe("selection scope-before-domain lock order", () => {
       values: { inventoryQuery: canonicalQuery(criteria, Object.keys(criteria)), operationIdPrefix: "REF_CASE" },
       allowed: ["inventoryQuery", "operationIdPrefix"],
     }, expect.any(Function));
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("SELECT r.scope_id,r.baseline_id,r.revision::text,v.inputs"),
+      ["a", identity.tenantId, "delegated"]);
     expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_read_contexts"),
       [selection.id, identity.tenantId, expect.any(String), "7", "a", JSON.stringify(criteria)]);
   });
@@ -246,6 +342,76 @@ describe("selection scope-before-domain lock order", () => {
     });
     expect(events).toEqual(["principal", "scope:a:update", "scope:z:update",
       "principal", "scope:a:update", "scope:z:update", "domain:a", "domain:z"]);
+  });
+});
+
+describe("selected-read completion fences", () => {
+  it.each([
+    { deadline: "selection", expired: true, dependenciesExpired: false, exportId: undefined },
+    { deadline: "dependency", expired: false, dependenciesExpired: true, exportId: undefined },
+    { deadline: "export", expired: true, dependenciesExpired: false, exportId: "export" },
+  ])("rolls back when the $deadline expires during the read callback", async ({ expired, dependenciesExpired, exportId }) => {
+    const { selections, query, validate, client } = fixture();
+    const original = query.getMockImplementation()!;
+    let completed = false;
+    query.mockImplementation(async (statement, values) => {
+      const response = await original(statement, values);
+      if (typeof statement === "string" && statement.startsWith("SELECT *,clock_timestamp() AS validated_at")) {
+        expect(values?.[5]).toBe(exportId ?? null);
+        return result(response.rows.map(row => ({ ...row,
+          expired: completed && expired, dependencies_expired: completed && dependenciesExpired,
+        })));
+      }
+      return response;
+    });
+    const work = vi.fn(async () => { completed = true; return "must not escape"; });
+    await expect(selections.read(selection.id, identity, work, { exportId })).rejects.toMatchObject({
+      status: 409, code: "selection_invalidated", details: { reason: "expired" },
+    });
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(validate).toHaveBeenCalledTimes(roots.length);
+    expect(query).toHaveBeenCalledWith("ROLLBACK");
+    expect(query.mock.calls.some(([statement]) => statement === "COMMIT")).toBe(false);
+    expect(client.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a live result without replaying the callback or domain validators", async () => {
+    const { selections, query, validate } = fixture();
+    const value = { rows: ["selected-row"] };
+    const work = vi.fn(async () => value);
+    await expect(selections.read(selection.id, identity, work)).resolves.toBe(value);
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(validate).toHaveBeenCalledTimes(roots.length);
+    expect(query.mock.calls.filter(([statement]) => typeof statement === "string"
+      && statement.startsWith("SELECT *,clock_timestamp() AS validated_at"))).toHaveLength(2);
+    expect(query).toHaveBeenCalledWith("COMMIT");
+  });
+
+  it("keeps a live export readable beyond the page TTL", async () => {
+    const { selections, query } = fixture();
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      const response = await original(statement, values);
+      if (typeof statement === "string" && statement.startsWith("SELECT *,clock_timestamp() AS validated_at")) {
+        expect(values?.[5]).toBe("export");
+        expect(statement).toContain("e.status IN ('queued','building','ready')");
+        expect(statement).toContain("e.expires_at>clock_timestamp()");
+        return result(response.rows.map(row => ({ ...row, expires_at: new Date(at.getTime() - 1) })));
+      }
+      return response;
+    });
+    await expect(selections.read(selection.id, identity, async () => "export-row", { exportId: "export" }))
+      .resolves.toBe("export-row");
+  });
+
+  it("propagates callback failures without attempting a completion check", async () => {
+    const { selections, query } = fixture();
+    const failure = new Error("selected work failed");
+    await expect(selections.read(selection.id, identity, async () => { throw failure; })).rejects.toBe(failure);
+    expect(query.mock.calls.filter(([statement]) => typeof statement === "string"
+      && statement.startsWith("SELECT *,clock_timestamp() AS validated_at"))).toHaveLength(1);
+    expect(query).toHaveBeenCalledWith("ROLLBACK");
+    expect(query.mock.calls.some(([statement]) => statement === "COMMIT")).toBe(false);
   });
 });
 

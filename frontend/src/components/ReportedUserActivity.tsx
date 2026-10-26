@@ -39,7 +39,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
   const queryKey = JSON.stringify(query);
   const data = read.data;
   const directoryProgress = useUserSourceProgress(data?.sources.directory);
-  const hasCohortEvidence = Boolean(data && ["available", "stale"].includes(data.sources.directory.state) && data.reports.setId);
+  const hasCohortEvidence = Boolean(data && data.sources.directory.state === "available" && data.reports.setId);
   const [initialReadComplete, setInitialReadComplete] = useState(false);
   if (!initialReadComplete && (data || read.error || read.invalidated)) setInitialReadComplete(true);
   const [hasShownPageControls, setHasShownPageControls] = useState(false);
@@ -71,7 +71,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
       defaultCohort="all" search={route.search} searchRef={focus} sort={`${filters.sort}:${filters.order}`}
       sorts={(["responses", "agentsUsed", "lastActivity", "name"] as const).flatMap(sort => (["desc", "asc"] as const).map(order => ({
         value: `${sort}:${order}`, label: `${sort === "responses" ? "Agent responses" : sort === "agentsUsed" ? "Agents used" : sort === "lastActivity" ? "User activity" : "Name"} ${order === "asc" ? "ascending" : "descending"}`,
-      })))} matchingCount={hasCohortEvidence ? data?.counts.filtered : undefined} loading={read.loading} validThreshold={valid} agent={route.agentId}
+      })))} matchingCount={hasCohortEvidence ? data?.counts.filtered : undefined} loading={read.loading || Boolean(directoryProgress && !hasCohortEvidence)} validThreshold={valid} agent={route.agentId}
       onClearAgent={() => onRouteChange({ ...route, agentId: undefined, page: 0 })}
       onSearch={search => onRouteChange({ ...route, search, page: 0 })} onChange={value => {
         setFilters({ ...filters, company: value.company, department: value.department, cohort: value.cohort }); setThreshold(value.lowResponseThreshold);
@@ -80,13 +80,14 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
       exportButton={<ReportExportButton key={JSON.stringify([query, read.invalidated || withdrawsSelectedRead(read.error)])} preserveOnRefresh kind="official_users" selectionId={read.selectedData?.selection.id} label="Export users CSV"
         admissionAllowed={() => read.isCurrentData(true)}
         onSelectionInvalidated={read.invalidateSelection}
-        disabled={!valid || !read.selectedData?.reports.setId || !["available", "stale"].includes(read.selectedData.sources.directory.state)} />} />
+        disabled={!valid || !read.selectedData?.reports.setId || read.selectedData.sources.directory.state !== "available"} />} />
       <div className="table-shell copilot-users-table-shell" role="region" aria-label="Reported user activity" tabIndex={0}><table className="agent-table copilot-users-table reported-users-table">
         <thead><tr><ReportSortHeading label="User" sort="name" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agent responses" sort="responses" query={filters} onChange={setFilters} />
           <ReportSortHeading label="Agents used" sort="agentsUsed" query={filters} onChange={setFilters} />
           <th scope="col">Company</th><th scope="col">Department</th><ReportSortHeading label="Last activity" sort="lastActivity" query={filters} onChange={setFilters} /></tr></thead>
         <tbody>{data?.value.map(user => <tr key={user.username}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
+          if (!read.isCurrentData(true)) return;
           trigger.current = event.currentTarget; setSelected({ username: user.username, selectionId: data.selection.id, queryKey });
         }}>
           {user.displayName || user.username}</button><small>{user.username}</small></th><td data-numeric>{usageCount(user.reportedResponses)}</td>
@@ -107,7 +108,7 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
     {data ? <details className="copilot-users-provenance"><summary>Report sources</summary><UsageReportContext reports={data.reports} inlineSources /></details> : null}
     {selected ? <UserDetailModal key={selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
       filters={route.agentId ? { agentId: route.agentId } : undefined}
-      returnFocusTo={trigger} closeLabel="Close reported user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
+      returnFocusTo={trigger} closeLabel="Close reported user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent} onOpenAdoption={onRouteChange}
       onFocusAgent={(agentId, reportSetId) => {
         if (!read.isCurrentData(true)) return;
         setSelected(undefined); read.restart(); resetFilters(); onRouteChange({ ...route, search: "", agentId, reportSetId, page: 0 });

@@ -56,7 +56,7 @@ function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInve
   </div>;
   return <section className="copilot-users" aria-label="Users and adoption" aria-busy={false}>
     <header className="copilot-users-header"><div><h2>Users</h2><p className="sr-only" id={cohortDescriptionId}>{current.section === "adoption"
-      ? "People and organization-built agents grouped by company and department."
+      ? "People and all agents used, grouped by company and department."
       : current.view === "licenses"
       ? "Effective paid M365 Copilot licenses and adoption."
       : "Agent activity by users without paid Copilot."}</p></div>
@@ -77,10 +77,10 @@ function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInve
     {current.view === "activity" ? <ReportedUserActivity route={current} onRouteChange={change} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
         : <LicensedUsers route={current} change={change} revision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} reportContext={reportContext} />}
     </>}
-    {current.detailId ? <UserDetailModal key={current.detailId} identity={current.detailId} kind="directory"
+    {current.detailId ? <UserDetailModal key={current.detailId} identity={current.detailId} kind="directory" reportSetId={current.reportSetId}
       activeTab={current.detailTab} onTabChange={detailTab => change({ ...current, detailTab })}
       returnFocusTo={current.section === "adoption" ? adoptionTrigger : cohort} closeLabel="Close user details" onClose={() => change({ ...current, detailId: undefined, detailTab: undefined })}
-      dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} /> : null}
+      dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} onOpenAdoption={change} /> : null}
   </section>;
 }
 function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpenAgent, reportContext }: {
@@ -156,6 +156,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
           ["Company", "company"], ["Department", "department"], ["Last activity", "lastActivity"]] as const).map(([label, sort]) =>
           <ReportSortHeading key={sort} label={label} sort={sort} query={filters} onChange={setFilters} />)}</tr></thead>
           <tbody>{data?.value.map(user => <tr key={user.directory.objectId}><th scope="row"><button type="button" className="agent-name-button user-name-button" aria-haspopup="dialog" onClick={event => {
+            if (!read.isCurrentData(true)) return;
             trigger.current = event.currentTarget; setSelected({ id: user.directory.objectId, selectionId: data.selection.id, queryKey });
           }}>
             {user.directory.displayName || user.directory.userPrincipalName}</button><small>{user.directory.userPrincipalName}</small>
@@ -181,14 +182,17 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
         <p>Unknown activity metrics: {usageCount(data.summary.unknownMetricsUsers)}</p>
         {data.summary.unresolvedIdentities > 0 ? <button type="button" className="secondary"
           aria-expanded={unresolvedSelectionId === data.selection.id}
-          onClick={() => setUnresolvedSelectionId(value => value === data.selection.id ? undefined : data.selection.id)}>
+          onClick={() => {
+            if (!read.isCurrentData(true) && unresolvedSelectionId !== data.selection.id) return;
+            setUnresolvedSelectionId(value => value === data.selection.id ? undefined : data.selection.id);
+          }}>
           Unresolved report identities ({data.summary.unresolvedIdentities.toLocaleString()})</button> : null}
         {unresolvedSelectionId === data.selection.id ? <UnresolvedIdentities selectionId={data.selection.id} onRestartSelection={restartSelection}
           onSelectionInvalidated={read.invalidateSelection} /> : null}
       </details>
     </> : null}
     {selected ? <UserDetailModal key={selected.id} identity={selected.id} selectionId={selected.selectionId} kind="directory"
-      returnFocusTo={trigger} closeLabel="Close user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent}
+      returnFocusTo={trigger} closeLabel="Close user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent} onOpenAdoption={change}
       dataRevision={revision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
       onSelectionInvalidated={() => { if (selected.selectionId === read.selectedData?.selection.id) read.invalidateSelection(); }} /> : null}
   </>;

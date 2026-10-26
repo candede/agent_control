@@ -10,8 +10,9 @@ import { ApiError } from "../api/client";
 import { useSavedQueryClient } from "../savedQueries";
 import { CapabilityContext } from "../capabilityContext";
 import { useReportPrincipalScope } from "../useReportPage";
+import { useBrowserAvailability } from "../useBrowserAvailability";
 import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "../selectedRead";
-import type { UserDetailTab } from "../workbenchRouting";
+import { usersRouteSearch, workbenchUrl, type UserDetailTab, type UsersRouteState } from "../workbenchRouting";
 import { usageCount, usageDate } from "../usageInsights";
 import { observeDialogFocus, trapDialogFocus } from "../dialogFocus";
 import { lockBodyScroll } from "../bodyScrollLock";
@@ -29,16 +30,18 @@ const appLabels = {
   wordCopilotLastActivityDate: "Word", excelCopilotLastActivityDate: "Excel", powerpointCopilotLastActivityDate: "PowerPoint",
   outlookCopilotLastActivityDate: "Outlook", onenoteCopilotLastActivityDate: "OneNote", loopCopilotLastActivityDate: "Loop",
 } as const;
-type Props = { identity: string; selectionId?: string; kind: "directory" | "report"; filters?: UserRelationshipFilters;
+type Props = { identity: string; selectionId?: string; reportSetId?: string; kind: "directory" | "report"; filters?: UserRelationshipFilters;
   investigationAgent?: { recordId: string; name: string };
   initialTab?: UserDetailTab;
   activeTab?: UserDetailTab; onTabChange?: (tab: UserDetailTab) => void;
   returnFocusTo: RefObject<HTMLElement | null>; closeLabel: string; onClose: () => void;
   onRestartSelection?: () => void; onSelectionInvalidated?: () => void;
+  onOpenAdoption?: (route: UsersRouteState) => void;
   onFocusAgent?: (agentId: string, reportSetId: string) => void; onOpenAgent?: (id: string) => void; dataRevision?: number; agentInventoryRevision?: number };
-export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, kind, filters, investigationAgent, initialTab = "overview", activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
+export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, reportSetId, kind, filters, investigationAgent, initialTab = "overview", activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, onOpenAdoption, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
   const identity = kind === "directory" ? requestedIdentity.toLowerCase() : requestedIdentity;
   const selectionId = requestedSelectionId?.toLowerCase();
+  const setId = selectionId ? undefined : reportSetId?.toLowerCase();
   const dialog = useRef<HTMLDialogElement>(null), close = useRef<HTMLButtonElement>(null), id = useId();
   const [internalTab, setTab] = useState<UserDetailTab>(initialTab);
   const tab = activeTab ?? internalTab;
@@ -58,31 +61,36 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     setRelationshipQuery(defaultRelationshipQuery);
     setResponsibilityPerson(undefined);
   } else if (!visited.includes(tab)) setVisited([...visited, tab]);
-  const owner = JSON.stringify([principal, kind, identity, selectionId, dataRevision]);
+  const owner = JSON.stringify([principal, kind, identity, selectionId, dataRevision, setId]);
   const [rejected, setRejected] = useState<{ owner: string; error: Error }>();
   if (rejected && rejected.owner !== owner) setRejected(undefined);
   const validIdentity = kind !== "directory" || isGraphGuid(identity);
-  const directUser = kind === "directory" && !selectionId;
+  const directRead = !selectionId;
+  const directUser = kind === "directory" && directRead;
   function changeTab(next: UserDetailTab) {
     setTab(next);
     onTabChange?.(next);
   }
   const path = `${kind === "directory" ? "copilot-usage" : "official-usage"}/users/${encodeURIComponent(identity)}`;
-  const queryKey = useMemo(() => ["saved", "report-detail", principal, kind, identity, selectionId, dataRevision, readRevision],
-    [principal, kind, identity, selectionId, dataRevision, readRevision]);
+  const queryKey = useMemo(() => ["saved", "report-detail", principal, kind, identity, selectionId, dataRevision, readRevision, setId],
+    [principal, kind, identity, selectionId, dataRevision, readRevision, setId]);
   const read = useQuery<OfficialReportDetail<CombinedUser | ReportUser>>({
     queryKey, enabled: cached => validIdentity && rejected?.owner !== owner
       && (!cached.state.data || selectedReadRemaining(cached.state.data.selection) > 0)
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
     gcTime: 0, staleTime: Infinity, structuralSharing: false,
     placeholderData: (previous, query) => query?.queryKey[2] === principal && query.queryKey[3] === kind
-      && query.queryKey[4] === identity ? previous : undefined,
+      && query.queryKey[4] === identity && query.queryKey[8] === setId ? previous : undefined,
     queryFn: async ({ signal }) => {
       const startedAt = performance.now();
-      const result = await readReportDetail<CombinedUser | ReportUser>(path, selectionId, signal);
+      const result = setId
+        ? await readReportDetail<CombinedUser | ReportUser>(path, undefined, signal, setId)
+        : await readReportDetail<CombinedUser | ReportUser>(path, selectionId, signal);
       signal.throwIfAborted();
       const exactIdentity = "directory" in result.value ? result.value.directory.objectId.toLowerCase() : result.value.username;
-      if (selectionId && result.selection.id.toLowerCase() !== selectionId || exactIdentity !== identity || (kind === "directory") !== ("directory" in result.value)) {
+      if (selectionId && result.selection.id.toLowerCase() !== selectionId
+        || setId && result.reports.setId?.toLowerCase() !== setId
+        || exactIdentity !== identity || (kind === "directory") !== ("directory" in result.value)) {
         throw new ApiError(409, "selection_invalidated", "Exact user evidence does not match this selection.");
       }
       return acceptSelectedRead(result, startedAt);
@@ -96,31 +104,33 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     ?? read.error ?? (incompleteRead
       ? new Error(read.isPending || cachedRead?.status === "pending" ? "The user detail read was cancelled. Retry user details." : "User details need reloading. Retry user details.") : null);
   const selectionInvalidated = readError instanceof ApiError && readError.code === "selection_invalidated" && !isExpiredSelection(readError);
-  const observedRead = useRef<{ selection?: string; liveSelection?: string; publication?: string }>({});
+  const missingProfile = directUser && read.error instanceof ApiError && read.error.code === "data_record_not_found";
+  const observedRead = useRef<{ owner?: string; initialPublication?: string; selection?: string; liveSelection?: string; publication?: string }>({});
   const publishedUsers = publication?.revisions?.users;
-  const available = document.visibilityState === "visible" && navigator.onLine;
+  const available = useBrowserAvailability();
   const renewDetail = useEffectEvent(() => {
-    if (directUser) setReadRevision(value => value + 1);
+    if (directRead) setReadRevision(value => value + 1);
     else onRestartSelection?.();
   });
   useEffect(() => {
-    if (!validIdentity || !available || read.isFetching || read.isError && !isExpiredSelection(read.error)) return;
+    if (observedRead.current.owner !== owner) observedRead.current = { owner, initialPublication: publishedUsers };
     const previous = observedRead.current;
+    if (!validIdentity || !available || read.isFetching || read.isError && !isExpiredSelection(read.error) && !missingProfile) return;
     if (read.data && leaseActive) previous.liveSelection = read.data.selection.id;
-    const changed = directUser && publishedUsers && read.data
-      && (previous.publication ?? read.data.selection.publicationRevisions.users) !== publishedUsers;
+    const changed = directRead && publishedUsers && (read.data || missingProfile)
+      && (previous.publication ?? read.data?.selection.publicationRevisions.users ?? previous.initialPublication) !== publishedUsers;
     observedRead.current.publication = publishedUsers;
     if (!changed && (!leaseEnded || !read.data || previous.liveSelection !== read.data.selection.id || previous.selection === read.data.selection.id)) return;
     observedRead.current.selection = read.data?.selection.id;
     renewDetail();
-  }, [available, directUser, leaseActive, leaseEnded, onRestartSelection, publishedUsers, read.data, read.error, read.isError, read.isFetching, validIdentity]);
+  }, [available, directRead, leaseActive, leaseEnded, missingProfile, onRestartSelection, owner, publishedUsers, read.data, read.error, read.isError, read.isFetching, validIdentity]);
   useEffect(() => {
     if (selectionInvalidated) onSelectionInvalidated?.();
   }, [selectionInvalidated, onSelectionInvalidated]);
   useEffect(() => {
-    if (selectionInvalidated && !directUser) void client.cancelQueries({ queryKey, exact: true });
-  }, [client, directUser, queryKey, selectionInvalidated]);
-  const restartSelection = onRestartSelection ?? (directUser ? () => {
+    if (selectionInvalidated && !directRead) void client.cancelQueries({ queryKey, exact: true });
+  }, [client, directRead, queryKey, selectionInvalidated]);
+  const restartSelection = onRestartSelection ?? (directRead ? () => {
     // Cancellation must not restore evidence rejected by a child read.
     void client.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
     setRejected(undefined);
@@ -180,7 +190,6 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     : undefined;
   const name = directory?.directory.displayName || reported?.displayName || evidence?.displayName || evidence?.userPrincipalName || identity;
   const username = directory?.directory.userPrincipalName || reported?.username || evidence?.userPrincipalName || identity;
-  const missingProfile = directUser && read.error instanceof ApiError && read.error.code === "data_record_not_found";
   const restoreFocus = useEffectEvent((previous: Element | null) => {
     const target = returnFocusTo.current;
     if (target?.isConnected) {
@@ -214,6 +223,20 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
       && directory.attention.includes("app_activity_inactive") ? "Review app activity" : null,
     current && directory.copilotServiceState !== "enabled" && directory.copilotServiceState !== "unknown" ? "Review paid features" : null,
   ].filter((value): value is string => value !== null) : [];
+  function organizationValue(field: "Company" | "Department", rawValue: string | null) {
+    const value = rawValue?.trim();
+    if (!value) return "Not reported";
+    const route: UsersRouteState = { view: "licenses", section: "adoption",
+      company: directory?.directory.companyName?.trim() || null,
+      ...(field === "Department" ? { department: value } : {}),
+      reportSetId: detail?.reports.setId ?? undefined, search: "", page: 0 };
+    return <a href={workbenchUrl("users", usersRouteSearch(route))} aria-label={`View adoption for ${field.toLowerCase()} ${value}`}
+      onClick={event => {
+        if (!onOpenAdoption || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        onOpenAdoption(route);
+      }}>{value}</a>;
+  }
   useEffect(() => {
     const panel = dialog.current?.querySelector<HTMLElement>('[role="tabpanel"]:not([hidden])');
     if (panel) panel.scrollTop = 0;
@@ -264,7 +287,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
           {directory && !current ? <p className="copilot-users-notice">Showing saved user details. Refresh Users in Sync to verify current licensing.</p> : null}
           <section className="user-detail-card" aria-label="Saved directory organization"><h3>Organization</h3>
             {directory ? <dl className="user-profile-grid">{([
-              ["Company", directory.directory.companyName || "Not reported"], ["Department", directory.directory.department || "Not reported"],
+              ["Company", organizationValue("Company", directory.directory.companyName)], ["Department", organizationValue("Department", directory.directory.department)],
               ["User type", directory.directory.userType], ["Employee type", directory.directory.employeeType],
               ["Directory account", directory.directory.accountEnabled === false ? "Account disabled" : directory.directory.accountEnabled === true ? "Enabled" : "Unknown"],
             ] as const).filter(([, value]) => value).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>

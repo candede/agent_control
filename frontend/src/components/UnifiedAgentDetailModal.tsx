@@ -14,6 +14,7 @@ import { quarantineTargetKey, quarantineTargetReason } from "../quarantineTarget
 import { CapabilityContext } from "../capabilityContext";
 import { providerActionAllowed } from "../capabilityState";
 import { useAgentPeople } from "../useAgentPeople";
+import type { UsersRouteState } from "../workbenchRouting";
 import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineControls";
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
@@ -66,6 +67,7 @@ type Props = {
   onPeopleChanged?: () => void;
   onQuarantineJobChange?: (job: QuarantineJob) => void;
   onOpenPerson?: (id: string) => void;
+  onOpenAdoption?: (route: UsersRouteState) => void;
 };
 
 export function UnifiedAgentDetailModal({
@@ -102,6 +104,7 @@ export function UnifiedAgentDetailModal({
   onPeopleChanged,
   onQuarantineJobChange,
   onOpenPerson,
+  onOpenAdoption,
 }: Props) {
   const peopleState = useAgentPeople(record, roles, onPeopleChanged);
   const dialog = useRef<HTMLDialogElement>(null);
@@ -128,6 +131,7 @@ export function UnifiedAgentDetailModal({
     setPackageSelection({ ...packageSelection, packageId: record.packages[0].id });
   }
   const requestedPackage = useRef<string | undefined>(undefined);
+  const packageDetailWasLoading = useRef(packageDetailLoading);
   const packageSelectId = useId();
   const inspectAction = useWorkbenchAction("packages.inspect");
   const accessAction = useWorkbenchAction("packages.access");
@@ -155,6 +159,7 @@ export function UnifiedAgentDetailModal({
   ]);
   const currentDetail = packageDetailStale ? undefined : selectedDetail;
   const hasPackageConfirmation = Boolean(packageConfirmation);
+  const inventoryReloadDisabled = packageInventoryPending || packageActionsBusy || hasPackageConfirmation;
   const packageResult = packageResults?.find(result => result.id === selectedPackage?.id);
   const controlError = packageControlError && packageControlError.packageId === selectedPackage?.id ? packageControlError.message : undefined;
   const packageKey = JSON.stringify([
@@ -172,6 +177,10 @@ export function UnifiedAgentDetailModal({
   });
 
   useEffect(() => {
+    if (packageDetailWasLoading.current && !packageDetailLoading && !packageDetailError) {
+      requestedPackage.current = undefined;
+    }
+    packageDetailWasLoading.current = packageDetailLoading;
     if (!selectedPackage) {
       requestedPackage.current = undefined;
       return;
@@ -252,7 +261,7 @@ export function UnifiedAgentDetailModal({
       <header>
         <div><p className="eyebrow">Agent management</p><h2 id="unified-agent-detail-title">{record.displayName}</h2></div>
         {!inventoryError && onRetryInventory ? <button type="button" className="secondary icon-button" aria-label="Reload saved inventory"
-          title="Reload saved inventory" disabled={packageInventoryPending || packageActionsBusy || hasPackageConfirmation}
+          title="Reload saved inventory" disabled={inventoryReloadDisabled}
           onClick={onRetryInventory}><RefreshCw size={18} aria-hidden="true" /></button> : null}
         <button ref={closeButton} type="button" className="icon-button" aria-label="Close unified agent details" onClick={close}><X aria-hidden="true" /></button>
       </header>
@@ -275,7 +284,7 @@ export function UnifiedAgentDetailModal({
       {packageDetailError ? <p className="error-banner unified-agent-detail-error" role="alert">{packageDetailError}</p> : null}
       {inventoryError ? <div className="error-banner unified-agent-detail-error" role="alert">
         <p>{inventoryError}</p>
-        {onRetryInventory ? <button type="button" className="secondary" disabled={packageInventoryPending}
+        {onRetryInventory ? <button type="button" className="secondary" disabled={inventoryReloadDisabled}
           onClick={onRetryInventory}>Retry saved inventory</button> : null}
       </div> : null}
       <section ref={panel} id={`unified-agent-panel-${selectedTab}`} role="tabpanel" aria-labelledby={`unified-agent-tab-${selectedTab}`} tabIndex={0} className="inventory-detail-section">
@@ -316,6 +325,7 @@ export function UnifiedAgentDetailModal({
           onInvalidated={() => { if (selectionId) onInventoryInvalidated?.(selectionId); }} /> : null}
         {selectedTab === "reports" || selectedTab === "users" ? <AgentUsagePanel key={record.id}
           view={selectedTab === "reports" ? "usage" : "users"}
+          onOpenAdoption={onOpenAdoption}
           record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId?.toLowerCase(), inventoryRevision])} dataRevision={dataRevision}
           inventorySelectionId={selectionId} onReloadInventory={onRetryInventory}
           canRemoveReviewedAssociations={canManage}

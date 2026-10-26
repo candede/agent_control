@@ -4,7 +4,7 @@ import type { UserSourceMetadata } from "./userSources.js";
 export type AdoptionPerson = {
   id: string;
   name: string;
-  agents: number;
+  agents: number | null;
   responses: number | null;
   champion: boolean;
 };
@@ -14,7 +14,8 @@ export type AdoptionAgent = {
   name: string;
   /** Bounded preview. Full saved text is provided by the selected inventory About contract. */
   description: string | null;
-  type: string | null;
+  creatorType: string | null;
+  inventoryId: string | null;
 };
 
 export type AdoptionGroup = {
@@ -28,6 +29,5 @@ export type AdoptionGroup = {
 export type AdoptionPage = ReportListPage<AdoptionGroup> & {
   page: ReportListPage<AdoptionGroup>["page"] & { number: number; offset: number };
   directory: UserSourceMetadata;
-  inventoryAvailable: boolean;
-  summary: { people: number; champs: number; agents: number };
+  summary: { people: number; champs: number; agents: number | null };
 };

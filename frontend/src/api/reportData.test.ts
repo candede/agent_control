@@ -2,11 +2,21 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { ApiError, request } from "./client";
 import { cancelReportExport, createReportExport, mutateAgentReportAssociation, normalizeReportSearch, previewReportBundle, reportExportStatus, stageReport,
-  readAgentReportHistory } from "./reportData";
+  readAgentReportHistory, readReportDetail } from "./reportData";
 import type { CandidateAgentUsageMutation } from "../../../backend/src/types/officialReportApi";
 
 vi.mock("./client", async original => ({ ...await original<typeof import("./client")>(), request: vi.fn() }));
 afterEach(() => { vi.useRealTimers(); vi.mocked(request).mockReset(); });
+it.each([
+  { selectionId: undefined, setId: undefined, suffix: "" },
+  { selectionId: "owned-selection", setId: undefined, suffix: "?selectionId=owned-selection" },
+  { selectionId: undefined, setId: "historical-report", suffix: "?setId=historical-report" },
+])("scopes exact details with $suffix", async ({ selectionId, setId, suffix }) => {
+  const signal = new AbortController().signal;
+  await readReportDetail("copilot-usage/users/exact-user", selectionId, signal, setId);
+  expect(request).toHaveBeenCalledExactlyOnceWith(`/api/copilot-usage/users/exact-user${suffix}`, { signal });
+});
+
 it("uses canonical pinned agent history routes with paired history windows", async () => {
   await readAgentReportHistory("agent:exact", { selectionId: "inventory-selection", inventorySelectionId: "inventory-selection", compareFromSetId: "from", compareToSetId: "to" });
   expect(request).toHaveBeenLastCalledWith("/api/agent-inventory/agent%3Aexact/usage-history?selectionId=inventory-selection&inventorySelectionId=inventory-selection&compareFromSetId=from&compareToSetId=to", { signal: undefined });

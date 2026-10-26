@@ -47,21 +47,21 @@
   },
   "caseB": {
     "champions": [
-      {"person": 1, "rank": 1, "created": 3, "responses": 10, "agents": 4},
-      {"person": 2, "rank": 2, "created": 2, "responses": 50, "agents": 3},
-      {"person": 3, "rank": 3, "created": 2, "responses": 20, "agents": 8}
+      {"person": 4, "rank": 1, "created": 0, "responses": 100, "agents": 1},
+      {"person": 2, "rank": 2, "created": 2, "responses": 50, "agents": 2},
+      {"person": 3, "rank": 3, "created": 2, "responses": 20, "agents": 7}
     ],
-    "createdEdges": [[1,1],[1,2],[1,3],[2,4],[2,5],[3,6],[3,7]],
-    "usedEdges": [[1,1],[1,9],[2,4],[2,10],[3,6],[3,11],[3,12],[3,13],[3,14],[3,15],[3,16]],
+    "createdEdges": [[2,4],[2,5],[3,6],[3,7]],
+    "usedEdges": [[4,8],[2,4],[2,10],[3,6],[3,11],[3,12],[3,13],[3,14],[3,15],[3,16]],
     "reportOnlyEdge": {"person": 2, "id": "report:P_extra"},
-    "excluded": {"person": 4, "agent": 8, "reportAgent": "P_nonchampion"},
-    "associationCount": 19,
+    "excluded": {"person": 1, "agent": 9, "reportAgent": "P_extra_9"},
+    "associationCount": 15,
     "claims": {
-      "championIds": ["20000000-0000-4000-8000-000000000001","20000000-0000-4000-8000-000000000002","20000000-0000-4000-8000-000000000003"],
-      "associationCount": 19,
-      "distinctCanonicalAgents": 15,
+      "championIds": ["20000000-0000-4000-8000-000000000004","20000000-0000-4000-8000-000000000002","20000000-0000-4000-8000-000000000003"],
+      "associationCount": 15,
+      "distinctCanonicalAgents": 12,
       "reportOnlyAgents": ["report:P_extra"],
-      "departmentAgent8IsChampionAssociation": false,
+      "departmentAgent9IsChampionAssociation": false,
       "rankingAuthority": "API"
     }
   },

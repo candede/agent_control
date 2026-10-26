@@ -50,7 +50,7 @@ function requestQuery(endpoint: ReportEndpoint, query: Record<string, unknown>):
   for (const [key, value] of Object.entries(query)) {
     if (["selectionId", "cursor", "limit"].includes(key)) continue;
     if (!reportQueryFields.includes(key as typeof reportQueryFields[number])) throw new AppError(400, "invalid_usage_query", "Unsupported query parameter.");
-    const text = key === "creatorType" && value === "" ? "" : scalar(value);
+    const text = key === "creatorType" && typeof value === "string" ? value : scalar(value);
     values[key] = ["inactiveDays", "activityWindowDays", "lowResponseThreshold"].includes(key) ? Number(text)
       : key === "responsesOnly" ? text === "true" ? true : text === "false" ? false : text
         : (key === "company" || key === "department") ? text === "~null" ? null : text.startsWith("~string:") ? text.slice(8) : text : text;

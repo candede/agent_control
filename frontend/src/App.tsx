@@ -1590,6 +1590,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         .then(result => { if (!abort.signal.aborted && sessionOwnerRef.current === owner) setGroupTargetCount({ key: groupTargetKey, count: result.count }); })
         .catch(error => {
           if (abort.signal.aborted || sessionOwnerRef.current !== owner) return;
+          if (isExpiredSelection(error)) {
+            setExpiredAgentSelection(selectionId);
+            return;
+          }
           if (error instanceof ApiError && ["selection_invalidated", "inventory_changed"].includes(error.code)) {
             invalidateBookmarkedInventory(selectionId);
             return;
@@ -3758,6 +3762,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             navigateToView("users");
             handleUsersRouteChange({ view: "licenses", detailId: personId, detailTab: "responsibility", search: "", page: 0 }, true);
           }}
+          onOpenAdoption={route => {
+            if (!ownsAgentScope(principalKey)) return;
+            navigateToView("users");
+            handleUsersRouteChange(route, true);
+          }}
           usageContext={unifiedAgentDetailPage?.sourcePage?.usageContext}
           inventoryRevision={unifiedAgentDetailPage?.sourcePage?.selection.revision}
           inventoryError={unifiedAgentReadError}
@@ -3792,7 +3801,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           packageInventoryPending={loadingAgents || unifiedAgentDetailPage?.listPage !== unifiedAgentPage}
           packageDetailLoading={Boolean(loadingAgentDetailId)}
           packageDetailError={agentDetailError}
-          packageActionsBusy={Boolean(busyAgentId || busyBulkAction || refreshingAgents)}
+          packageActionsBusy={Boolean(busyAgentId || busyBulkAction || preparingBulkAction || refreshingAgents)}
           packageActionsBlockedReason={agentLeaseEnded ? "Refreshing saved inventory..." : bulkJobStatusUnrecognized ? jobStatusMessage(undefined) : undefined}
           onUpdatePackageAccess={handleInlineAccessUpdate}
           packageAccessRevisions={packageAccessRevisions}

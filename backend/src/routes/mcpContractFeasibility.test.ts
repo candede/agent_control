@@ -340,21 +340,18 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     const reports = new LargeTenantUsersReports(fakePool, secret, 7);
     const context = {
       identity, query: reportQuery("adoption"), endpoint: "adoption", queryHash: "synthetic",
-      tokenMode: "delegated", report: { setId: null },
+      tokenMode: "delegated", report: { setId: null, lineages: [] },
       metadata: { directory: { generationId: null }, app_activity: { generationId: null } },
       selection: { id: selected.selectionId, revision: selected.revision }, evaluatedAt: new Date("2026-01-31T00:00:00Z"),
     } as ReportReadContext;
     const dataset = adoptionDataset(reports, context);
     expect(dataset.relations).toContain("user_agents AS");
-    expect(dataset.relations).toContain("SELECT * FROM creators UNION SELECT * FROM used");
-    const implementation = readFileSync(resolve(root, "backend/src/services/adoptionGroups.ts"), "utf8");
-    expect(implementation).toContain('created DESC,responses DESC NULLS LAST,agents::bigint DESC,lower(name) COLLATE "C",identity');
-    expect(implementation).toContain("rank<=3 AND (created>0 OR coalesce(responses,0)>0)");
-    const expectedChampions = ["p1", "p2", "p3"];
-    const expectedChampionAgents = ["P_p1", "P_p2", "P_p3"];
-    expect(expectedChampions).not.toContain("p4");
-    expect(expectedChampionAgents).not.toContain("P_nonchampion");
-    expect(document).toContain("p1=(3,10,4),p2=(2,50,3),p3=(2,20,8)");
+    expect(dataset.relations).not.toContain("creators");
+    expect(dataset.relations).not.toContain("current_agents");
+    expect(dataset.relations).toContain("WHERE r.kind='userAgents' AND r.responses>0");
+    expect(dataset.relations).toContain('responses DESC NULLS LAST,agents DESC,lower(name) COLLATE "C",identity');
+    expect(dataset.relations).toContain("rank<=3 AND (coalesce(responses,0)>0 OR agents>0)");
+    expect(document).toContain("p1=(3,10,2),p2=(2,50,2),p3=(2,20,7)");
     expect(document).toContain("Jan->Mar comparable50%");
     expect(document).toContain("Jan->overlap/Jan->Apr/undated not growth");
   });

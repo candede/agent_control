@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createRef, type ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +7,9 @@ import type { ReportRelationship } from "../../../backend/src/types/officialRepo
 import { ApiError, getAgentResponsibility } from "../api/client";
 import { readReportDetail, readReportPage } from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
+import { PublicationContext } from "../publicationContext";
 import { createSavedQueryClient } from "../savedQueries";
+import { parseUsersRoute } from "../workbenchRouting";
 import { responsibilityFixture } from "../test/agentResponsibilityFixture";
 import { deferred } from "../test/deferred";
 import { mockNativeDialogs } from "../test/dialog";
@@ -44,6 +46,97 @@ beforeEach(() => {
 });
 
 describe("user detail lifecycle", () => {
+  it.each(["Company", "Department"] as const)("links %s to a clean, report-scoped Adoption route", async field => {
+    const saved = evidence(combinedUser());
+    saved.value.directory.companyName = "  H\u00f4pital & Health / +  ";
+    saved.value.directory.department = "  R&D + Nursing (Dep)  ";
+    saved.reports.setId = "10000000-0000-4000-8000-000000000099";
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    const onOpenAdoption = vi.fn(), settings = props({ onOpenAdoption });
+    render(<UserDetailModal {...settings} />);
+    const value = (field === "Company" ? saved.value.directory.companyName : saved.value.directory.department).trim();
+    const link = await screen.findByRole<HTMLAnchorElement>("link", { name: `View adoption for ${field.toLowerCase()} ${value}` });
+    const url = new URL(link.href);
+    expect(url.pathname).toBe("/users");
+    expect([...url.searchParams.keys()].sort()).toEqual(
+      (field === "Company" ? ["section", "company", "snapshot"] : ["section", "company", "department", "snapshot"]).sort());
+    const destination = { view: "licenses", section: "adoption", company: "H\u00f4pital & Health / +",
+      ...(field === "Department" ? { department: "R&D + Nursing (Dep)" } : {}),
+      reportSetId: saved.reports.setId, search: "", page: 0 };
+    expect(parseUsersRoute(url.search)).toMatchObject(destination);
+    fireEvent.click(link);
+    expect(onOpenAdoption).toHaveBeenCalledExactlyOnceWith(destination);
+    expect(settings.onClose).not.toHaveBeenCalled();
+  });
+
+  it("preserves native modified-click navigation without closing details", async () => {
+    const onOpenAdoption = vi.fn(), settings = props({ onOpenAdoption }), handled: boolean[] = [];
+    render(<div onClick={event => { handled.push(event.defaultPrevented); event.preventDefault(); }}>
+      <UserDetailModal {...settings} />
+    </div>);
+    const link = await screen.findByRole("link", { name: "View adoption for company Contoso" });
+    for (const gesture of [{ ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 }]) {
+      fireEvent.click(link, gesture);
+    }
+    expect(handled).toEqual([false, false, false, false, false]);
+    expect(onOpenAdoption).not.toHaveBeenCalled();
+    expect(settings.onClose).not.toHaveBeenCalled();
+    fireEvent.click(link);
+    expect(handled.at(-1)).toBe(true);
+    expect(onOpenAdoption).toHaveBeenCalledOnce();
+  });
+
+  it.each([null, "   "])("keeps missing organization values (%j) as plain text", async missing => {
+    const saved = evidence(combinedUser());
+    saved.value.directory.companyName = missing;
+    saved.value.directory.department = missing;
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    render(<UserDetailModal {...props()} />);
+    const organization = await screen.findByRole("region", { name: "Saved directory organization" });
+    expect(within(organization).getAllByText("Not reported")).toHaveLength(2);
+    expect(within(organization).queryByRole("link")).not.toBeInTheDocument();
+  });
+
+  it.each([null, "   "])("scopes a department without a company (%j) to the missing-company group", async company => {
+    const saved = evidence(combinedUser());
+    saved.value.directory.companyName = company;
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    render(<UserDetailModal {...props()} />);
+    const link = await screen.findByRole<HTMLAnchorElement>("link", { name: "View adoption for department Engineering" });
+    const url = new URL(link.href);
+    expect(url.searchParams.get("company")).toBe("~null");
+    expect(parseUsersRoute(url.search)).toMatchObject({ section: "adoption", company: null, department: "Engineering" });
+    expect(screen.queryByRole("link", { name: /View adoption for company/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps literal facet markers distinct from missing organization values", async () => {
+    const saved = evidence(combinedUser());
+    saved.value.directory.companyName = "~null";
+    saved.value.directory.department = "~string:null";
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    render(<UserDetailModal {...props()} />);
+    const link = await screen.findByRole<HTMLAnchorElement>("link", { name: "View adoption for department ~string:null" });
+    expect(parseUsersRoute(new URL(link.href).search)).toMatchObject({ company: "~null", department: "~string:null" });
+  });
+
+  it("uses verified directory organization, not report labels, for reported-user links", async () => {
+    const reported = evidence(reportUser(1, { company: "Report company", department: "Report department" }));
+    vi.mocked(readReportDetail).mockImplementation(async path => path.endsWith("/directory") ? evidence(combinedUser()) : reported);
+    render(<UserDetailModal {...props({ kind: "report", identity: reported.value.username, selectionId: reported.selection.id })} />);
+    const link = await screen.findByRole<HTMLAnchorElement>("link", { name: "View adoption for department Engineering" });
+    expect(parseUsersRoute(new URL(link.href).search)).toMatchObject({ company: "Contoso", department: "Engineering",
+      reportSetId: reported.reports.setId });
+    expect(screen.queryByRole("link", { name: /Report company|Report department/ })).not.toBeInTheDocument();
+  });
+
+  it("does not fabricate organization links for an unresolved reported user", async () => {
+    const reported = evidence(reportUser(1, { objectId: null }));
+    vi.mocked(readReportDetail).mockResolvedValue(reported);
+    render(<UserDetailModal {...props({ kind: "report", identity: reported.value.username })} />);
+    await screen.findByText("Organization details are unavailable for this report identity.");
+    expect(within(screen.getByRole("region", { name: "Saved directory organization" })).queryByRole("link")).not.toBeInTheDocument();
+  });
+
   it("opens paid-feature details for a Graph GUID without UUID version or variant restrictions", async () => {
     const objectId = "aaaaaaaa-aaaa-7aaa-1aaa-aaaaaaaaaaaa";
     const saved = evidence(combinedUser());
@@ -153,12 +246,15 @@ describe("user detail lifecycle", () => {
     });
   });
 
-  it("does not revive a rejected child selection when its direct-user restart is cancelled", async () => {
-    const client = createSavedQueryClient();
+  it.each(["directory", "report"] as const)("does not revive a rejected child selection when its independent %s restart is cancelled", async kind => {
+    const client = createSavedQueryClient(), saved = evidence(kind === "directory" ? combinedUser() : reportUser());
+    vi.mocked(readReportDetail).mockImplementation(async path => path.endsWith("/directory") ? evidence(combinedUser()) : saved);
     vi.mocked(readReportPage).mockRejectedValue(new ApiError(409, "selection_invalidated", "User selection changed."));
-    render(<QueryClientProvider client={client}><UserDetailModal {...props({ activeTab: "licenses" })} /></QueryClientProvider>);
+    render(<QueryClientProvider client={client}><UserDetailModal {...props({
+      kind, identity: kind === "directory" ? combinedUser().directory.objectId : reportUser().username, activeTab: "licenses",
+    })} /></QueryClientProvider>);
     const restart = await screen.findByRole("button", { name: "Restart selection" });
-    const pending = deferred<ReturnType<typeof evidence>>();
+    const pending = deferred<typeof saved>();
     vi.mocked(readReportDetail).mockReturnValue(pending.promise);
     fireEvent.click(restart);
     await screen.findByText("Loading exact user details...");
@@ -166,7 +262,7 @@ describe("user detail lifecycle", () => {
     expect(await screen.findByRole("button", { name: "Retry user details" })).toBeVisible();
     expect(screen.queryByText(/Loading exact user details/)).not.toBeInTheDocument();
     expect(readReportPage).toHaveBeenCalledOnce();
-    await act(async () => pending.resolve(evidence(combinedUser())));
+    await act(async () => pending.resolve(saved));
     expect(screen.getByRole("button", { name: "Retry user details" })).toBeVisible();
     expect(readReportPage).toHaveBeenCalledOnce();
   });
@@ -183,6 +279,163 @@ describe("user detail lifecycle", () => {
     fireEvent.click(restart);
     expect(await screen.findByText("Contoso")).toBeVisible();
     expect(readReportDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["licenses", "usage"] as const)("restarts an independently opened reported user after its %s child rejects the selection", async activeTab => {
+    const reported = evidence(reportUser()), saved = evidence(combinedUser());
+    vi.mocked(readReportDetail).mockImplementation(async path => path.endsWith("/directory") ? saved : reported);
+    vi.mocked(readReportPage).mockRejectedValue(new ApiError(409, "selection_invalidated", "User selection changed."));
+    render(<UserDetailModal {...props({ kind: "report", identity: reported.value.username, activeTab })} />);
+    const restart = await screen.findByRole("button", { name: "Restart selection" });
+    const replacement = evidence(reportUser()), directory = evidence(combinedUser());
+    replacement.selection.id = directory.selection.id = "20000000-0000-4000-8000-000000000009";
+    vi.mocked(readReportDetail).mockImplementation(async path => path.endsWith("/directory") ? directory : replacement);
+    vi.mocked(readReportPage).mockResolvedValue(reportPage([], {
+      selection: replacement.selection, counts: { total: 0, filtered: 0 },
+    }));
+    fireEvent.click(restart);
+    expect(await screen.findByText(activeTab === "licenses"
+      ? "Paid-feature status is unavailable. Refresh Users in Sync." : "No agent relationships reported")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(readReportDetail).toHaveBeenCalledTimes(4);
+    expect(readReportPage).toHaveBeenLastCalledWith(expect.any(String),
+      expect.objectContaining({ selectionId: replacement.selection.id }), expect.any(AbortSignal));
+  });
+
+  it.each(["directory", "report"] as const)("automatically renews an independently opened %s user without changing its report set", async kind => {
+    const saved = evidence(kind === "directory" ? combinedUser() : reportUser(1, { objectId: null }));
+    const replacement = evidence({ ...saved.value, ...(kind === "report" ? { displayName: "Renewed report user" } : {}) });
+    saved.selection.expiresAt = new Date(Date.now() + 5000).toISOString();
+    replacement.selection.id = "20000000-0000-4000-8000-000000000009";
+    vi.mocked(readReportDetail).mockResolvedValueOnce(saved).mockResolvedValue(replacement);
+    const identity = kind === "directory" ? combinedUser().directory.objectId : reportUser().username;
+    render(<UserDetailModal {...props({ kind, identity, reportSetId: saved.reports.setId! })} />);
+    await screen.findByRole("region", { name: "Saved directory organization" });
+    vi.spyOn(performance, "now").mockReturnValue(performance.now() + 6000);
+    fireEvent.focus(window);
+    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(2));
+    expect(readReportDetail).toHaveBeenLastCalledWith(
+      `${kind === "directory" ? "copilot-usage" : "official-usage"}/users/${encodeURIComponent(identity)}`,
+      undefined, expect.any(AbortSignal), saved.reports.setId);
+    await waitFor(() => expect(screen.queryByText("Loading exact user details...")).not.toBeInTheDocument());
+    fireEvent.focus(window);
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["during", "after"] as const)("recovers a missing direct user when Users publishes %s the initial read", async timing => {
+    const saved = evidence(combinedUser()), pending = deferred<typeof saved>();
+    const initial = saved.selection.publicationRevisions, published = { ...initial, users: "4".repeat(64) };
+    saved.selection.publicationRevisions = published;
+    const settings = props({ reportSetId: saved.reports.setId! });
+    const content = (revisions = initial) => <PublicationContext value={{ admit: vi.fn(), revisions }}>
+      <UserDetailModal {...settings} />
+    </PublicationContext>;
+    vi.mocked(readReportDetail).mockReturnValueOnce(pending.promise).mockResolvedValue(saved);
+    const view = render(content());
+    if (timing === "during") view.rerender(content(published));
+    await act(async () => pending.reject(new ApiError(404, "data_record_not_found", "Exact user is not saved.")));
+    if (timing === "after") {
+      await screen.findByText(/This user is not in the saved Users directory/);
+      view.rerender(content());
+      fireEvent.focus(window);
+      expect(readReportDetail).toHaveBeenCalledOnce();
+      view.rerender(content(published));
+    }
+    expect(await screen.findByText("Contoso")).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+    expect(readReportDetail).toHaveBeenLastCalledWith(
+      `copilot-usage/users/${saved.value.directory.objectId}`, undefined, expect.any(AbortSignal), saved.reports.setId);
+    view.rerender(content(published));
+    fireEvent.focus(window);
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/This user is not in the saved Users directory/)).not.toBeInTheDocument();
+  });
+
+  it.each(["hidden", "offline"] as const)("resumes missing-user publication recovery after the browser was %s", async state => {
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(true);
+    const saved = evidence(combinedUser()), initial = saved.selection.publicationRevisions;
+    const published = { ...initial, users: "4".repeat(64) }, settings = props();
+    saved.selection.publicationRevisions = published;
+    const content = (revisions = initial) => <PublicationContext value={{ admit: vi.fn(), revisions }}>
+      <UserDetailModal {...settings} />
+    </PublicationContext>;
+    vi.mocked(readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Exact user is not saved."));
+    const view = render(content());
+    await screen.findByText(/This user is not in the saved Users directory/);
+    visibility.mockReturnValue(state === "hidden" ? "hidden" : "visible");
+    online.mockReturnValue(state !== "offline");
+    act(() => state === "hidden" ? document.dispatchEvent(new Event("visibilitychange")) : window.dispatchEvent(new Event("offline")));
+    view.rerender(content(published));
+    expect(readReportDetail).toHaveBeenCalledOnce();
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    visibility.mockReturnValue("visible");
+    online.mockReturnValue(true);
+    act(() => state === "hidden" ? document.dispatchEvent(new Event("visibilitychange")) : window.dispatchEvent(new Event("online")));
+    expect(await screen.findByText("Contoso")).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a still-missing direct user only once per new Users publication", async () => {
+    const saved = evidence(combinedUser()), initial = saved.selection.publicationRevisions, settings = props();
+    const published = { ...initial, users: "4".repeat(64) };
+    const content = (revisions = initial) => <PublicationContext value={{ admit: vi.fn(), revisions }}>
+      <UserDetailModal {...settings} />
+    </PublicationContext>;
+    vi.mocked(readReportDetail).mockRejectedValue(new ApiError(404, "data_record_not_found", "Exact user is not saved."));
+    const view = render(content());
+    await screen.findByText(/This user is not in the saved Users directory/);
+    view.rerender(content(published));
+    await waitFor(() => expect(readReportDetail).toHaveBeenCalledTimes(2));
+    await screen.findByText(/This user is not in the saved Users directory/);
+    view.rerender(content(published));
+    fireEvent.focus(window);
+    expect(readReportDetail).toHaveBeenCalledTimes(2);
+    saved.selection.publicationRevisions = { ...initial, users: "5".repeat(64) };
+    vi.mocked(readReportDetail).mockResolvedValue(saved);
+    view.rerender(content(saved.selection.publicationRevisions));
+    expect(await screen.findByText("Contoso")).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([401, 403, 409])("does not replay a %s rejection when Users publishes", async status => {
+    const initial = evidence(combinedUser()).selection.publicationRevisions, settings = props();
+    const content = (revisions = initial) => <PublicationContext value={{ admit: vi.fn(), revisions }}>
+      <UserDetailModal {...settings} />
+    </PublicationContext>;
+    vi.mocked(readReportDetail).mockRejectedValue(new ApiError(status,
+      status === 409 ? "selection_invalidated" : "access_denied", "User details were rejected."));
+    const view = render(content());
+    expect(await screen.findByRole("alert")).toHaveTextContent("User details were rejected.");
+    view.rerender(content({ ...initial, users: "4".repeat(64) }));
+    fireEvent.focus(window);
+    expect(readReportDetail).toHaveBeenCalledOnce();
+    expect(screen.getByRole("alert")).toHaveTextContent("User details were rejected.");
+    expect(screen.queryByText("Contoso")).not.toBeInTheDocument();
+  });
+
+  it.each(["identity", "principal"] as const)("does not carry publication observations across a different %s owner", async boundary => {
+    const saved = evidence(combinedUser()), replacement = evidence(combinedUser(boundary === "identity" ? 2 : 1));
+    const published = { ...saved.selection.publicationRevisions, users: "4".repeat(64) };
+    saved.selection.publicationRevisions = published;
+    const fresh = structuredClone(replacement);
+    fresh.selection.id = "20000000-0000-4000-8000-000000000009";
+    fresh.selection.publicationRevisions = published;
+    fresh.value.directory.companyName = "Current company";
+    vi.mocked(readReportDetail).mockResolvedValueOnce(saved).mockResolvedValueOnce(replacement).mockResolvedValue(fresh);
+    const settings = props();
+    const content = (changed = false) => <CapabilityContext value={{ ...capability, user: {
+      ...capability.user!, homeAccountId: changed && boundary === "principal" ? "another" : capability.user!.homeAccountId,
+    } }}><PublicationContext value={{ admit: vi.fn(), revisions: published }}>
+      <UserDetailModal {...settings} identity={changed ? replacement.value.directory.objectId : saved.value.directory.objectId} />
+    </PublicationContext></CapabilityContext>;
+    const view = render(content());
+    await screen.findByText("Contoso");
+    view.rerender(content(true));
+    expect(await screen.findByText("Current company")).toBeVisible();
+    expect(readReportDetail).toHaveBeenCalledTimes(3);
+    fireEvent.focus(window);
+    expect(readReportDetail).toHaveBeenCalledTimes(3);
   });
 
   it("does not cancel or repin an admitted exact read at lease end and retains the historical result", async () => {

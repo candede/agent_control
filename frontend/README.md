@@ -62,6 +62,11 @@ Users opens the unchanged **Users** view by default. **Adoption** shows
 always-visible Company / Department sections with independent people and agent
 lists; search matches company and department keywords. Group pages show five
 groups at a time, without collapsed sections.
+Compact previous/next arrows and a current/total page indicator sit at the right
+of the existing Adoption results heading, so paging does not require scrolling
+past the groups. They share the full bottom pager's selection and loading state;
+the bottom page buttons, range summary, and direct page jump remain unchanged.
+On narrow screens the subtitle spans below the title and compact controls.
 
 Users and Adoption share the Agents header layout, with the view selectors next
 to the title and summary cards starting at the same height. Adoption uses the
@@ -74,22 +79,43 @@ groups, and the agent count deduplicates agents shared across groups.
 Company and Department option searches stay visible while filters change;
 dropdowns keep their normal height instead of stretching to match adjacent fields.
 
-The compact `agents/responses` counts mean distinct organization-built agents
-created or used, and reported agent responses in the selected report (not
-lifetime usage). Up to three colleagues with creation or usage evidence are marked **Copilot Champ**,
-ordered by verified agents created, then reported responses. This is a suggestion,
-not a competition or an assigned role. Missing usage is shown as unavailable.
+In user details, Company links to Adoption filtered by that company, and
+Department links to Adoption filtered by both the user's company and department.
+The links keep the user's selected report set, clear unrelated filters, and close
+the details overlays on normal navigation. They also support opening in a new tab.
+Missing values stay as plain "Not reported" text; a department without a reported
+company links to that department under the explicit missing-company filter.
 
-Group agents are the deduplicated union of verified creations and reported use by
-group members, excluding identified first- and third-party agents. Agent entries
+Independently opened directory and reported-user details automatically renew
+their saved selection while visible and online, retaining any selected report
+set. Rejected evidence offers a local restart when no parent selection owns the
+read. A direct directory user missing during initial collection is read again
+when Users publishes new data, without closing the modal or manually starting sync.
+
+The compact `agents/responses` counts mean distinct report agents with positive
+responses, and total reported agent responses in the selected report (not
+lifetime usage). Up to three colleagues with reported usage are marked **Copilot
+Champ**, ordered by reported responses, agents used, name and exact identity.
+Creation does not qualify or boost a person. This is a suggestion, not a
+competition or an assigned role. Missing relationship reports show unknown agent
+counts; an empty report shows zero. Group usage filters do not classify unknown
+usage as measured zero.
+
+Group agents are deduplicated by exact report agent ID across positively used
+relationships, including organization-built, Microsoft and third-party agents.
+Created-but-unused agents remain in inventory, not Adoption. Agent entries
 show name, the saved About text (long description preferred, short description
-only as a fallback), and authoring type; clicking opens existing details.
+only as a fallback), and reported creator category. Inventory is optional
+enrichment, not a requirement for an agent to appear. A verified, unambiguous
+inventory match provides the existing detail link; report-only agents remain
+visible with an explicit inventory-details-unavailable note.
 About previews strip HTML using the agent modal's sanitizer and show at most
 300 plain-text characters, including a trailing ellipsis when truncated.
 Previews end at a word boundary where possible. Clicking the agent name opens
 the existing details modal with the full About text; no expansion control is added.
 Membership uses the saved directory, not a complete workforce census or
-historical department membership. Agents use current authorized saved inventory;
+historical department membership. Optional agent metadata uses pinned authorized
+saved inventory;
 appearing in a group does not imply access for every group member. No groups,
 champion assignments, or additional synchronization state are persisted.
 
@@ -149,19 +175,35 @@ routine reload/restart warnings. Open details keep the selected identity, tab an
 search draft, then adopt the replacement evidence. Renewal reads saved data only;
 it does not start provider collection. Paged views restart at the first page with
 the same filters rather than mix cursor generations. Historical reports keep the
-selected report set. Inventory refresh retires unsent mutation previews, but
+selected report set, including user details opened from Adoption or a direct user
+link. Changing that report set retires the previous detail evidence.
+Retained Users rows and coverage remain visible during a replacement read, but
+new detail and unresolved-identity reads wait for the current selection; already
+open details retain their identity and tab while refreshing.
+Agent Users retains its search draft and locally selected
+historical period across inventory renewal; account, role or agent changes clear
+that navigation and any open user investigation. An expired selected-group count
+also renews saved inventory without removing the displayed rows or starting provider collection; the old
+group selection is retired before further actions. Inventory refresh retires unsent mutation previews, but
 does not cancel independent Microsoft access verification or replay submitted
 actions. Linked user profile and license evidence follows the current directory
 identity; removing or changing that link retires the old profile.
 Microsoft-confirmed changes appear locally
 immediately; subsequent saved-data publications replace them. Actual read and
 authorization failures remain visible.
+In agent details, a cancelled saved-detail read resumes automatically once the
+inventory is ready; a failed read still requires an explicit retry. Automatic
+saved-detail reads and both saved inventory reload controls pause during package
+management, bulk preview preparation and confirmation.
 Table CSV exports run on the backend using the selection captured at the click,
 without holding the table against new publications or idle renewal. Export
 progress and downloads survive table refreshes; later exports use the current
 selection. Manually changing filters still clears the previous export controls.
 Access denial or actual selection rejection still withdraws the
 affected evidence.
+If a failed page's selection expires, its error remains visible and recovery
+restarts the selection (or its parent) instead of retrying expired evidence.
+Expiry notices describe previously loaded data only when that data is displayed.
 
 ## Frontend structure
 

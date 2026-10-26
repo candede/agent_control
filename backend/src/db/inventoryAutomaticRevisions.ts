@@ -25,6 +25,7 @@ export async function readAutomaticInventoryRevisions(scope: { tenantId: string;
         AND (h.generation_id IS NOT NULL OR s.epoch>0)
         AND (s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical') OR s.source IN ('directory','app_activity') AND s.selector='complete')
       UNION ALL SELECT 'agent_people',coalesce((SELECT revision FROM inventory_people_revisions WHERE tenant_id=$1 AND principal_id=$2),0)::text
+      UNION ALL SELECT 'agent_usage',coalesce((SELECT revision FROM agent_usage_state WHERE tenant_id=$1),0)::text
       UNION ALL SELECT 'authorization',coalesce((SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2),0)::text
       UNION ALL SELECT 'reports',jsonb_build_array(coalesce(h.revision,0),coalesce(h.invalidation_epoch,0),coalesce(s.revision,1),s.active_set_id)::text
         FROM (SELECT $1::text AS tenant_id) tenant LEFT JOIN official_usage_history_state h USING(tenant_id)
@@ -42,7 +43,7 @@ export async function readAutomaticInventoryRevisions(scope: { tenantId: string;
         const targets = row.source === "canonical" ? ["graph_packages", "power_platform"] as const
           : row.source === "directory" ? ["graph_packages", "power_platform", "users"] as const
             : row.source === "app_activity" ? ["users"] as const
-              : row.source === "agent_people" ? ["graph_packages", "power_platform"] as const
+              : ["agent_people", "agent_usage"].includes(row.source) ? ["graph_packages", "power_platform"] as const
                 : [row.source as "graph_packages" | "power_platform"];
         for (const target of targets) hashes[target].update(JSON.stringify(row));
       }

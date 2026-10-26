@@ -173,6 +173,44 @@ describe("report search SQL contracts", () => {
 });
 
 describe("exact agent usage input normalization", () => {
+  it.each([
+    ["graph_packages:Package-A", "graph_packages:Package-A"],
+    ["agent:abcdefab-1234-4567-89ab-abcdefabcdef", "agent:ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF"],
+    ["graph_packages:Package-A", "graph_packages:%50ackage-A"],
+    ["power_platform:Default-abcdefab-1234-4567-89ab-abcdefabcdef:abcdefab-1234-4567-89ab-abcdefabcdef",
+      "power_platform:DEFAULT-ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF:ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF"],
+  ])("rejects duplicate exact summary identities before a saved read: %j, %j", async (first, alias) => {
+    const read = vi.spyOn(reports, "read").mockResolvedValue([]);
+    await expect(async () => new OfficialAgentUsage(reports).summaries("11111111-1111-4111-8111-111111111111", identity, [first, alias]))
+      .rejects.toMatchObject({ status: 400, code: "data_exact_ids_limit" });
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent:not-a-uuid", "graph_packages:%", "graph_packages:"])(
+    "rejects malformed summary identities before a saved read: %j", async recordId => {
+      const read = vi.spyOn(reports, "read").mockResolvedValue([]);
+      await expect(async () => new OfficialAgentUsage(reports).summaries("11111111-1111-4111-8111-111111111111", identity, [recordId]))
+        .rejects.toMatchObject({ status: 400, code: "invalid_agent_usage_record" });
+      expect(read).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["graph_packages:%50ackage-A", "graph_packages:package-a"],
+    ["power_platform:Env-A:Opaque-A", "power_platform:env-a:Opaque-A"],
+    ["power_platform:Env-A:Opaque-A", "power_platform:Env-A:opaque-a"],
+  ])("preserves distinct opaque summary identities: %j, %j", async (first, second) => {
+    const f = usersHarness();
+    f.saved.report = { ...f.saved.report, setId: f.saved.selection.id, activeSetId: f.saved.selection.id, availability: "active" };
+    const summaries = await f.usage.summaries(f.saved.selection.id, identity, [first, second]);
+    expect(summaries.map(row => row.recordId)).toEqual([first, second]);
+    expect(summaries).toMatchObject([
+      { status: "linked", responses: 4, activeUsers: 1, associationCount: 1 },
+      { status: "linked", responses: 4, activeUsers: 1, associationCount: 1 },
+    ]);
+    expect(reports.read).toHaveBeenCalledOnce();
+  });
+
   function usersHarness() {
     const saved = readContext("official_agents", ""), client = Object.assign(new pg.Client(), { release: vi.fn() });
     const query = vi.spyOn(client, "query").mockImplementation(async (sql: string) => {
@@ -180,6 +218,8 @@ describe("exact agent usage input normalization", () => {
         ? [{ agent_id: "abcdefab-1234-4567-89ab-abcdefabcdef", control_revision: "current-inventory" }]
         : sql.includes("SELECT revision::text") ? [{ revision: "0" }]
           : sql.includes("AS total,") ? [{ total: "2", filtered: "2" }]
+            : sql.includes("SELECT count(*)::text AS n,sum(responses)::text")
+              ? [{ n: "1", responses: "4", active_users: "1", last_activity: null }]
             : [{ username: "CaseUser", name: "J\u030c", responses: "4" }, { username: "caseuser", name: "Other", responses: "2" }];
       return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
     });

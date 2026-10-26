@@ -26,12 +26,19 @@
 .report-page-jump input { flex: 0 0 76px; width: 76px; min-height: 40px; padding: 6px 10px; font-size: 13px; }
 .report-page-jump button { padding-inline: 14px; }
 
+.report-pagination-compact { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.report-pagination-compact > [role="status"] { font-variant-numeric: tabular-nums; }
+.report-pagination-compact > button.secondary { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 32px; width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 7px; }
+.report-pagination-compact button[aria-disabled="true"] { cursor: default; opacity: 0.45; }
+.report-pagination-compact button[aria-disabled="true"]:hover { background: var(--surface); color: var(--muted); }
+
 @media (max-width: 1100px) {
   .copilot-users-pagination.report-pagination-numbered { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .report-pagination-summary { display: flex; justify-content: space-between; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
   .report-pagination-actions { justify-content: center; }
 }
 @media (max-width: 600px) {
+  .report-pagination-compact > button.secondary { flex-basis: 44px; width: 44px; min-width: 44px; height: 44px; min-height: 44px; }
   .copilot-users-pagination.report-pagination-numbered { padding: 14px 12px; }
   .report-pagination-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .report-page-numbers { grid-column: 1 / -1; grid-row: 1; justify-content: center; gap: 3px; }

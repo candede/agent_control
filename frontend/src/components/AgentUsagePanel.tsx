@@ -8,6 +8,7 @@ import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
 import { useSavedQueryClient } from "../savedQueries";
 import { useReportPage } from "../useReportPage";
+import type { UsersRouteState } from "../workbenchRouting";
 import { isExpiredSelection } from "../selectedRead";
 import { usageCount, usageDate } from "../usageInsights";
 import { ReportPageControls, ReportReadStatus } from "./ReportPageControls";
@@ -18,11 +19,12 @@ import { usagePeriodLabel } from "../agentUsageTrends";
 import "./agentInsights.css";
 
 type Props = { record: UnifiedAgentRecord; view: "usage" | "users"; context?: InventoryReportContext; inventoryRevision?: string; dataRevision?: number;
-  inventorySelectionId?: string; onReloadInventory?: () => void;
+  inventorySelectionId?: string; onReloadInventory?: () => void; onOpenAdoption?: (route: UsersRouteState) => void;
   canRemoveReviewedAssociations: boolean; disabled?: boolean; onChanged?: () => void };
 const contextFields = ["selectionId", "reportSetId", "usageRevision", "inventoryRevision"] as const;
 type RecoverySource = "history" | "users";
 type RemovalEvidence = { revision: number; uncertain: boolean };
+type UsageNavigation = { owner: string; investigatedUser?: string; viewedSetId?: string; search: string };
 
 function uncertainRemoval(cause: unknown) {
   return !(cause instanceof ApiError) || cause.status === 0 || cause.status >= 500 || cause.code === "invalid_response";
@@ -32,10 +34,13 @@ export function AgentUsagePanel(props: Props) {
   const capability = useContext(CapabilityContext), user = capability?.user;
   const principalScope = JSON.stringify([user?.tenantId, user?.homeAccountId, [...(user?.roles ?? [])].sort()]);
   const client = useSavedQueryClient();
-  // Owned here because AgentUsageSession remounts whenever the inventory or report revision changes.
-  const [investigatedUser, setInvestigatedUser] = useState<string>();
+  // Navigation outlives evidence revisions, but never its principal or agent.
+  const navigationOwner = JSON.stringify([principalScope, props.record.id]);
+  const [navigation, setNavigation] = useState<UsageNavigation>({ owner: navigationOwner, search: "" });
+  if (navigation.owner !== navigationOwner) setNavigation({ owner: navigationOwner, search: "" });
+  else if (props.view !== "users" && navigation.investigatedUser) setNavigation({ ...navigation, investigatedUser: undefined });
+  const { investigatedUser, viewedSetId, search } = navigation;
   const investigationTrigger = useRef<HTMLButtonElement | null>(null);
-  if (props.view !== "users" && investigatedUser) setInvestigatedUser(undefined);
   const [mutationOwner, setMutationOwner] = useState({ client, principalScope });
   if (mutationOwner.client !== client || mutationOwner.principalScope !== principalScope) setMutationOwner({ client, principalScope });
   const committedOwner = useRef(mutationOwner);
@@ -104,20 +109,24 @@ export function AgentUsagePanel(props: Props) {
   if (capability && !hasRole(user, "AgentControl.Viewer")) return <p role="alert">Current Viewer access is required to read agent usage.</p>;
   const readScope = JSON.stringify([principalScope, props.record.id, context?.revision, context?.reports.setId, props.inventoryRevision, inventorySelectionId, removalRevision.data?.revision ?? 0]);
   return <><AgentUsageSession key={readScope} principalScope={readScope} recoverInventory={recoverInventory} usageReady={usageReady} {...props}
-    investigationTrigger={investigationTrigger} onInvestigateUser={setInvestigatedUser}
+    investigationTrigger={investigationTrigger} onInvestigateUser={identity => setNavigation(previous => ({ ...previous, investigatedUser: identity }))}
+    viewedSetId={viewedSetId} onSelectPeriod={setId => setNavigation(previous => ({ ...previous, viewedSetId: setId }))}
+    search={search} onSearchChange={value => setNavigation(previous => ({ ...previous, search: value }))}
     client={client} busy={busy} submitRemoval={submitRemoval} removalUncertain={removalRevision.data?.uncertain ?? false}
     context={context} inventorySelectionId={inventorySelectionId}
     canRemoveReviewedAssociations={props.canRemoveReviewedAssociations && (!capability || hasRole(user, "AgentControl.Admin"))} />
     {investigatedUser ? <UserDetailModal key={investigatedUser} identity={investigatedUser} kind="report"
       investigationAgent={{ recordId: props.record.id, name: props.record.displayName }}
-      returnFocusTo={investigationTrigger} closeLabel="Close user details" onClose={() => setInvestigatedUser(undefined)} /> : null}
+      onOpenAdoption={props.onOpenAdoption}
+      returnFocusTo={investigationTrigger} closeLabel="Close user details" onClose={() => setNavigation(previous => ({ ...previous, investigatedUser: undefined }))} /> : null}
   </>;
 }
 
 function AgentUsageSession({ record, view, context: inventoryContext, dataRevision = 0, canRemoveReviewedAssociations: canManage,
   disabled, principalScope, inventorySelectionId, onReloadInventory, recoverInventory, usageReady, client, busy, submitRemoval, removalUncertain,
-  investigationTrigger, onInvestigateUser }: Props & {
+  investigationTrigger, onInvestigateUser, viewedSetId, onSelectPeriod, search, onSearchChange }: Props & {
     investigationTrigger: MutableRefObject<HTMLButtonElement | null>; onInvestigateUser: (username: string) => void;
+    viewedSetId?: string; onSelectPeriod: (setId?: string) => void; search: string; onSearchChange: (value: string) => void;
     principalScope: string; recoverInventory: (source?: RecoverySource) => void; usageReady: (source?: RecoverySource) => void;
     client: QueryClient; busy: boolean; removalUncertain: boolean; submitRemoval: (input: CandidateAgentUsageMutation, uiSignal: AbortSignal) => Promise<void>;
   }) {
@@ -128,7 +137,7 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
   const [validatedUsersContext, setValidatedUsersContext] = useState<string>();
   const [historyMetadata, setHistoryMetadata] = useState<Pick<CandidateAgentUsageHistory, "context" | "latestReportSetId">>();
   if (view === "users" && !usersRequested) setUsersRequested(true);
-  const [viewedSetId, setViewedSetId] = useState<string>(), [historyCursor, setHistoryCursor] = useState<string>();
+  const [historyCursor, setHistoryCursor] = useState<string>();
   const [remove, setRemove] = useState<{ row: CandidateAgentUsageAssociations["value"][number]; context: CandidateAgentUsageSummary["context"] }>();
   const [confirmed, setConfirmed] = useState(false), [error, setError] = useState<{ message: string; invalidated: boolean }>();
   const selectionId = capturedSelection ?? inventorySelectionId;
@@ -309,7 +318,7 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
     setHistoryCursor(undefined);
   }
   function selectPeriod(setId?: string) {
-    setViewedSetId(setId === latestSetId ? undefined : setId);
+    onSelectPeriod(setId === latestSetId ? undefined : setId);
     setCursor(undefined); setRemove(undefined); setConfirmed(false); setError(undefined);
   }
   function restartUsage() {
@@ -372,6 +381,7 @@ function AgentUsageSession({ record, view, context: inventoryContext, dataRevisi
         && context.reportSetId === requestedSetId && usersContextKey === validatedUsersContext
         ? <AgentUsers key={usersContextKey}
         recordId={record.id} agentName={record.displayName} context={context} revision={dataRevision}
+        search={search} onSearchChange={onSearchChange}
         investigationTrigger={investigationTrigger} onInvestigateUser={onInvestigateUser} inventorySelectionId={inventorySelectionId}
         setId={reportOverride} revalidating={revalidating} active={view === "users" && Boolean(usage)}
         onReady={usageReady} onInvalidated={recoverInventory} onRestartSelection={restartUsage} /> : null}
@@ -432,13 +442,13 @@ function targetLabel(target: CandidateAgentUsageAssociations["value"][number]["t
 function UsageMetric({ label, value }: { label: string; value: string }) {
   return <div className="agent-usage-metric"><dt>{label}</dt><dd><strong>{value}</strong></dd></div>;
 }
-function AgentUsers({ recordId, agentName, context, revision, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active,
+function AgentUsers({ recordId, agentName, context, revision, search, onSearchChange, onRestartSelection, inventorySelectionId, setId, onInvalidated, onReady, revalidating, active,
   investigationTrigger, onInvestigateUser }: {
   investigationTrigger: MutableRefObject<HTMLButtonElement | null>; onInvestigateUser: (username: string) => void;
   recordId: string; agentName: string; context: CandidateAgentUsageSummary["context"]; revision: number; onRestartSelection: () => void;
+  search: string; onSearchChange: (value: string) => void;
   inventorySelectionId?: string; setId?: string; onInvalidated: () => void; onReady: () => void; revalidating: boolean; active: boolean;
 }) {
-  const [search, setSearch] = useState("");
   const [requested, setRequested] = useState(active);
   const [readRevision, setReadRevision] = useState(revision);
   if (active && !requested) setRequested(true);
@@ -456,7 +466,7 @@ function AgentUsers({ recordId, agentName, context, revision, onRestartSelection
   return <section className="agent-usage-users" aria-label="Agent users" aria-busy={read.loading || revalidating}>
     <div className="agent-insight-toolbar"><h4>Users{data ? ` (${data.counts.filtered.toLocaleString()})` : ""}</h4>
       <input type="search" aria-label="Search agent users" placeholder="Search by name or email" maxLength={256} value={search}
-        onChange={event => setSearch(event.target.value)} /></div>
+        onChange={event => onSearchChange(event.target.value)} /></div>
     <ReportReadStatus read={read} />
     {changed && !revalidating ? <div className="error-banner" role="alert">The report or inventory changed. Reload agent usage.
       <button type="button" className="secondary" onClick={onRestartSelection}>Reload usage</button></div> : null}

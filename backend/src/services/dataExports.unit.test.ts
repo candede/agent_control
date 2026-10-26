@@ -676,8 +676,10 @@ function inventoryLifecycle() {
       tenant_id: fixture.identity.tenantId, principal_id: fixture.identity.principalId, epoch: "1", session_epoch: "1",
     }]);
     if (statement.startsWith("SELECT g.id FROM data_generations")) return result([{ id: "inventory-baseline" }]);
-    if (statement.startsWith("SELECT v.inputs FROM inventory_revisions")) return result([{ inputs: [] }]);
-    if (statement.startsWith("SELECT 1 FROM jsonb_to_recordset")) return result();
+    if (statement.startsWith("SELECT 1 FROM inventory_revisions")) {
+      expect(values).toEqual(["inventory-root", "1", "inventory-baseline", fixture.identity.tenantId, [fixture.identity.principalId], ""]);
+      return result([{}]);
+    }
     if (statement.startsWith("SELECT 1 FROM inventory_read_contexts c")) {
       expect(values).toEqual(["selection", fixture.identity.tenantId, "inventory-root"]);
       return result(association.revision === "1" ? [] : [{}]);

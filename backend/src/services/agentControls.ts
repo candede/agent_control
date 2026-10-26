@@ -3,7 +3,8 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { InventoryMutationStages } from "../db/inventoryMutationStages.js";
 import { NativeInventory } from "../db/nativeInventory.js";
-import { currentInventorySourcesSql, selectedInventorySourcesSql } from "../db/inventoryAuthority.js";
+import { currentInventorySourcesSql } from "../db/inventoryAuthority.js";
+import { selectedInventorySourcesSql } from "../db/inventorySelections.js";
 import { digest, encodeBatch } from "../db/dataBounds.js";
 import { beginAccountSessionValidation, assertAccountSessionValidation } from "../db/sessions.js";
 import { reportIdentity } from "./reportIdentity.js";
@@ -156,13 +157,15 @@ export class AgentControls {
         identity.sessionEpoch, selectionId, preview.confirmationHash, receipt, expiresAt]);
       assertAccountSessionValidation(validation);
     });
+    assertAccountSessionValidation(validation);
     return preview;
   }
 
   async execute(user: AuthenticatedUser, receiptId: string, confirmationHash: string, idempotencyKey: string): Promise<AgentControlExecution> {
     requireProviderAdmissions();
+    const validation = beginAccountSessionValidation(user.tenantId!, user.homeAccountId);
     const identity = await reportIdentity(this.database, user);
-    const validation = beginAccountSessionValidation(identity.tenantId, identity.principalId);
+    assertAccountSessionValidation(validation);
     let row = (await this.database.query<ReceiptRow>(`SELECT * FROM agent_control_receipts
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND retained_until>clock_timestamp()`,
     [receiptId, identity.tenantId, identity.principalId])).rows[0];
@@ -223,8 +226,9 @@ export class AgentControls {
         job = await this.retainedChild(identity, accepted, child, key);
         if (job && admissionError === "child_admission_expired") admissionError = null;
       }
-      children.push(this.childProjection(child,job,admissionError));
+      children.push(this.childProjection(child,job,admissionError,accepted.expires_at));
     }
+    assertAccountSessionValidation(validation);
     return this.executionProjection({...accepted,accepted_at:accepted.accepted_at,origin:accepted.origin},children);
   }
 
@@ -239,7 +243,7 @@ export class AgentControls {
     for (const [index,child] of accepted.receipt.children.entries()) {
       assertAccountSessionValidation(validation);
       const job=await this.retainedChild(identity,accepted,child,`agent-control-${receiptId}-${index}`);
-      children.push(this.childProjection(child,job,job?null:accepted.expires_at.getTime()<=Date.now()?"child_admission_expired":"child_not_accepted"));
+      children.push(this.childProjection(child,job,job?null:accepted.expires_at.getTime()<=Date.now()?"child_admission_expired":"child_not_accepted",accepted.expires_at));
     }
     assertAccountSessionValidation(validation);
     return this.executionProjection({...accepted,accepted_at:accepted.accepted_at,origin:accepted.origin},children);
@@ -253,7 +257,7 @@ export class AgentControls {
         action:accepted.receipt.preview.action==="block"?"quarantine":"unquarantine",snapshotId:child.snapshotId,
         resourceNativeIds:child.resourceNativeIds,confirmationHash:child.confirmationHash,idempotencyKey:key});
   }
-  private childProjection(child: ChildIntent,job: ChildJob | undefined,errorCode: string | null): AgentControlChild {
+  private childProjection(child: ChildIntent,job: ChildJob | undefined,errorCode: string | null,expiresAt: Date): AgentControlChild {
     const base={provider:child.provider,recordIds:child.recordIds};
     if (job) {
       const url=child.provider==="graph_packages"?`/api/agents/bulk-jobs/${job.id}`:`/api/quarantine/jobs/${job.id}`;
@@ -266,14 +270,14 @@ export class AgentControls {
           statusUrl: url, itemsUrl: child.provider === "graph_packages" ? `${url}/items` : null,
           cancelUrl: `${url}/cancel`, resumeUrl: `${url}/resume`, reconcileUrl: `${url}/reconcile` };
     }
-    return { ...base, accepted: false, jobId: null, status: null, final: false, verified: false,
+    return { ...base, accepted: false, jobId: null, status: null, final: expiresAt.getTime()<=Date.now(), verified: false,
       verification: "unverified", errorCode,statusUrl: null, itemsUrl: null, cancelUrl: null, resumeUrl: null, reconcileUrl: null };
   }
   private executionProjection(accepted: AcceptedReceipt,children: AgentControlChild[]): AgentControlExecution {
     const admitted = children.filter(child => child.accepted).length;
     return { receiptId:accepted.id, confirmationHash:accepted.confirmation_hash, accepted: true, acceptedAt: accepted.accepted_at.toISOString(), origin: accepted.origin,
       outcome: !children.length ? "ineligible" : !admitted ? "failed" : admitted < children.length || accepted.receipt.preview.ineligibleCount ? "partial" : "accepted",
-      final: children.length > 0 && children.every(child => child.final), verified: children.length > 0 && children.every(child => child.verified),
+      final: children.every(child => child.final), verified: children.length > 0 && children.every(child => child.verified),
       providerAtomicity: false, ineligibleCount: accepted.receipt.preview.ineligibleCount, children };
   }
 

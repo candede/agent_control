@@ -4,7 +4,7 @@ import { digest } from "../db/dataBounds.js";
 import { officialReportCount as exactCount } from "../db/officialReportBounds.js";
 import { readableHistorySql } from "../db/officialReportHistory.js";
 import { reportPeriodSortKey } from "../db/officialReportQueries.js";
-import { selectedInventorySourcesSql } from "../db/inventoryAuthority.js";
+import { selectedInventorySourcesSql } from "../db/inventorySelections.js";
 import { bounded, type LargeTenantUsersReports, type ReportReadContext } from "./largeTenantUsersReports.js";
 import type { AgentUsageComparison, AgentUsageHistoryPoint, CandidateAgentUsageContext, CandidateAgentUsageHistory } from "../types/officialReportApi.js";
 

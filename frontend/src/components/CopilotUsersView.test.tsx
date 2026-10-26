@@ -255,6 +255,52 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(api.readReportDetail).not.toHaveBeenCalled();
     expect(getAgentResponsibility).not.toHaveBeenCalled();
   });
+  it("keeps direct user details pinned to the route's report set across report changes and refreshes", async () => {
+    const historical = page([ada], { reports: { ...reports, setId: "abcdef12-abcd-4abc-8abc-abcdef123456" } });
+    const next = page([named(1, "Ada", 8)], {
+      reports: { ...reports, setId: "10000000-0000-4000-8000-000000000099" },
+      selection: { ...historical.selection, id: "replacement-exact-selection" },
+    });
+    const pending = deferred<Awaited<ReturnType<typeof api.readReportDetail>>>();
+    vi.mocked(api.readReportPage).mockResolvedValue(historical);
+    detail(ada, historical);
+    const route = { view: "licenses" as const, detailId: ada.directory.objectId, reportSetId: historical.reports.setId!, search: "", page: 0 };
+    const view = render(<CopilotUsersView route={route} />);
+    const modal = within(await screen.findByRole("dialog", { name: "Ada" }));
+    expect(api.readReportDetail).toHaveBeenCalledExactlyOnceWith(
+      `copilot-usage/users/${ada.directory.objectId}`, undefined, expect.any(AbortSignal), route.reportSetId);
+    view.rerender(<CopilotUsersView route={{ ...route, reportSetId: route.reportSetId.toUpperCase() }} />);
+    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    vi.mocked(api.readReportPage).mockResolvedValue(next);
+    vi.mocked(api.readReportDetail).mockReturnValueOnce(pending.promise);
+    view.rerender(<CopilotUsersView route={{ ...route, reportSetId: next.reports.setId! }} />);
+    await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledTimes(2));
+    expect(api.readReportDetail).toHaveBeenLastCalledWith(
+      `copilot-usage/users/${ada.directory.objectId}`, undefined, expect.any(AbortSignal), next.reports.setId);
+    expect(modal.queryByRole("group", { name: "User summary" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve({ value: next.value[0], reports: next.reports, sources: next.sources, selection: next.selection }));
+    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("8");
+    detail(next.value[0], next);
+    view.rerender(<CopilotUsersView route={{ ...route, reportSetId: next.reports.setId! }} dataRevision={1} />);
+    await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledTimes(3));
+    expect(api.readReportDetail).toHaveBeenLastCalledWith(
+      `copilot-usage/users/${ada.directory.objectId}`, undefined, expect.any(AbortSignal), next.reports.setId);
+    detail();
+    vi.mocked(api.readReportPage).mockResolvedValue(page());
+    view.rerender(<CopilotUsersView route={{ ...route, reportSetId: undefined }} dataRevision={1} />);
+    await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledTimes(4));
+    expect(api.readReportDetail).toHaveBeenLastCalledWith(
+      `copilot-usage/users/${ada.directory.objectId}`, undefined, expect.any(AbortSignal));
+    await waitFor(() => expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("200"));
+  });
+  it("rejects direct user details returned for a different report set", async () => {
+    const route = { view: "licenses" as const, detailId: ada.directory.objectId,
+      reportSetId: "10000000-0000-4000-8000-000000000099", search: "", page: 0 };
+    vi.mocked(api.readReportPage).mockResolvedValue(page([ada], { reports: { ...reports, setId: route.reportSetId } }));
+    render(<CopilotUsersView route={route} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Exact user evidence does not match this selection.");
+    expect(screen.queryByRole("group", { name: "User summary" })).not.toBeInTheDocument();
+  });
   it("restarts an expired direct-user selection without changing the user or active tab", async () => {
     const original = page();
     const refreshed = { ...original, selection: { ...original.selection, id: "refreshed-exact-selection" } };
@@ -833,6 +879,21 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/users/unresolved-identities",
       expect.objectContaining({ selectionId: current.selection.id, limit: 50 }), expect.any(AbortSignal)));
   });
+  it("does not reopen unresolved identities from retained coverage before the replacement read completes", async () => {
+    const saved = page(), replacement = deferred<ReportPage<CombinedUser>>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(saved).mockReturnValue(replacement.promise);
+    const view = render(<CopilotUsersView />);
+    await userEvent.click(await screen.findByText("Data sources and coverage"));
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("region", { name: "Unresolved report identities" })).not.toBeInTheDocument();
+    await act(async () => replacement.resolve(saved));
+    vi.mocked(api.readReportPage).mockResolvedValue(reportPage([]));
+    await userEvent.click(screen.getByRole("button", { name: /^Unresolved report identities/ }));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+  });
   it.each(["licenses", "activity"] as const)("keeps %s row details open while adopting a replacement revision", async viewName => {
     const row = viewName === "licenses" ? ada : reportUser(1, { displayName: "Ada", objectId: null });
     const saved = reportPage([row]);
@@ -860,6 +921,37 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     await screen.findByRole("button", { name: "Ada" });
     expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
     expect(api.readReportDetail).toHaveBeenCalledTimes(2);
+  });
+  it.each(["licenses", "activity"] as const)("does not open new %s details from retained rows before the replacement read completes", async viewName => {
+    const row = viewName === "licenses" ? ada : reportUser(1, { displayName: "Ada", objectId: null });
+    const saved = reportPage([row]), replacement = deferred<typeof saved>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(saved).mockReturnValueOnce(replacement.promise);
+    vi.mocked(api.readReportDetail).mockResolvedValue({ value: row, reports: saved.reports, sources: saved.sources, selection: saved.selection });
+    const route = { view: viewName, search: "", page: 0 };
+    const view = render(<CopilotUsersView route={route} />);
+    await screen.findByRole("button", { name: "Ada" });
+    view.rerender(<CopilotUsersView route={route} dataRevision={1} />);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("button", { name: "Ada" }));
+    expect(api.readReportDetail).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await act(async () => replacement.resolve(saved));
+    await userEvent.click(screen.getByRole("button", { name: "Ada" }));
+    expect(await screen.findByRole("dialog", { name: "Ada" })).toBeVisible();
+  });
+  it.each(["licenses", "activity"] as const)("allows new %s details while the current selection revalidates", async viewName => {
+    const row = viewName === "licenses" ? ada : reportUser(1, { displayName: "Ada", objectId: null });
+    const saved = reportPage([row]), revalidation = deferred<typeof saved>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(saved).mockReturnValueOnce(revalidation.promise);
+    vi.mocked(api.readReportDetail).mockResolvedValue({ value: row, reports: saved.reports, sources: saved.sources, selection: saved.selection });
+    render(<CopilotUsersView route={{ view: viewName, search: "", page: 0 }} />);
+    await screen.findByRole("button", { name: "Ada" });
+    fireEvent.focus(window);
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await userEvent.click(screen.getByRole("button", { name: "Ada" }));
+    expect(await screen.findByRole("dialog", { name: "Ada" })).toBeVisible();
+    expect(api.readReportDetail).toHaveBeenCalledOnce();
+    await act(async () => revalidation.resolve(saved));
   });
   it.each(["paid facet", "activity facet", "unresolved identities"] as const)(
     "withdraws parent evidence and cancels exports when %s reject its selection", async source => {

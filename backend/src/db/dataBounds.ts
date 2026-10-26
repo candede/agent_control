@@ -10,7 +10,7 @@ export const dataLimits = Object.freeze({
   agentDefinitionWorkBytes: 16 * 1024 ** 2,
   generationBytes: 8 * 1024 ** 3, tenantBytes: 64 * 1024 ** 3,
   sourceRows: 100_000, derivedRows: 200_000, plansPerUser: 1000, pages: 10_000, wireRows: 5_000_000,
-  pageRows: 100, roots: 16, queue: 32, acquireMs: 5_000,
+  pageRows: 100, roots: 16, selectionRoots: 20, queue: 32, acquireMs: 5_000,
   leaseMs: 60_000, heartbeatMs: 20_000,
 });
 

@@ -10,6 +10,7 @@ import { LargeTenantUsersReports, reportQuery } from "./largeTenantUsersReports.
 import { readAdoptionGroups } from "./adoptionGroups.js";
 import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
 import type { ReportQuery } from "../types/officialReportData.js";
+import { DataSyncRepository } from "../db/dataSync.js";
 
 describe("read-only adoption groups", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -60,11 +61,28 @@ describe("read-only adoption groups", () => {
     expect(page.value.find(group => group.department === "HR")?.people).toHaveLength(2);
     expect(page.value.find(group => group.department === "Department not provided")?.people).toHaveLength(1);
     expect(page.value.flatMap(group => group.people).every(person => !person.champion && person.responses === null)).toBe(true);
-    expect(page.inventoryAvailable).toBe(false);
+    expect(page.summary.agents).toBeNull();
+    expect(page.value.flatMap(group => group.people).every(person => person.agents === null)).toBe(true);
     expect((await read({ search: "CONTOSO hr" })).value).toHaveLength(1);
     expect((await read({ search: "no-match" })).counts).toEqual({ total: 2, filtered: 0 });
   });
-  it("unions creations and usage, deduplicates agents, excludes first/third party, and marks up to three champs", async () => {
+  it("shares Unicode normalization across groups, search, exact organization filters and facets", async () => {
+    const { identity, reader, read } = await setup([
+      user(1, "J\u030c", "J\u030c"), user(2, "\u01f0", "\u01f0"), user(3, "\u01f0", "Other"),
+    ]);
+    const page = await read();
+    expect(page.counts).toEqual({ total: 2, filtered: 2 });
+    expect(page.value.find(group => group.department === "J\u030c")?.people).toHaveLength(2);
+    expect((await read({ search: "\u01f0" })).counts.filtered).toBe(2);
+    expect((await read({ company: "\u01f0", department: "\u01f0" })).counts.filtered).toBe(1);
+    expect((await read({ company: "J\u030c", department: "J\u030c" })).counts.filtered).toBe(1);
+    const selected = await reader.capture(identity, "delegated", "adoption");
+    expect((await reader.facets(selected.id, identity, { field: "company", search: "\u01f0" })).value)
+      .toEqual([{ value: "J\u030c", count: 2 }]);
+    expect((await reader.facets(selected.id, identity, { field: "department", search: "\u01f0" })).value)
+      .toEqual([{ value: "J\u030c", count: 1 }]);
+  });
+  it("counts all positively used report agents, enriches matched inventory, and excludes unused creations", async () => {
     const { identity, read } = await setup(Array.from({ length: 5 }, (_, i) => user(i + 1)));
     await saveUsageInventory(fixture.runtime, identity, [
       { packages: ["HR-A", "HR-B"], native: { nativeId: randomUUID(), environmentId: randomUUID(), createdBy: user(5).identity.objectId },
@@ -77,27 +95,137 @@ describe("read-only adoption groups", () => {
     ]);
     const today = new Date().toISOString().slice(0, 10);
     await publish(identity, {
-      users: Array.from({ length: 5 }, (_, i) => `user${i + 1}@example.invalid,User ${i + 1},2,${(i + 1) * 10},${today}`),
-      agents: ["HR-A", "HR-B", "First", "Third"].map(id => `${id},${id},Your org,5,0,100,${today}`),
+      users: [35, 20, 30, 40, 0].map((responses, i) => `user${i + 1}@example.invalid,User ${i + 1},${i === 0 ? 3 : i === 4 ? 0 : 1},${responses},${today}`),
+      agents: [["HR-A", "Your org"], ["HR-B", "Your org"], ["First", "Microsoft"], ["Third", "External"],
+        ["Report-only", "Agent built by Third party"], ["Zero", "Microsoft"]]
+        .map(([id, creator]) => `${id},${id},${creator},5,0,100,${today}`),
       userAgents: [
         `HR-A,HR-A,Your org,user1@example.invalid,10,${today}`,
         `HR-B,HR-B,Your org,user1@example.invalid,20,${today}`,
         `HR-A,HR-A,Your org,user2@example.invalid,20,${today}`,
         `First,First,Microsoft,user3@example.invalid,30,${today}`,
         `Third,Third,External,user4@example.invalid,40,${today}`,
+        `Report-only,Report-only,Agent built by Third party,user1@example.invalid,5,${today}`,
+        `Zero,Zero,Microsoft,user5@example.invalid,0,${today}`,
       ],
     });
     const page = await read(), group = page.value[0];
-    expect(page.inventoryAvailable).toBe(true);
-    expect(group.agents).toHaveLength(2);
-    expect(new Set(group.agents.map(agent => agent.id)).size).toBe(2);
-    expect(group.agents.every(agent => agent.type === "Copilot Studio")).toBe(true);
+    expect(group.agents).toHaveLength(5);
+    expect(new Set(group.agents.map(agent => agent.id)).size).toBe(5);
+    expect(group.agents.map(agent => agent.name)).toEqual(["First", "HR-A", "HR-B", "Report-only", "Third"]);
+    expect(group.agents.find(agent => agent.name === "First")?.creatorType).toBe("Microsoft");
+    expect(group.agents.find(agent => agent.name === "Third")?.creatorType).toBe("External");
+    expect(group.agents.find(agent => agent.name === "Report-only")).toMatchObject({
+      id: "report:Report-only", creatorType: "Agent built by Third party", description: null, inventoryId: null,
+    });
+    expect(group.agents.filter(agent => agent.name.startsWith("HR-")).every(agent => agent.inventoryId?.startsWith("agent:"))).toBe(true);
+    expect(group.agents.find(agent => agent.name === "HR-A")?.inventoryId)
+      .toBe(group.agents.find(agent => agent.name === "HR-B")?.inventoryId);
     expect(group.agents.map(agent => agent.description)).toEqual(expect.arrayContaining([
-      "Helps HR colleagues find policies and onboarding guidance.", "Helps with HR requests.",
+      "Helps HR colleagues find policies and onboarding guidance.",
     ]));
-    expect(group.people[0]).toMatchObject({ id: user(5).identity.objectId, agents: 2, champion: true, responses: 50 });
-    expect(group.people.find(person => person.id === user(1).identity.objectId)?.agents).toBe(1);
+    expect(group.people[0]).toMatchObject({ id: user(4).identity.objectId, agents: 1, champion: true, responses: 40 });
+    expect(group.people.find(person => person.id === user(1).identity.objectId)?.agents).toBe(3);
+    expect(group.people.find(person => person.id === user(5).identity.objectId)).toMatchObject({ agents: 0, champion: false });
     expect(group.people.filter(person => person.champion)).toHaveLength(3);
+    expect(page.summary.agents).toBe(5);
+  });
+  it.each(["pending", "running"] as const)("keeps agents, metrics, filters, facets and pages consistent during %s reconciliation", async state => {
+    const { identity, reader, read } = await setup([user(1, "A"), user(2, "B")]);
+    await saveUsageInventory(fixture.runtime, identity, [
+      { packages: ["A"], packageFields: { type: "custom" } },
+      { packages: ["B"], packageFields: { type: "custom" } },
+      { packages: ["Microsoft"], packageFields: { type: "firstParty" } },
+    ]);
+    const today = new Date().toISOString().slice(0, 10);
+    await publish(identity, {
+      users: [`user1@example.invalid,User 1,2,20,${today}`, `user2@example.invalid,User 2,1,10,${today}`],
+      agents: ["A", "B", "Microsoft"].map(id => `${id},${id},Your org,1,0,10,${today}`),
+      userAgents: [`A,A,Your org,user1@example.invalid,10,${today}`,
+        `Microsoft,Microsoft,Microsoft,user1@example.invalid,10,${today}`,
+        `B,B,Your org,user2@example.invalid,10,${today}`],
+    });
+    const selection = await reader.capture(identity, "delegated", "adoption", { adoptionAgents: "with" });
+    const page = (cursor?: string) => reader.read(selection.id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 1, cursor }));
+    const first = await page();
+    expect(first.summary).toEqual({ people: 2, champs: 2, agents: 3 });
+    await fixture.operator.query(`UPDATE inventory_reconciliation SET status=$3,
+      pending_inputs=CASE WHEN $3='idle' THEN published_inputs ELSE NULL END,
+      pending_deadline=clock_timestamp()+interval '30 minutes'
+      WHERE tenant_id=$1 AND scope_id IN (SELECT id FROM data_scope_epochs WHERE principal_id=$2)`,
+    [identity.tenantId, identity.principalId, state === "pending" ? "idle" : "running"]);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_live_sources
+      WHERE tenant_id=$1 AND principal_id=$2`, [identity.tenantId, identity.principalId])).rows[0].count).toBe(0);
+    expect(await page()).toEqual(expect.objectContaining({
+      value: first.value, counts: first.counts, summary: first.summary,
+    }));
+    const second = await page(first.page.nextCursor!);
+    expect(second.value[0]).toMatchObject({ company: "B", agents: [{ name: "B" }] });
+    expect((await page(second.page.previousCursor!)).value).toEqual(first.value);
+    expect((await reader.facets(selection.id, identity, { field: "company", limit: 10 })).value)
+      .toEqual([{ value: "A", count: 1 }, { value: "B", count: 1 }]);
+    const fresh = await read({ adoptionAgents: "with" });
+    expect(fresh.summary).toEqual(first.summary);
+    expect(fresh.value.map(group => group.agents)).toEqual([first.value[0].agents, second.value[0].agents]);
+    expect(fresh.value[0].people[0]).toMatchObject({ agents: 2, responses: 20 });
+    expect((await read({ adoptionAgents: "without" })).counts.filtered).toBe(0);
+    const users = await reader.capture(identity, "delegated", "copilot_users");
+    const modal = await reader.page(users.id, identity, { limit: 10, endpoint: "relationships", child: user(1).identity.objectId });
+    expect(modal.counts.filtered).toBe(2);
+  });
+  it("automatically captures published usage without inventory and freezes old report selections", async () => {
+    const { identity, reader, read } = await setup([user(1)]);
+    const beforeUsage = await reader.capture(identity, "delegated", "adoption");
+    const page = (id: string) => reader.read(id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 5 }));
+    const today = new Date().toISOString().slice(0, 10);
+    await publish(identity, {
+      users: [`user1@example.invalid,User 1,1,10,${today}`],
+      agents: [], userAgents: [`Report-only,Reported assistant,Microsoft,user1@example.invalid,10,${today}`],
+    });
+    expect(await page(beforeUsage.id)).toMatchObject({ summary: { agents: null } });
+    const populated = await reader.capture(identity, "delegated", "adoption");
+    const saved = await page(populated.id);
+    expect(saved).toMatchObject({ summary: { agents: 1 }, value: [{
+      agents: [{ id: "report:Report-only", name: "Reported assistant", inventoryId: null, creatorType: "Microsoft" }],
+      people: [{ agents: 1, responses: 10 }],
+    }] });
+    await saveUsageInventory(fixture.runtime, identity, [{
+      packages: ["Created"], native: { nativeId: randomUUID(), environmentId: randomUUID(), createdBy: user(1).identity.objectId },
+      packageFields: { type: "custom" },
+    }]);
+    expect(await read()).toMatchObject({ summary: { agents: 1 } });
+    await saveUsageInventory(fixture.runtime, identity, []);
+    expect((await page(populated.id)).value).toEqual(saved.value);
+    expect(await read()).toMatchObject({ summary: { agents: 1 } });
+    await publish(identity, {
+      users: [`user1@example.invalid,User 1,2,20,${today}`], agents: [],
+      userAgents: [`Report-only,Reported assistant,Microsoft,user1@example.invalid,10,${today}`,
+        `Third-party,External assistant,External,user1@example.invalid,10,${today}`],
+    });
+    expect((await page(populated.id)).value).toEqual(saved.value);
+    expect(await read()).toMatchObject({ summary: { agents: 2 }, value: [{ people: [{ agents: 2, responses: 20 }] }] });
+    expect((await page(beforeUsage.id)).summary.agents).toBeNull();
+  });
+  it("rejects changed associations, cleared inventory, expired selections and other principals instead of returning zero agents", async () => {
+    const { identity, reader } = await setup([user(1)]);
+    await saveUsageInventory(fixture.runtime, identity, []);
+    await publish(identity, { users: [], agents: [], userAgents: [] });
+    const capture = () => reader.capture(identity, "delegated", "adoption");
+    const page = (id: string, who = identity) => reader.read(id, who,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 5 }));
+    const changed = await capture();
+    await fixture.operator.query(`INSERT INTO agent_usage_state(tenant_id,revision) VALUES($1,1)
+      ON CONFLICT(tenant_id) DO UPDATE SET revision=agent_usage_state.revision+1`, [identity.tenantId]);
+    await expect(page(changed.id)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "changed" } });
+    const expired = await capture();
+    await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [expired.id]);
+    await expect(page(expired.id)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "expired" } });
+    const cleared = await capture();
+    await expect(page(cleared.id, { ...identity, principalId: randomUUID() })).rejects.toMatchObject({ code: "selection_invalidated" });
+    await new DataSyncRepository(fixture.runtime).submit(identity, { mode: "full", clearSavedData: true });
+    await expect(page(cleared.id)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
   it("keeps departments separate across companies and pages forward/backward in both sort directions", async () => {
     const { identity, reader } = await setup([user(1, "A"), user(2, "B"), user(3, "C"), user(4, "D")]);
@@ -114,6 +242,20 @@ describe("read-only adoption groups", () => {
       await expect(reader.read(selected.id, { ...identity, principalId: "another-user" },
         (client, context) => readAdoptionGroups(client, reader, context, { limit: 2 }))).rejects.toThrow();
     }
+  });
+  it.each(["asc", "desc"] as const)("pages %s groups with long Unicode organization labels", async order => {
+    const { identity, reader } = await setup(Array.from({ length: 5 }, (_, index) =>
+      user(index + 1, "\u337f".repeat(256), "\u337f".repeat(255) + index)));
+    const selected = await reader.capture(identity, "delegated", "adoption", { order });
+    const read = (cursor?: string) => reader.read(selected.id, identity,
+      (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, cursor }));
+    const first = await read(), second = await read(first.page.nextCursor!), last = await read(second.page.nextCursor!);
+    expect([first.page.number, second.page.number, last.page.number]).toEqual([1, 2, 3]);
+    expect(new Set([...first.value, ...second.value, ...last.value].map(group => group.id)).size).toBe(5);
+    expect(Buffer.byteLength(first.page.nextCursor!)).toBeLessThanOrEqual(4096);
+    expect(last.page.nextCursor).toBeNull();
+    expect((await read(last.page.previousCursor!)).value).toEqual(second.value);
+    expect((await read(second.page.previousCursor!)).value).toEqual(first.value);
   });
   it.each(["asc", "desc"] as const)("resumes a fresh %s selection at the visible group after directory changes", async order => {
     const users = [user(1, "B"), user(2, "C"), user(3, "D"), user(4, "E"), user(5, "F"), user(6, "G")];
@@ -211,13 +353,18 @@ describe("read-only adoption groups", () => {
       [user(2).identity.objectId, user(3).identity.objectId].includes(person.id))
       .every(person => person.responses === null && person.agents === 0 && !person.champion)).toBe(true);
   });
-  it("distinguishes a collected empty inventory from unavailable inventory", async () => {
+  it("distinguishes an empty relationship report from missing usage without requiring inventory", async () => {
     const { identity, read } = await setup([user(1)]);
-    await saveUsageInventory(fixture.runtime, identity, []);
+    expect((await read()).summary.agents).toBeNull();
+    expect((await read({ adoptionAgents: "without" })).counts.filtered).toBe(0);
+    expect((await read({ adoptionAgents: "with" })).counts.filtered).toBe(0);
+    await publish(identity, { users: [], agents: [], userAgents: [] });
     const page = await read();
-    expect(page.inventoryAvailable).toBe(true);
+    expect(page.summary.agents).toBe(0);
     expect(page.value[0].agents).toEqual([]);
+    expect(page.value[0].people[0].agents).toBe(0);
     expect(page.value[0].people[0].champion).toBe(false);
+    expect((await read({ adoptionAgents: "without" })).counts.filtered).toBe(1);
   });
   it("filters all groups before paging and exposes selected company and department facets", async () => {
     const { identity, reader, read } = await setup([
@@ -228,8 +375,9 @@ describe("read-only adoption groups", () => {
         packageFields: { type: "custom", platform: "CopilotStudio" } },
     ]);
     const today = new Date().toISOString().slice(0, 10);
-    await publish(identity, { users: [`user2@example.invalid,User 2,1,10,${today}`],
-      agents: [`Created,Created,Your org,0,0,0,${today}`], userAgents: [] });
+    await publish(identity, { users: [`user2@example.invalid,User 2,1,10,${today}`, `user4@example.invalid,User 4,1,20,${today}`],
+      agents: [`Created,Created,Your org,0,0,0,${today}`],
+      userAgents: [`Used,External agent,Agent built by Third party,user4@example.invalid,20,${today}`] });
     expect((await read()).summary).toEqual({ people: 5, champs: 2, agents: 1 });
     const champs = await read({ adoptionChamps: "with" }, 1);
     expect(champs.counts).toEqual({ total: 5, filtered: 2 });

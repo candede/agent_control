@@ -1,9 +1,16 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import { layoutTime, mockLayoutApi } from "./layoutFixtures";
+import type { AdoptionGroup, AdoptionPage } from "../../backend/src/types/adoption";
+import type { CandidateAgentUsageAssociations, CandidateAgentUsageSummary, CandidateAgentUsageUsers } from "../../backend/src/types/officialReportApi";
+import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { automaticRefreshFixture, isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
-import { selectedFixtureRead } from "../src/test/selectedUsageFixture";
+import { selectedFixtureRead, selectedUsersPage } from "../src/test/selectedUsageFixture";
+import { reportPage, reportSelection } from "../src/test/reportDataFixture";
 import { responsibilityFixture } from "../src/test/agentResponsibilityFixture";
+import { agentUsageHistoryFixture } from "../src/test/automaticAgentUsageFixture";
+import { selectedCohortData, selectedCohortRead } from "./selectedCohortFixture";
+import { inventoryFixtureSelection } from "./selectedInventoryFixture";
+import { usersRouteSearch, workbenchUrl } from "../src/workbenchRouting";
 
 async function openUser(page: Page) {
   await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { configurable: true, value: true }));
@@ -44,6 +51,118 @@ async function openUser(page: Page) {
 }
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
+for (const origin of ["licensed users", "Adoption", "reported users", "agent users"] as const) {
+  for (const field of ["Company", "Department"] as const) {
+    test(`${field} organization link opens filtered Adoption from ${origin}`, async ({ page }) => {
+      const opened = await openUser(page);
+      const cohort = selectedCohortData();
+      if (origin === "agent users") cohort.directory.reports = unifiedAgents.usageContext!.reports;
+      const directory = origin === "reported users" || origin === "agent users" ? cohort.directory : selectedUsersPage();
+      const person = directory.value.find(user => user.directory.displayName === (origin === "reported users" ? "Emery" : "Ada"))!;
+      const company = person.directory.companyName!, department = person.directory.department!;
+      const group: AdoptionGroup = { id: "operations", company, department,
+        people: [{ id: person.directory.objectId, name: person.directory.displayName!, agents: 1, responses: 200, champion: true }],
+        agents: [{ id: "report:synthetic-researcher", name: "Researcher", creatorType: "Microsoft", inventoryId: null, description: null }] };
+      const requests: URLSearchParams[] = [];
+      await page.route(url => url.pathname === "/api/copilot-usage/adoption", route => {
+        const params = new URL(route.request().url()).searchParams;
+        requests.push(params);
+        const value = [group].filter(row => (!params.has("company") || params.get("company") === `~string:${row.company}`)
+          && (!params.has("department") || params.get("department") === `~string:${row.department}`)
+          && (!params.has("search") || `${row.company} ${row.department}`.toLowerCase().includes(params.get("search")!.toLowerCase()))
+          && params.get("adoptionChamps") !== "without" && params.get("adoptionAgents") !== "without");
+        const response: AdoptionPage = {
+          ...reportPage(value, { reports: directory.reports, sources: directory.sources,
+            selection: reportSelection(5, Date.parse(layoutTime)), counts: { total: 1, filtered: value.length } }),
+          directory: directory.sources.directory,
+          page: { limit: 5, number: 1, offset: 0, nextCursor: null, previousCursor: null },
+          summary: { people: value.length, champs: value.length, agents: value.length },
+        };
+        return route.fulfill({ json: response });
+      });
+      if (origin === "reported users" || origin === "agent users") {
+        await page.route(url => url.pathname.startsWith("/api/official-usage/users"), route => {
+          const body = selectedCohortRead(route.request().url(), cohort);
+          expect(body, "Reported-user navigation keeps exact selected directory evidence").toBeDefined();
+          return route.fulfill({ json: body });
+        });
+      }
+      if (origin === "Adoption") {
+        await page.goto(workbenchUrl("users", usersRouteSearch({ view: "licenses", section: "adoption",
+          company: "Old company", department: "Old department", adoptionChamps: "without", adoptionAgents: "without",
+          search: "Old search", detailId: person.directory.objectId, page: 0 })));
+      } else if (origin === "reported users") {
+        await page.goto("/users?view=activity&q=Emery&agent=synthetic-researcher");
+        await page.getByRole("button", { name: "Emery", exact: true }).click();
+      } else if (origin === "agent users") {
+        const agent = unifiedAgents.value[0];
+        await page.route(url => url.pathname.startsWith(`/api/agent-inventory/${encodeURIComponent(agent.id)}/usage`), route => {
+          const context = { selectionId: inventoryFixtureSelection(route).id, reportSetId: directory.reports.setId,
+            usageRevision: "b".repeat(64), inventoryRevision: "c".repeat(64), reports: directory.reports };
+          const path = new URL(route.request().url()).pathname;
+          if (path.endsWith("/usage-history")) {
+            const history = agentUsageHistoryFixture(context, agent.id);
+            history.value = history.value.map(point => ({ ...point, status: "linked", responses: 200, associationCount: 1 }));
+            history.latestReported = history.value[0];
+            return route.fulfill({ json: history });
+          }
+          if (path.endsWith("/usage-associations")) {
+            const response: CandidateAgentUsageAssociations = { context,
+              value: [{ reportAgentId: agent.packages[0].id, agentName: agent.displayName, responses: 200, basis: "exact_package_id",
+                target: { source: "graph_packages", packageId: agent.packages[0].id, snapshotId: "60000000-0000-4000-8000-000000000001" } }],
+              page: { limit: 50, nextCursor: null, previousCursor: null }, counts: { total: 1, filtered: 1 } };
+            return route.fulfill({ json: response });
+          }
+          if (path.endsWith("/usage-users")) {
+            const response: CandidateAgentUsageUsers = { ...reportPage([{ username: person.directory.userPrincipalName!,
+              displayName: person.directory.displayName!, responses: 200 }], { reports: directory.reports, sources: directory.sources,
+              selection: { ...reportSelection(6, Date.parse(layoutTime)), id: context.selectionId } }), context };
+            return route.fulfill({ json: response });
+          }
+          expect(path.endsWith("/usage")).toBe(true);
+          const response: CandidateAgentUsageSummary = { recordId: agent.id, status: "linked", responses: 200, activeUsers: 1,
+            lastActivityDateUtc: directory.reports.reportingPeriod!.endDate, associationCount: 1, context };
+          return route.fulfill({ json: response });
+        });
+        await page.goto("/agents");
+        await page.getByRole("button", { name: `View details for ${agent.displayName}`, exact: true }).click();
+        const agentDialog = page.getByRole("dialog", { name: agent.displayName, exact: true });
+        await agentDialog.getByRole("tab", { name: "Users", exact: true }).click();
+        await agentDialog.getByRole("button", { name: `View details for Ada on ${agent.displayName}`, exact: true }).click();
+        await expect(page.locator("dialog[open]")).toHaveCount(2);
+      }
+      const dialog = page.getByRole("dialog", { name: person.directory.displayName!, exact: true });
+      const value = field === "Company" ? company : department;
+      const link = dialog.getByRole("link", { name: `View adoption for ${field.toLowerCase()} ${value}` });
+      await expect(link).toBeVisible();
+      const destination = workbenchUrl("users", usersRouteSearch({ view: "licenses", section: "adoption", company,
+        ...(field === "Department" ? { department } : {}), reportSetId: directory.reports.setId!, search: "", page: 0 }));
+      await expect(link).toHaveAttribute("href", destination);
+      requests.length = 0;
+      await page.evaluate(() => { document.documentElement.dataset.organizationNavigation = "in-app"; });
+      await link.click();
+      await expect(page).toHaveURL(new URL(destination, page.url()).href);
+      await expect(page.locator("dialog[open]")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Adoption", exact: true })).toHaveAttribute("aria-pressed", "true");
+      await expect(page.getByRole("region", { name: `${company} / ${department}`, exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Remove company filter", exact: true })).toContainText(company);
+      await expect(page.getByRole("button", { name: "Remove department filter", exact: true })).toHaveCount(field === "Department" ? 1 : 0);
+      expect(requests.length).toBeGreaterThan(0);
+      const query = requests.at(-1)!;
+      expect(query.get("company")).toBe(`~string:${company}`);
+      expect(query.get("department")).toBe(field === "Department" ? `~string:${department}` : null);
+      expect(query.get("setId")).toBe(directory.reports.setId);
+      for (const unrelated of ["search", "agentId", "adoptionChamps", "adoptionAgents", "cursor"]) {
+        expect(query.has(unrelated), unrelated).toBe(false);
+      }
+      expect(await page.evaluate(() => document.documentElement.dataset.organizationNavigation)).toBe("in-app");
+      expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
+      expect(opened.writes.filter(path => path !== "/api/agent-inventory/selections")).toEqual([]);
+      expect(opened.unexpected).toEqual([]);
+    });
+  }
+}
 
 test("user Logs offers human-attributed Defender invocations without starting a query on open", async ({ page }, info) => {
   const { dialog, writes, unexpected } = await openUser(page);

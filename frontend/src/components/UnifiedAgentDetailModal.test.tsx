@@ -932,6 +932,73 @@ describe("UnifiedAgentDetailModal", () => {
     expect(props.onInspectPackage).toHaveBeenLastCalledWith(second);
   });
 
+  it.each([false, true])("resumes a cancelled saved-detail read after the same inventory selection settles (retained detail=%s)", retained => {
+    const { props, update } = renderDetail({
+      selectionId: "saved-selection",
+      packageDetail: retained ? { ...record.packages[0], longDescription: "Previous saved details" } : undefined,
+      packageDetailStale: retained,
+    });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    update({ packageDetailLoading: true });
+    update({ packageDetailLoading: true, packageInventoryPending: true });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ packageDetailLoading: false, packageInventoryPending: true });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    update({ packageDetailLoading: false, packageInventoryPending: false });
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+    expect(props.onInspectPackage).toHaveBeenLastCalledWith(record.packages[0]);
+    update({ packageDetailLoading: true });
+    update({ packageDetail: { ...record.packages[0], longDescription: "Recovered saved details" }, packageDetailStale: false });
+    expect(screen.getByText("Recovered saved details")).toBeVisible();
+    expect(screen.queryByText("Previous saved details")).not.toBeInTheDocument();
+    expect(props.onInspectPackage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not restart an in-flight saved-detail read when the same inventory selection settles", () => {
+    const { props, update } = renderDetail({ selectionId: "saved-selection" });
+    update({ packageDetailLoading: true, packageInventoryPending: true });
+    update({ packageDetailLoading: true, packageInventoryPending: false });
+    expect(props.onInspectPackage).toHaveBeenCalledExactlyOnceWith(record.packages[0]);
+    update({ packageDetail: record.packages[0], packageDetailLoading: false });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("does not restart a failed saved-detail read after inventory settles (retained detail=%s)", retained => {
+    const detail = retained ? record.packages[0] : undefined;
+    const { props, update } = renderDetail({ selectionId: "saved-selection", packageDetail: detail });
+    update({ packageDetail: detail, packageDetailStale: true, packageDetailLoading: true });
+    update({ packageDetail: detail, packageDetailStale: true, packageDetailLoading: true, packageInventoryPending: true });
+    update({ packageDetail: undefined, packageDetailLoading: false, packageInventoryPending: true, packageDetailError: "Saved read denied." });
+    update({ packageDetail: undefined, packageDetailLoading: false, packageInventoryPending: false, packageDetailError: "Saved read denied." });
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    expect(screen.getByRole("alert")).toHaveTextContent("Saved read denied.");
+  });
+
+  it.each([
+    ["pending inventory", { packageInventoryPending: true }],
+    ["management action", { packageActionsBusy: true }],
+    ["package confirmation", { packageConfirmation: <p>Exact package confirmation</p> }],
+  ] as const)("pauses both inventory reload controls during %s", async (_scenario, paused) => {
+    const onRetryInventory = vi.fn();
+    const { update } = renderDetail({ ...paused, onRetryInventory });
+    const reload = screen.getByRole("button", { name: "Reload saved inventory" });
+    expect(reload).toBeDisabled();
+    await userEvent.click(reload);
+    expect(onRetryInventory).not.toHaveBeenCalled();
+
+    update({ ...paused, inventoryError: "Replacement inventory unavailable." });
+    const retry = screen.getByRole("button", { name: "Retry saved inventory" });
+    expect(retry).toBeDisabled();
+    await userEvent.click(retry);
+    expect(onRetryInventory).not.toHaveBeenCalled();
+
+    update({ packageInventoryPending: false, packageActionsBusy: false, packageConfirmation: undefined,
+      inventoryError: "Replacement inventory unavailable." });
+    expect(retry).toBeEnabled();
+    await userEvent.click(retry);
+    expect(onRetryInventory).toHaveBeenCalledOnce();
+  });
+
   it.each([undefined, "Previous package read failed."])(
     "waits for explicit inventory recovery before reading saved versions (detail error=%s)",
     async packageDetailError => {

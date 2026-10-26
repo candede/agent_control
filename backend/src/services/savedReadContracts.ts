@@ -2,7 +2,7 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { digest, exactCount } from "../db/dataBounds.js";
 import { reportRelationsSql } from "../db/officialReportQueries.js";
-import { selectedInventorySourcesSql } from "../db/inventoryAuthority.js";
+import { selectedInventorySourcesSql } from "../db/inventorySelections.js";
 import type { InventoryQueries } from "../db/inventoryQueries.js";
 import type { AgentRelationship, ChampionAgentPage, SavedAgentRelationship, SavedRelationshipPage, UserResolution } from "../types/savedReadContracts.js";
 import type { LargeTenantUsersReports, ReportReadContext } from "./largeTenantUsersReports.js";
@@ -89,6 +89,7 @@ export class SavedReadContracts {
   private async page(client: pg.PoolClient, context: ReportReadContext, inventoryId: string,
     inventorySelection: SavedRelationshipPage["inventorySelection"], sql: string, values: unknown[], key: unknown[],
     needsReport: boolean, options: { limit: number; cursor?: string }): Promise<SavedRelationshipPage> {
+    if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) throw new SelectionError("invalid_cursor");
     const expected = { identity: context.identity, endpoint: "saved-agent-relationships", selectionId: context.selection.id,
       revision: digest(JSON.stringify([context.selection.revision, inventorySelection.id, inventorySelection.revision,
         inventorySelection.evaluatedAt, inventorySelection.expiresAt, inventorySelection.publicationRevisions])),
@@ -143,35 +144,29 @@ export class SavedReadContracts {
         throw new AppError(400, "champion_group_required", "Select one exact company and department.");
       }
       const inventorySelection = await this.compound(client, context, inventoryId);
-      const dataset = adoptionDataset(this.reports, context, inventoryId);
-      const ranked = `${dataset.relations}, person_metrics AS (
-        SELECT u.identity,u.group_id,coalesce(nullif(u.display_name,''),u.upn) AS name,
-          (SELECT count(*) FROM creators c WHERE c.user_id=u.identity) AS created,
-          coalesce(u.responses,u.bridge_responses) AS responses,
-          (SELECT count(*) FROM user_agents a WHERE a.user_id=u.identity) AS agents
-        FROM adoption_users u JOIN matching_groups g ON g.identity=u.group_id
-      ), ranked AS (
-        SELECT *,row_number() OVER(PARTITION BY group_id ORDER BY created DESC,responses DESC NULLS LAST,
-          agents DESC,lower(name) COLLATE "C",identity) AS rank FROM person_metrics
-      ), champions AS (SELECT * FROM ranked WHERE rank<=3 AND (created>0 OR coalesce(responses,0)>0))`;
+      const dataset = adoptionDataset(this.reports, context);
       const group = (await client.query<{ company: string | null; department: string | null;
-        people: Array<{ identity: string; name: string | null; rank: number; created: string; responses: string | null; agents: string }> }>(
-        `${ranked} SELECT (SELECT company FROM matching_groups LIMIT 1) AS company,
+        people: Array<{ identity: string; name: string | null; rank: number; responses: string | null; agents: string }> }>(
+        `${dataset.relations} SELECT (SELECT company FROM matching_groups LIMIT 1) AS company,
           (SELECT department FROM matching_groups LIMIT 1) AS department,
           coalesce(jsonb_agg(to_jsonb(person) ORDER BY person.rank) FILTER(WHERE person.identity IS NOT NULL),'[]'::jsonb) AS people
-        FROM (SELECT identity,name,rank::int,created::text,responses::text,agents::text FROM champions) person
+        FROM (SELECT identity,name,rank::int,responses::text,agents::text FROM adoption_champions) person
         RIGHT JOIN (SELECT 1) anchor ON true`, dataset.values)).rows[0];
       const people = group.people;
-      // The portal's organization-filtered agent list is used only for rank metrics.
-      // The projection below deliberately uses all authorized champion associations.
       const ids = people.map(row => row.identity);
+      const created = (await client.query(`${reportRelationsSql}${this.relations()}
+        SELECT person_id,count(DISTINCT id)::text AS count FROM relationships
+        WHERE person_id=ANY($9::text[]) AND relationship='created' GROUP BY person_id`,
+      [...this.reports.parameters(context), identity.principalId, inventoryId, ids])).rows;
+      const createdCounts = new Map<string, number>(created.map(row => [row.person_id, exactCount(row.count)]));
       const sql = `${reportRelationsSql}${this.relations()}, requested AS (
         SELECT * FROM relationships WHERE person_id=ANY($9::text[]) AND relationship IN ('used','created'))`;
       const page = await this.page(client, context, inventoryId, inventorySelection, sql, [...this.reports.parameters(context), identity.principalId, inventoryId, ids],
         [context.query.company, context.query.department, ids], true, options);
       return bounded({ ...page, company: group.company, department: group.department,
-        champions: people.map(row => ({ objectId: row.identity, name: row.name, rank: row.rank, created: exactCount(row.created),
-          responses: row.responses === null ? null : exactCount(row.responses), agents: exactCount(row.agents) })) }, 524288);
+        champions: people.map(row => ({ objectId: row.identity, name: row.name, rank: row.rank, created: createdCounts.get(row.identity) ?? 0,
+          responses: row.responses === null ? null : exactCount(row.responses),
+          agents: context.report.lineages.some(lineage => lineage.kind === "userAgents") ? exactCount(row.agents) : null })) }, 524288);
     });
   }
 }

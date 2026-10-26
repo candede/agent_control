@@ -33,8 +33,8 @@ export const reportPages = {
   history: (query: ReportPageRequest, signal?: AbortSignal) => readReportPage<ReportHistorySet>("official-usage/history", query, signal),
   overview: (query: ReportPageRequest, signal?: AbortSignal) => readReportPage<ReportOverviewAgent>("official-usage/overview", query, signal),
 };
-export function readReportDetail<T>(path: string, selectionId: string | undefined, signal?: AbortSignal) {
-  return request<OfficialReportDetail<T>>(`/api/${path}${reportQueryString({ selectionId })}`, { signal });
+export function readReportDetail<T>(path: string, selectionId: string | undefined, signal?: AbortSignal, setId?: string) {
+  return request<OfficialReportDetail<T>>(`/api/${path}${reportQueryString({ selectionId, setId })}`, { signal });
 }
 export function readReportFacet(path: string, selectionId: string, field: "company" | "department" | "creatorType",
   options: { cursor?: string; search?: string; signal?: AbortSignal } = {}) {

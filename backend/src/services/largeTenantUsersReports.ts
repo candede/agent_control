@@ -18,6 +18,7 @@ import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisio
 import type { PublicationRevisions, PublishedSelectedRead } from "../types/dataSelection.js";
 import { isPublicationRevisions } from "../types/dataSelection.js";
 import { adoptionDataset } from "./adoptionGroups.js";
+import { inventoryAssociationRevision, inventorySelectionRoots, validateInventoryRoot } from "../db/inventorySelections.js";
 
 export const reportQueryFields = ["setId", "scope", "search", "company", "department", "entitlement", "serviceState", "appActivity",
   "reportActivity", "cohort", "licenseCohort", "creatorType", "agentId", "username", "responsesOnly", "startDate", "endDate",
@@ -36,11 +37,12 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
   const query = { ...input };
   for (const key of ["company", "department", "creatorType", "agentId", "username"] as const) {
     const value = query[key];
+    const invalidText = key === "creatorType" ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cs}]/u : /[\0\r\n\p{Cs}]/u;
     if (value !== undefined && !(value === null && ["company", "department"].includes(key))
       && (typeof value !== "string" || value.length > (key === "agentId" || key === "username" ? 512 : 256)
         || (key === "agentId" || key === "username") && !value.trim()
         || (key === "agentId" || key === "username") && /[\p{Cc}\p{Cs}]/u.test(value)
-        || /[\0\r\n]/.test(value))) throw new SelectionError("invalid_cursor");
+        || invalidText.test(value))) throw new SelectionError("invalid_cursor");
   }
   if (query.setId !== undefined) query.setId = reportUuid(query.setId).toLowerCase();
   for (const [key, values] of [
@@ -102,8 +104,9 @@ export class LargeTenantUsersReports {
     if (!Number.isInteger(staleAfterDays) || staleAfterDays < 1 || staleAfterDays > 365) throw new Error("official_freshness_configuration");
     this.sources = new UserSourcesRepository(database, secret);
     this.history = new OfficialReportHistory(database);
-    this.selections = new DataSelections(database, (client, root, identity) => root.kind === "tenant_history"
-      ? this.history.validateRoot(client, root, identity) : this.sources.validateRoot(client, root, identity));
+    this.selections = new DataSelections(database, (client, root, identity) => root.kind === "inventory_delta"
+      ? validateInventoryRoot(client, root, identity) : root.kind === "tenant_history"
+        ? this.history.validateRoot(client, root, identity) : this.sources.validateRoot(client, root, identity));
     this.codec = new CursorCodec(secret);
   }
   private aggregate(context: ReportReadContext, scope: string, value?: SelectedAggregate) {
@@ -159,6 +162,19 @@ export class LargeTenantUsersReports {
       const report = await this.metadata(client, identity.tenantId, query.setId, evaluatedAt);
       const publicationRevisions = await readAutomaticInventoryRevisions(identity, client);
       const roots: DependencyRoot[] = [history];
+      let associationRevision: string | undefined;
+      if (endpoint === "adoption" && report.lineages.some(lineage => lineage.kind === "userAgents")) {
+        const scope = (await client.query<{ id: string }>(`SELECT id FROM data_scope_epochs
+          WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_canonical'
+            AND token_mode='delegated' AND selector='complete'`,
+        [identity.tenantId, identity.principalId])).rows[0];
+        if (scope) {
+          const inventory = await inventorySelectionRoots(client, { ...scope, tenantId: identity.tenantId, tokenMode: "delegated" },
+            new Date(evaluatedAt.getTime() + 30 * 60_000));
+          roots.push(...inventory);
+          if (inventory.length) associationRevision = await inventoryAssociationRevision(client, identity.tenantId);
+        }
+      }
       for (const source of Object.values(metadata)) if (source.generationId) roots.push({
         kind: "generation", generationId: source.generationId, scopeId: source.scopeId!, revision: source.revision!,
         expiresAt: new Date(evaluatedAt.getTime() + 30 * 60_000),
@@ -173,7 +189,7 @@ export class LargeTenantUsersReports {
         persist: async (connection, selection) => {
           await connection.query(`INSERT INTO official_usage_read_contexts(selection_id,tenant_id,token_mode,metadata,report_metadata,set_id,history_revision,history_epoch)
             VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8)`,
-          [selection.id, identity.tenantId, tokenMode, JSON.stringify({ ...metadata, publicationRevisions }), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
+          [selection.id, identity.tenantId, tokenMode, JSON.stringify({ ...metadata, publicationRevisions, associationRevision }), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
         } };
     });
   }
@@ -234,8 +250,15 @@ export class LargeTenantUsersReports {
     if (!row) throw new SelectionError("selection_invalidated");
     const query = reportQuery(row.endpoint, row.query_json);
     if (canonicalQuery(query, reportQueryFields) !== row.query_hash) throw new SelectionError("invalid_cursor");
-    const { publicationRevisions, ...metadata } = row.metadata;
+    const { publicationRevisions, associationRevision, ...metadata } = row.metadata;
     if (!isPublicationRevisions(publicationRevisions)) throw new SelectionError("selection_invalidated", "unavailable");
+    if (row.endpoint === "adoption") {
+      if (associationRevision !== undefined && (typeof associationRevision !== "string"
+        || associationRevision !== await inventoryAssociationRevision(client, identity.tenantId))) {
+        throw new SelectionError("selection_invalidated", "changed");
+      }
+      await client.query("SELECT set_config('jit','off',true)");
+    }
     return { identity, tokenMode: row.token_mode, endpoint: row.endpoint, query, queryHash: row.query_hash, metadata,
       report: row.report_metadata, evaluatedAt: row.evaluated_at,
       selection: { id: selectionId, revision: row.revision, expiresAt: row.expires_at.toISOString(), evaluatedAt: row.evaluated_at.toISOString(),
@@ -627,11 +650,12 @@ export class LargeTenantUsersReports {
       const { sql, values } = this.dataset(copy);
       const where = this.filter(copy, copy.endpoint, values, options.field === "creatorType" ? undefined : options.field);
       values.push(search);
-      const facetKey = context.endpoint === "adoption" ? `lower(normalize(${field},NFKC))` : field;
+      const facetKey = context.endpoint === "adoption" ? reportSearchSql(field) : field;
       const facetLabel = context.endpoint === "adoption" ? `min(${field} COLLATE "C")` : field;
+      const pageKey = context.endpoint === "adoption" ? reportSearchSql("value") : 'lower(normalize(value,NFKC) COLLATE "default")';
       const base = `WITH dataset AS (${sql}), options AS (SELECT ${facetLabel} AS value,count(*)::text AS count FROM dataset
         WHERE ${where} AND strpos(${reportSearchSql(`COALESCE(${field},'')`)},$${values.length})>0 GROUP BY ${facetKey}),
-        ordered AS (SELECT *,lower(normalize(value,NFKC) COLLATE "default") AS page_key,COALESCE(value,chr(1)) AS identity FROM options)`;
+        ordered AS (SELECT *,${pageKey} AS page_key,COALESCE(value,chr(1)) AS identity FROM options)`;
       const counts = (await client.query(`${base} SELECT count(*)::text AS filtered,
         (SELECT count(*) FROM (SELECT ${facetKey} FROM dataset GROUP BY ${facetKey}) all_options)::text AS total FROM ordered`, values)).rows[0];
       const expected = { identity, endpoint: `facets:${options.field}`, selectionId: id, revision: context.selection.revision,

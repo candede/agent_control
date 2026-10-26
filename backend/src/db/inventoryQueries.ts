@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { DataSelections, CursorCodec, SelectionError, type SelectionIdentity, type DependencyRoot } from "../services/dataSelections.js";
+import { DataSelections, CursorCodec, SelectionError, type SelectionIdentity } from "../services/dataSelections.js";
 import { LargeTenantUsersReports, type ReportCurrentData } from "../services/largeTenantUsersReports.js";
 import { officialAgentsSql } from "./officialReportQueries.js";
 import { userSourceObjectIds, userSourcePeopleInRead, userSourceSearch, userSourceSearchSql } from "./userSources.js";
@@ -12,6 +12,7 @@ import { AppError } from "../errors.js";
 import { readInventoryResponsibility } from "./inventoryResponsibility.js";
 import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
 import { currentInventorySourcesSql, lockInventorySelection } from "./inventoryAuthority.js";
+import { inventoryAssociationRevision, inventorySelectionRoots, validateInventoryRoot } from "./inventorySelections.js";
 import { decodeInventoryFacet, encodeInventoryFacet } from "../types/inventoryFacets.js";
 import { inventoryNativeRootChoicesSql } from "./inventoryInputScopes.js";
 import { pendingInventoryIdentityExpirySql } from "./inventoryIdentityExpiry.js";
@@ -58,7 +59,8 @@ type Context = { data: ReportCurrentData; selectionId: string;expiresAt: number;
 type PageOptions = { limit?: number; cursor?: string; recordId?: string; expectedQuery?: InventoryQuery; explicitExportId?: string;
   exportKind?: "unified_agents" | "graph_packages" | "power_platform_agents" };
 
-export function inventoryPackageResidualSql(alias: "member" | "r") {
+export function inventoryPackageResidualSql(alias: "member" | "r" | "selected",
+  collections: readonly ("supportedHosts" | "elementTypes" | "categories")[] = ["supportedHosts", "elementTypes"]) {
   return `CASE WHEN ${alias}.domain='packages' THEN ${alias}.residual
     ||jsonb_build_object('savedSource',jsonb_build_object('scopeId',${alias}.scope_id,'identity',${alias}.identity))||coalesce((
     SELECT jsonb_object_agg(collection.value,coalesce((
@@ -66,7 +68,7 @@ export function inventoryPackageResidualSql(alias: "member" | "r") {
       WHERE item.generation_id=${alias}.generation_id AND item.identity=${alias}.identity AND item.kind=collection.value
     ),'[]'::jsonb)) FROM inventory_facts collection
     WHERE collection.generation_id=${alias}.generation_id AND collection.identity=${alias}.identity
-      AND collection.kind='collection' AND collection.value IN ('supportedHosts','elementTypes')
+      AND collection.kind='collection' AND collection.value IN (${collections.map(value => `'${value}'`).join(",")})
   ),'{}'::jsonb) ELSE ${alias}.residual END`;
 }
 
@@ -116,7 +118,7 @@ export class InventoryQueries {
     summaryCaches.set(database,this.summaryCache);
     this.reports = new LargeTenantUsersReports(database, secret, reportStaleDays);
     this.selections = new DataSelections(database, (client, root, identity, exportSelectionId) => root.kind === "inventory_delta"
-      ? this.validateRoot(client, root, identity, exportSelectionId)
+      ? validateInventoryRoot(client, root, identity, this.authorizedApplicationScope, exportSelectionId)
       : root.kind === "tenant_history" ? this.reports.history.validateRoot(client, root, identity)
         : this.reports.sources.validateRoot(client, root, identity),
     (scope, identity) => scope.tenant_id === identity.tenantId && scope.tenant_id === this.authorizedApplicationScope?.tenantId
@@ -124,35 +126,6 @@ export class InventoryQueries {
       && scope.source === "inventory_packages");
     this.cursors = new CursorCodec(secret);
   }
-  async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) {
-    if (root.kind !== "inventory_delta") throw new SelectionError("selection_invalidated");
-    const revision = (await client.query(`SELECT v.inputs FROM inventory_revisions v JOIN inventory_roots r ON r.baseline_id=v.baseline_id
-      JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=v.scope_id
-      JOIN data_generations anchor ON anchor.id=v.baseline_id
-      WHERE v.scope_id=$1 AND v.revision=$2 AND v.baseline_id=$3 AND v.tenant_id=$4 AND r.collected_before<=$2
-        AND s.principal_id=ANY($5::text[]) AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-        AND (s.token_mode<>'application' OR s.source='inventory_packages' AND s.principal_id=$6
-          AND EXISTS(SELECT 1 FROM capability_configuration c WHERE c.tenant_id=s.tenant_id
-            AND c.capability_id='graph.package.read.application' AND c.enabled AND c.shared_data_scope))
-        AND g.state IN ('published','retired') AND g.validated
-        AND anchor.state IN ('published','retired')`,
-    [root.scopeId, root.revision, root.generationId, identity.tenantId, this.sourceOwners(identity),
-      this.authorizedApplicationScope?.tenantId === identity.tenantId ? this.authorizedApplicationScope.principalId : ""])).rows[0];
-    if (!revision) throw new SelectionError("selection_invalidated");
-    const invalid = await client.query(`SELECT 1 FROM jsonb_to_recordset($1::jsonb) r("scopeId" uuid,"baselineId" uuid,epoch bigint,"expiresAt" timestamptz)
-      LEFT JOIN data_scope_epochs s ON s.id=r."scopeId" LEFT JOIN data_generations g ON g.id=r."baselineId"
-      WHERE s.epoch IS DISTINCT FROM r.epoch OR s.tenant_id<>$2 OR NOT(s.principal_id=ANY($3::text[]))
-        OR g.id IS NULL OR g.state NOT IN ('published','retired') LIMIT 1`, [JSON.stringify(revision.inputs), identity.tenantId, this.sourceOwners(identity)]);
-    if (invalid.rowCount) throw new SelectionError("selection_invalidated");
-    if (exportSelectionId !== undefined) {
-      const changed = await client.query(`SELECT 1 FROM inventory_read_contexts c
-        WHERE c.selection_id=$1 AND c.tenant_id=$2 AND c.root_scope_id=$3
-          AND c.association_revision IS DISTINCT FROM coalesce(inventory_association_revision($2),0)`,
-      [exportSelectionId, identity.tenantId, root.scopeId]);
-      if (changed.rowCount) throw new SelectionError("selection_invalidated");
-    }
-  }
-
   async capture(identity: SelectionIdentity, scopeId: string, query: InventoryQuery = {}, tokenMode: "delegated" | "application" = "delegated") {
     identity = { ...identity };
     query = { ...query };
@@ -164,23 +137,15 @@ export class InventoryQueries {
     const sourceScope = await this.reports.sources.ensureScope(identity, "delegated");
     await this.reports.history.ensure(identity.tenantId);
     return this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
-      const root = (await client.query(`SELECT r.*,g.expires_at,s.epoch FROM inventory_roots r
-        JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
-        JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=r.scope_id
-        WHERE r.scope_id=$1 AND r.current AND r.tenant_id=$2 AND s.principal_id=ANY($3::text[]) AND s.token_mode=$4`,
-      [scopeId, identity.tenantId, this.sourceOwners(identity), tokenMode])).rows[0];
-      if (!root) throw new SelectionError("selection_invalidated");
-      const data = await this.reports.currentInventoryData(client, identity, at);
       const pinUntil = new Date(at.getTime() + 30 * 60_000);
-      const roots: DependencyRoot[] = [{ kind: "inventory_delta", scopeId, generationId: root.baseline_id, revision: root.revision, expiresAt: pinUntil },
-        await this.reports.history.root(client, identity.tenantId, at)];
+      const roots = await inventorySelectionRoots(client, { id: scopeId, tenantId: identity.tenantId, tokenMode }, pinUntil);
+      if (!roots.length) throw new SelectionError("selection_invalidated");
+      const data = await this.reports.currentInventoryData(client, identity, at);
+      roots.push(await this.reports.history.root(client, identity.tenantId, at));
       if (needsPeopleCache(query)) {
         const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
         roots.push({ kind: "user_sources", scopeId: sourceScope, revision: epoch, expiresAt: new Date(at.getTime() + 600_000) });
       }
-      const inputs = (await client.query("SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$2", [scopeId, root.revision])).rows[0]?.inputs ?? [];
-      for (const input of inputs) roots.push({ kind: "inventory_delta", scopeId: input.scopeId, generationId: input.baselineId,
-        revision: input.revision, expiresAt: pinUntil });
       // Directory labels are exported, so their immutable generation remains pinned.
       for (const metadata of [data.metadata.directory]) if (metadata.generationId) roots.push({
         kind: "generation", scopeId: metadata.scopeId!, generationId: metadata.generationId,
@@ -190,7 +155,7 @@ export class InventoryQueries {
         FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>$3`,
       [identity.tenantId, identity.principalId, at])).rows[0]?.expires_at : null;
       return { roots, nextTransition: transition ?? undefined, persist: async (connection, selection) => {
-        const association = (await connection.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
+        const association = await inventoryAssociationRevision(connection, identity.tenantId);
         await connection.query(`INSERT INTO inventory_read_contexts(selection_id,tenant_id,report_context,association_revision,root_scope_id,query_values)
           VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb)`, [selection.id, identity.tenantId, JSON.stringify(data), association, scopeId, JSON.stringify(criteria)]);
       } };
@@ -221,7 +186,7 @@ export class InventoryQueries {
     selected: Awaited<ReturnType<DataSelections["assert"]>>): Promise<Context> {
     const saved = (await client.query(`SELECT c.*,s.source,s.token_mode FROM inventory_read_contexts c
       JOIN data_scope_epochs s ON s.id=c.root_scope_id WHERE c.selection_id=$1 AND c.tenant_id=$2`, [id, identity.tenantId])).rows[0];
-    const association = (await client.query("SELECT inventory_association_revision($1)::text AS revision", [identity.tenantId])).rows[0]?.revision ?? "0";
+    const association = await inventoryAssociationRevision(client, identity.tenantId);
     if (!saved) throw new SelectionError("selection_invalidated", "unavailable");
     if (saved.association_revision !== association) throw new SelectionError("selection_invalidated", "changed");
     const pin = selected.pins.find(pin => pin.scope_id === saved.root_scope_id);
@@ -891,6 +856,7 @@ export class InventoryQueries {
   facets(id: string, identity: SelectionIdentity, field: "type" | "publisher" | "host" | "platform" | "environmentId" | "source" | "linkState" | "blocked" | "availableTo", options: { limit?: number; cursor?: string; search?: string; selected?: boolean } = {}) {
     const limit = pageLimit(options.limit);
     if (!["type", "publisher", "host", "platform", "environmentId", "source", "linkState", "blocked", "availableTo"].includes(field)) throw new SelectionError("invalid_cursor");
+    const search = userSourceSearch(options.search ?? "");
     return this.read(id, identity, async (client, context, selection) => {
       if (options.selected && (options.cursor || options.search || !["type", "publisher", "host", "platform", "environmentId", "availableTo"].includes(field))) {
         throw new SelectionError("invalid_cursor");
@@ -899,12 +865,12 @@ export class InventoryQueries {
       if (options.selected && selectedValue === undefined) return { value: [], total: 0, nextCursor: null };
       if (field === "environmentId" && typeof selectedValue === "string") selectedValue = normalizeEnvironmentIdentity(selectedValue);
       if (field === "platform" && typeof selectedValue === "string") selectedValue = normalizePackageAuthoringTool(selectedValue);
-      const cursor = this.continuation(id, identity, selection, "facets", [field, options.search ?? "", Boolean(options.selected)], options.cursor);
+      const cursor = this.continuation(id, identity, selection, "facets", [field, search, Boolean(options.selected)], options.cursor);
       const { sql, values } = this.relation(context);
       const where = this.filter(options.selected ? { inventoryScope: context.query.inventoryScope } : context.query, values, field);
       values.push(options.selected ? encodeInventoryFacet(selectedValue as Parameters<typeof encodeInventoryFacet>[0]) : null);
       const selectedWhere = `($${values.length}::text IS NULL OR value=$${values.length})`;
-      values.push(field, cursor.after ?? null, options.search ?? "");
+      values.push(field, cursor.after ?? null, search);
       const n = values.length;
       const scalar = ({ environmentId: `(${normalizeEnvironmentIdentitySql("f.environment_id")})`,
         source: "f.presence", linkState: "f.link_state" } as Record<string, string>)[field];
@@ -915,9 +881,9 @@ export class InventoryQueries {
       const facets = `${sql}, options AS (SELECT ${expression} AS value,min(${label} COLLATE "C") AS label FROM facts f
         ${scalar ? `CROSS JOIN (SELECT $${n - 2}::text AS field) binding` : `JOIN inventory_facts x ON x.generation_id=f.generation_id
           AND x.identity=f.identity AND x.kind=$${n - 2}`}
-        WHERE ${where} AND position(lower($${n}::text) IN lower(${label}))>0 GROUP BY ${expression}
+        WHERE ${where} AND strpos(${userSourceSearchSql(label)},$${n})>0 GROUP BY ${expression}
         ${field === "availableTo" ? `UNION ALL SELECT '~some-or-all','Allowed for Some or All'
-          WHERE position(lower($${n}::text) IN lower('Allowed for Some or All'))>0 AND EXISTS(
+          WHERE strpos(${userSourceSearchSql("'Allowed for Some or All'")},$${n})>0 AND EXISTS(
             SELECT 1 FROM facts f JOIN inventory_facts x ON x.generation_id=f.generation_id AND x.identity=f.identity
               AND x.kind='availableTo' WHERE ${where} AND ${assignedAccessSql})` : ""})`;
       const total = exactCount((await client.query(`${facets} SELECT count(*)::text AS n FROM options
@@ -964,7 +930,9 @@ export class InventoryQueries {
         JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
         JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
         WHERE ${inventoryAsOf()} AND s.source_identity=$3 AND r.domain='packages' AND r.native_id=$3
-      ) SELECT selected.*,
+      ) SELECT selected.record_id,selected.source_scope_id,selected.identity,selected.generation_id,
+        ${inventoryPackageResidualSql("selected", ["supportedHosts", "elementTypes", "categories"])} AS residual,
+        selected.evidence,selected.observed_at,selected.expires_at,
         EXISTS(SELECT 1 FROM inventory_roots root JOIN inventory_memberships live
           ON live.baseline_id=root.baseline_id AND live.valid_from_revision<=root.revision
             AND (live.valid_to_revision IS NULL OR live.valid_to_revision>root.revision)

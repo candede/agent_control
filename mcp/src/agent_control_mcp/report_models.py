@@ -17,6 +17,9 @@ class Page(WireModel):
     limit: SafeInteger
     nextCursor: str | None
     previousCursor: str | None
+    anchor: str | None = None
+    number: SafeInteger | None = None
+    offset: SafeInteger | None = None
 
 
 class Counts(WireModel):
@@ -488,7 +491,7 @@ class Champion(WireModel):
     rank: SafeInteger
     created: SafeInteger
     responses: SafeInteger | None
-    agents: SafeInteger
+    agents: SafeInteger | None
 
 
 class ChampionAgents(SavedRelationships):
@@ -500,7 +503,7 @@ class ChampionAgents(SavedRelationships):
 class AdoptionPerson(WireModel):
     id: str
     name: str
-    agents: SafeInteger
+    agents: SafeInteger | None
     responses: SafeInteger | None
     champion: bool
 
@@ -509,7 +512,8 @@ class AdoptionAgent(WireModel):
     id: str
     name: str
     description: str | None
-    type: str | None
+    creatorType: str | None
+    inventoryId: str | None
 
 
 class AdoptionGroup(WireModel):
@@ -523,12 +527,17 @@ class AdoptionGroup(WireModel):
 class AdoptionSummary(WireModel):
     people: SafeInteger
     champs: SafeInteger
-    agents: SafeInteger
+    agents: SafeInteger | None
+
+
+class AdoptionPaging(Page):
+    number: SafeInteger
+    offset: SafeInteger
 
 
 class AdoptionPage(ReportList[AdoptionGroup]):
+    page: AdoptionPaging
     directory: SourceMetadata
-    inventoryAvailable: bool
     summary: AdoptionSummary
 
 
@@ -619,11 +628,16 @@ class UsageUsers(ReportList[UsageUser]):
     context: UsageContext
 
 
-class UsageTarget(WireModel):
-    source: Literal["graph_packages", "power_platform"]
-    packageId: str | None = None
-    nativeId: str | None = None
-    environmentId: str | None = None
+class GraphUsageTarget(WireModel):
+    source: Literal["graph_packages"]
+    packageId: str
+    snapshotId: str
+
+
+class PowerPlatformUsageTarget(WireModel):
+    source: Literal["power_platform"]
+    nativeId: str
+    environmentId: str | None
     snapshotId: str
 
 
@@ -632,7 +646,7 @@ class UsageAssociation(WireModel):
     agentName: str
     responses: SafeInteger
     basis: Literal["reviewed", "exact_package_id"]
-    target: UsageTarget
+    target: GraphUsageTarget | PowerPlatformUsageTarget = Field(discriminator="source")
 
 
 class UsageAssociations(WireModel):

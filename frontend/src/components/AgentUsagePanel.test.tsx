@@ -83,10 +83,13 @@ afterEach(() => { cleanup(); vi.resetAllMocks(); });
 describe("restored agent usage and users", () => {
   it("opens user details (Overview first) with Logs scoped to the saved inventory agent, not a CSV agent ID, and closes when hidden", async () => {
     const view = renderPanel();
+    const onOpenAdoption = vi.fn();
+    view.rerender(view.content({ onOpenAdoption }));
     fireEvent.click(await screen.findByRole("button", { name: "View details for person0@example.invalid on Excel" }));
     expect(UserDetailModal).toHaveBeenLastCalledWith(expect.objectContaining({
       identity: "person0@example.invalid", kind: "report",
       investigationAgent: { recordId: record.id, name: "Excel" },
+      onOpenAdoption,
     }), undefined);
     expect(vi.mocked(UserDetailModal).mock.lastCall?.[0]).not.toHaveProperty("selectionId");
     expect(vi.mocked(UserDetailModal).mock.lastCall?.[0]).not.toHaveProperty("initialTab");
@@ -101,6 +104,44 @@ describe("restored agent usage and users", () => {
     view.rerender(view.content({ inventoryRevision: "b".repeat(64) }));
     await screen.findByText("person0@example.invalid");
     expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
+  });
+  it.each(["tenant", "principal", "roles", "agent", "access"] as const)(
+    "retires user investigation across a %s A-B-A boundary", async boundary => {
+      const view = renderPanel();
+      fireEvent.click(await screen.findByRole("button", { name: "View details for person0@example.invalid on Excel" }));
+      expect(screen.getByLabelText("Scoped user logs")).toBeVisible();
+      const principal: SessionUser = { ...view.principal, ...(boundary === "tenant" ? { tenantId: "different" }
+        : boundary === "principal" ? { homeAccountId: "different" }
+          : boundary === "roles" ? { roles: ["AgentControl.Viewer"] } : boundary === "access" ? { roles: [] } : {}) };
+      view.rerender(view.content(boundary === "agent" ? { record: { ...record, id: "different" } } : {}, principal));
+      expect(screen.queryByLabelText("Scoped user logs")).not.toBeInTheDocument();
+      view.rerender(view.content());
+      expect(screen.queryByLabelText("Scoped user logs")).not.toBeInTheDocument();
+    });
+  it("keeps the users search draft and restarts paging when inventory evidence is replaced", async () => {
+    vi.mocked(api.readAgentReportSummary).mockImplementation(async (_id, query) =>
+      summary({ context: { ...context, selectionId: query.selectionId ?? selectionId } }));
+    vi.mocked(api.readAgentReportAssociations).mockImplementation(async (_id, query) =>
+      links({ context: { ...context, selectionId: query.selectionId } }));
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      const page = users(query?.cursor, query?.search);
+      return { ...page, selection: { ...page.selection, id: query?.selectionId ?? selectionId },
+        context: { ...context, selectionId: query?.selectionId ?? selectionId } };
+    });
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    await screen.findByText("person0@example.invalid");
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search agent users" }), { target: { value: " Person " } });
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Next users" })).toHaveAttribute("aria-disabled", "false"));
+    fireEvent.click(screen.getByRole("button", { name: "Next users" }));
+    await screen.findByText("person25@example.invalid");
+    const replacement = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    view.rerender(view.content({ inventorySelectionId: replacement, inventoryRevision: "replacement" }));
+    await screen.findByText("person0@example.invalid");
+    expect(screen.getByRole("searchbox", { name: "Search agent users" })).toHaveValue(" Person ");
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/usage-users"),
+      { selectionId: replacement, inventorySelectionId: replacement, search: "person", limit: 25 }, expect.any(AbortSignal));
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
   });
   it.each(["page", "revision", "disabled", "account", "unmount"] as const)(
     "retires report-link callbacks across %s changes", async boundary => {
@@ -817,6 +858,47 @@ describe("restored agent usage and users", () => {
     fireEvent.click(screen.getByRole("button", { name: "Return to latest report" }));
     await screen.findByRole("heading", { name: "Usage not reported" });
     expect(onReloadInventory).not.toHaveBeenCalled();
+    expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
+  });
+  it("keeps the local historical period when inventory evidence is replaced", async () => {
+    const historicalId = "77777777-7777-4777-8777-777777777777";
+    const historical: AgentUsageHistoryPoint = { setId: historicalId, reportingStart: "2026-09-01", reportingEnd: "2026-10-01",
+      periodProvenance: "activity_range", acceptedAt: "2026-10-02T00:00:00Z", status: "linked", responses: 200,
+      lastActivityDateUtc: "2026-10-01T00:00:00Z", associationCount: 1 };
+    const current: AgentUsageHistoryPoint = { ...historical, setId: reports.setId!, reportingStart: "2026-09-05", reportingEnd: "2026-10-04",
+      status: "unlinked", responses: null, associationCount: 0 };
+    vi.mocked(api.readAgentReportHistory).mockImplementation(async (_id, query) =>
+      agentUsageHistoryFixture({ ...context, selectionId: query.selectionId }, record.id, [current, historical]));
+    vi.mocked(api.readAgentReportSummary).mockImplementation(async (_id, query) => {
+      const selected = { ...context, selectionId: query.selectionId ?? selectionId };
+      return query.setId === historicalId ? summary({ responses: 200,
+        context: { ...selected, reportSetId: historicalId, reports: { ...reports, setId: historicalId } } })
+        : summary({ status: "unlinked", responses: null, context: selected });
+    });
+    vi.mocked(api.readAgentReportAssociations).mockImplementation(async (_id, query) =>
+      links({ context: { ...context, selectionId: query.selectionId, reportSetId: query.setId ?? reports.setId,
+        reports: { ...reports, setId: query.setId ?? reports.setId } } }));
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      const page = users();
+      return { ...page, selection: { ...page.selection, id: query?.selectionId ?? selectionId },
+        reports: { ...reports, setId: query?.setId ?? reports.setId },
+        context: { ...context, selectionId: query?.selectionId ?? selectionId, reportSetId: query?.setId ?? reports.setId,
+          reports: { ...reports, setId: query?.setId ?? reports.setId } } };
+    });
+    const view = renderPanel({ inventorySelectionId: selectionId });
+    fireEvent.click(await screen.findByRole("button", { name: "View this period" }));
+    await screen.findByText("person0@example.invalid");
+    const replacement = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    view.rerender(view.content({ inventorySelectionId: replacement, inventoryRevision: "replacement" }));
+    await waitFor(() => expect(api.readAgentReportSummary).toHaveBeenCalledTimes(3));
+    expect(await screen.findByText("person0@example.invalid")).toBeVisible();
+    expect(screen.getByLabelText("CSV report dates")).toHaveTextContent("Historical report dates");
+    expect(screen.getByLabelText("Selected agent report metrics")).toHaveTextContent("200");
+    expect(api.readAgentReportSummary).toHaveBeenLastCalledWith(record.id,
+      { selectionId: replacement, inventorySelectionId: replacement, setId: historicalId }, expect.any(AbortSignal));
+    expect(api.readReportPage).toHaveBeenLastCalledWith(expect.stringContaining("/usage-users"),
+      expect.objectContaining({ selectionId: replacement, inventorySelectionId: replacement, setId: historicalId }), expect.any(AbortSignal));
+    expect(screen.queryByText("Reviewed report links")).not.toBeInTheDocument();
     expect(api.mutateAgentReportAssociation).not.toHaveBeenCalled();
   });
   it("cancels a pending association confirmation when leaving Users", async () => {

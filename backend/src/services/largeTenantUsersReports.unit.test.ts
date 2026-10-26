@@ -434,6 +434,52 @@ describe("report facet cursors", () => {
   });
 });
 
+describe("exact report text filters", () => {
+  it.each(["Custom\tAgent", "Custom\nAgent", "Custom\r\nAgent"])(
+    "retains imported creator types in exact filters and saved query hashes: %j", creatorType => {
+      expect(acceptedCreatorType(creatorType)).toBe(creatorType);
+      for (const endpoint of ["copilot_users", "official_users", "official_agents", "relationships"] as const) {
+        const query = reportQuery(endpoint, { creatorType });
+        expect(query.creatorType).toBe(creatorType);
+        expect(reportQuery(endpoint, query)).toEqual(query);
+        expect(canonicalQuery(query, reportQueryFields)).toBe(
+          canonicalQuery(reportQuery(endpoint, query), reportQueryFields),
+        );
+        const values: unknown[] = [];
+        const sql = reports.filter({ ...context(endpoint), query }, endpoint, values);
+        expect(sql).toContain("creator_type=$");
+        expect(values).toContain(creatorType);
+      }
+    },
+  );
+
+  it.each(["company", "department", "creatorType"] as const)(
+    "rejects unpaired surrogates in %s before database work", async field => {
+      for (const value of ["Invalid\ud800", "Invalid\udfff"]) {
+        await expect(reports.capture(identity, "delegated", "official_users", { [field]: value }))
+          .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
+      }
+      expect(database.connect).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["company", "department", "creatorType"] as const)(
+    "preserves valid surrogate pairs in %s", field => {
+      const value = "Team \ud83e\udd16";
+      expect(reportQuery("official_users", { [field]: value })[field]).toBe(value);
+    },
+  );
+
+  it.each(["Custom\0Agent", "Custom\u000bAgent", "Custom\u0085Agent"])(
+    "rejects creator-type characters that imports reject: %j", async creatorType => {
+      expect(() => acceptedCreatorType(creatorType)).toThrow();
+      await expect(reports.capture(identity, "delegated", "official_agents", { creatorType }))
+        .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
+      expect(database.connect).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe("report facet search", () => {
   it("reuses a cursor for canonically equivalent option searches", async () => {
     const { saved, query } = facetHarness(), first = facetRow("\u01f0"), second = facetRow("\u01f0z");

@@ -152,10 +152,10 @@ Partial app-report coverage does not invalidate uniquely matched, fresh rows: th
 
 ## Users: paid users and active users without paid Copilot
 
-The **Adoption** tab groups saved users and organization-built agents by company
+The **Adoption** tab groups saved users and all agents used by company
 and department, with five groups per page. Paging keeps the current groups and
-summary visible while the requested page loads. Numbered controls above and below
-the groups show the current range, total, and page, with first/last pages and
+summary visible while the requested page loads. A single set of numbered controls
+below the groups shows the current range, total, and page, with first/last pages and
 ellipses for larger result sets. **Go to page** jumps directly to any valid page
 without fetching intermediate pages. Explicit navigation focuses the results
 heading; background refresh never moves focus or scroll. Automatic source
@@ -163,6 +163,11 @@ publications
 and saved-selection renewal keep the first visible group as the page anchor
 instead of returning to page one. Search and filter changes intentionally start
 at the beginning of the new results.
+
+Group identities, organization filters, search and facets share Unicode
+compatibility normalization and case folding, including normalization after
+lowercasing. Paging cursors retain a bounded group identity rather than the
+organization labels, so long saved labels do not prevent page navigation.
 
 `GET /api/copilot-usage/adoption` returns the first group's identity in
 `page.anchor`, and its one-based page and zero-based group offset in `page.number`
@@ -177,6 +182,38 @@ matching groups. If that group no longer exists in the results,
 the read starts at the first matching group. Expired or rejected evidence never
 becomes actionable merely because its content remains visible during loading.
 
+Each Adoption selection pins the directory and the selected usage reports.
+Agent lists, counts, champions, filters and facets use the same saved dependencies
+across pages. Published inventory and its source revisions are optional enrichment
+for saved descriptions and verified inventory-detail links; missing, empty or
+reconciling inventory does not hide reported agents. Report-only agents remain
+visible with their reported names and creator labels, without a broken inventory
+detail link. Automatic publication refresh captures new report data and optional
+inventory metadata without manual page refresh. Clearing saved data and
+authorization changes invalidate the affected selection. Usage-association changes
+also invalidate selections that captured inventory enrichment.
+
+The Agents column deduplicates exact report agent IDs with positive responses
+from people uniquely matched to each group in the selected reporting period.
+Organization-built, Microsoft-built and third-party agents are included, even
+without an inventory match or an Agents-summary report. Shared agents appear in
+every group that used them, but count once in the overall **Agents used** summary.
+Created-but-unused agents and zero-response relationships are not usage.
+A person's `Agents / responses` value combines their distinct positively used
+report-agent count with their total reported agent responses. User details retain
+all reported relationships, including zero-response rows, so their row count can
+still exceed the Adoption usage count. Missing Users & agents reports produce
+unknown agent counts, not measured zeroes; a published empty report produces zero.
+Neither **With agent usage** nor **Without agent usage** classifies missing usage
+as a measured result.
+
+Up to three **Copilot Champs** per group are ranked by reported responses
+descending, distinct agents used descending, lowercase name and exact user
+identity. Positive reported responses or positive agent usage qualify; inventory
+creation does not qualify or boost a person. The MCP champion view uses the same
+ranking and separately exposes each champion's authorized created/used
+relationships.
+
 A view dropdown defaults to **Paid M365 Copilot users** and also offers **Active users without paid Copilot**. The default view shows users with verified active paid features, including grace-period and partially active users and those with zero or unavailable activity. **Using agents**, **Needs attention**, **No reported agent activity**, and their adoption cohorts use that same licensed population. The API's `measuredActivityUsers`, `needsAttentionUsers` and `unknownMetricsUsers` also exclude inactive/unverified candidates. Measured activity includes positive evidence from either agent report or recent Office-app activity; unknown metrics covers uncertain agent activity or missing app evidence. The **All checked users** and **Unlinked report identities** sections are not shown, and the checked-directory-count/scope banner is removed.
 
 The paid view shares the non-paid view's search, matching count, **Filters** popup, removable chips, and table layout. Its popup contains **Company**, **Department**, **Activity**, **Low-response threshold**, and **Sort**. Organization dropdowns use all effectively licensed users in the saved snapshot and combine as exact, trimmed matches before 50-row paging. The Activity dropdown and summary cards select the same cohort. Clear and Reset preserve sorting; invalid thresholds show an error and retain the last valid filter.
@@ -188,6 +225,8 @@ Select a paid user to inspect their effective paid Copilot classification, named
 **Active users without paid Copilot** uses `GET /api/official-usage/users?licenseCohort=active_without_paid` for a server-paginated user table, at most 50 rows. The server selects only uniquely linked, verified non-paid users with positive reported agent activity before search, sorting, counts, rankings, paging and export. Current licensing comes from the latest successful principal-private Users sync; activity can come from any selected retained reporting period. No historical licensing analysis is performed. When a subsequent sync verifies a paid license, the user moves to the paid cohort regardless of when activity occurred.
 
 The optional `licenseCoverage` response describes available/unavailable verification, its observation timestamp, and paid/unpaid/unknown counts among active report identities before user filters. Unmatched, concealed, ambiguous and unknown licenses are excluded with a compact recovery notice, not classified as unpaid. A failed, missing or expired directory source makes the unpaid cohort unavailable and disables export. A bridge-only identity with a positive response can qualify after exact license verification; its missing Users-report totals remain **Unknown**, never replaced by a relationship sum. The unfiltered report API remains available for report-specific analytics and does not silently acquire this cohort restriction.
+
+Expired directory evidence is not a measured empty non-paid cohort: the table shows licensing as unavailable, not zero matching users, and cannot start a new export. While automatic license verification is queued or running, missing cohort counts show **Updating...** and the empty state describes verification in progress. A successful Users publication restores the matching count, rows and new exports automatically, without a separate enable action.
 
 The toolbar matches Agents: search, matching count, **Filters**, removable chips, and CSV export. The shared filter popup applies changes immediately and contains **Company**, **Department**, response cohort, low-response threshold, and sort order. Company and department are dropdowns populated from the entire eligible saved cohort, not just the visible page. They combine as exact, trimmed matches before search, sorting, paging and CSV export. Missing organization fields are shown as **Not set** and do not match a selected value. Clear and Reset preserve sorting. Date bounds, user recency, relationship creator and response-producing controls are no longer shown; existing API clients can still use those query parameters.
 

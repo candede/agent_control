@@ -292,6 +292,12 @@ synthetic Entra/JWKS/API transports and current TypeScript source-derived
 fixtures, including optional nested evidence. This is local source evidence,
 not live SQL, Entra consent, provider or external-client qualification.
 
+Usage association targets preserve the API's source-specific identity contract:
+`graph_packages` requires `packageId` and `snapshotId`; `power_platform` requires
+`nativeId`, explicit nullable `environmentId`, and `snapshotId`. Missing required
+fields or fields from the other source produce `invalid_api_response`, not a
+successful association with incomplete identity.
+
 The catalog covers saved capabilities/workspace jobs; inventory selections,
 facets, detail, members, sections, children and About; exact saved users,
 licensing, responsibility and relationships; adoption/champions; official
@@ -1074,7 +1080,10 @@ retained children, but cannot admit a missing child (`child_admission_expired`).
 A later client cannot replace initiating
 origin/actor, change the receipt or key, or use attribution as operation identity.
 Execution reports admission (`accepted|partial|ineligible|failed`) independently
-from each child's status and final/verified flags. Parent `verified` means all
+from each child's status and final/verified flags. All-ineligible receipts are
+final but never verified. A missing child is non-final only while its receipt
+can still admit work; after expiry it is final and unverified. Existing children
+retain their own lifecycle state even after receipt expiry. Parent `verified` means all
 eligible submitted child effects are verified; it never converts an ineligible
 requested target into success. `partial` and `ineligibleCount` remain authoritative
 even when those eligible effects are verified. Current canonical unresolved-
@@ -1090,12 +1099,15 @@ labels, filters, confirmations and effects.
 
 Current `/agent-responsibility` reports only native responsibility, not all
 usage; `search` is substring search, not exact UPN resolution. Current adoption
-`agents` includes **all group's** organization-filtered created/positive-response
-used agents; it is not champions-only or complete champion usage. The04 SQL joins
+`agents` includes **all group's** positively used report agents, including
+Microsoft, third-party and report-only agents; it is not champions-only. Inventory
+is optional enrichment, never a usage-membership requirement. The04 SQL joins
 the requested champions against their full authorized associations, not consume
-that department array. SQL ranking is created DESC, responses DESC NULLS LAST,
-associated agents DESC, lowercase name then exact identity; eligible means
-created>0 or responses>0, max3. No designated groups.
+that department array. Shared Adoption SQL ranking is responses DESC NULLS LAST,
+distinct positively used report agents DESC, lowercase name then exact identity;
+eligible means positive responses or agent usage, max3. Creation counts are
+separate inventory metrics and do not influence rank. Missing relationship-report
+counts are null, not measured zeroes. No designated groups.
 
 04 extends the **existing** usage-history operation, not a new comparison
 route: optional paired `compareFromSetId,compareToSetId` UUIDs under its pinned
@@ -1150,6 +1162,8 @@ page and use the same optional comparison fields and errors.
   includes records under its original organization rules. The **group** page
   keeps its existing10-group cap; the new relationship page uses the ordinary
   shared50/default100/max, not a hidden10-edge clamp or MCP-specific default.
+  Both HTTP handlers and the shared relationship service reject non-integer
+  limits and values outside 1–100.
   Returned company/department are actual saved labels, not their `~string:`
   wire encodings; a missing champion name remains null.
   Source references lead to full About/configuration on the same pinned inventory.
@@ -1424,7 +1438,7 @@ Names deliberately duplicate; report-only usernames are not directory keys.
 | Case | Exact data and expected useful result |
 | --- | --- |
 | A | `alex@example.invalid`, exact objectId `aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`, 103 agents `agent:10000000-0000-4000-8000-000000000001` through suffix`000000000103`, duplicate label `Shared name`. SQL inventory pages100+3; SDK used-relationship pages50+49 (98 canonical006..103 plus report-only `report:P_report_only`), created=001..003, owned=004..005, modified=005. All source associations and Unicode long101/native102 About continuations are exact; About103 stays missing. No guessed UPN/report linkage; native/guest private home-account keys remain distinct. |
-| B | company`Example Company`,department`Research`; five people p1..p5 (`20000000-0000-4000-8000-000000000001`..005). (created,responses,associated): p1=(3,10,4),p2=(2,50,3),p3=(2,20,8),p4=(0,100,1),p5=(0,null,0). Champions p1,p2,p3 in that order; p4's `P_nonchampion` excluded from champions-only result, not the department list. Report sets `30000000-0000-4000-8000-000000000001`..005: Jan1-30 responses100; Jan16-Feb14 responses120 (overlap); Mar1-30 responses150; Apr1-7 responses40 (unequal); undated null. All operator_asserted except undated unknown; Jan->Mar comparable50% snapshot increase, Jan->overlap/Jan->Apr/undated not growth. Separate Agents/bridge totals100/97 stay discrepant; licensed/unlicensed7/3 not total10. |
+| B | company`Example Company`,department`Research`; five people p1..p5 (`20000000-0000-4000-8000-000000000001`..005). (created,responses,used): p1=(3,10,2),p2=(2,50,2),p3=(2,20,7),p4=(0,100,1),p5=(0,null,0). Champions p4,p2,p3 in that order; p1's `P_extra_9` excluded from champions-only result, not the department list. Report sets `30000000-0000-4000-8000-000000000001`..005: Jan1-30 responses100; Jan16-Feb14 responses120 (overlap); Mar1-30 responses150; Apr1-7 responses40 (unequal); undated null. All operator_asserted except undated unknown; Jan->Mar comparable50% snapshot increase, Jan->overlap/Jan->Apr/undated not growth. Separate Agents/bridge totals100/97 stay discrepant; licensed/unlicensed7/3 not total10. |
 | C | selected evaluatedAt`2026-01-31T00:00:00.000Z`,createdWithinDays30 ->cutoff`2026-01-01T00:00:00.000Z`. 101 eligible exact records across100+1 pages; created at boundary included,1ms before excluded even modified/collected/imported Jan31; unknown creation excluded. Existing any-source semantics preserved. Both explicit package and generic Studio actions tested in both directions in04A: package ID`T_pkg_001`; Studio native`studio-agent-001`,environment`40000000-0000-4000-8000-000000000001`,bot`50000000-0000-4000-8000-000000000001`. Interactive waits after exact preview; externally scheduled execution does not. Expired hash, changed membership/prestate, revoked authority, duplicate key, one failed child and sent-unknown outcomes remain explicit, no blind retry. |
 
 Fixtures execute bounded corpus/SDK/parser/projection/cursor behavior, direct

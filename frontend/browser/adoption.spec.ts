@@ -18,8 +18,11 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
         { id: "person-4", name: "Sam Patel", agents: 0, responses: 0, champion: false },
       ],
       agents: [
-        { id: agent.id, name: agent.displayName, description: "Finds policies, onboarding guidance and employee resources.", type: "Copilot Studio" },
-        { id: "another-agent", name: "HR Policy Assistant", description: "Answers everyday questions about leave, benefits and company policies.", type: "Microsoft 365 Copilot Agent Builder" },
+        { id: "report:policy", inventoryId: agent.id, name: agent.displayName,
+          description: "Finds policies, onboarding guidance and employee resources.", creatorType: "User-created agent" },
+        { id: "report:another-agent", inventoryId: null, name: "HR Policy Assistant",
+          description: "Answers everyday questions about leave, benefits and company policies.", creatorType: "Agent built by Microsoft" },
+        { id: "report:external", inventoryId: null, name: "External assistant", description: null, creatorType: "Agent built by Third party" },
       ] },
     { id: "finance", company: "Contoso", department: "Finance",
       people: [{ id: "person-5", name: "Jamie Lee", agents: 0, responses: null, champion: false }],
@@ -36,7 +39,7 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
       && (!params.has("adoptionAgents") || Boolean(group.agents.length) === (params.get("adoptionAgents") === "with")));
     const result: AdoptionPage = { ...reportPage(value, { counts: { total: groups.length, filtered: value.length } }),
       page: { limit: 5, number: 1, offset: 0, anchor: value[0]?.id, nextCursor: null, previousCursor: null },
-      directory: source("directory"), inventoryAvailable: true,
+      directory: source("directory"),
       summary: { people: value.reduce((sum, group) => sum + group.people.length, 0),
         champs: value.reduce((sum, group) => sum + group.people.filter(person => person.champion).length, 0),
         agents: new Set(value.flatMap(group => group.agents.map(agent => agent.id))).size } };
@@ -60,6 +63,10 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
   await expect(hr.getByText("10/200")).toBeVisible();
   await expect(hr.getByText("Copilot Champ", { exact: true })).toHaveCount(3);
   await expect(hr.getByRole("button", { name: "Sam Patel" })).toBeVisible();
+  await expect(hr.getByText("Microsoft", { exact: true })).toBeVisible();
+  await expect(hr.getByText("Third-party", { exact: true })).toBeVisible();
+  await expect(hr.getByText("External assistant", { exact: true })).toBeVisible();
+  await expect(hr.getByRole("button", { name: "External assistant", exact: true })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Contoso / Finance" })).toBeVisible();
   await page.getByRole("button", { name: "Filters", exact: true }).click();
   const filters = page.getByRole("dialog", { name: "Filter groups" });
@@ -158,7 +165,7 @@ for (const boundary of ["publication", "expiry"] as const) {
         page: { limit: 5, number: start / 5 + 1, offset: start, anchor: groups[start].id,
           previousCursor: start ? "fresh-previous" : null,
           nextCursor: start < 10 ? selection.id === initial.id ? "old-next" : "fresh-next" : null },
-        directory: source("directory"), inventoryAvailable: true, summary: { people: 180, champs: 0, agents: 0 } };
+        directory: source("directory"), summary: { people: 180, champs: 0, agents: 0 } };
       await route.fulfill({ json: result });
     });
     await page.goto("/users?section=adoption");
@@ -211,8 +218,8 @@ test("numbered adoption pages jump directly, stay accessible, and fit enterprise
       { id: `person-${index}-2`, name: "Alex Morgan", agents: 5, responses: 128, champion: true },
       { id: `person-${index}-3`, name: "Jordan Taylor", agents: 2, responses: 46, champion: false },
     ],
-    agents: [{ id: unifiedAgents.value[2].id, name: "Knowledge Assistant",
-      description: "Find policies, discover resources, and get answers to everyday questions.", type: "Copilot Studio" }],
+    agents: [{ id: "report:knowledge", inventoryId: unifiedAgents.value[2].id, name: "Knowledge Assistant",
+      description: "Find policies, discover resources, and get answers to everyday questions.", creatorType: "User-created agent" }],
   }));
   const selection = reportSelection(2, Date.now()), requests: URLSearchParams[] = [];
   await page.route(url => url.pathname === "/api/copilot-usage/adoption", route => {
@@ -225,54 +232,96 @@ test("numbered adoption pages jump directly, stay accessible, and fit enterprise
       ...reportPage(value), selection, counts: { total: groups.length, filtered: filtered.length },
       page: { limit: 5, number, offset, anchor: value[0]?.id,
         previousCursor: number > 1 ? "previous" : null, nextCursor: offset + value.length < filtered.length ? "next" : null },
-      directory: source("directory"), inventoryAvailable: true,
+      directory: source("directory"),
       summary: { people: filtered.length * 3, champs: filtered.length * 2, agents: 1 },
     };
     return route.fulfill({ json: result });
   });
   await page.goto("/users?section=adoption");
-  const top = page.getByRole("navigation", { name: "groups pages", exact: true });
-  const bottom = page.getByRole("navigation", { name: "groups pages (bottom)", exact: true });
-  await expect(top.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  const pages = page.getByRole("navigation", { name: "groups pages", exact: true });
+  const shortcuts = page.getByRole("navigation", { name: "groups page shortcuts", exact: true });
+  const heading = page.locator(".adoption-results-heading");
+  await expect(page.locator(".adoption-view").getByRole("navigation")).toHaveCount(2);
+  await expect(heading.getByRole("navigation", { name: "groups page shortcuts" })).toBeVisible();
+  expect(await pages.evaluate(element => element.previousElementSibling?.matches(".adoption-groups"))).toBe(true);
+  await expect(pages.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(shortcuts.getByRole("status", { name: "Page 1 of 16", exact: true })).toHaveText("1 / 16");
+  await expect(shortcuts.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
   const initialRequests = requests.length;
-  await top.getByRole("button", { name: "Page 4", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Contoso / Department 16", exact: true })).toBeVisible();
+  await shortcuts.getByRole("button", { name: "Next groups" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("region", { name: "Contoso / Department 06", exact: true })).toBeVisible();
   expect(requests).toHaveLength(initialRequests + 1);
+  expect(requests.at(-1)?.get("pageNumber")).toBe("2");
+  expect(requests.at(-1)?.get("selectionId")).toBe(selection.id);
+  expect(requests.at(-1)?.has("cursor")).toBe(false);
+  await expect(pages.getByRole("button", { name: "Page 2", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(shortcuts.getByRole("status", { name: "Page 2 of 16", exact: true })).toHaveText("2 / 16");
+  await pages.getByRole("button", { name: "Page 4", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Contoso / Department 16", exact: true })).toBeVisible();
+  expect(requests).toHaveLength(initialRequests + 2);
   expect(requests.at(-1)?.get("pageNumber")).toBe("4");
   expect(requests.at(-1)?.get("selectionId")).toBe(selection.id);
   expect(requests.at(-1)?.has("cursor")).toBe(false);
-  for (const navigation of [top, bottom]) {
-    await expect(navigation.getByRole("button", { name: "Page 4", exact: true })).toHaveAttribute("aria-current", "page");
-    await expect(navigation).toContainText("Showing 16–20 of 80 groups");
-  }
+  await expect(pages.getByRole("button", { name: "Page 4", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(shortcuts.getByRole("status", { name: "Page 4 of 16", exact: true })).toHaveText("4 / 16");
+  await expect(pages).toContainText("Showing 16–20 of 80 groups");
   await expect(page.getByRole("heading", { name: "Company & department adoption" })).toBeFocused();
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  async function checkHeaderLayout() {
+    const bounds = (await heading.boundingBox())!, controls = (await shortcuts.boundingBox())!;
+    const title = (await heading.getByRole("heading").boundingBox())!, subtitle = (await heading.locator("p").boundingBox())!;
+    expect(controls.width).toBeLessThanOrEqual(170);
+    expect(Math.abs(bounds.x + bounds.width - controls.x - controls.width)).toBeLessThanOrEqual(1);
+    expect(title.x + title.width).toBeLessThanOrEqual(controls.x);
+    expect(controls.y).toBeGreaterThanOrEqual(bounds.y);
+    expect(controls.y + controls.height).toBeLessThanOrEqual(bounds.y + bounds.height + 1);
+    for (const button of await shortcuts.getByRole("button").all()) {
+      const target = (await button.boundingBox())!, size = page.viewportSize()!.width <= 600 ? 44 : 32;
+      expect(target.width).toBe(size);
+      expect(target.height).toBe(size);
+    }
+    if (page.viewportSize()!.width <= 760) {
+      expect(subtitle.y).toBeGreaterThanOrEqual(Math.max(title.y + title.height, controls.y + controls.height));
+      expect(Math.abs(subtitle.width - bounds.width)).toBeLessThanOrEqual(1);
+    } else {
+      expect(subtitle.x + subtitle.width).toBeLessThanOrEqual(controls.x);
+    }
+  }
+  await checkHeaderLayout();
   if (info.project.name === "desktop") {
     const viewport = page.viewportSize()!;
-    for (const width of [320, 768, 1024]) {
+    for (const width of [320, 768, 1024, 2000]) {
       await page.setViewportSize({ width, height: 900 });
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-      const navigation = (await top.boundingBox())!, numbers = (await top.getByRole("list", { name: "Page numbers" }).boundingBox())!;
+      const navigation = (await pages.boundingBox())!, numbers = (await pages.getByRole("list", { name: "Page numbers" }).boundingBox())!;
       expect(numbers.x).toBeGreaterThanOrEqual(navigation.x);
       expect(numbers.x + numbers.width).toBeLessThanOrEqual(navigation.x + navigation.width);
+      await checkHeaderLayout();
+      await heading.screenshot({ path: info.outputPath(`compact-adoption-header-${width}.png`) });
     }
     await page.setViewportSize(viewport);
   }
   await page.screenshot({ path: info.outputPath(`numbered-adoption-${info.project.name}.png`), fullPage: true });
-  await top.getByRole("spinbutton", { name: "Go to page" }).fill("16");
-  await top.getByRole("spinbutton", { name: "Go to page" }).press("Enter");
+  await pages.getByRole("spinbutton", { name: "Go to page" }).fill("16");
+  await pages.getByRole("spinbutton", { name: "Go to page" }).press("Enter");
   await expect(page.getByRole("region", { name: "Contoso / Department 76", exact: true })).toBeVisible();
-  expect(requests).toHaveLength(initialRequests + 2);
-  await expect(top.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
-  await expect(top).toContainText("Showing 76–80 of 80 groups");
-  await bottom.getByRole("button", { name: "Page 1", exact: true }).click();
-  await expect(page.getByRole("region", { name: "Fabrikam / Department 01", exact: true })).toBeVisible();
   expect(requests).toHaveLength(initialRequests + 3);
-  await expect(top.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
+  await expect(pages.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+  await expect(shortcuts.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+  await expect(shortcuts.getByRole("status", { name: "Page 16 of 16", exact: true })).toHaveText("16 / 16");
+  await expect(pages).toContainText("Showing 76–80 of 80 groups");
+  await pages.getByRole("button", { name: "Page 1", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Fabrikam / Department 01", exact: true })).toBeVisible();
+  expect(requests).toHaveLength(initialRequests + 4);
+  await expect(pages.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
+  await expect(shortcuts.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "true");
   await page.getByRole("searchbox", { name: "Search groups" }).fill("department 01");
-  await expect(top).toContainText("Showing 1–1 of 1 groups");
-  await expect(top.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(pages).toContainText("Showing 1–1 of 1 groups");
+  await expect(pages.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(shortcuts.getByRole("status", { name: "Page 1 of 1", exact: true })).toHaveText("1 / 1");
+  await expect(shortcuts.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
   expect(requests.at(-1)?.has("pageNumber")).toBe(false);
   expect(requests.at(-1)?.has("selectionId")).toBe(false);
   expect(unexpected).toEqual([]);

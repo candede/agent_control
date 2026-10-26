@@ -7,14 +7,15 @@ import { digest, encodeBatch } from "../db/dataBounds.js";
 import { officialReportCount as exactCount } from "../db/officialReportBounds.js";
 import { reportRelationsSql } from "../db/officialReportQueries.js";
 import { LargeTenantUsersReports, bounded, reportQuery, reportQueryFields, reportSearchSql, type ReportReadContext, type ReportCurrentData } from "./largeTenantUsersReports.js";
-import type { InventoryReportSummary } from "../types/unifiedAgents.js";
+import { unifiedAgentRecordId, type InventoryReportSummary } from "../types/unifiedAgents.js";
 import { canonicalQuery, SelectionError, type SelectionIdentity } from "./dataSelections.js";
 import type { AuditActor } from "../types/audit.js";
 import { AuditLog } from "./auditLog.js";
 import { officialAgentUsageMutation } from "./officialAgentUsageInput.js";
 import { requireAdmissions } from "./maintenance.js";
 import type { CandidateAgentUsageSummary, CandidateAgentUsageMutation, CandidateAgentUsageUsers } from "../types/officialReportApi.js";
-import { currentInventorySourcesSql, selectedInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
+import { currentInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
+import { selectedInventorySourcesSql } from "../db/inventorySelections.js";
 import type { InventoryQueries } from "../db/inventoryQueries.js";
 import { readAgentHistory, reportAgentLinksSql } from "./officialAgentHistory.js";
 export type { CandidateAgentUsageMutation } from "../types/officialReportApi.js";
@@ -150,6 +151,8 @@ export class OfficialAgentUsage {
   summaries(selectionId: string, identity: SelectionIdentity, recordIds: readonly string[], setId?: string) {
     if (recordIds.length > 100 || new Set(recordIds).size !== recordIds.length) throw new AppError(400, "data_exact_ids_limit", "At most 100 unique exact agent IDs.");
     encodeBatch(recordIds);
+    const ids = recordIds.map(recordId => unifiedAgentRecordId(parseRecordId(recordId)));
+    if (new Set(ids).size !== ids.length) throw new AppError(400, "data_exact_ids_limit", "Exact agent IDs must be distinct.");
     return this.read(selectionId, identity, async (client, context) => {
       const results: CandidateAgentUsageSummary[] = [];
       for (const recordId of recordIds) {

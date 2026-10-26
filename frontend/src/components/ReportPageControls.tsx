@@ -12,9 +12,15 @@ export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<Re
     {read.restartable ? <>{" "}<button type="button" onClick={read.restart}>Restart selection</button></>
       : " Close this detail and restart its parent selection."}</div>;
   if (read.loading && !read.data) return <p className={quietLoading ? "sr-only" : undefined} role="status">Loading saved data...</p>;
-  if (read.leaseEnded && (!read.error || isExpiredSelection(read.error))) return <div role="status" className="copilot-users-notice">Showing previously loaded saved data. Load a new selection before paging, exporting or acting.
-    {read.restartable ? <>{" "}<button type="button" onClick={read.restart}>Restart selection</button></>
-      : " Restart its parent selection."}</div>;
+  if (read.leaseEnded) {
+    const failure = read.error && !isExpiredSelection(read.error) ? read.error : undefined;
+    return <div role={failure ? "alert" : "status"} className={failure ? "error-banner" : "copilot-users-notice"}>
+      {failure ? <>{failure.message}{" "}</> : null}
+      {read.data ? "Showing previously loaded saved data." : "This selection expired."}{" "}
+      Load a new selection before paging, exporting or acting.
+      {read.restartable ? <>{" "}<button type="button" onClick={read.restart}>Restart selection</button></>
+        : " Restart its parent selection."}</div>;
+  }
   if (read.error) return <div role="alert" className="error-banner">{read.error.message}
     {" "}<button type="button" onClick={read.retry}>Retry saved data</button></div>;
   return null;
@@ -22,11 +28,11 @@ export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<Re
 type PageControlsProps = {
   data?: Pick<ReportPage<unknown>, "page" | "counts" | "value">; previous: () => void; next: () => void;
   loading?: boolean; disabled?: boolean; leaseEnded?: boolean; label?: string; compact?: boolean;
-  goToPage?: (page: number) => boolean; placement?: "top" | "bottom";
+  goToPage?: (page: number) => boolean;
 };
-export function ReportPageControls({ data, previous, next, loading = false, disabled = false, leaseEnded = false, label = "rows", compact = false, goToPage, placement = "top" }: PageControlsProps) {
+export function ReportPageControls({ data, previous, next, loading = false, disabled = false, leaseEnded = false, label = "rows", compact = false, goToPage }: PageControlsProps) {
   if (goToPage) return <NumberedPageControls data={data} previous={previous} next={next} loading={loading}
-    disabled={disabled} leaseEnded={leaseEnded} label={label} goToPage={goToPage} placement={placement} />;
+    disabled={disabled} leaseEnded={leaseEnded} label={label} compact={compact} goToPage={goToPage} />;
   const previousDisabled = disabled || leaseEnded || loading || !data?.page.previousCursor, nextDisabled = disabled || leaseEnded || loading || !data?.page.nextCursor;
   return <nav className="copilot-users-pagination" aria-label={`${label} pages`} aria-busy={loading}>
     <span role="status">{usageCount(data?.counts.filtered)} matching {label}{data ? `; ${data.value.length} on this page` : ""}</span>
@@ -48,17 +54,34 @@ function visiblePages(current: number, total: number): (number | "start-gap" | "
     ...(end < total - 1 ? ["end-gap" as const] : []), total];
 }
 
-function NumberedPageControls({ data, previous, next, loading, disabled, leaseEnded, label = "rows", goToPage, placement }: PageControlsProps & { goToPage: (page: number) => boolean }) {
+function NumberedPageControls({ data, previous, next, loading, disabled, leaseEnded, label = "rows", compact = false, goToPage }: PageControlsProps & { goToPage: (page: number) => boolean }) {
   const inputId = useId();
   const input = useRef<HTMLInputElement>(null);
   const current = data?.page.number ?? 1;
   const total = data ? Math.max(1, Math.ceil(data.counts.filtered / data.page.limit)) : 1;
   const blocked = Boolean(disabled || leaseEnded || loading || !data);
+  if (compact) {
+    const pageLabel = data ? `Page ${current.toLocaleString()} of ${total.toLocaleString()}`
+      : loading ? `Loading ${label}...` : `${label} unavailable`;
+    return <nav className="report-pagination-compact" aria-label={`${label} page shortcuts`} aria-busy={loading}>
+      <button type="button" className="secondary" aria-label={`Previous ${label}`} title={`Previous ${label}`}
+        aria-disabled={blocked || current <= 1} onClick={() => { if (!blocked && current > 1) previous(); }}>
+        <ChevronLeft size={16} aria-hidden="true" />
+      </button>
+      <span role="status" aria-live="off" aria-label={pageLabel} title={pageLabel}>
+        {data ? `${current.toLocaleString()} / ${total.toLocaleString()}` : "— / —"}
+      </span>
+      <button type="button" className="secondary" aria-label={`Next ${label}`} title={`Next ${label}`}
+        aria-disabled={blocked || current >= total} onClick={() => { if (!blocked && current < total) next(); }}>
+        <ChevronRight size={16} aria-hidden="true" />
+      </button>
+    </nav>;
+  }
   const start = data?.value.length ? (data.page.offset ?? 0) + 1 : 0;
   const end = data ? (data.page.offset ?? 0) + data.value.length : 0;
   return <nav className="copilot-users-pagination report-pagination-numbered"
-    aria-label={`${label} pages${placement === "bottom" ? " (bottom)" : ""}`} aria-busy={loading}>
-    <div className="report-pagination-summary" role={placement === "bottom" ? undefined : "status"} aria-atomic="true">
+    aria-label={`${label} pages`} aria-busy={loading}>
+    <div className="report-pagination-summary" role="status" aria-atomic="true">
       <span>{data ? <>Showing <strong>{start.toLocaleString()}–{end.toLocaleString()}</strong> of{" "}
         <strong>{data.counts.filtered.toLocaleString()}</strong> {label}</> : loading ? `Loading ${label}...` : `${label} unavailable`}</span>
       <small>{data ? <>Page {current.toLocaleString()} of {total.toLocaleString()}</> : " "}</small>

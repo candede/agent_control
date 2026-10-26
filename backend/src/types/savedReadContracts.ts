@@ -43,7 +43,7 @@ export type SavedRelationshipPage = {
 export type ChampionAgentPage = SavedRelationshipPage & {
   company: string | null;
   department: string | null;
-  champions: { objectId: string; name: string | null; rank: number; created: number; responses: number | null; agents: number }[];
+  champions: { objectId: string; name: string | null; rank: number; created: number; responses: number | null; agents: number | null }[];
 };
 export type AgentAboutPage = {
   recordId: string;

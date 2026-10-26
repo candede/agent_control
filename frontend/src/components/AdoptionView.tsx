@@ -11,6 +11,14 @@ import { FilterPopover } from "./FilterPopover";
 import { ReportFacet } from "./ReportFacet";
 import "./adoption.css";
 
+function creatorLabel(value: string | null) {
+  const key = value?.trim().toLowerCase();
+  if (key === "agent built by microsoft" || key === "microsoft") return "Microsoft";
+  if (["agent built by third party", "third-party", "third party", "external"].includes(key ?? "")) return "Third-party";
+  if (["user-created agent", "agent built by your org", "your org"].includes(key ?? "")) return "Organization-built";
+  return value?.trim() || "Creator unknown";
+}
+
 export function AdoptionView({ route, change, revision, reportContext, onOpenAgent, onOpenPerson }: {
   route: UsersRouteState;
   change: (route: UsersRouteState) => void;
@@ -35,7 +43,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
   const fields = [{ key: "company", label: "Company" }, { key: "department", label: "Department" }] as const;
   const evidenceFilters = [
     { key: "adoptionChamps", label: "Copilot Champs", with: "With Copilot Champs", without: "Without Copilot Champs" },
-    { key: "adoptionAgents", label: "Group agents", with: "With organization-built agents", without: "Without organization-built agents" },
+    { key: "adoptionAgents", label: "Group agents", with: "With agent usage", without: "Without agent usage" },
   ] as const;
   const chips = [
     ...fields.filter(field => route[field.key] !== undefined).map(field => ({
@@ -56,6 +64,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
   }, revision, !searchPending);
   const loading = searchPending || read.loading;
   const data = read.data;
+  const agentsAvailable = data?.reports.lineages.some(lineage => lineage.kind === "userAgents");
   function goToPage(page: number) {
     if (!read.goToPage?.(page)) return false;
     resultsHeading.current?.focus({ preventScroll: true });
@@ -73,7 +82,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
         ["Groups", data?.counts.filtered, "Company / department"],
         ["People", data?.summary.people, "In matching groups"],
         ["Copilot Champs", data?.summary.champs, "Up to 3 per group"],
-        ["Organization agents", data?.summary.agents, "Distinct created or used agents"],
+        ["Agents used", data?.summary.agents, "Distinct agents with reported responses"],
       ] as const).map(([label, count, hint]) => <div key={label} className="metric"><span>{label}</span>
         <strong>{usageCount(count)}</strong><small>{hint}</small></div>)}
       {reportContext}
@@ -123,19 +132,19 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
     <ReportReadStatus read={{ ...read, loading }} quietLoading />
     {data?.directory.state !== undefined && data.directory.state !== "available"
       ? <p role="status" className="reported-users-note">Group membership uses {data.directory.state} saved directory data. Refresh Users in Sync.</p> : null}
-    {data && !data.inventoryAvailable ? <p role="status" className="reported-users-note">Agent inventory is unavailable. Refresh Agents in Sync to populate group agents.</p> : null}
+    {data && !agentsAvailable ? <p role="status" className="reported-users-note">Agent usage is unavailable. Add the Users &amp; agents report in Sync. Group agents populate automatically when report data is published.</p> : null}
     {data && data.reports.availability !== "active" ? <p role="status" className="reported-users-note">
       {data.reports.setId ? "Usage is from a stale saved report." : "Usage is unavailable. Import usage reports in Sync."}
     </p> : null}
     <div className="adoption-results-heading">
       <h3 ref={resultsHeading} id={resultsId} tabIndex={-1}>Company &amp; department adoption</h3>
-      <p>Explore people, Copilot Champs, and organization-built agents in each group.</p>
+      <p>Explore people, Copilot Champs, and all agents used in each group, including Microsoft and third-party agents.</p>
+      <ReportPageControls {...navigation} compact />
     </div>
-    <ReportPageControls {...navigation} />
     <section className="adoption-groups" aria-labelledby={resultsId} aria-busy={loading}>
     {data?.value.map(group => <section className="adoption-group" key={group.id} aria-label={`${group.company} / ${group.department}`}>
       <header><div className="adoption-group-heading"><span>{group.company}</span><h4>{group.department}</h4></div>
-        <small>{group.people.length} {group.people.length === 1 ? "user" : "users"} · {group.agents.length} {group.agents.length === 1 ? "agent" : "agents"}</small></header>
+        <small>{group.people.length} {group.people.length === 1 ? "user" : "users"} · {agentsAvailable ? group.agents.length : "Unknown"} {agentsAvailable && group.agents.length === 1 ? "agent" : "agents"}</small></header>
       <div className="adoption-group-columns">
         <div className="adoption-people"><h5>People <small>Agents / responses</small></h5>
           <ul>{group.people.map(person => <li key={person.id}>
@@ -143,26 +152,28 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
               if (read.isCurrentData(true)) onOpenPerson(person.id);
             }}>{person.name}</button>
               {person.champion ? <span className="copilot-user-badge">Copilot Champ</span> : null}</div>
-            <span className="adoption-count" title={`${person.agents} agents created or used; ${person.responses === null ? "responses unavailable" : `${person.responses} responses`}`}>
+            <span className="adoption-count" title={`${person.agents ?? "Unknown"} agents used with reported responses; ${person.responses === null ? "responses unavailable" : `${person.responses} responses`}`}>
               {usageCount(person.agents)}/{usageCount(person.responses)}
             </span>
           </li>)}</ul>
         </div>
         <div className="adoption-agents"><h5>Agents</h5>
           <ul>{group.agents.map(agent => <li key={agent.id}>
-            <div className="adoption-agent-heading">{onOpenAgent ? <button type="button" className="adoption-name" onClick={() => {
-              if (read.isCurrentData(true)) onOpenAgent(agent.id);
+            <div className="adoption-agent-heading">{onOpenAgent && agent.inventoryId ? <button type="button" className="adoption-name" onClick={() => {
+              if (read.isCurrentData(true) && agent.inventoryId) onOpenAgent(agent.inventoryId);
             }}>{agent.name}</button> : <strong>{agent.name}</strong>}
-              {agent.type ? <small>{agent.type.replace("Microsoft 365 Copilot Agent Builder", "Agent Builder")}</small> : null}</div>
+              <small title={agent.creatorType ?? undefined}>{creatorLabel(agent.creatorType)}</small></div>
+            {!agent.inventoryId ? <small className="adoption-empty">Reported usage only; inventory details unavailable.</small> : null}
             <p aria-label="Saved description preview">{getAdoptionDescriptionPreview(agent.description) || "Description unavailable"}</p>
           </li>)}</ul>
-          {!group.agents.length ? <p className="adoption-empty">No organization-built agents found.</p> : null}
+          {!group.agents.length ? <p className="adoption-empty">{agentsAvailable
+            ? "No agent usage reported." : "Agent usage data is unavailable."}</p> : null}
         </div>
       </div>
     </section>)}
     {data && !data.value.length ? <p className="reported-users-empty">{data.counts.total
       ? "No groups match your search and filters." : "No saved users to group. Refresh Users in Sync."}</p> : null}
     </section>
-    <ReportPageControls {...navigation} placement="bottom" />
+    <ReportPageControls {...navigation} />
   </div>;
 }

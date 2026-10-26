@@ -187,6 +187,7 @@
 .user-profile-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin: 0; font-size: 14px; }
 .user-profile-grid dt { color: var(--muted); font-size: 12px; }
 .user-profile-grid dd { margin: 4px 0 0; }
+.user-profile-grid a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
 .user-detail-panel .copilot-service-plans { grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 12px; }
 .user-detail-panel .copilot-service-plans li { align-content: start; padding: 18px; border-radius: 10px; }
 

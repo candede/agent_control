@@ -35,9 +35,15 @@ the current schema.
 - A saved selection binds its principal, authorization, source roots, revisions
   and expiry. Cursors continue that selection, not a newly captured dataset.
   Unrelated publication does not invalidate every selected view.
+  The 16 native-source limit is separate from the 20 selection-pin limit, which
+  also accommodates the canonical root and report, directory and people-cache
+  dependencies.
 - Safe replacement keeps valid pinned reads until their own fences close.
   Revocation, privacy deletion, invalidated source scope and selection expiry
   deny affected reads. Readable retained history never grants mutation authority.
+  Selected reads recheck selection and dependency expiry using the database
+  clock after their callback finishes, before committing the result. A live
+  export can extend the page TTL, but never an expired dependency.
 - Collection, reconciliation, retention and exports use bounded batches and
   existing resource limits. No provider wait owns a database transaction.
 
@@ -61,6 +67,11 @@ substitute for that complete text. Source references and provenance identify
 the observed field, provider maturity and observation time in the API. The agent
 Overview automatically loads the complete description without a load-more control
 or an inline provenance/byte-count strip.
+
+Package detail reads reconstruct saved hosts, element types and categories from
+child facts, preserving absent versus empty collections and the source reference
+used for complete About text. Inventory and facet searches share Unicode
+normalization and case folding; facet cursors bind the normalized search.
 
 ### Maker-controlled sharing and captured agent configuration
 

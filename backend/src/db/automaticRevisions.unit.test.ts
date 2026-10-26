@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataSyncRepository } from "./dataSync.js";
@@ -36,7 +37,7 @@ function fixture() {
   const database = new pg.Pool({ max: 4 });
   pools.add(database);
   const state: { markers: Marker[]; users: UserSource[] } = {
-    markers: ["agent_people", "app_activity", "authorization", "canonical", "directory", "graph_packages", "power_platform"].map(source => ({
+    markers: ["agent_people", "agent_usage", "app_activity", "authorization", "canonical", "directory", "graph_packages", "power_platform", "reports"].map(source => ({
       source, id: `${source}-snapshot`, observed_at: observedAt, expires_at: expiresAt,
     })),
     users: (["app_activity", "directory"] as const).map(source => ({
@@ -90,7 +91,7 @@ describe("automatic saved-data revision boundaries", () => {
     }
   });
 
-  it.each(["graph_packages", "graph_package_details", "power_platform", "agent_people"])(
+  it.each(["graph_packages", "graph_package_details", "power_platform", "agent_people", "agent_usage"])(
     "%s publications do not invalidate the combined Users license/activity data",
     async source => {
       const f = fixture();
@@ -101,7 +102,7 @@ describe("automatic saved-data revision boundaries", () => {
       const changed = source.startsWith("graph_") ? "graph_packages" : "power_platform";
       const unchanged = changed === "graph_packages" ? "power_platform" : "graph_packages";
       expect(after[changed]).not.toBe(before[changed]);
-      if (source === "agent_people") expect(after[unchanged]).not.toBe(before[unchanged]);
+      if (["agent_people", "agent_usage"].includes(source)) expect(after[unchanged]).not.toBe(before[unchanged]);
       else expect(after[unchanged]).toBe(before[unchanged]);
       expect(after.users).toBe(before.users);
       expect(await readAutomaticInventoryRevisions(scope, f.database)).not.toEqual(observed);
@@ -119,6 +120,17 @@ describe("automatic saved-data revision boundaries", () => {
     else expect(after.graph_packages).toBe(before.graph_packages);
     if (source === "directory") expect(after.power_platform).not.toBe(before.power_platform);
     else expect(after.power_platform).toBe(before.power_platform);
+  });
+
+  it.each(["canonical", "authorization", "reports"])("invalidates every projection depending on %s", async source => {
+    const f = fixture();
+    const before = await f.repository.automaticRevisions(scope);
+    f.state.markers.find(row => row.source === source)!.id += "-updated";
+    const after = await f.repository.automaticRevisions(scope);
+    expect(after.graph_packages).not.toBe(before.graph_packages);
+    expect(after.power_platform).not.toBe(before.power_platform);
+    if (source === "canonical") expect(after.users).toBe(before.users);
+    else expect(after.users).not.toBe(before.users);
   });
 
   it.each(["directory", "app_activity"] as const)("keeps %s failures and progress separate from retained publications", async source => {
@@ -205,7 +217,33 @@ describe("automatic saved-data revision boundaries", () => {
     const sql = f.query.mock.calls.map(([text]) => String(text)).join("\n");
     expect(sql).toContain("data_generation_heads");
     expect(sql).toContain("inventory_people_revisions");
+    expect(sql).toContain("UNION ALL SELECT 'agent_usage',coalesce((SELECT revision FROM agent_usage_state WHERE tenant_id=$1),0)::text");
     expect(sql).not.toMatch(/package_inventory_snapshots|object_id/);
+  });
+
+  it.each([
+    [250, ["", "0249"]],
+    [251, ["", "0249", "0250"]],
+    [501, ["", "0249", "0499", "0500"]],
+  ] as const)("hashes all %i markers exactly once across bounded pages", async (count, afterIds) => {
+    const f = fixture();
+    f.state.markers = Array.from({ length: count }, (_, index) => ({
+      source: "graph_packages", id: String(index).padStart(4, "0"), observed_at: observedAt, expires_at: expiresAt,
+    }));
+    const revisions = await f.repository.automaticRevisions(scope);
+    for (const source of ["graph_packages", "power_platform", "users"] as const) {
+      const expected = createHash("sha256").update(JSON.stringify(["publication-observer-v4", source, scope.tenantId, scope.principalId]));
+      if (source === "graph_packages") {
+        for (const { source, id } of f.state.markers) expected.update(JSON.stringify({ source, id }));
+      }
+      expect(revisions[source]).toBe(expected.digest("hex"));
+    }
+    const reads = f.query.mock.calls.filter(([text]) => String(text).includes("WITH markers AS"));
+    expect(reads.map(([, values]) => values![3])).toEqual(afterIds);
+    expect(reads.map(([, values]) => values![2])).toEqual(afterIds.map(id => id ? "graph_packages" : ""));
+    expect(f.query.mock.calls.filter(([text]) => text === "BEGIN ISOLATION LEVEL REPEATABLE READ")).toHaveLength(1);
+    expect(f.client.release).toHaveBeenCalledTimes(1);
+    expect(f.database.query).not.toHaveBeenCalled();
   });
 
   it("scopes empty dataset revisions and rejects missing account scope", async () => {
@@ -213,9 +251,30 @@ describe("automatic saved-data revision boundaries", () => {
     f.state.markers = [];
     f.state.users = [];
     const before = await f.repository.automaticRevisions(scope);
-    const other = await f.repository.automaticRevisions({ ...scope, principalId: "other-reader" });
-    for (const key of ["graph_packages", "power_platform", "users"] as const) expect(other[key]).not.toBe(before[key]);
-    await expect(f.repository.automaticRevisions({ ...scope, tenantId: "" })).rejects.toMatchObject({ code: "scope_mismatch" });
+    for (const field of ["tenantId", "principalId"] as const) {
+      const other = await f.repository.automaticRevisions({ ...scope, [field]: "other-scope" });
+      for (const key of ["graph_packages", "power_platform", "users"] as const) expect(other[key]).not.toBe(before[key]);
+      await expect(f.repository.automaticRevisions({ ...scope, [field]: "" })).rejects.toMatchObject({ status: 403, code: "scope_mismatch" });
+    }
+    expect(f.database.connect).toHaveBeenCalledTimes(3);
+  });
+
+  it("rolls back and releases the selected client when a later marker page fails", async () => {
+    const f = fixture(), implementation = f.query.getMockImplementation()!;
+    const failure = new Error("Marker page failed.");
+    f.state.markers = Array.from({ length: 251 }, (_, index) => ({
+      source: "graph_packages", id: String(index).padStart(4, "0"), observed_at: observedAt, expires_at: expiresAt,
+    }));
+    f.query.mockImplementation(async (text, values) => {
+      if (String(text).includes("WITH markers AS") && values![3] !== "") throw failure;
+      return implementation(text, values);
+    });
+    await expect(f.repository.automaticRevisions(scope)).rejects.toBe(failure);
+    expect(f.query.mock.calls.filter(([text]) => String(text).includes("WITH markers AS"))).toHaveLength(2);
+    expect(f.query.mock.calls.filter(([text]) => text === "ROLLBACK")).toHaveLength(1);
+    expect(f.query.mock.calls.filter(([text]) => text === "COMMIT")).toHaveLength(0);
+    expect(f.client.release).toHaveBeenCalledTimes(1);
+    expect(f.database.query).not.toHaveBeenCalled();
   });
 
   it("propagates serialization conflicts without replay or weaker pool reads", async () => {

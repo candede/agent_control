@@ -370,17 +370,20 @@ async def test_case_b_top_three_only_all_associations_and_no_department_substitu
                     "name": f"Person {number}",
                     "agents": count,
                     "responses": responses,
-                    "champion": number <= 3,
+                    "champion": number in (2, 3, 4),
                 }
                 for number, count, responses in (
-                    (1, 4, 10),
-                    (2, 3, 50),
-                    (3, 8, 20),
+                    (1, 2, 10),
+                    (2, 2, 50),
+                    (3, 7, 20),
                     (4, 1, 100),
                     (5, 0, None),
                 )
             ],
-            "agents": [{"id": agent(8), "name": "Nonchampion", "description": None, "type": None}],
+            "agents": [{
+                "id": "report:P_extra_9", "name": "Nonchampion", "description": None,
+                "creatorType": "Your org", "inventoryId": agent(9),
+            }],
         }
     ]
     group["page"].update(limit=10, nextCursor=None, previousCursor=None)
@@ -393,7 +396,7 @@ async def test_case_b_top_three_only_all_associations_and_no_department_substitu
         },
         group,
     )
-    assert department["value"][0]["agents"][0]["id"] == agent(8)
+    assert department["value"][0]["agents"][0]["inventoryId"] == agent(9)
     champs = [
         {
             **{key: row[key] for key in ("rank", "created", "responses", "agents")},
@@ -425,7 +428,7 @@ async def test_case_b_top_three_only_all_associations_and_no_department_substitu
             f"signed:champions-{offset + 5}" if offset + 5 < len(rows) else None,
         )
         # Distinct agents differs from edges: the same exact agent can be created and used.
-        page["counts"]["distinctAgents"] = 16
+        page["counts"]["distinctAgents"] = 13
         page["page"]["limit"] = 5
         page.update(company=CORPUS["company"], department=CORPUS["department"], champions=champs)
         result = await workflow(
@@ -454,7 +457,7 @@ async def test_case_b_top_three_only_all_associations_and_no_department_substitu
         "reportOnlyAgents": sorted(
             {row["id"] for row in actual if row["identityState"] == "report_only"}
         ),
-        "departmentAgent8IsChampionAssociation": any(row["id"] == agent(8) for row in actual),
+        "departmentAgent9IsChampionAssociation": any(row["id"] == agent(9) for row in actual),
         "rankingAuthority": "API",
     }
     assert claims == case["claims"]

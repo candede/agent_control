@@ -79,9 +79,10 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("selected active users without paid Copilot", () => {
-  it.each(["queued", "running"] as const)("describes license verification during %s Users sync without assigning a manual task", async status => {
+  it.each((["queued", "running"] as const).flatMap(status => (["partial", "stale"] as const).map(state => ({ status, state }))))(
+    "describes $state license verification during $status Users sync without assigning a manual task", async ({ status, state }) => {
     const saved = page({ value: [], counts: { total: 3, filtered: 0 } });
-    saved.sources.directory.state = "partial";
+    saved.sources.directory.state = state;
     vi.mocked(api.readReportPage).mockResolvedValue(saved);
     render(<PublicationContext value={{ admit: vi.fn(), usersRefresh: { checking: false, status } }}>
       <ReportedUserActivity route={initial} onRouteChange={vi.fn()} />
@@ -90,17 +91,21 @@ describe("selected active users without paid Copilot", () => {
     expect(screen.getByText("Users sync is in progress. Please wait a moment; this page will update automatically.")).toBeVisible();
     expect(screen.queryByText(/Run Users sync|Non-paid user activity unavailable/)).not.toBeInTheDocument();
     expect(screen.getByText("Users will appear automatically when license verification completes.")).toBeVisible();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("Updating...");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
   });
 
-  it("reads the retained stale directory cohort with truthful age while its successor fails", async () => {
-    const saved = page();
+  it("does not present expired directory licensing as a measured empty cohort or an exportable selection", async () => {
+    const saved = page({ value: [], counts: { total: 3, filtered: 0 } });
     saved.sources.directory = { ...saved.sources.directory, state: "stale", attemptStatus: "failed",
       expiresAt: "2000-01-01T00:00:00Z", message: "Successor sync failed; showing the last published directory." };
     vi.mocked(api.readReportPage).mockResolvedValue(saved);
     renderActivity();
-    expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "Non-paid user activity unavailable" })).toBeVisible();
     expect(screen.getByText(/Saved directory data is out of date/)).toHaveTextContent("Successor sync failed");
-    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("Unavailable");
+    expect(screen.queryByText("No matching reported users")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
   it.each(["success", "denied"] as const)("preserves detail tab and draft during automatic saved-data renewal (%s)", async outcome => {
@@ -146,6 +151,7 @@ describe("selected active users without paid Copilot", () => {
     renderActivity();
     expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("3 matching users");
     expect(screen.queryByText(/Refreshing license data|Showing the last saved data|License data unavailable/)).not.toBeInTheDocument();
   });
 
@@ -175,27 +181,41 @@ describe("selected active users without paid Copilot", () => {
     expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("0");
   });
-  it("shows newly verified report users when background sync publishes, without a manual action or prompt", async () => {
+  it.each(["available", "stale"] as const)("shows newly verified report users when background sync replaces %s evidence, without a manual action or prompt", async state => {
     const before = page({ value: [], counts: { total: 1, filtered: 0 } });
+    before.sources.directory.state = state;
     const after = page({ value: [ada], selection: reportSelection(9), counts: { total: 1, filtered: 1 } });
     after.selection.publicationRevisions.users = "4".repeat(64);
     const admit = vi.fn(), client = createSavedQueryClient();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(before).mockResolvedValue(after);
+    vi.mocked(api.createReportExport).mockReturnValue(deferred<{ id: string }>().promise);
     const surface = (revisions = before.selection.publicationRevisions) => <SavedQueryProvider client={client}>
-      <PublicationContext value={{ admit, revisions }}>
+      <PublicationContext value={{ admit, revisions, usersRefresh: { checking: false, status: "running" } }}>
         <ReportedUserActivity route={initial} onRouteChange={vi.fn()} />
       </PublicationContext>
     </SavedQueryProvider>;
     const view = render(surface());
     try {
-      expect(await screen.findByText(/No matching reported users/)).toBeVisible();
+      expect(await screen.findByRole("heading", { name: state === "available" ? "No matching reported users" : "Verifying user licenses" })).toBeVisible();
       expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
+      if (state === "stale") {
+        const exporting = screen.getByRole("button", { name: "Export users CSV" });
+        expect(exporting).toBeDisabled();
+        fireEvent.click(exporting);
+        expect(api.createReportExport).not.toHaveBeenCalled();
+      }
       view.rerender(surface(after.selection.publicationRevisions));
       expect(await screen.findByRole("button", { name: "Ada" })).toBeVisible();
       expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("1");
       expect(api.readReportPage).toHaveBeenCalledTimes(2);
       expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("selectionId");
       expect(screen.queryByText(/need a license check|Run Users sync/)).not.toBeInTheDocument();
+      const exporting = screen.getByRole("button", { name: "Export users CSV" });
+      expect(exporting).toBeEnabled();
+      fireEvent.click(exporting);
+      expect(api.createReportExport).toHaveBeenCalledExactlyOnceWith({
+        kind: "official_users", selectionId: after.selection.id, ids: undefined, idempotencyKey: expect.any(String),
+      }, expect.any(AbortSignal));
     } finally { view.unmount(); client.clear(); }
   });
   it("makes unavailable directory verification explicit and disables export until a new valid revision", async () => {

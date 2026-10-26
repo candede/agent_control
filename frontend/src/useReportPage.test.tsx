@@ -1,4 +1,4 @@
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +10,7 @@ import { deferred } from "./test/deferred";
 import { reportPage, reportSelection } from "./test/reportDataFixture";
 import { useReportPage } from "./useReportPage";
 import { PublicationContext } from "./publicationContext";
+import { ReportPageControls, ReportReadStatus } from "./components/ReportPageControls";
 
 vi.mock("./api/reportData", async original => ({
   ...await original<typeof import("./api/reportData")>(), readReportPage: vi.fn(),
@@ -274,6 +275,43 @@ describe("report page selection lifetimes", () => {
     expect(result.current.invalidated).toBe(false);
     expect(result.current.loading).toBe(false);
     expect(result.current.data).toBeUndefined();
+  });
+
+  it.each([false, true])("offers working recovery when a failed page outlives its selection (pinned=%s)", async pinned => {
+    vi.useFakeTimers();
+    const initial = page("initial"), restartParent = vi.fn();
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockRejectedValueOnce(new Error("Page unavailable."));
+    function ReadView() {
+      const read = useReportPage<string>("official-usage/aggregate", pinned ? { selectionId: "initial" } : {},
+        0, true, pinned ? restartParent : undefined);
+      return <><ReportReadStatus read={read} /><ReportPageControls {...read} /></>;
+    }
+    render(<ReadView />, { wrapper: sharedQueries() });
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    fireEvent.click(screen.getByRole("button", { name: "Next rows" }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(screen.getByRole("alert")).toHaveTextContent("Page unavailable.");
+    expect(screen.getByRole("button", { name: "Retry saved data" })).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(screen.getByRole("alert")).toHaveTextContent("Page unavailable.");
+    expect(screen.getByRole("alert")).toHaveTextContent("This selection expired.");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Showing previously loaded saved data.");
+    expect(screen.queryByRole("button", { name: "Retry saved data" })).not.toBeInTheDocument();
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    expect(restartParent).not.toHaveBeenCalled();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(page("replacement"));
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    if (pinned) {
+      expect(restartParent).toHaveBeenCalledOnce();
+      expect(api.readReportPage).toHaveBeenCalledTimes(2);
+    } else {
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.readReportPage).toHaveBeenCalledTimes(3);
+      expect(api.readReportPage).toHaveBeenLastCalledWith("official-usage/aggregate", { limit: 50 }, expect.any(AbortSignal));
+      expect(screen.getByRole("button", { name: "Next rows" })).toHaveAttribute("aria-disabled", "false");
+    }
   });
 
   it("ignores a failed page's stale retry after that page has recovered", async () => {

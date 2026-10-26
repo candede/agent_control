@@ -127,7 +127,7 @@ export class DataSelections {
       observeDataWork("selection", { pins: roots.length });
       const filters = queryValues === undefined ? requestedFilters : canonicalFilters(queryValues, query.allowed);
       const queryHash = digest(JSON.stringify(filters));
-      if (!roots.length || roots.length > dataLimits.roots || new Set(roots.map(root => root.scopeId)).size !== roots.length) throw new Error("data_selection_roots");
+      if (!roots.length || roots.length > dataLimits.selectionRoots || new Set(roots.map(root => root.scopeId)).size !== roots.length) throw new Error("data_selection_roots");
       const expiresAt = new Date(Math.min(now.getTime() + 600_000, nextTransition?.getTime() ?? Infinity, ...roots.map(root => root.expiresAt.getTime())));
       if (expiresAt <= now) throw new SelectionError("selection_invalidated", "expired");
       const counts = (await client.query(`SELECT count(*)::int AS tenant,
@@ -211,7 +211,7 @@ export class DataSelections {
     [id, identity.tenantId, identity.principalId, identity.authorizationHash, identity.sessionEpoch, exportId ?? null])).rows[0];
     if (!owned) throw new SelectionError("selection_invalidated");
     const pins = (await client.query(`SELECT *,expires_at<=clock_timestamp() AS expired FROM data_generation_pins WHERE selection_id=$1 AND tenant_id=$2 ORDER BY scope_id`, [id, identity.tenantId])).rows;
-    if (!pins.length || pins.length > 16) throw new SelectionError("selection_invalidated", "unavailable");
+    if (!pins.length || pins.length > dataLimits.selectionRoots) throw new SelectionError("selection_invalidated", "unavailable");
     let scopeChanged = false;
     for (const pin of pins) {
       const scope = await lockDataScope(client, pin.scope_id, identity.tenantId, isSelectedRead(client) ? "share" : "update");
@@ -229,6 +229,11 @@ export class DataSelections {
         : { kind: pin.root_kind, scopeId: pin.scope_id, generationId: pin.generation_id, revision: pin.revision, expiresAt: pin.expires_at };
       await this.validateRoot(client, root, identity, exportId === undefined ? undefined : id);
     }
+    const selection = await this.validateLease(client, id, identity, pins.length, exportId);
+    return { selection, pins };
+  }
+
+  private async validateLease(client: pg.PoolClient, id: string, identity: SelectionIdentity, rootCount: number, exportId?: string) {
     const selection = (await client.query(`SELECT *,clock_timestamp() AS validated_at,
       EXISTS(SELECT 1 FROM data_generation_pins pin WHERE pin.selection_id=data_read_selections.id
         AND pin.expires_at<=clock_timestamp()) AS dependencies_expired,
@@ -239,9 +244,9 @@ export class DataSelections {
       AND authorization_hash=$4 AND session_epoch=$5 AND invalidated_at IS NULL
       FOR SHARE`,
     [id, identity.tenantId, identity.principalId, identity.authorizationHash, identity.sessionEpoch, exportId ?? null])).rows[0];
-    if (!selection || selection.root_count !== pins.length) throw new SelectionError("selection_invalidated", "changed");
+    if (!selection || selection.root_count !== rootCount) throw new SelectionError("selection_invalidated", "changed");
     if (selection.expired || selection.dependencies_expired) throw new SelectionError("selection_invalidated", "expired");
-    return { selection, pins };
+    return selection;
   }
 
   read<T>(
@@ -251,7 +256,9 @@ export class DataSelections {
   ): Promise<T> {
     return this.connections.selectedRead(async client => {
       const selected = await this.assert(client, id, identity, options.exportId);
-      return work(client, selected);
+      const value = await work(client, selected);
+      await this.validateLease(client, id, identity, selected.pins.length, options.exportId);
+      return value;
     }, { signal: options.signal });
   }
 

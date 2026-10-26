@@ -241,9 +241,9 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
         sourceIdentity: missingMembers.value[0].source_identity, field: "long",
       })}`)).toMatchObject({ state: "missing", text: null, totalBytes: 0 });
       const adoptionPreview = await json<AdoptionPage>(request, "/copilot-usage/adoption?company=~string%3AExample%20Company&department=~string%3AResearch");
-      expect(adoptionPreview.value.flatMap(group => group.agents).find(agent => agent.id === `agent:${canonical(101)}`)?.description)
+      expect(adoptionPreview.value.flatMap(group => group.agents).find(agent => agent.inventoryId === `agent:${canonical(101)}`)?.description)
         .toBe(Array.from(fullText).slice(0, 2048).join(""));
-      expect(adoptionPreview.value.flatMap(group => group.agents).find(agent => agent.id === `agent:${canonical(102)}`)?.description)
+      expect(adoptionPreview.value.flatMap(group => group.agents).find(agent => agent.inventoryId === `agent:${canonical(102)}`)?.description)
         .toContain("Saved native About");
       const foreign = { ...pins.identity, principalId: "foreign-private-reader" };
       await expect(pins.inventory.about(pins.inventorySelectionId, foreign, canonical(101), {
@@ -311,21 +311,21 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
       ...Array.from({ length: 6 }, (_, i) => ({ n: i + 11, person: 3 }))];
     await saveUsageInventory(database, scope, [...[1, 1, 1, 2, 2, 3, 3].map((p, i) => ({
       canonicalId: canonical(i + 1), packages: [`P${i + 1}`], native: { nativeId: `native-${i}`, environmentId: "environment", createdBy: person(p) },
-    })), { canonicalId: canonical(8), packages: ["P_nonchampion"], packageFields: { type: "custom" } },
+    })), { canonicalId: canonical(8), packages: ["P_highest_usage"], packageFields: { type: "custom" } },
       ...additional.map(row => ({ canonicalId: canonical(row.n), packages: [`P_extra_${row.n}`], packageFields: { type: "custom" } }))]);
     const imported = await reports(database, identity, { agents: ["P1,A,Your org,7,3,10,2026-01-30", "P4,B,Your org,0,0,50,2026-01-30",
-      "P6,C,Your org,0,0,20,2026-01-30", "P_nonchampion,D,Your org,0,0,20,2026-01-30",
+      "P6,C,Your org,0,0,20,2026-01-30", "P_highest_usage,D,Your org,0,0,20,2026-01-30",
       ...additional.map(row => `P_extra_${row.n},Extra,Your org,0,0,0,2026-01-30`)],
     userAgents: ["P1,A,Your org,p1@example.invalid,10,2026-01-30", "P4,B,Your org,p2@example.invalid,50,2026-01-30",
       "P6,C,Your org,p3@example.invalid,20,2026-01-30", "P_extra,Extra,Microsoft,p2@example.invalid,0,2026-01-30",
-      "P_nonchampion,D,Your org,p4@example.invalid,9,2026-01-30",
+      "P_highest_usage,D,Your org,p4@example.invalid,9,2026-01-30",
       ...additional.map(row => `P_extra_${row.n},Extra,Your org,p${row.person}@example.invalid,1,2026-01-30`)],
     users: ["p1@example.invalid,Person 1,4,10,2026-01-30", "p2@example.invalid,Person 2,3,50,2026-01-30",
       "p3@example.invalid,Person 3,8,20,2026-01-30", "p4@example.invalid,Person 4,1,100,2026-01-30"] });
     const pins = await selections(database, scope, actor, request, "adoption");
     const portal = await json<AdoptionPage>(request, `/copilot-usage/adoption?${new URLSearchParams({ selectionId: pins.selectionId })}`);
-    expect(portal.value[0].people.filter(row => row.champion).map(row => row.id)).toEqual([person(1), person(2), person(3)]);
-    expect(portal.value[0].agents.map(row => row.id)).toContain(`agent:${canonical(8)}`);
+    expect(portal.value[0].people.filter(row => row.champion).map(row => row.id)).toEqual([person(4), person(2), person(3)]);
+    expect(portal.value[0].agents.map(row => row.id)).toContain(`report:${corpus.caseB.excluded.reportAgent}`);
     const aggregate = await json<ReportPage<ReportAgent>>(request, `/official-usage/aggregate?${new URLSearchParams({ setId: imported.setId })}`);
     expect(aggregate.summary).toMatchObject({ reportedResponses: 100, bridgeResponses: 97, licensedOccurrences: 7,
       unlicensedOccurrences: 3, responseReconciliation: "mismatch", activeUsersAreNonAdditive: true });
@@ -338,7 +338,7 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
       expect(page).toMatchObject({ company: "Example Company", department: "Research" });
       expect(page.champions.map(row => row.objectId)).toEqual(corpus.caseB.claims.championIds);
       expect(page.champions.map(({ created, responses, agents }) => ({ created, responses, agents }))).toEqual([
-        { created: 3, responses: 10, agents: 4 }, { created: 2, responses: 50, agents: 3 }, { created: 2, responses: 20, agents: 8 },
+        { created: 0, responses: 100, agents: 1 }, { created: 2, responses: 50, agents: 2 }, { created: 2, responses: 20, agents: 7 },
       ]);
       values.push(...page.value); cursor = page.page.nextCursor ?? undefined;
     } while (cursor);
@@ -348,8 +348,8 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
       ...corpus.caseB.usedEdges.map(([p, n]: [number, number]) => [person(p), `agent:${canonical(n)}`, "used"].join("|")),
       [person(corpus.caseB.reportOnlyEdge.person), corpus.caseB.reportOnlyEdge.id, "used"].join("|"),
     ].sort());
-    expect(values.some(row => row.reportAgentId === "P_nonchampion")).toBe(false);
-    expect(values.some(row => row.id === `agent:${canonical(8)}`)).toBe(false);
+    expect(values.some(row => row.reportAgentId === corpus.caseB.excluded.reportAgent)).toBe(false);
+    expect(values.some(row => row.id === `agent:${canonical(corpus.caseB.excluded.agent)}`)).toBe(false);
     expect(values).toContainEqual(expect.objectContaining({ id: "report:P_extra", relationship: "used" }));
     const malformed = await request("/copilot-usage/adoption?adoptionChamps=maybe");
     expect(malformed.status).toBe(400);
@@ -428,7 +428,8 @@ describe.sequential("canonical phase04 saved reads on real web/bearer handlers",
     console.info("phase04_champion_query_work", JSON.stringify({ transport, users: 5001, agents: 103, pages: 3, queries: work.length,
       rows: work.reduce((n, query) => n + query.rows, 0), milliseconds: championElapsed,
       sqlMilliseconds: work.reduce((n, query) => n + query.milliseconds, 0) }));
-    expect(work.length).toBeLessThanOrEqual(256);
+    // Both selections validate the pinned inventory and source revisions.
+    expect(work.length).toBeLessThanOrEqual(320);
     expect(work.reduce((n, query) => n + query.rows, 0)).toBeLessThanOrEqual(1024);
     expect(work.some(query => query.failed)).toBe(false);
     expect(championElapsed).toBeLessThan(15000);

@@ -211,7 +211,8 @@ describe("report query HTTP contracts", () => {
         expect.objectContaining({ creatorType: "" }));
     },
   );
-  it.each(["creatorType=&creatorType=Custom", "creatorType=%00", `creatorType=${"x".repeat(257)}`, "agentId=", "agentId=Agent%09ID", "limit="])(
+  it.each(["creatorType=&creatorType=Custom", "creatorType=%00", "creatorType=Custom%0BAgent", "creatorType=Custom%C2%85Agent",
+    `creatorType=${"x".repeat(257)}`, "agentId=", "agentId=Agent%09ID", "limit="])(
     "still rejects malformed scalars: %s", async query => {
       expect(await request("GET", `/official-usage/aggregate?${query}`)).toMatchObject({ status: 400 });
       expect(reports.capture).not.toHaveBeenCalled();
@@ -225,6 +226,25 @@ describe("report query HTTP contracts", () => {
         reportQuery("official_agents", { creatorType }));
     }
   });
+  it.each(["Custom\tAgent", "Custom\nAgent", "Custom\r\nAgent"])(
+    "round-trips imported creator-type whitespace through capture and selected rereads: %j", async creatorType => {
+      allowPage();
+      for (const [path, endpoint] of [
+        ["official-usage/aggregate", "official_agents"],
+        ["official-usage/users", "official_users"],
+        ["copilot-usage/users", "copilot_users"],
+        ["official-usage/agent-users", "relationships"],
+      ] as const) {
+        expect(await request("GET", `/${path}${reportQueryString({ creatorType })}`))
+          .toMatchObject({ status: 200 });
+        expect(reports.capture).toHaveBeenLastCalledWith(identity, "delegated", endpoint,
+          expect.objectContaining({ creatorType }));
+        expect(await request("GET", `/${path}${reportQueryString({ selectionId, creatorType })}`))
+          .toMatchObject({ status: 200 });
+        expect(saved.query.creatorType).toBe(creatorType);
+      }
+    },
+  );
   it("reuses an immutable empty creator-type filter", async () => {
     saved = context("official_agents", { creatorType: "" });
     allowPage();

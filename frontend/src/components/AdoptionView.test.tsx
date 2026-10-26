@@ -21,12 +21,13 @@ const group: AdoptionGroup = {
     { id: "person-2", name: "Alex", agents: 2, responses: 40, champion: true },
     { id: "person-3", name: "Robin", agents: 0, responses: null, champion: false },
   ],
-  agents: [{ id: "agent:10000000-0000-4000-8000-000000000001", name: "Policy Assistant",
-    description: "Answers employee policy questions.", type: "Microsoft 365 Copilot Agent Builder" }],
+  agents: [{ id: "report:policy-assistant", name: "Policy Assistant",
+    description: "Answers employee policy questions.", creatorType: "User-created agent",
+    inventoryId: "agent:10000000-0000-4000-8000-000000000001" }],
 };
 function page(value: AdoptionGroup[] = [group], number = 1, total = value.length): AdoptionPage {
   const result = reportPage(value, { counts: { total, filtered: total } });
-  return { ...result, page: { ...result.page, limit: 5, number, offset: (number - 1) * 5, anchor: value[0]?.id }, directory: source("directory"), inventoryAvailable: true,
+  return { ...result, page: { ...result.page, limit: 5, number, offset: (number - 1) * 5, anchor: value[0]?.id }, directory: source("directory"),
     summary: { people: value.reduce((sum, group) => sum + group.people.length, 0),
       champs: value.reduce((sum, group) => sum + group.people.filter(person => person.champion).length, 0),
       agents: new Set(value.flatMap(group => group.agents.map(agent => agent.id))).size } };
@@ -58,13 +59,33 @@ describe("Adoption", () => {
     expect(section.getByText("0/Unknown")).toBeVisible();
     expect(section.getByText("3 users · 1 agent")).toBeVisible();
     expect(section.getByText("Answers employee policy questions.")).toBeVisible();
-    expect(section.getByText("Agent Builder")).toBeVisible();
+    expect(section.getByText("Organization-built")).toBeVisible();
     expect(document.querySelector("details")).toBeNull();
     expect(screen.queryByText(/Built in group|Used by|Created by/)).not.toBeInTheDocument();
     fireEvent.click(section.getByRole("button", { name: "Policy Assistant" }));
-    expect(onOpenAgent).toHaveBeenCalledWith(group.agents[0].id);
+    expect(onOpenAgent).toHaveBeenCalledWith(group.agents[0].inventoryId);
     fireEvent.click(section.getByRole("button", { name: "Maya" }));
     expect(onOpenPerson).toHaveBeenCalledWith("person-1");
+  });
+  it("shows Microsoft, third-party and unknown report-only agents without requiring inventory or offering broken detail links", async () => {
+    vi.mocked(api.readReportPage).mockResolvedValue(page([{ ...group, agents: [
+      ...group.agents,
+      { id: "report:microsoft", name: "Researcher", creatorType: "Agent built by Microsoft", inventoryId: null, description: null },
+      { id: "report:third-party", name: "External assistant", creatorType: "Agent built by Third party", inventoryId: null, description: null },
+      { id: "report:organization", name: "Company assistant", creatorType: "Agent built by your org", inventoryId: null, description: null },
+      { id: "report:unknown", name: "Unclassified assistant", creatorType: null, inventoryId: null, description: null },
+    ] }]));
+    mount();
+    const section = within(await screen.findByRole("region", { name: "Contoso / HR" }));
+    expect(section.getByText("Researcher")).toBeVisible();
+    expect(section.getByText("Microsoft")).toBeVisible();
+    expect(section.getByText("Third-party")).toBeVisible();
+    expect(section.getAllByText("Organization-built")).toHaveLength(2);
+    expect(section.getByText("Creator unknown")).toBeVisible();
+    expect(section.getByText("3 users · 5 agents")).toBeVisible();
+    expect(section.getAllByText("Reported usage only; inventory details unavailable.")).toHaveLength(4);
+    expect(section.queryByRole("button", { name: "Researcher" })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Adoption summary" })).toHaveTextContent("Agents used5");
   });
   it("searches group names and clears only search", async () => {
     mount(); await screen.findByText("Maya");
@@ -141,17 +162,22 @@ describe("Adoption", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
       expect.objectContaining({ limit: 5, selectionId: first.selection.id, pageNumber: 2 }), expect.any(AbortSignal)));
   });
-  it("keeps the current groups and summary mounted while the next page loads", async () => {
+  it.each(["groups pages", "groups page shortcuts"])("keeps groups mounted and both pagers synchronized while paging with %s", async navigationLabel => {
     const first = page(undefined, 1, 6), pending = deferred<AdoptionPage>();
     first.page.nextCursor = "group-next";
     vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockReturnValueOnce(pending.promise);
     mount();
     const region = await screen.findByRole("region", { name: "Contoso / HR" });
-    fireEvent.click(pages().getByRole("button", { name: "Next groups" }));
+    fireEvent.click(within(screen.getByRole("navigation", { name: navigationLabel })).getByRole("button", { name: "Next groups" }));
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(screen.getByRole("region", { name: "Contoso / HR" })).toBe(region);
     expect(screen.getByRole("status", { name: "Matching groups" })).toHaveTextContent("6 matching groups");
     expect(pages().getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+    const shortcuts = within(screen.getByRole("navigation", { name: "groups page shortcuts" }));
+    expect(shortcuts.getByRole("status", { name: "Page 1 of 2" })).toHaveTextContent("1 / 2");
+    expect(shortcuts.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shortcuts.getByRole("button", { name: "Next groups" }));
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole("button", { name: "Maya" }));
     expect(onOpenPerson).not.toHaveBeenCalled();
     const second = page([{ ...group, id: "group-it", department: "IT" }], 2, 6);
@@ -159,21 +185,33 @@ describe("Adoption", () => {
     await act(async () => pending.resolve(second));
     expect(await screen.findByRole("region", { name: "Contoso / IT" })).toBeVisible();
     expect(screen.queryByRole("region", { name: "Contoso / HR" })).not.toBeInTheDocument();
+    expect(shortcuts.getByRole("status", { name: "Page 2 of 2" })).toHaveTextContent("2 / 2");
+    expect(shortcuts.getByRole("button", { name: "Previous groups" })).toHaveAttribute("aria-disabled", "false");
+    expect(shortcuts.getByRole("button", { name: "Next groups" })).toHaveAttribute("aria-disabled", "true");
+    expect(pages().getByRole("button", { name: "Page 2" })).toHaveAttribute("aria-current", "page");
+    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+      expect.objectContaining({ limit: 5, selectionId: first.selection.id, pageNumber: 2 }), expect.any(AbortSignal));
   });
-  it("jumps directly to page four in one request, focuses results, and synchronizes both controls", async () => {
+  it("adds compact paging inside the results heading without changing full paging below the groups", async () => {
     const first = page(undefined, 1, 20), fourth = page([{ ...group, id: "group-finance", department: "Finance" }], 4, 20);
     vi.mocked(api.readReportPage).mockResolvedValueOnce(first).mockResolvedValueOnce(fourth);
     mount();
     await screen.findByText("Maya");
+    const navigation = screen.getByRole("navigation", { name: "groups pages" });
+    expect(screen.getAllByRole("navigation")).toHaveLength(2);
+    const shortcuts = screen.getByRole("navigation", { name: "groups page shortcuts" });
+    expect(shortcuts.parentElement).toHaveClass("adoption-results-heading");
+    expect(within(shortcuts.parentElement!).getByRole("heading", { name: "Company & department adoption" })).toBeVisible();
+    expect(within(shortcuts).queryByRole("list")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Company & department adoption" }).nextElementSibling).toBe(navigation);
     fireEvent.click(pages().getByRole("button", { name: "Page 4" }));
     await screen.findByRole("region", { name: "Contoso / Finance" });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
     expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
       expect.objectContaining({ pageNumber: 4, selectionId: first.selection.id }), expect.any(AbortSignal));
     expect(screen.getByRole("heading", { name: "Company & department adoption" })).toHaveFocus();
-    for (const name of ["groups pages", "groups pages (bottom)"]) {
-      expect(within(screen.getByRole("navigation", { name })).getByRole("button", { name: "Page 4" })).toHaveAttribute("aria-current", "page");
-    }
+    expect(pages().getByRole("button", { name: "Page 4" })).toHaveAttribute("aria-current", "page");
+    expect(within(shortcuts).getByRole("status", { name: "Page 4 of 4" })).toHaveTextContent("4 / 4");
     expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledExactlyOnceWith({ block: "start" });
   });
   it.each(["publication", "revision", "expiry"] as const)(
@@ -291,7 +329,7 @@ describe("Adoption", () => {
   it("shows empty groups and missing agent descriptions without inventing data", async () => {
     vi.mocked(api.readReportPage).mockResolvedValue(page([{ ...group, agents: [] }]));
     mount();
-    expect(await screen.findByText("No organization-built agents found.")).toBeVisible();
+    expect(await screen.findByText("No agent usage reported.")).toBeVisible();
     expect(screen.getByText("Robin")).toBeVisible();
   });
   it("shows About markup as sanitized plain text", async () => {
@@ -316,17 +354,17 @@ describe("Adoption", () => {
     expect(screen.queryByText(description.trim())).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Show more/ })).not.toBeInTheDocument();
     fireEvent.click(agent);
-    expect(onOpenAgent).toHaveBeenCalledWith(group.agents[0].id);
+    expect(onOpenAgent).toHaveBeenCalledWith(group.agents[0].inventoryId);
     expect(result.value[0].agents[0].description).toBe(description);
   });
   it("surfaces unavailable sources", async () => {
     const missing = page([]);
     missing.directory = { ...missing.directory, state: "unavailable" };
-    missing.inventoryAvailable = false;
-    missing.reports = { ...missing.reports, setId: null, availability: "never_imported" };
+    missing.reports = { ...missing.reports, setId: null, availability: "never_imported", lineages: [] };
+    missing.summary.agents = null;
     vi.mocked(api.readReportPage).mockResolvedValue(missing);
     mount();
-    expect(await screen.findByText(/Agent inventory is unavailable/)).toBeVisible();
+    expect(await screen.findByText(/Agent usage is unavailable/)).toBeVisible();
     expect(screen.getByText(/Usage is unavailable/)).toBeVisible();
     expect(screen.getByText(/Group membership uses unavailable/)).toBeVisible();
   });
@@ -390,7 +428,7 @@ describe("Adoption", () => {
     expect(change).toHaveBeenLastCalledWith({ ...filtered, company: undefined, department: undefined,
       adoptionChamps: undefined, adoptionAgents: undefined, search: "" });
   });
-  it("refreshes on inventory publication, not merely reordered revision properties", async () => {
+  it("refreshes optional inventory metadata on publication, not merely reordered revision properties", async () => {
     const revisions = page().selection.publicationRevisions;
     const admit = vi.fn();
     const renderPage = (powerPlatform: string) => <SavedQueryProvider>
@@ -410,5 +448,47 @@ describe("Adoption", () => {
     await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
     await waitFor(() => expect(admit).toHaveBeenLastCalledWith(next.selection.publicationRevisions));
+  });
+  it("automatically populates published usage and retains agents while the next report publication loads", async () => {
+    const empty = page([{ ...group, agents: [], people: group.people.map(person => ({ ...person, agents: null })) }]);
+    empty.reports = { ...empty.reports, lineages: empty.reports.lineages.filter(lineage => lineage.kind !== "userAgents") };
+    empty.summary.agents = null;
+    const populated = page();
+    populated.selection = { ...reportSelection(3), publicationRevisions: {
+      ...empty.selection.publicationRevisions, users: "4".repeat(64),
+    } };
+    const pending = deferred<AdoptionPage>();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(empty).mockReturnValueOnce(pending.promise);
+    const content = (revisions: AdoptionPage["selection"]["publicationRevisions"]) => <SavedQueryProvider>
+      <PublicationContext value={{ admit: vi.fn(), revisions }}>
+        <AdoptionView route={route} change={change} revision={0} reportContext={null} onOpenPerson={onOpenPerson} />
+      </PublicationContext>
+    </SavedQueryProvider>;
+    const view = render(content(empty.selection.publicationRevisions));
+    await screen.findByText(/Agent usage is unavailable/);
+    expect(screen.getByText("3 users · Unknown agents")).toBeVisible();
+    expect(screen.getByText("Unknown/200")).toBeVisible();
+    expect(screen.getByText("Agent usage data is unavailable.")).toBeVisible();
+    expect(screen.queryByText("No agent usage reported.")).not.toBeInTheDocument();
+    view.rerender(content(populated.selection.publicationRevisions));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    await act(async () => pending.resolve(populated));
+    expect(await screen.findByText("Policy Assistant")).toBeVisible();
+    expect(screen.queryByText(/Agent usage is unavailable/)).not.toBeInTheDocument();
+
+    const next = page();
+    next.selection = { ...reportSelection(4), publicationRevisions: {
+      ...populated.selection.publicationRevisions, users: "5".repeat(64),
+    } };
+    const refreshing = deferred<AdoptionPage>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(refreshing.promise);
+    view.rerender(content(next.selection.publicationRevisions));
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+    expect(screen.getByText("Policy Assistant")).toBeVisible();
+    expect(screen.queryByText("No agent usage reported.")).not.toBeInTheDocument();
+    await act(async () => refreshing.resolve(next));
+    expect(screen.getByText("Policy Assistant")).toBeVisible();
+    expect(change).not.toHaveBeenCalled();
+    expect(HTMLElement.prototype.scrollIntoView).not.toHaveBeenCalled();
   });
 });

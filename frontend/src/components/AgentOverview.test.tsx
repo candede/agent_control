@@ -205,6 +205,43 @@ describe("purposeful saved agent context", () => {
     expect(screen.getAllByRole("button", { name: /View responsibility/ })).toHaveLength(1);
   });
 
+  it.each([false, true])("keeps complete package About and saved metadata when details load (native=%s)", async native => {
+    const savedSource = { scopeId: "package-scope", identity: "Exact-package" };
+    const selectedPackage: CopilotPackage = {
+      id: "Exact-package", displayName: "Package", isBlocked: false, supportedHosts: ["Teams"], savedSource,
+      sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package",
+      lifecycle: "unknown", identityConfidence: "exact_native", provenance: {},
+    };
+    const first = "A".repeat(16_384), last = "Complete saved package description.";
+    const page: Awaited<ReturnType<typeof api.getAgentAbout>> = {
+      recordId: record.id, sourceScopeId: savedSource.scopeId, sourceIdentity: savedSource.identity,
+      generationId: "package-generation", field: "long", state: "available", source: "graph_packages",
+      provenance: { path: "longDescription", maturity: "ga" }, observedAt: "2026-01-01T00:00:00Z",
+      text: first, totalBytes: first.length + last.length, returnedBytes: first.length, nextCursor: "next",
+      selection: { id: "selection", revision: "revision", evaluatedAt: "2026-01-01T00:00:00Z",
+        validatedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-02T00:00:00Z",
+        publicationRevisions: { graph_packages: "a".repeat(64), power_platform: "b".repeat(64), users: "c".repeat(64) } },
+    };
+    const about = vi.spyOn(api, "getAgentAbout").mockResolvedValueOnce(page)
+      .mockResolvedValueOnce({ ...page, text: last, returnedBytes: last.length, nextCursor: null });
+    const props = {
+      record: { ...record, presence: native ? "both" as const : "graph_packages" as const, packages: [selectedPackage],
+        powerPlatformResource: native ? { ...resource, savedSource: { scopeId: "native-scope", identity: "native" } } : null },
+      selectionId: "selection", selectedPackage, peopleState,
+    };
+    const { rerender } = render(<AgentOverview {...props} />);
+    expect((await screen.findByLabelText("Agent description")).textContent).toBe(first + last);
+    rerender(<AgentOverview {...props} packageDetail={{ ...selectedPackage, categories: ["Productivity"] }} />);
+    expect(screen.getByLabelText("Agent description").textContent).toBe(first + last);
+    expect(field("Hosts")).toHaveTextContent("Teams");
+    expect(field("Categories")).toHaveTextContent("Productivity");
+    expect(about).toHaveBeenCalledTimes(2);
+    expect(about).toHaveBeenNthCalledWith(1, "selection", record.id, savedSource, "long", { signal: expect.any(AbortSignal) });
+    expect(about).toHaveBeenLastCalledWith("selection", record.id, savedSource, "long",
+      { cursor: "next", signal: expect.any(AbortSignal) });
+    expect(screen.queryByRole("button", { name: /load more/i })).not.toBeInTheDocument();
+  });
+
   it("shows a known person once without directory diagnostics or expansion controls", () => {
     const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     render(<AgentOverview record={record} peopleState={{ ...peopleState, people: {
