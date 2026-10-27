@@ -9,6 +9,7 @@ export function hasRole(user: SessionUser | undefined, role: AppRole) {
 export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
   if (!hasRole(user, "AgentControl.Viewer")) return ["permissions"];
   return [
+    "dashboard",
     "agents",
     "users",
     "sync",

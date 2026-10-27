@@ -14,6 +14,7 @@ import type { ReportEndpoint, ReportQuery } from "../types/officialReportData.js
 import type { UserSourceMetadata } from "../types/userSources.js";
 import { reportQueryString } from "../../../frontend/src/api/reportData.js";
 import { createOfficialReportDataRouter } from "./officialReportData.js";
+import * as adoptionHistory from "../services/adoptionHistory.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -36,6 +37,7 @@ const database = new pg.Pool({ max: 4 });
 const client = Object.assign(new pg.Client(), { release: vi.fn() });
 const reports = new LargeTenantUsersReports(database, "synthetic-official-report-route-secret", 35);
 let server: Server, saved: ReportReadContext;
+let signedIn = true, roles = ["AgentControl.Admin"], identified = identity;
 
 function source(source: UserSourceMetadata["source"]): UserSourceMetadata {
   return { source, generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
@@ -64,16 +66,17 @@ beforeAll(async () => {
   app.use(express.json());
   app.use(session({ secret: "synthetic-official-report-route-secret", resave: false, saveUninitialized: false }));
   app.use((request, _response, next) => {
+    if (!signedIn) { next(); return; }
     request.session.accountId = identity.principalId;
     request.session.tenantId = identity.tenantId;
     request.session.clientId = config.tenants[0].clientId;
     request.session.rolesValidatedAt = Date.now();
     request.session.csrfToken = "fixture-csrf";
     request.session.user = { tenantId: identity.tenantId, homeAccountId: identity.principalId,
-      username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Admin"] };
+      username: "reader@example.invalid", displayName: "Reader", roles };
     next();
   });
-  app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity, tokenMode: "delegated" }),
+  app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity: identified, tokenMode: "delegated" }),
     enqueueExport: async () => { throw new Error("Unexpected export dispatch"); } }));
   app.use(errorHandler);
   server = await new Promise<Server>(resolve => {
@@ -81,6 +84,7 @@ beforeAll(async () => {
   });
 });
 beforeEach(() => {
+  signedIn = true; roles = ["AgentControl.Admin"]; identified = identity;
   saved = context("official_agents");
   vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
   vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected database query"));
@@ -131,6 +135,77 @@ function allowPage() {
   });
   return vi.spyOn(reports, "page");
 }
+
+describe("retained adoption history HTTP contract", () => {
+  let read: ReturnType<typeof vi.spyOn<typeof adoptionHistory, "readAdoptionHistory">>;
+  beforeEach(() => {
+    saved = context("adoption_history");
+    read = vi.spyOn(adoptionHistory, "readAdoptionHistory").mockImplementation(async (_client, _reports, context, options) => ({
+      value: [], reports: context.report, selection: context.selection, counts: { total: 0, filtered: 0 },
+      page: { limit: options?.limit ?? 50, nextCursor: null, previousCursor: null },
+    }));
+  });
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"])("serves saved adoption to %s without provider or source reads", async role => {
+    roles = [role];
+    expect(await request("GET", "/official-usage/history/adoption?limit=100")).toMatchObject({
+      status: 200, body: { value: [], counts: { total: 0, filtered: 0 }, page: { limit: 100 } },
+    });
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "adoption_history", {});
+    expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, saved, { limit: 100 });
+  });
+  it.each([
+    "setId=44444444-4444-4444-8444-444444444444", "scope=history", "startDate=2025-01-01", "search=user",
+    "sort=reportingPeriod", "company=Contoso", "tenantId=foreign", "all=true", "offset=0",
+    "limit=0", "limit=101", "limit=1.5", "limit=1&limit=2", "cursor=a&cursor=b",
+    "selectionId=invalid", "selectionId=one&selectionId=two",
+  ])("rejects malformed or filtered intent before capture: %s", async query => {
+    expect(await request("GET", `/official-usage/history/adoption?${query}`)).toMatchObject({ status: 400 });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+  it("reuses the frozen selection explicitly or from a continuation", async () => {
+    const cursor = reports.codec.encode({ identity, endpoint: "adoption_history", selectionId, revision: saved.selection.revision,
+      queryHash: saved.queryHash, direction: "next", boundary: { key: "1/2025-01-01", id: setId, nullRank: 0 } });
+    for (const query of [`selectionId=${selectionId}`, `cursor=${cursor}`]) {
+      expect(await request("GET", `/official-usage/history/adoption?${query}`)).toMatchObject({ status: 200 });
+    }
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(read.mock.calls[1][3]).toEqual({ limit: 50, cursor });
+  });
+  it("rejects a foreign report selection without recapture", async () => {
+    saved = context("history");
+    expect(await request("GET", `/official-usage/history/adoption?selectionId=${selectionId}`)).toMatchObject({
+      status: 400, body: { code: "invalid_cursor" },
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(reports.capture).not.toHaveBeenCalled();
+  });
+  it("propagates deleted, corrected, expired, or damaged selection invalidation without a fallback", async () => {
+    vi.mocked(reports.read).mockRejectedValue(new SelectionError("selection_invalidated"));
+    expect(await request("GET", `/official-usage/history/adoption?selectionId=${selectionId}`)).toMatchObject({
+      status: 409, body: { code: "selection_invalidated" },
+    });
+    expect(read).not.toHaveBeenCalled();
+    expect(reports.capture).not.toHaveBeenCalled();
+  });
+  it("requires a real authenticated application role", async () => {
+    roles = [];
+    expect(await request("GET", "/official-usage/history/adoption")).toMatchObject({
+      status: 403, body: { code: "missing_internal_role" },
+    });
+    signedIn = false;
+    expect(await request("GET", "/official-usage/history/adoption")).toMatchObject({ status: 401 });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+  it.each(["tenantId", "principalId"] as const)("rejects an injected %s mismatch", async key => {
+    identified = { ...identity, [key]: "foreign" };
+    expect(await request("GET", "/official-usage/history/adoption")).toMatchObject({ status: 401 });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
+  });
+});
 
 describe("report query HTTP contracts", () => {
   it.each(["official-usage/overview", "official-usage/aggregate", "official-usage/users", "official-usage/agent-users", "copilot-usage/users"])(

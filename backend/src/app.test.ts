@@ -359,7 +359,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect((await request("/api/auth/callback")).status).toBe(400);
     expect((await request("/assets/missing.js")).status).toBe(404);
     expect((await request("/missing.css")).status).toBe(404);
-    for (const route of ["/agents", "/users", "/sync", "/audit", "/permissions", "/jobs"]) {
+    for (const route of ["/agents", "/dashboard", "/users", "/sync", "/audit", "/permissions", "/jobs"]) {
       const deepLink = await request(route);
       expect(deepLink.status).toBe(200);
       expect(deepLink.headers.get("cache-control")).toContain("no-store");

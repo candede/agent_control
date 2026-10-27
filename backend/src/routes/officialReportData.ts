@@ -18,6 +18,7 @@ import { config } from "../config.js";
 import { abortableRead, createExportPublicationValidator } from "../services/csvExport.js";
 import { operationalLog } from "../services/telemetry.js";
 import { readAdoptionGroups } from "../services/adoptionGroups.js";
+import { readAdoptionHistory } from "../services/adoptionHistory.js";
 import { SavedReadContracts } from "../services/savedReadContracts.js";
 import type { AgentRelationship } from "../types/savedReadContracts.js";
 
@@ -148,6 +149,14 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   route("get", "/official-usage/history/options", "read", failSafe(async (request, response) => {
     const context = await selected(request, "history");
     response.json(await reports.historyOptions(context.id, context.identity, pageOptions(request.query)));
+  }));
+  route("get", "/official-usage/history/adoption", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["selectionId", "cursor", "limit"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Use an unfiltered retained history selection.");
+    }
+    const context = await selected(request, "adoption_history");
+    response.json(await reports.read(context.id, context.identity, (client, read) =>
+      readAdoptionHistory(client, reports, read, pageOptions(request.query))));
   }));
   route("get", "/copilot-usage/adoption", "read", failSafe(async (request, response) => {
     const anchor = request.query.anchor === undefined ? undefined : scalar(request.query.anchor, 64);

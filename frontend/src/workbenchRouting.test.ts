@@ -3,6 +3,8 @@ import {
   agentRouteSearch,
   auditRouteSearch,
   dataSyncRouteSearch,
+  dashboardRouteSearch,
+  parseDashboardRoute,
   parseDataSyncRoute,
   parseAgentRoute,
   parseAuditRoute,
@@ -61,9 +63,20 @@ describe("workbench routing", () => {
   });
 
   it("maps every canonical deep link without a query-string view alias", () => {
+    expect(parseWorkbenchView("/dashboard")).toBe("dashboard");
+    expect(isWorkbenchPath("/dashboard")).toBe(true);
     expect(parseWorkbenchView("/agents")).toBe("agents");
     expect(parseWorkbenchView("/sync")).toBe("sync");
     expect(parseWorkbenchView("/unknown")).toBe("agents");
+  });
+
+  it("round trips a dashboard baseline without changing the report selection", () => {
+    const baselineId = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    const state = parseDashboardRoute(`?baseline=${baselineId}&snapshot=not-dashboard-context`);
+    expect(state).toEqual({ baselineId: baselineId.toLowerCase() });
+    expect(workbenchUrl("dashboard", dashboardRouteSearch(state))).toBe(`/dashboard?baseline=${baselineId.toLowerCase()}`);
+    expect(parseDashboardRoute("?baseline=invalid")).toEqual({ baselineId: undefined });
+    expect(dashboardRouteSearch({ baselineId: "invalid" }).toString()).toBe("");
   });
 
   it("does not recognize an unregistered path", () => {

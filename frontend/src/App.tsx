@@ -108,6 +108,7 @@ import { BulkActions, type BulkProgress, type BulkJobCommand } from "./component
 import { AgentInventoryOverview, AgentInventoryScopes } from "./components/AgentInventoryOverview";
 import { AgentInventoryFilters, type AgentFilterValues } from "./components/AgentInventoryFilters";
 import { CopilotUsersView } from "./components/CopilotUsersView";
+import { AdoptionDashboard } from "./components/AdoptionDashboard";
 import { CopilotStudioQuarantineControls } from "./components/CopilotStudioQuarantineControls";
 import { OfficialUsageImportModal } from "./components/OfficialUsageImportModal";
 import { OfficialUsageReportSelector } from "./components/OfficialUsageReportSelector";
@@ -119,7 +120,9 @@ import { PowerPlatformSourceJob } from "./components/PowerPlatformSourceJob";
 import { SyncHistoryView } from "./components/SyncHistoryView";
 import {
   agentRouteSearch,
+  dashboardRouteSearch,
   dataSyncRouteSearch,
+  parseDashboardRoute,
   parseDataSyncRoute,
   parseAgentRoute,
   parseUsersRoute,
@@ -128,6 +131,7 @@ import {
   isWorkbenchPath,
   workbenchUrl,
   type UsersRouteState,
+  type DashboardRouteState,
   type SyncReportRouteState,
   type WorkbenchViewId,
 } from "./workbenchRouting";
@@ -161,7 +165,7 @@ function publicRouteSearch() {
   for (const key of [
     "detail", "detailTab", "tab", "person", "agent", "page", "selected", "selectionState", "selectionCount",
     "selectedResource", "inventorySnapshot", "quarantineJob", "controlJob", "refreshJob", "mode",
-    "syncRun", "powerPlatformJob", "reports", "staging", "snapshot", "correction", "window",
+    "syncRun", "powerPlatformJob", "reports", "staging", "snapshot", "correction", "window", "baseline",
   ]) search.delete(key);
   return search;
 }
@@ -262,6 +266,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setPowerPlatformJobSelection({ id, initialJob });
   }, []);
   const [usersRoute, setUsersRoute] = useState(() => parseUsersRoute(readViewSearch("users")));
+  const [dashboardRoute, setDashboardRoute] = useState(() => parseDashboardRoute(readViewSearch("dashboard")));
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
   const [initialRouteSession] = useState(() => crypto.randomUUID());
@@ -734,6 +739,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setRequestedInventorySnapshotId(route.inventorySnapshotId);
       } else if (view === "users") {
         setUsersRoute(parseUsersRoute(window.location.search));
+      } else if (view === "dashboard") {
+        setDashboardRoute(parseDashboardRoute(window.location.search));
       } else if (view === "sync") {
         const route = parseDataSyncRoute(window.location.search);
         const next = workbenchUrl("sync", dataSyncRouteSearch(route));
@@ -877,6 +884,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const next = workbenchUrl("users", usersRouteSearch(usersRoute));
     replaceRoute("users", next);
   }, [activeView, replaceRoute, user, usersRoute]);
+
+  useEffect(() => {
+    if (!user || activeView !== "dashboard") return;
+    replaceRoute("dashboard", workbenchUrl("dashboard", dashboardRouteSearch(dashboardRoute)));
+  }, [activeView, dashboardRoute, replaceRoute, user]);
 
   const invalidateBookmarkedInventory = useEffectEvent((selectionId: string) => {
     if (selectionId !== inventoryNavigation.current.selectionId) return;
@@ -1358,7 +1370,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
   const blockingWorkspace = hasRole(user, "AgentControl.Viewer") && syncSetupStatus !== "ready"
-    && visibleActiveView !== "sync" && visibleActiveView !== "permissions";
+    && visibleActiveView !== "sync" && visibleActiveView !== "permissions" && visibleActiveView !== "dashboard";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
   const automaticAction = findWorkbenchAction(workbenchMetadata?.actions, "data-sync.auto-refresh");
@@ -1425,6 +1437,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setRequestedPackageRefreshMode(route.refreshMode);
     } else if (view === "users") {
       setUsersRoute(parseUsersRoute(search.toString()));
+    } else if (view === "dashboard") {
+      setDashboardRoute(parseDashboardRoute(search.toString()));
     }
     const next = workbenchUrl(view, search);
     if (`${window.location.pathname}${window.location.search}` !== next) {
@@ -1441,6 +1455,16 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       else window.history.pushState(routeHistoryState("users"), "", next);
     }
     setUsersRoute(route);
+  }
+
+  function handleDashboardRouteChange(route: DashboardRouteState) {
+    const search = dashboardRouteSearch(route);
+    savedViewSearches.current.set("dashboard", search.toString());
+    const next = workbenchUrl("dashboard", search);
+    if (`${window.location.pathname}${window.location.search}` !== next) {
+      window.history.pushState(routeHistoryState("dashboard"), "", next);
+    }
+    setDashboardRoute(route);
   }
 
   function handleSyncReportRouteChange(reports: SyncReportRouteState | undefined) {
@@ -3298,6 +3322,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           <h1>Agent Control</h1>
         </div>
         <nav className="view-switcher" aria-label="Primary views">
+              {visibleViews.includes("dashboard") ? (
+              <CapabilityGate roles={["AgentControl.Viewer"]}>
+              <button type="button" className={visibleActiveView === "dashboard" ? "view-button active" : "view-button"}
+                aria-current={visibleActiveView === "dashboard" ? "page" : undefined} onClick={() => navigateToView("dashboard")}>
+                Dashboard
+              </button>
+              </CapabilityGate>
+              ) : null}
               {visibleViews.includes("agents") ? (
               <CapabilityGate roles={["AgentControl.Viewer"]}>
               <button
@@ -3473,6 +3505,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         : visibleActiveView === "agents" && hasRole(user, "AgentControl.Viewer")
           && initialAgentReadOwner !== principalKey
           ? <WorkspaceSkeleton view="agents" showSummary={canReadSensitiveUsage} />
+        : visibleActiveView === "dashboard" ? <AdoptionDashboard key={`dashboard:${principalKey}`}
+          revision={officialUsageDashboardRevision} baselineId={dashboardRoute.baselineId}
+          onBaselineChange={baselineId => handleDashboardRouteChange({ baselineId })} />
         : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>

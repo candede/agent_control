@@ -37,6 +37,7 @@ import { createInventoryVerification, createUnifiedVerification, inventoryPageMe
 import { responsibilityFixture, responsibilityOwnerId } from "./agentResponsibilityFixture";
 import { unifiedAgentInventoryScopes } from "../../../backend/src/types/unifiedAgents";
 import { decodeInventoryFacet, encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets";
+import { adoptionSnapshot, reportPage } from "./reportDataFixture";
 
 mockNativeDialogs();
 
@@ -355,6 +356,50 @@ export function registerAppSessionTests(register: () => void) {
 }
 
 export function sessionAndNavigationCases() {
+  it("opens Dashboard directly before inventory setup settles and preserves its baseline across navigation", async () => {
+    const first = adoptionSnapshot(1, { reportingStart: "2026-08-14", reportingEnd: "2026-09-12" });
+    const second = adoptionSnapshot(2, { reportingStart: "2026-09-09", reportingEnd: "2026-10-08", activeUsers: 344 });
+    const latest = adoptionSnapshot(3, { reportingStart: "2026-09-27", reportingEnd: "2026-10-26", activeUsers: 306 });
+    window.history.replaceState({}, "", `/dashboard?baseline=${second.id}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const pendingSetup = deferredResponse();
+    transport.fetchMock.mockImplementation((input, init) => {
+      if (new URL(input, "http://localhost").pathname === "/api/official-usage/history/adoption") {
+        return Promise.resolve(Response.json(reportPage([latest, second, first])));
+      }
+      if (input === "/api/data-sync/state") return pendingSetup.promise;
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    const users = within(await screen.findByRole("region", { name: "Active users" }));
+    expect(users.getAllByText("-38 (-11%)")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Dashboard" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("combobox", { name: "Compare latest with baseline" })).toHaveValue(second.id);
+    expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toBe(false);
+    await act(async () => pendingSetup.resolve(await base("/api/data-sync/state")));
+    fireEvent.change(screen.getByRole("combobox", { name: "Compare latest with baseline" }), { target: { value: first.id } });
+    expect(window.location.search).toBe(`?baseline=${first.id}`);
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("region", { name: "Users and adoption" });
+    await userEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    expect(await screen.findByRole("combobox", { name: "Compare latest with baseline" })).toHaveValue(first.id);
+    expect(window.location.pathname).toBe("/dashboard");
+    expect(window.location.search).toBe(`?baseline=${first.id}`);
+  });
+
+  it("does not grant Dashboard to a session without the Viewer role", async () => {
+    window.history.replaceState({}, "", "/dashboard");
+    const transport = appTransport({ initialRoles: [], revalidatedRoles: [] });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(screen.queryByRole("button", { name: "Dashboard" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Adoption trends" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname === "/api/official-usage/history/adoption")).toBe(false);
+  });
+
   it("shows checking then Users sync progress on sign-in and adopts published counts without a manual task", async () => {
     vi.useFakeTimers();
     window.history.replaceState({}, "", "/users");

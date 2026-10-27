@@ -25,6 +25,7 @@ export const reportQueryFields = ["setId", "scope", "search", "company", "depart
   "lowResponseThreshold", "inactiveDays", "activityWindowDays", "adoptionChamps", "adoptionAgents", "sort", "order"] as const;
 const sorts = {
   adoption: ["name"],
+  adoption_history: [],
   copilot_users: ["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity"],
   official_users: ["name", "responses", "agentsUsed", "lastActivity"],
   official_agents: ["name", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"],
@@ -34,6 +35,10 @@ const sorts = {
 export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportQuery {
   if (!Object.hasOwn(sorts, endpoint) || !input || typeof input !== "object" || Array.isArray(input)
     || Object.keys(input).some(key => !reportQueryFields.includes(key as typeof reportQueryFields[number]))) throw new SelectionError("invalid_cursor");
+  if (endpoint === "adoption_history") {
+    if (Object.keys(input).length) throw new SelectionError("invalid_cursor");
+    return {};
+  }
   const query = { ...input };
   for (const key of ["company", "department", "creatorType", "agentId", "username"] as const) {
     const value = query[key];
@@ -157,9 +162,16 @@ export class LargeTenantUsersReports {
     const query = reportQuery(endpoint, input);
     await this.prepareHistoryCapture(identity.tenantId);
     return this.selections.captureWith(identity, endpoint, { values: query, allowed: reportQueryFields }, async (client, evaluatedAt) => {
-      const metadata = await this.sources.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
+      const historyOnly = endpoint === "adoption_history";
+      const absentSource = (source: "directory" | "app_activity"): UserSourceMetadataSet["directory"] => ({
+        source, generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
+        attemptedAt: null, attemptStatus: null, attemptObservedCount: null, errorCode: null, message: null,
+        rowCount: null, state: "unavailable", reportRefreshDate: null, period: null, reportVersion: null,
+      });
+      const metadata = historyOnly ? { directory: absentSource("directory"), app_activity: absentSource("app_activity") }
+        : await this.sources.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
       const history = await this.history.root(client, identity.tenantId, evaluatedAt);
-      const report = await this.metadata(client, identity.tenantId, query.setId, evaluatedAt);
+      const report = await this.metadata(client, identity.tenantId, query.setId, evaluatedAt, historyOnly);
       const publicationRevisions = await readAutomaticInventoryRevisions(identity, client);
       const roots: DependencyRoot[] = [history];
       let associationRevision: string | undefined;
@@ -205,14 +217,14 @@ export class LargeTenantUsersReports {
       historyRevision: context.report.historyRevision, historyEpoch: context.report.historyEpoch };
   }
 
-  private async metadata(client: pg.PoolClient, tenant: string, setId: string | undefined, now: Date): Promise<ReportMetadata> {
+  private async metadata(client: pg.PoolClient, tenant: string, setId: string | undefined, now: Date, historyOnly = false): Promise<ReportMetadata> {
     const state = (await client.query(`SELECT h.revision::text AS history_revision,h.invalidation_epoch::text,
       s.active_set_id,s.revision::text AS active_revision,
       (SELECT count(*) FROM official_usage_history_memberships m WHERE m.tenant_id=h.tenant_id AND m.valid_to_revision IS NULL)::int AS retained,
       (SELECT count(*) FROM official_usage_sets t WHERE t.tenant_id=h.tenant_id AND NOT t.complete AND t.deleted_at IS NULL)::int AS incomplete
       FROM official_usage_history_state h LEFT JOIN official_usage_state s ON s.tenant_id=h.tenant_id WHERE h.tenant_id=$1`, [tenant])).rows[0]
       ?? { history_revision: "0", invalidation_epoch: "0", active_set_id: null, active_revision: "1", retained: 0, incomplete: 0 };
-    const chosen = setId ?? state.active_set_id;
+    const chosen = historyOnly ? null : setId ?? state.active_set_id;
     const set = chosen ? (await client.query(`SELECT s.id,s.reporting_start::text,s.reporting_end::text,s.period_provenance,s.accepted_at,s.expires_at
       FROM official_usage_sets s JOIN official_usage_history_memberships m ON m.set_id=s.id AND m.tenant_id=s.tenant_id
       WHERE s.id=$1 AND s.tenant_id=$2 AND s.deleted_at IS NULL AND s.complete AND m.valid_to_revision IS NULL

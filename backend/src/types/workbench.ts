@@ -3,6 +3,7 @@ import type { DataSyncSourceId } from "./dataSync.js";
 
 export const workbenchViewIds = [
   "agents",
+  "dashboard",
   "users",
   "sync",
   "audit",

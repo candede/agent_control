@@ -65,6 +65,10 @@ To add Microsoft 365 Copilot agent usage, export the **Agents**,
 from **Sync > Add CSV reports**. See the
 [usage import guide](docs/official-usage-import.md).
 
+**Dashboard** compares active users and active agents across retained reports,
+with a selectable baseline and recent report-to-report direction. It does not
+estimate daily activity or treat import dates as usage dates.
+
 ## Common commands
 
 ```powershell

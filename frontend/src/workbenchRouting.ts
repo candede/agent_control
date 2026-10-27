@@ -12,7 +12,9 @@ import { quarantineTargetKey } from "./quarantineTarget";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 
-export type WorkbenchViewId = "agents" | "users" | "sync" | "audit" | "permissions";
+export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions";
+
+export type DashboardRouteState = { baselineId?: string };
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
@@ -93,6 +95,7 @@ export const maximumPackageSelection = 5_000;
 export const maximumInlinePackageRouteBytes = 4_096;
 
 const viewPaths: Record<WorkbenchViewId, string> = {
+  dashboard: "/dashboard",
   agents: "/agents",
   users: "/users",
   sync: "/sync",
@@ -119,6 +122,17 @@ export function workbenchUrl(
 ) {
   const query = search.toString();
   return `${viewPaths[view]}${query ? `?${query}` : ""}`;
+}
+
+export function parseDashboardRoute(search: string): DashboardRouteState {
+  const baseline = routeParams(search).get("baseline");
+  return { baselineId: isGraphGuid(baseline) ? baseline!.toLowerCase() : undefined };
+}
+
+export function dashboardRouteSearch(state: DashboardRouteState): URLSearchParams {
+  const params = new URLSearchParams();
+  if (isGraphGuid(state.baselineId)) params.set("baseline", state.baselineId!.toLowerCase());
+  return params;
 }
 
 export function parseDataSyncRoute(search: string): DataSyncRouteState {

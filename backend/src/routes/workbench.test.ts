@@ -17,7 +17,7 @@ const run = (overrides: Partial<DataSyncRun> = {}): DataSyncRun => ({
 
 describe("sync jobs projection", () => {
   it("keeps only current workbench views", () => {
-    expect(workbenchViewIds).toEqual(["agents", "users", "sync", "audit", "permissions"]);
+    expect(workbenchViewIds).toEqual(["agents", "dashboard", "users", "sync", "audit", "permissions"]);
   });
 
   it("counts successful zero-row sources and keeps a manual upload incomplete", () => {

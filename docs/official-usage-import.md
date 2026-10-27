@@ -59,6 +59,8 @@ copy.
 
 - Use **Agents** for agent usage and user drilldowns.
 - Use **Users** for licensing and reported user activity.
+- Use **Dashboard** for adoption changes across retained reports, independently of
+  the report currently selected on Agents or Users.
 - Use the report selector on Agents or Users to change the displayed report set.
 - Use **Sync > Manage reports** to inspect or delete accepted report sets.
 
@@ -134,6 +136,48 @@ Microsoft documents the following interpretation constraints:
 - Usernames can be anonymized according to Microsoft 365 report settings. They remain case-sensitive dataset-scoped identifiers and are never guessed back to people.
 
 ## Initial setup and retained history
+
+### Adoption dashboard
+
+**Dashboard** (`/dashboard`) shows the progression of active users and active
+agents across complete retained report sets, without limiting history to
+Microsoft's rolling export window. It works for Viewers and Admins without
+requiring current inventory or license synchronization. The Users **Adoption**
+tab remains the company/department exploration view.
+
+The dashboard loads every history page under one consistent saved selection
+before displaying comparisons. The earliest dated observation is the default
+baseline; selecting another baseline changes only this dashboard and preserves
+the choice in its URL. Headline cards show the latest dated observation and its
+absolute/percentage differences from the baseline and previous dated report.
+Two aligned charts share the report timeline. A zero baseline shows the absolute
+change without an undefined percentage. Unequal explicitly supplied reporting
+windows and identical end dates do not receive a directional comparison.
+
+Active users are distinct exact positive-response usernames from Users and
+Users & agents within each report set. Active agents are distinct positive-response
+agent IDs from Agents and Users & agents. Users are not joined across reports,
+and report agent IDs are not silently replaced by current inventory identities.
+Response volume uses the Agents export only. The snapshots table keeps the
+independent user/relationship source counts and response totals visible; they
+are not forced to reconcile or added together. **Inspect report** opens the
+exact saved report in Sync.
+
+Observed activity ranges remain labeled as observations, not verified reporting
+windows. Import dates are provenance, not usage dates. Reports without activity
+dates retain their counts in a separate table but do not establish chronological
+direction. Recent direction describes snapshot movement, not a daily/monthly
+growth rate or a forecast. Deleted, superseded, expired or damaged reports do not
+contribute; missing reports are not zero-use periods. Creation/publication dates
+and today's license/inventory populations do not substitute for usage or
+historical adoption denominators.
+
+The read-only `GET /api/official-usage/history/adoption` endpoint accepts the
+existing saved `selectionId`, `cursor` and `limit` parameters and returns
+cursor-paged snapshot metrics. It does not change the selected shared report or
+call Microsoft providers.
+
+### Retained report interpretation
 
 The **Sync** page presents **CSV usage reports** separately from automatic sync and sync history. Its compact summary shows the saved-set count, **Observed activity dates (UTC)** across all retained complete sets, and last import time. The dates include all three CSV kinds and older reports, regardless of current selection or pagination; they are not administrator-supplied reporting windows. Undated reports show **No dates found in imported reports**. Dates are never inferred from import time, and the bounds do not imply continuous coverage or additive response totals.
 

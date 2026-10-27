@@ -1,7 +1,7 @@
 import type { OfficialUsageAvailability, OfficialUsageReportKind, OfficialUsageReportBase } from "./officialReportRecords.js";
 import type { UserSourceFacts, UserSourceFilter, UserSourceMetadata, UserSourcePage, UserSourcePlan } from "./userSources.js";
 
-export type ReportEndpoint = "copilot_users" | "adoption" | "official_agents" | "official_users" | "relationships" | "history" | "overview" | "unresolved" | "plans" | "observations";
+export type ReportEndpoint = "copilot_users" | "adoption" | "adoption_history" | "official_agents" | "official_users" | "relationships" | "history" | "overview" | "unresolved" | "plans" | "observations";
 export type ReportQuery = {
   setId?: string; scope?: "history" | "selected"; search?: string;
   company?: string | null; department?: string | null;

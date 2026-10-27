@@ -1,6 +1,7 @@
 import type { CombinedUser, ReportAgent, ReportHistorySet, ReportMetadata, ReportOverviewAgent, ReportPage, ReportSummary, ReportUser } from "../../../backend/src/types/officialReportData";
 import type { UserSourceMetadata } from "../../../backend/src/types/userSources";
 import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
+import type { AdoptionSnapshot } from "../../../backend/src/types/adoptionDashboard";
 export const reportSetId = "10000000-0000-4000-8000-000000000001";
 export const selectionId = "20000000-0000-4000-8000-000000000002";
 const capturedAt = Date.now();
@@ -83,6 +84,12 @@ export function historySet(index = 1, overrides: Partial<ReportHistorySet> = {})
   return { id: `10000000-0000-4000-8000-${String(index).padStart(12, "0")}`, bundleId: `60000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
     contentHash: index.toString(16).padStart(64, "0"), reportingStart, reportingEnd, periodProvenance: "operator_asserted",
     supersedesSetId: null, acceptedAt, visibility: "retained", active: index === 1, ...overrides };
+}
+export function adoptionSnapshot(index = 1, overrides: Partial<AdoptionSnapshot> = {}): AdoptionSnapshot {
+  const set = historySet(index);
+  return { id: set.id, reportingStart: set.reportingStart, reportingEnd: set.reportingEnd, periodProvenance: "activity_range",
+    acceptedAt: set.acceptedAt, activeUsers: 300, activeAgents: 244, responses: 9693,
+    userReportActiveUsers: 300, relationshipActiveUsers: 300, userReportResponses: 9697, relationshipResponses: 9693, ...overrides };
 }
 export function overviewAgent(index = 1, overrides: Partial<ReportOverviewAgent> = {}): ReportOverviewAgent {
   return { agentId: `agent-${index}`, agentName: `Agent ${index}`, observationCount: 32, hasResponses: true,
