@@ -122,6 +122,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     && (nativeSourceRow ? savedCount(nativeSourceRow.agent_count) === counts.native_agents : counts.native_agents === 0);
   const rowIds = new Set<string>(), visibleSources = new Set<string>();
   let visiblePackages = 0, visibleNativeAgents = 0;
+  let memberSourcesAvailable = true, memberSourcesFresh = true;
   const value: UnifiedAgentRecord[] = page.value.map(row => {
     validateRow(row, evaluatedAt);
     if (rowIds.has(row.id)) return invalid("Saved inventory contains duplicate logical rows.");
@@ -130,6 +131,11 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
       const key = JSON.stringify([member.domain, member.scope_id, member.source_identity]);
       if (visibleSources.has(key)) return invalid("Saved inventory contains duplicate source memberships.");
       visibleSources.add(key);
+      const kind = member.domain === "packages" ? "graph_packages" : "power_platform";
+      const source = page.freshness.sources.find(source => source.scope_id === member.scope_id
+        && source.source === (member.domain === "packages" ? "inventory_packages" : "inventory_power_platform"));
+      memberSourcesAvailable &&= status(source, kind, evaluatedAt).state === "available";
+      memberSourcesFresh &&= status(source ? { ...source, current: true } : undefined, kind, evaluatedAt).state === "available";
     }
     const packages = row.members.filter(member => member.domain === "packages");
     const resource = row.members.find(member => member.domain === "power_platform");
@@ -207,9 +213,18 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
   if (visiblePending > pendingPackages || counts.invalid_packages === 0 && value.some(row => row.identity.invalidMetadata)) {
     return invalid("Saved package verification counts disagree with their selected member evidence.");
   }
-  const partial = sourcePartial || value.some(row => row.powerPlatformResource !== null && !row.observations.powerPlatform?.current
+  const partial = sourcePartial || !memberSourcesAvailable || value.some(row => row.powerPlatformResource !== null && !row.observations.powerPlatform?.current
     || Object.values(row.observations.packageSnapshots).some(observation => !observation.current));
   const sourceScopes = !partial;
+  // Publication may supersede healthy captured revisions; their strict current/partial flags remain unchanged.
+  const updating = ["stale", "catching_up", "reconciling"].includes(page.freshness.state) && !page.partial && memberSourcesFresh
+    && Object.values(inventorySourceStatuses(page.freshness.sources.map(source => ({ ...source, current: true })), evaluatedAt))
+      .every(source => source.state === "available")
+    && value.every(row => [...Object.values(row.observations.packageSnapshots),
+      ...(row.observations.powerPlatform ? [row.observations.powerPlatform] : [])]
+      .every(observation => inventoryObservation(observation.id, observation.observedAt, observation.expiresAt, true, evaluatedAt).current));
+  const verificationStatus = !sourceMemberships || !identityLinks || invalidPackages > 0 || !sourceScopes && !updating
+    ? "needs_attention" : updating ? "updating" : pendingPackages ? "details_pending" : "verified";
   const result: UnifiedAgentInventoryPage = { value, inventoryScope: page.inventoryScope,
     usageContext: { reports: page.reports, revision: page.selection.id,
       expiresAt },
@@ -225,7 +240,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     identityCollection: { checkedPackages: counts.checked_packages, pendingPackages, invalidPackages,
       pendingDetails: { missing: pendingPackages - counts.stale_packages - counts.invalidated_packages,
         stale: counts.stale_packages, invalidated: counts.invalidated_packages } },
-    verification: { status: !sourceScopes || !sourceMemberships || !identityLinks || invalidPackages > 0 ? "needs_attention" : pendingPackages ? "details_pending" : "verified", scope: "authorized_saved_sources",
+    verification: { status: verificationStatus, scope: "authorized_saved_sources",
       checkedAt: evaluatedAt, graphPackageCount: counts.packages,
       powerPlatformAgentCount: counts.native_agents, representedSourceCount: counts.represented,
       uniqueSourceCount: counts.unique_sources, logicalAgentCount: page.counts.total,

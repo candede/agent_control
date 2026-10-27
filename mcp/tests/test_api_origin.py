@@ -127,13 +127,17 @@ async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence
         {"scp": "Mcp.Access"},
         {"roles": []},
         {"roles": ["GlobalAdministrator"]},
-        {"iat": int(time.time()) - 310},
-        {"nbf": int(time.time()) + 120},
-        {"exp": int(time.time()) - 1},
+        {"iat": -310},
+        {"nbf": 120},
+        {"exp": -1},
     ],
 )
 async def test_obo_denies_wrong_or_stale_authority(invocation, entra, claims):
-    entra.response_claims = claims
+    # Resolve time offsets at invocation so collection order cannot age the claims.
+    now = int(time.time())
+    entra.response_claims = {
+        key: now + value if key in {"iat", "nbf", "exp"} else value for key, value in claims.items()
+    }
     with pytest.raises(AdapterError) as error:
         await invocation.get_capabilities()
     assert error.value.status == 401

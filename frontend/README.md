@@ -53,6 +53,22 @@ online. Permissions is recovery guidance after an actual failure, not a setup
 approval step. Purview/Defender searches run explicitly under current real
 authorization; configured application reads need no prior qualification query.
 
+Sync inventory health checks read saved data independently of the Agents browsing
+selection and pause while hidden or offline. Each check has a 30-second deadline.
+Timeouts, network errors, HTTP 408/429 responses and server failures remain visible
+and retry automatically after at least 30 seconds, honoring longer `Retry-After`
+delays. Authorization and other contract failures remain visible without automatic
+retries; diagnostics offers a saved-only retry after recovery.
+
+Agents browsing failures appear separately in diagnostics and do not invalidate a
+successful inventory health receipt. Matching-detail refreshes and filtered exports
+still require a usable saved browsing selection; the saved-only retry also reloads
+a failed browsing selection without starting provider collection.
+
+Sync automatically renews expired saved Agents selections for filtered exports
+without collecting provider data. Reauthentication from inventory diagnostics
+returns to the exact waiting Power Platform source job; resuming remains explicit.
+
 Sync history keeps its Outcome filter beside Refresh history. During automatic
 or manual history reads, the refresh icon animates without adding a visible
 loading message or shifting the table. Loading status remains available to

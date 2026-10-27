@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from contextlib import suppress
 from urllib.parse import parse_qs
 
 import httpx2
@@ -335,6 +336,16 @@ def response_for(operation, source_fixtures):
     if model is jobs.Deleted:
         return {"deleted": True, "id": GUID}
     raise AssertionError(f"No independent source fixture for {model.__name__}")
+
+
+def test_inventory_updating_status_keeps_strict_partial_verification_checks():
+    body = sample(inventory.Verification.model_json_schema())
+    body["status"] = "updating"
+    body["checks"]["sourceScopes"] = False
+    verification = inventory.Verification.model_validate(body)
+    assert verification.status == "updating"
+    assert verification.checks.sourceScopes is False
+    assert verification.model_dump(mode="json") == body
 
 
 @pytest.mark.parametrize("operation", OPERATIONS, ids=lambda operation: operation.name)
@@ -866,32 +877,42 @@ async def test_stateful_submissions_never_replayed_and_invalid_json_not_empty(rp
     assert json.loads(invalid["content"][0]["text"])["code"] == "invalid_api_response"
 
 
-async def test_real_sdk_cancellation_propagates_to_inflight_api(browser, rpc, entra):
+@pytest.mark.parametrize("exchange_delay", [0, 0.6], ids=["immediate", "delayed-exchange"])
+async def test_real_sdk_cancellation_propagates_to_inflight_api(
+    exchange_delay, browser, rpc, entra, service, monkeypatch
+):
+    exchange = service.api.exchange.exchange
+
+    async def delayed_exchange(upstream):
+        await asyncio.sleep(exchange_delay)
+        return await exchange(upstream)
+
+    monkeypatch.setattr(service.api.exchange, "exchange", delayed_exchange)
     entra.block_api = asyncio.Event()
     pending = asyncio.create_task(rpc("list_capabilities"))
-    for _ in range(100):
-        if entra.api_calls:
-            break
-        await asyncio.sleep(0.005)
-    assert len(entra.api_calls) == 1
-    # The real SDK owns JSON-RPC cancellation, not a fabricated API success.
-    canceled = await browser.post(
-        "/mcp",
-        headers=rpc.headers,
-        json={
-            "jsonrpc": "2.0",
-            "method": "notifications/cancelled",
-            "params": {"requestId": 2, "reason": "synthetic cancellation"},
-        },
-    )
-    assert canceled.status_code == 202
-    await asyncio.wait_for(entra.api_cancelled.wait(), 3)
     try:
-        response = await asyncio.wait_for(pending, 3)
-        assert response.get("isError"), response
-    except asyncio.CancelledError, KeyError, httpx2.RemoteProtocolError:
-        pass
+        await asyncio.wait_for(entra.api_started.wait(), 3)
+        assert len(entra.api_calls) == 1
+        # The real SDK owns JSON-RPC cancellation, not a fabricated API success.
+        canceled = await browser.post(
+            "/mcp",
+            headers=rpc.headers,
+            json={
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": 2, "reason": "synthetic cancellation"},
+            },
+        )
+        assert canceled.status_code == 202
+        await asyncio.wait_for(entra.api_cancelled.wait(), 3)
+        try:
+            response = await asyncio.wait_for(pending, 3)
+            assert response.get("isError"), response
+        except asyncio.CancelledError, KeyError, httpx2.RemoteProtocolError:
+            pass
     finally:
         entra.block_api.set()
         if not pending.done():
             pending.cancel()
+        with suppress(asyncio.CancelledError, KeyError, httpx2.RemoteProtocolError):
+            await pending

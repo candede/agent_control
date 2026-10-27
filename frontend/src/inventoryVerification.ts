@@ -5,16 +5,18 @@ export const powerPlatformInventoryCaveat = "Microsoft Power Platform inventory 
 export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryHealth, error?: string): string[] {
   if (error) return [error];
   if (!inventory) return [];
+  const updating = inventoryUpdating(inventory);
   const reasons = new Set([
-    ...inventory.errors.map(item => item.message),
-    ...Object.values(inventory.sources).flatMap(source => source.error ? [source.error.message] : []),
+    ...inventory.errors.filter(item => !updating || item.code !== "snapshot_stale").map(item => item.message),
+    ...Object.values(inventory.sources).flatMap(source =>
+      source.error && (!updating || source.error.code !== "snapshot_stale") ? [source.error.message] : []),
   ]);
   for (const source of Object.values(inventory.sources)) {
-    if (!source.error && source.observation?.current === false) {
+    if (!updating && !source.error && source.observation?.current === false) {
       reasons.add("A selected saved source is stale or no longer authoritative. Refresh it in Data sync.");
     }
   }
-  if (!inventory.verification.checks.sourceScopes && !reasons.size) {
+  if (!updating && !inventory.verification.checks.sourceScopes && !reasons.size) {
     reasons.add("Saved source coverage is incomplete. Check source permissions and refresh the affected source in Data sync.");
   }
   if (!inventory.verification.checks.sourceMemberships) {
@@ -29,10 +31,14 @@ export function inventoryAttentionReasons(inventory?: UnifiedAgentInventoryHealt
   if (!inventory.verification.checks.identityLinks || inventory.summary.conflicting || inventory.summary.ambiguous) {
     reasons.add(`${inventory.summary.conflicting.toLocaleString()} conflicting and ${inventory.summary.ambiguous.toLocaleString()} ambiguous identity links. Review the affected agents' matching details; names alone cannot resolve them.`);
   }
-  if (!reasons.size && (inventory.partial || inventory.verification.status === "needs_attention" && !pending)) {
+  if (!updating && !reasons.size && (inventory.partial || inventory.verification.status === "needs_attention" && !pending)) {
     reasons.add("Saved inventory checks are incomplete. Open diagnostics to recheck source coverage and identity accounting.");
   }
   return [...reasons];
+}
+
+export function inventoryUpdating(inventory?: UnifiedAgentInventoryHealth) {
+  return inventory?.verification.status === "updating";
 }
 
 export function inventoryDetailsPending(inventory?: UnifiedAgentInventoryHealth) {

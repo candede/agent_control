@@ -15,7 +15,7 @@ type NativeRow = {
   native_id: string; environment_id: string; generation_id: string; root_generation_id: string;
   observed_at: Date; expires_at: Date; residual: Omit<PowerPlatformResource, "identifiers">;
   identifiers: InventoryIdentifier[]; identifier_count: number;
-  control: { environmentId: string; botId: string; provenance?: unknown } | null;
+  control: NonNullable<PowerPlatformResource["quarantineIdentity"]> | null;
 };
 
 export class NativeInventory {

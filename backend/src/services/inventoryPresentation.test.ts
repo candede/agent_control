@@ -503,11 +503,104 @@ describe("saved inventory projection invariants", () => {
     }
   });
 
-  it.each(["stale", "catching_up", "reconciling", "failed"])("does not certify a %s selected canonical root", state => {
+  it.each(["stale", "catching_up", "reconciling"])("presents a healthy %s selected root as updating without certifying it", state => {
+    for (const pendingPackages of [0, 1]) {
+      for (const supersededSource of [false, true]) {
+        const raw = savedPage(pendingPackages, 0);
+        raw.freshness.state = state;
+        if (supersededSource) raw.freshness.sources[0].current = false;
+        const page = inventoryPresentation(raw);
+        expect(page).toMatchObject({ partial: true,
+          verification: { status: "updating", checks: { sourceScopes: false, sourceMemberships: true, identityLinks: true } } });
+        expect(page.sources.graphPackages.observation?.current).toBe(!supersededSource);
+        expect(inventoryDetailsPending(page)).toBe(pendingPackages > 0);
+        expect(inventoryAttentionReasons(page)).toEqual([]);
+      }
+    }
+  });
+
+  it("does not treat failed reconciliation as normal progress", () => {
     const raw = savedPage(0, 0);
-    raw.freshness.state = state;
+    raw.freshness.state = "failed";
     expect(inventoryPresentation(raw)).toMatchObject({ partial: true,
       verification: { status: "needs_attention", checks: { sourceScopes: false } } });
+  });
+
+  it.each(["expired", "future", "incomplete", "limited", "missing", "accounting", "conflict", "invalid_metadata"] as const)(
+    "keeps %s evidence actionable during reconciliation", problem => {
+      const raw = savedPage(1, problem === "invalid_metadata" ? 1 : 0);
+      raw.freshness.state = "reconciling";
+      raw.freshness.sources[0].current = false;
+      if (problem === "expired") Object.assign(raw.freshness.sources[0],
+        { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt });
+      if (problem === "future") raw.freshness.sources[0].observed_at = "2026-09-20T12:00:00.000001Z";
+      if (problem === "incomplete") raw.freshness.sources[0].complete = false;
+      if (problem === "limited") raw.freshness.sources[0].catalog_complete = false;
+      if (problem === "missing") raw.freshness.sources.shift();
+      if (problem === "accounting") raw.verificationCounts.unique_sources--;
+      if (problem === "conflict") raw.summary.conflicting = 1;
+      const page = inventoryPresentation(raw);
+      expect(page.verification.status).toBe("needs_attention");
+      expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
+    });
+
+  it("does not hide an expired visible source member behind reconciliation progress", () => {
+    const raw = memberPage();
+    raw.freshness.state = "reconciling";
+    raw.value[0].members[0].catalog_observed_at = "2026-09-19T00:00:00Z";
+    raw.value[0].members[0].catalog_expires_at = observedAt;
+    const page = inventoryPresentation(raw);
+    expect(page.verification.status).toBe("needs_attention");
+    expect(page.value[0].observations.packageSnapshots["Package-Exact"].current).toBe(false);
+    expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
+  });
+
+  it.each(["packages", "power_platform"])("does not hide a %s member's missing selected source scope during reconciliation", domain => {
+    for (const state of ["stale", "catching_up", "reconciling"]) {
+      for (const scope of ["absent-scope", domain === "packages" ? "native-scope" : "package-scope"]) {
+        const raw = memberPage(true);
+        raw.freshness.state = state;
+        raw.value[0].members.find(member => member.domain === domain)!.scope_id = scope;
+        const page = inventoryPresentation(raw);
+        expect(page).toMatchObject({ partial: true,
+          verification: { status: "needs_attention", checks: { sourceScopes: false } } });
+        expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
+        expect([...unifiedAgentExportRows(page)][0].inventoryVerificationStatus).toBe("needs_attention");
+      }
+    }
+  });
+
+  it.each(["expired", "future", "incomplete", "exact"] as const)(
+    "does not hide a visible member's %s native scope behind a healthy primary scope", problem => {
+      for (const state of ["idle", "reconciling"]) {
+        const raw = memberPage(true);
+        raw.freshness.state = state;
+        const source = { ...raw.freshness.sources[1], scope_id: "member-native-scope", generation_id: "member-native-root",
+          catalog_observed_at: "2026-09-19T00:00:00Z" };
+        if (problem === "expired") Object.assign(source,
+          { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt });
+        if (problem === "future") source.observed_at = "2026-09-20T12:00:00.000001Z";
+        if (problem === "incomplete") source.complete = false;
+        if (problem === "exact") Object.assign(source, { channel: "control", expected_count: null });
+        raw.freshness.sources.push(source);
+        raw.value[0].members[1].scope_id = source.scope_id;
+        const page = inventoryPresentation(raw);
+        expect(page.sources.powerPlatform.state).toBe("available");
+        expect(page).toMatchObject({ partial: true,
+          verification: { status: "needs_attention", checks: { sourceScopes: false } } });
+        expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
+      }
+    },
+  );
+
+  it.each(["packages", "power_platform"])("retains normal updating for a healthy superseded %s member scope", domain => {
+    const raw = memberPage(true);
+    raw.freshness.state = "reconciling";
+    raw.freshness.sources.find(source => source.source === (domain === "packages" ? "inventory_packages" : "inventory_power_platform"))!.current = false;
+    const page = inventoryPresentation(raw);
+    expect(page).toMatchObject({ partial: true,
+      verification: { status: "updating", checks: { sourceScopes: false } } });
+    expect(inventoryAttentionReasons(page)).toEqual([]);
   });
 
   it("retains exact selection precision and millisecond Date expiries at evaluation", () => {

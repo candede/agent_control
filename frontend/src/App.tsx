@@ -92,7 +92,7 @@ import { parseUnifiedAgentRecordId, unifiedAgentRecordId, type UnifiedAgentInven
 import { inventoryScopeAgentCount } from "./agentColumns";
 import { AgentInventoryQueries } from "./agentInventoryQueries";
 import { isExpiredSelection, selectedReadRemaining, useSelectedReadLease } from "./selectedRead";
-import { inventoryAttentionReasons } from "./inventoryVerification";
+import { inventoryAttentionReasons, inventoryUpdating } from "./inventoryVerification";
 import { providerActionAllowed } from "./capabilityState";
 import { quarantineTargetKey, quarantineTargetReason, type QuarantineSelectionSnapshot } from "./quarantineTarget";
 import { findUnifiedAgentRecord } from "./unifiedAgentIdentity";
@@ -1547,7 +1547,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const renewInventory = useEffectEvent(() => {
     if (agentReadLeaseActive && !agentLeaseEnded && visibleUnifiedAgentPage) liveInventorySelection.current = visibleUnifiedAgentPage.selection.id;
     if (!agentLeaseEnded || loadingAgents || unifiedAgentReadError || !visibleUnifiedAgentPage
-      || activeView !== "agents" && !userAgentOverlay || !isCurrentAgentScope() || document.visibilityState !== "visible" || !navigator.onLine
+      || activeView !== "agents" && activeView !== "sync" && !userAgentOverlay || !isCurrentAgentScope() || document.visibilityState !== "visible" || !navigator.onLine
       || liveInventorySelection.current !== visibleUnifiedAgentPage.selection.id
       || renewedInventorySelection.current === visibleUnifiedAgentPage.selection.id) return;
     renewedInventorySelection.current = visibleUnifiedAgentPage.selection.id;
@@ -1618,6 +1618,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const nativeObservation = visibleUnifiedAgentPage?.sources.powerPlatform.observation;
   const inventoryCollectionText = publishingAgentInventory
     ? "Publishing newly synced agents to the inventory. Results will appear automatically."
+    : inventoryUpdating(visibleUnifiedAgentPage) ? "Updating saved agent inventory. Results will appear automatically."
     : !visibleUnifiedAgentPage && agentInventoryPending ? "Loading saved agent inventory..."
     : !visibleUnifiedAgentPage && unifiedAgentReadError ? "Saved agent inventory unavailable." : [
     ...(agentInventoryScope !== "power_platform_only" ? [lastAgentListRefreshAt
@@ -3363,8 +3364,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           inventory={inventoryHealth.inventory}
           inventoryUnavailable={inventoryHealth.unavailable}
           verifyingInventory={inventoryHealth.loading}
-          inventoryError={inventoryHealth.error ?? unifiedAgentReadError}
-          operationError={error === unifiedAgentReadError ? undefined : error}
+          inventoryError={inventoryHealth.error}
+          operationError={unifiedAgentReadError && error && unifiedAgentReadError !== error
+            ? `${unifiedAgentReadError} ${error}` : error ?? unifiedAgentReadError}
           powerPlatformHistoryError={inventoryHistoryError}
           onVerifyInventory={() => {
             inventoryHealth.refresh();
@@ -3372,6 +3374,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             if (unifiedAgentReadError) requestCurrentAgentReload();
           }}
           selectedPackageCount={groupCountPending ? 0 : matchingPackageSelection ? matchingPackageCount : selectedPackageCount}
+          agentSelectionUnavailable={loadingAgents || agentSearchPending
+            ? "Wait for saved agent browsing inventory to finish loading."
+            : !agentExportRevision || agentExportNeedsReload
+              ? "Reload saved agent browsing inventory to use selected targets or saved export filters." : undefined}
           refreshingPackages={refreshingAgents}
           refreshingPowerPlatform={refreshingPowerPlatformAgents}
           inspectingPowerPlatformJob={Boolean(requestedPowerPlatformJobId)}

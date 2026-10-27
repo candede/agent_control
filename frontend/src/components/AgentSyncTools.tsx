@@ -2,7 +2,7 @@ import { useState } from "react";
 import { CircleAlert, Download, RefreshCw, ShieldCheck } from "lucide-react";
 import type { InventoryRefreshJob, UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../api/client";
 import { WorkbenchActionGate } from "../workbenchActionContext";
-import { inventoryAttentionReasons, inventoryDetailsPending } from "../inventoryVerification";
+import { inventoryAttentionReasons, inventoryDetailsPending, inventoryUpdating } from "../inventoryVerification";
 import { SavedAgentInventoryVerification } from "./SavedInventoryVerification";
 import { SyncDialog } from "./SyncDialog";
 
@@ -15,6 +15,7 @@ type Props = {
   powerPlatformHistoryError?: string;
   onVerifyInventory?: () => void;
   selectedPackageCount: number;
+  agentSelectionUnavailable?: string;
   refreshingPackages: boolean;
   refreshingPowerPlatform: boolean;
   inspectingPowerPlatformJob?: boolean;
@@ -38,6 +39,7 @@ export function AgentSyncTools({
   powerPlatformHistoryError,
   onVerifyInventory,
   selectedPackageCount,
+  agentSelectionUnavailable,
   refreshingPackages,
   refreshingPowerPlatform,
   inspectingPowerPlatformJob = false,
@@ -58,22 +60,24 @@ export function AgentSyncTools({
   const attentionReasons = verifyingInventory ? [] : inventoryAttentionReasons(currentInventory, inventoryError);
   const needsAttention = attentionReasons.length > 0;
   const detailsPending = inventoryDetailsPending(currentInventory);
+  const updating = inventoryUpdating(currentInventory);
   const health = verifyingInventory ? "Checking"
     : needsAttention ? "Needs attention" : inventoryUnavailable ? inventoryUnavailable.state === "preparing" ? "Preparing"
       : inventoryUnavailable.state === "unavailable" ? "Unavailable" : "Not collected"
-      : currentInventory ? detailsPending ? "Details pending" : "Verified" : "Not checked";
+      : currentInventory ? updating ? "Updating" : detailsPending ? "Details pending" : "Verified" : "Not checked";
   return (
     <section className="sync-inventory-tools" aria-labelledby="sync-inventory-heading">
       <div className="sync-inventory-summary">
         {needsAttention ? <CircleAlert size={22} aria-hidden="true" /> : <ShieldCheck size={22} aria-hidden="true" />}
         <div>
-          <div className="sync-health-heading"><h2 id="sync-inventory-heading">Inventory health</h2><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory && !detailsPending ? "success" : "progress"}`}>{health}</span></div>
+          <div className="sync-health-heading"><h2 id="sync-inventory-heading">Inventory health</h2><span className={`data-sync-state state-${needsAttention ? "attention" : currentInventory && !detailsPending && !updating ? "success" : "progress"}`}>{health}</span></div>
           <p role={needsAttention ? undefined : "status"}>{verifyingInventory
             ? "Checking saved inventory. Previous results are not the result of this check."
             : needsAttention ? "Catalog sync and inventory health are separate. The issues below explain what still needs attention."
               : inventoryUnavailable ? inventoryUnavailable.message
                 : !currentInventory ? "No saved inventory receipt is available. Open diagnostics to read saved inventory."
-                  : detailsPending ? "Saved source counts are checked. Exact package details are still pending; start collection and follow its progress in Graph package details below."
+                  : updating ? "Newly synced data is being added to saved inventory. Previous results remain available; updates appear automatically."
+                    : detailsPending ? "Saved source counts are checked. Exact package details refresh automatically; follow their progress in Graph package details below."
                     : "Counts and matching identities are checked automatically. No manual approval is needed."}</p>
         </div>
         <button type="button" className="secondary" aria-haspopup="dialog" onClick={() => setDiagnosticsOpen(true)}>View diagnostics</button>
@@ -125,8 +129,9 @@ export function AgentSyncTools({
                 </button>
               </WorkbenchActionGate>
               <WorkbenchActionGate actionId="packages.refresh.identities">
-                <button type="button" className="secondary" disabled={refreshingPackages || !currentInventory
-                  || selectedPackageCount < 1 || selectedPackageCount > 5000} onClick={onRefreshMatchingDetails}>
+                <button type="button" className="secondary" disabled={refreshingPackages || !currentInventory || Boolean(agentSelectionUnavailable)
+                  || selectedPackageCount < 1 || selectedPackageCount > 5000} onClick={onRefreshMatchingDetails}
+                  title={agentSelectionUnavailable}>
                   Refresh matching details
                 </button>
               </WorkbenchActionGate>
@@ -140,7 +145,9 @@ export function AgentSyncTools({
             {powerPlatformJob ? <p role="status">
               {powerPlatformHistoryError ? "Last observed agent refresh" : "Latest agent refresh"}: {powerPlatformJob.status.replaceAll("_", " ")}
               {powerPlatformJob.message ? ` - ${powerPlatformJob.message}` : ""}
-              {powerPlatformJob.status === "waiting_authorization" ? <> - <a href="/api/auth/login">Sign in again</a></> : null}
+              {powerPlatformJob.status === "waiting_authorization" ? <> - <a href={`/api/auth/login?${new URLSearchParams({
+                returnTo: `/sync?${new URLSearchParams({ powerPlatformJob: powerPlatformJob.id })}`,
+              })}`}>Sign in again</a></> : null}
             </p> : null}
             <div className="inline-actions">
               {powerPlatformJob ? <button type="button" onClick={() => { setDiagnosticsOpen(false); onInspectPowerPlatformJob(powerPlatformJob.id); }}>Inspect source job</button> : null}
@@ -153,11 +160,11 @@ export function AgentSyncTools({
                 <button type="button" className="secondary" disabled={refreshingPowerPlatform || inspectingPowerPlatformJob} onClick={onResumePowerPlatform}>Resume PP agent refresh</button>
               </WorkbenchActionGate> : null}
               <WorkbenchActionGate actionId="power-platform.export">
-                <button type="button" className="secondary" disabled={exportingPowerPlatform || !snapshotId}
+                <button type="button" className="secondary" disabled={exportingPowerPlatform || !snapshotId || Boolean(agentSelectionUnavailable)}
                   onClick={() => { if (onExportPowerPlatform()) setDiagnosticsOpen(false); }}
                   title={verifyingInventory ? "Wait for the current saved inventory check before exporting."
                     : inventoryError ? "Reload saved inventory successfully before exporting."
-                      : snapshotId ? "Exports Copilot Studio agents from the exact retained Power Platform snapshot" : "No retained Power Platform agent snapshot is available to export"}>
+                      : agentSelectionUnavailable ?? (snapshotId ? "Exports Copilot Studio agents from the exact retained Power Platform snapshot" : "No retained Power Platform agent snapshot is available to export")}>
                   <Download size={15} aria-hidden="true" />{exportingPowerPlatform ? "Exporting PP agents..." : "Export PP agent inventory CSV"}
                 </button>
               </WorkbenchActionGate>

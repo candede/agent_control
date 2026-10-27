@@ -156,7 +156,11 @@ export type PowerPlatformResource = {
   identifiersComplete?: boolean;
   connectorCounts?: { connectors: number; operations: number } | null;
   savedSource?: { scopeId: string; identity: string };
-  quarantineIdentity?: { environmentId: string; botId: string } | null;
+  quarantineIdentity?: {
+    environmentId: string;
+    botId: string;
+    provenance?: InventoryFieldProvenance | null;
+  } | null;
   provenance: Record<string, InventoryFieldProvenance>;
   details: PowerPlatformResourceDetails;
   unknownFieldCount: number;

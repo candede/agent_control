@@ -72,6 +72,7 @@ class Entra:
         self.response_claims = {}
         self.upstream_claims = {}
         self.block_api = None
+        self.api_started = asyncio.Event()
         self.api_cancelled = asyncio.Event()
         self.block_refresh = None
         self.refresh_started = asyncio.Event()
@@ -158,6 +159,7 @@ class Entra:
             )
         assert request.url.host == "api.example.test", str(request.url)
         self.api_calls.append(request)
+        self.api_started.set()
         assert "cookie" not in request.headers
         if self.block_api:
             try:

@@ -63,6 +63,15 @@ Sync shows current-attempt observations separately from last saved counts and
 last successful publication. A running count is not a provider total or ETA.
 Failed/partial attempts do not replace a complete saved source.
 
+Inventory health shows **Updating** while complete, unexpired saved sources are
+being reconciled or newly synced package details are being published. Previous
+results remain usable and updates appear automatically; no manual start or
+approval is needed. **Details pending** means exact package details are still
+being collected or refreshed, not that agents are missing. **Needs attention**
+is reserved for actual source, authorization, expiry, accounting or identity
+problems. Reconciliation does not hide those problems or certify an older
+selection as current.
+
 Retained run links use `/sync?syncRun=<id>`. Opening history, a job detail or
 another tab does not resubmit provider work. Explicit refresh starts only the
 selected supported sources. Automatic work obeys pause, visibility, online,

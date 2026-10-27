@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { RefreshCw } from "lucide-react";
 import type { InventorySnapshot, UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable, UnifiedAgentPowerPlatformObservation } from "../api/client";
-import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, powerPlatformInventoryCaveat, savedInventoryTime } from "../inventoryVerification";
+import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, inventoryUpdating, powerPlatformInventoryCaveat, savedInventoryTime } from "../inventoryVerification";
 import "./savedInventoryVerification.css";
 
 type ReadState = { loading?: boolean; error?: string };
@@ -13,9 +13,11 @@ export function SavedAgentInventoryVerification({
   const observation = inventory?.sources.powerPlatform.observation;
   const powerPlatform = observation && "roleScope" in observation ? observation : undefined;
   const noSources = inventory && Object.values(inventory.sources).every(source => source.state === "unavailable");
-  const needsAttention = inventoryAttentionReasons(inventory, error).length > 0;
+  const attentionReasons = inventoryAttentionReasons(inventory, error);
+  const needsAttention = attentionReasons.length > 0;
   const detailsPending = inventoryDetailsPending(inventory);
-  const fullyVerified = !needsAttention && !detailsPending;
+  const updating = inventoryUpdating(inventory);
+  const fullyVerified = !needsAttention && !detailsPending && !updating;
   return <section className="saved-inventory-verification" aria-label="Saved agent inventory verification" aria-busy={loading}>
     <div className="verification-heading">
       <h3>Saved inventory verification</h3>
@@ -31,9 +33,10 @@ export function SavedAgentInventoryVerification({
         : !receipt || !inventory ? <p role="status">Saved inventory verification is not available. Read the saved inventory to obtain a receipt.</p>
           : <>
             <p className={needsAttention ? "verification-attention" : "verification-success"} role="status">
-              <strong>{needsAttention ? "Saved inventory needs attention" : detailsPending ? "Saved source accounting verified" : "Saved inventory verified"}</strong>
-              {" "}- {detailsPending && !needsAttention ? "source coverage is checked, but exact package detail collection is still pending. Review Graph package details in Sync."
-                : "authorized saved-source collection, accounting and identity consistency."}
+              <strong>{needsAttention ? "Saved inventory needs attention" : updating ? "Saved inventory updating" : detailsPending ? "Saved source accounting verified" : "Saved inventory verified"}</strong>
+              {" "}- {updating && !needsAttention ? "newly synced data is being published automatically. Previous results remain available; no action is needed."
+                : detailsPending && !needsAttention ? "source coverage is checked, but exact package detail collection is still pending. Review Graph package details in Sync."
+                  : "authorized saved-source collection, accounting and identity consistency."}
             </p>
             <dl className="verification-counts" aria-label="Full saved agent accounting">
               <Fact label="Graph package targets">{inventory.sources.graphPackages.state === "unavailable" ? "Not available" : receipt.graphPackageCount.toLocaleString()}</Fact>
@@ -42,7 +45,8 @@ export function SavedAgentInventoryVerification({
               <Fact label="Logical agents">{noSources ? "Not established" : receipt.logicalAgentCount.toLocaleString()}</Fact>
             </dl>
             <ul className="verification-checks">
-              <li>{receipt.checks.sourceScopes ? "Saved source query scopes verified." : "A saved source is missing or its collection scope is limited."}</li>
+              <li>{receipt.checks.sourceScopes ? "Saved source query scopes verified."
+                : updating ? "Saved sources are being reconciled with newly synced data." : "A saved source is missing or its collection scope is limited."}</li>
               <li>{inventory.sources.graphPackages.state === "unavailable"
                 ? "Package identity metadata is not established: the saved Graph source is unavailable."
                 : receipt.checks.packageMetadata ? "Package identity metadata checked and valid."
@@ -55,8 +59,8 @@ export function SavedAgentInventoryVerification({
                 ? "Source membership accounting is not established: no saved agent source is available."
                 : receipt.checks.sourceMemberships ? "Each available source target is represented exactly once." : "Source membership accounting is not verified."}</li>
             </ul>
-            {inventory.partial || inventory.errors.length > 0 ? <p className="verification-attention">
-              <strong>Saved source limitations.</strong> {inventory.errors.map(item => item.message).join(" ")}
+            {needsAttention ? <p className="verification-attention">
+              <strong>Saved inventory issues.</strong> {attentionReasons.join(" ")}
             </p> : null}
             <p>These counts cover all unfiltered saved records, not the current page or display filters. Logical grouping follows exact source evidence; this does not prove every source-only row is a different physical agent.</p>
             <dl className="verification-dates">

@@ -207,7 +207,7 @@ export type UnifiedAgentInventorySummary = {
 };
 
 export type UnifiedAgentInventoryVerification = {
-  status: "verified" | "details_pending" | "needs_attention";
+  status: "verified" | "details_pending" | "updating" | "needs_attention";
   scope: "authorized_saved_sources";
   checkedAt: string;
   graphPackageCount: number;

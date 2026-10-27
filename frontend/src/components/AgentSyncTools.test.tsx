@@ -148,6 +148,41 @@ describe("AgentSyncTools", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
+  it("shows automatic publication as progress in Sync and diagnostics without requesting action", async () => {
+    const saved = inventory();
+    saved.partial = true;
+    saved.freshness.state = "reconciling";
+    saved.identityCollection = { checkedPackages: 120, pendingPackages: 890 };
+    saved.verification = { ...createUnifiedVerification(saved.verification, { sourceScopes: false },
+      undefined, saved.identityCollection), status: "updating" };
+    const error = { source: "graph_packages" as const, code: "snapshot_stale" as const,
+      message: "The selected saved source is stale or no longer authoritative. Refresh it in Data sync." };
+    saved.errors = [error];
+    saved.sources.graphPackages = { state: "partial",
+      observation: { ...saved.sources.graphPackages.observation!, current: false }, error };
+    const actions = props({ inventory: saved });
+    const view = render(<AgentSyncTools {...actions} />);
+    expect(screen.getByText("Updating", { exact: true })).toHaveClass("state-progress");
+    expect(screen.getByRole("status")).toHaveTextContent("updates appear automatically");
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText("What needs attention")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText("Saved inventory updating")).toBeVisible();
+    expect(screen.getByText(/Previous results remain available; no action is needed/)).toBeVisible();
+    expect(screen.getByText("Saved sources are being reconciled with newly synced data.")).toBeVisible();
+    expect(screen.queryByText("Saved inventory verified")).not.toBeInTheDocument();
+    expect(screen.queryByText("Saved source accounting verified")).not.toBeInTheDocument();
+    expect(screen.queryByText(error.message)).not.toBeInTheDocument();
+    expect(screen.queryByText("Saved inventory issues.")).not.toBeInTheDocument();
+    view.rerender(<AgentSyncTools {...actions} inventory={inventory()} />);
+    expect(screen.getByText("Verified", { exact: true })).toHaveClass("state-success");
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(screen.queryByText("Saved inventory updating")).not.toBeInTheDocument();
+    expect(actions.onRefreshPackages).not.toHaveBeenCalled();
+    expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
+    expect(actions.onVerifyInventory).not.toHaveBeenCalled();
+  });
+
   it("keeps invalid metadata separate from pending details and withdraws it during replacement verification", async () => {
     const saved = inventory();
     saved.identityCollection = { checkedPackages: 1009, pendingPackages: 1, invalidPackages: 1 };
@@ -275,6 +310,24 @@ describe("AgentSyncTools", () => {
     expect(source.getByRole("button", { name: "Inspect source job" })).toBeEnabled();
   });
 
+  it("returns reauthorization to the exact waiting source job without starting work", async () => {
+    const powerPlatformJob: InventoryRefreshJob = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", status: "waiting_authorization", roleScope: "unknown", environmentScope: null,
+      requestedTypes: ["microsoft.copilotstudio/agents"], pageCount: 0, observedCount: 0,
+      totalRecords: null, unknownFieldCount: 0, snapshotId: null,
+      createdAt: "2026-09-16T15:14:20Z", updatedAt: "2026-09-16T15:14:20Z", attemptedAt: null, finishedAt: null,
+    };
+    const actions = props({ inventory: inventory(), powerPlatformJob });
+    render(<AgentSyncTools {...actions} />);
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const login = new URL(screen.getByRole("link", { name: "Sign in again" }).getAttribute("href")!, window.location.origin);
+    expect(login.pathname).toBe("/api/auth/login");
+    expect(login.searchParams.get("returnTo")).toBe(`/sync?powerPlatformJob=${powerPlatformJob.id}`);
+    expect(actions.onInspectPowerPlatformJob).not.toHaveBeenCalled();
+    expect(actions.onRefreshPowerPlatform).not.toHaveBeenCalled();
+    expect(actions.onResumePowerPlatform).not.toHaveBeenCalled();
+  });
+
   it.each(["loading", "failed"] as const)("prevents matching refresh against %s saved inventory", async state => {
     const actions = props({ inventory: inventory(), selectedPackageCount: 1,
       verifyingInventory: state === "loading",
@@ -291,6 +344,34 @@ describe("AgentSyncTools", () => {
       expect(actions.onRefreshPackages).not.toHaveBeenCalled();
       expect(actions.onRefreshPowerPlatform).not.toHaveBeenCalled();
     }
+  });
+
+  it.each(["loading", "failed"] as const)("keeps verified health separate from a %s browsing selection", async state => {
+    const message = state === "loading" ? "Waiting for saved browsing inventory." : "Saved browsing inventory could not be read.";
+    const actions = props({ inventory: inventory(), selectedPackageCount: 1, agentSelectionUnavailable: message,
+      operationError: state === "failed" ? message : undefined });
+    const view = render(<AgentSyncTools {...actions} />);
+    expect(screen.getByText("Verified", { exact: true })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    expect(receipt.queryByRole("alert")).not.toBeInTheDocument();
+    if (state === "failed") expect(screen.getByRole("alert")).toHaveTextContent(message);
+    for (const name of ["Refresh matching details", "Export PP agent inventory CSV"]) {
+      const action = screen.getByRole("button", { name });
+      expect(action).toBeDisabled();
+      expect(action).toHaveAttribute("title", message);
+      await userEvent.click(action);
+    }
+    expect(actions.onRefreshMatchingDetails).not.toHaveBeenCalled();
+    expect(actions.onExportPowerPlatform).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Refresh agents" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh PP agent inventory" })).toBeEnabled();
+    view.rerender(<AgentSyncTools {...actions} agentSelectionUnavailable={undefined} operationError={undefined} />);
+    expect(screen.getByText("Saved inventory verified")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh matching details" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Export PP agent inventory CSV" })).toBeEnabled();
   });
 
   it("verifies measured collection and 1x source accounting without a partial warning for absent wids", async () => {

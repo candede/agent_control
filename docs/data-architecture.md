@@ -61,6 +61,12 @@ same canonical source model. Package records and logical agents are distinct
 counts. Source absence, unavailable metadata, explicit null, zero and false
 must remain distinguishable.
 
+Verification checks every visible member's selected source scope, not only the
+preferred Graph and Power Platform observations. Missing, incomplete, expired or
+future source evidence requires attention even while reconciliation is running.
+Healthy superseded sources may be shown as updating, without changing their
+strict current or partial flags.
+
 Exact source membership authorizes About/configuration reads. Full available
 About text has bounded continuation; short table/adoption previews are not a
 substitute for that complete text. Source references and provenance identify

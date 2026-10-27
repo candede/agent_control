@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { UnifiedAgentInventoryPage } from "./api/client";
-import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, savedInventoryTime } from "./inventoryVerification";
+import { inventoryAttentionReasons, inventoryCoverageLabel, inventoryDetailsPending, inventoryRequestScope, inventoryRoleHint, inventoryUpdating, savedInventoryTime } from "./inventoryVerification";
 import { createInventoryVerification, createUnifiedVerification, inventoryPageMetadata } from "./test/inventoryVerification";
 
 function savedInventory(): UnifiedAgentInventoryPage {
@@ -67,6 +67,7 @@ describe("saved inventory attention and pending evidence", () => {
   it("does not invent an error or pending details before a saved read exists", () => {
     expect(inventoryAttentionReasons()).toEqual([]);
     expect(inventoryDetailsPending()).toBe(false);
+    expect(inventoryUpdating()).toBe(false);
     expect(inventoryAttentionReasons(undefined, "Saved read failed.")).toEqual(["Saved read failed."]);
   });
 
@@ -110,6 +111,38 @@ describe("saved inventory attention and pending evidence", () => {
     expect(inventoryDetailsPending(inventory)).toBe(true);
     expect(inventoryAttentionReasons(inventory)).toEqual([
       `${invalidPackages} package${invalidPackages === 1 ? "" : "s"} with invalid matching metadata. Use diagnostics to refresh matching details for the affected packages.`,
+    ]);
+  });
+
+  it("does not turn a backend-confirmed publication update into an attention warning", () => {
+    const inventory = savedInventory();
+    const error = { source: "graph_packages" as const, code: "snapshot_stale" as const,
+      message: "The selected saved source is stale or no longer authoritative. Refresh it in Data sync." };
+    inventory.partial = true;
+    inventory.errors = [error];
+    inventory.sources.graphPackages = { state: "partial", observation: inventory.sources.graphPackages.observation!, error };
+    inventory.sources.powerPlatform.observation!.current = false;
+    inventory.identityCollection = { checkedPackages: 1, pendingPackages: 1 };
+    inventory.verification = { ...createUnifiedVerification(inventory.verification, { sourceScopes: false },
+      undefined, inventory.identityCollection), status: "updating" };
+    expect(inventoryUpdating(inventory)).toBe(true);
+    expect(inventoryAttentionReasons(inventory)).toEqual([]);
+    expect(inventoryAttentionReasons(inventory, "Saved read failed.")).toEqual(["Saved read failed."]);
+    inventory.errors.push({ source: "power_platform", code: "not_authorized_scope", message: "Provider access denied." });
+    expect(inventoryAttentionReasons(inventory)).toEqual(["Provider access denied."]);
+    inventory.verification.checks.sourceMemberships = false;
+    expect(inventoryAttentionReasons(inventory)).toContain(
+      "Saved source membership accounting is incomplete. Recheck the selected source counts and refresh inventory in Data sync.");
+  });
+
+  it("does not infer harmless progress from freshness alone", () => {
+    const inventory = savedInventory();
+    inventory.freshness.state = "reconciling";
+    inventory.partial = true;
+    inventory.verification = createUnifiedVerification(inventory.verification, { sourceScopes: false });
+    expect(inventoryUpdating(inventory)).toBe(false);
+    expect(inventoryAttentionReasons(inventory)).toEqual([
+      "Saved source coverage is incomplete. Check source permissions and refresh the affected source in Data sync.",
     ]);
   });
 

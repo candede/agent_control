@@ -1,6 +1,10 @@
 """Exact saved inventory projections, including source-specific configuration."""
 
+import re
+from datetime import datetime
 from typing import Literal
+
+from pydantic import Field, field_validator
 
 from .models import PublishedSelectedRead, SafeInteger, WireModel
 from .report_models import Counts, Page, ReportMetadata
@@ -123,9 +127,27 @@ class SavedEnvironment(WireModel):
 class ProviderUsage(WireModel):
     activeUsers: SafeInteger | None = None
     totalSessions: SafeInteger | None = None
-    totalRunTimeInHours: float | None = None
-    exceptionRate: float | None = None
+    totalRunTimeInHours: float | None = Field(
+        default=None, ge=0, le=9007199254740991, allow_inf_nan=False
+    )
+    exceptionRate: float | None = Field(
+        default=None, ge=0, le=9007199254740991, allow_inf_nan=False
+    )
     lastUsedDateTime: str | None = None
+
+    @field_validator("lastUsedDateTime")
+    @classmethod
+    def valid_usage_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:0[0-9]|1[0-3]):[0-5][0-9]|[+-]14:00)",
+            value,
+        ):
+            raise ValueError("Use a valid timezone-qualified inventory timestamp.")
+        datetime.fromisoformat(value)
+        return value
 
 
 class Principal(WireModel):
@@ -345,6 +367,7 @@ class ConnectorCounts(WireModel):
 class QuarantineIdentity(WireModel):
     environmentId: str
     botId: str
+    provenance: FieldProvenance | None = None
 
 
 class NativeResource(WireModel):
@@ -445,7 +468,7 @@ class VerificationChecks(WireModel):
 
 
 class Verification(WireModel):
-    status: Literal["verified", "details_pending", "needs_attention"]
+    status: Literal["verified", "details_pending", "updating", "needs_attention"]
     scope: Literal["authorized_saved_sources"]
     checkedAt: str
     graphPackageCount: SafeInteger

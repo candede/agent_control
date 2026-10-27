@@ -291,6 +291,9 @@ The real SDK `tools/list` and authenticated `tools/call` are tested against
 synthetic Entra/JWKS/API transports and current TypeScript source-derived
 fixtures, including optional nested evidence. This is local source evidence,
 not live SQL, Entra consent, provider or external-client qualification.
+Cancellation coverage waits for the mocked API request to start, including after
+a delayed token exchange, and collects the pending SDK task on failure as well as
+success.
 
 Usage association targets preserve the API's source-specific identity contract:
 `graph_packages` requires `packageId` and `snapshotId`; `power_platform` requires
@@ -683,6 +686,13 @@ domain shapes, not a new universal data envelope. Selected pages keep `value`
 previousCursor`, `selection` with id/revision/evaluatedAt/expiresAt/validatedAt
 and publication revisions, source/report/freshness/partial evidence.
 Continuation is explicit, total versus returned counts stay separate.
+Native quarantine identities retain their saved field provenance, including
+explicit null when provenance was not supplied. Optional package provider
+telemetry remains separate from report usage: runtime hours and exception rates
+must be finite, nonnegative numbers no larger than `Number.MAX_SAFE_INTEGER`;
+invalid values fail response validation instead of becoming null.
+Usage timestamps must be real, timezone-qualified calendar instants; original
+offsets and fractional precision (up to nine digits) are preserved.
 
 Errors use the existing `application/problem+json` envelope
 (`type,title,status,detail,code,requestId,details?`; also `X-Request-ID`; see

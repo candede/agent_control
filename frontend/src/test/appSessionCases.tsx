@@ -218,10 +218,24 @@ function powerPlatformRecord(nativeId: string, displayName: string): UnifiedAgen
   };
 }
 
+function unifiedRecordSummary(records: UnifiedAgentRecord[], count = records.length) {
+  const additionalRows = Math.max(0, count - records.length);
+  const hasPackages = records.some(record => record.packages.length > 0);
+  return {
+    total: count,
+    linked: records.filter(record => record.presence === "both").length,
+    graphOnly: records.filter(record => record.presence === "graph_packages").length + (hasPackages ? additionalRows : 0),
+    powerPlatformOnly: records.filter(record => record.presence === "power_platform").length + (hasPackages ? 0 : additionalRows),
+    ambiguous: records.filter(record => record.identity.state === "ambiguous").length,
+    conflicting: records.filter(record => record.identity.state === "conflicting").length,
+  };
+}
+
 function unifiedRecordsPage(records: UnifiedAgentRecord[], count = records.length): UnifiedAgentInventoryPage {
   const packageCount = new Set(records.flatMap(record => record.packages.map(item => item.id))).size;
   const nativeCount = new Set(records.flatMap(record => record.powerPlatformResource ? [`${record.powerPlatformResource.environmentId}:${record.powerPlatformResource.nativeId}`] : [])).size;
   const additionalRows = Math.max(0, count - records.length);
+  const summary = unifiedRecordSummary(records, count);
   return {
     ...unifiedPage,
     value: records,
@@ -231,8 +245,9 @@ function unifiedRecordsPage(records: UnifiedAgentRecord[], count = records.lengt
       powerPlatformAgentCount: nativeCount + (packageCount === 0 ? additionalRows : 0),
       logicalAgentCount: count,
     }),
-    summary: { total: count, linked: 0, graphOnly: records.filter(item => item.presence === "graph_packages").length, powerPlatformOnly: records.filter(item => item.presence === "power_platform").length, ambiguous: 0, conflicting: 0 },
-    filteredSummary: { total: count, linked: 0, graphOnly: records.filter(item => item.presence === "graph_packages").length, powerPlatformOnly: records.filter(item => item.presence === "power_platform").length, ambiguous: 0, conflicting: 0 },
+    summary,
+    scopeSummary: { ...summary },
+    filteredSummary: { ...summary },
     sources: {
       ...unifiedPage.sources,
       powerPlatform: { state: "available", observation: powerPlatformSnapshot(), error: null },
@@ -646,6 +661,34 @@ export function sessionAndNavigationCases() {
       await act(async () => {});
     }
     expect(reads()).toBe(before);
+  });
+
+  it("applies captured search before paginating the initial catalog transport", async () => {
+    const packages = Array.from({ length: 52 }, (_, index) => ({
+      ...agent, id: `catalog-package-${index}`,
+      displayName: index < 51 ? `Matched publication ${index}` : "Unrelated publication",
+    }));
+    const transport = initialCatalogTransport();
+    transport.page = { ...packagePage, value: packages, counts: { total: 52, scoped: 52, filtered: 52 } };
+    vi.stubGlobal("fetch", transport.fetchMock);
+
+    const first = await getUnifiedAgents({ inventoryScope: "catalog", search: "matched publication", limit: 50 });
+    if ("state" in first) throw new Error("Expected a selected catalog page.");
+    expect(first.counts).toMatchObject({ total: 52, scoped: 52, filtered: 51, packageTargets: 51 });
+    expect(first.summary.total).toBe(52);
+    expect(first.scopeSummary.total).toBe(52);
+    expect(first.filteredSummary).toMatchObject({ total: 51, graphOnly: 51 });
+    expect(first.value.map(record => record.packages[0].id)).toEqual(packages.slice(0, 50).map(item => item.id));
+    expect(first.page.nextCursor).toBe("fixture-page:50");
+    const second = await getUnifiedAgents({ selectionId: first.selection.id, cursor: first.page.nextCursor!, limit: 50 });
+    if ("state" in second) throw new Error("Expected a selected catalog page.");
+    expect(second.selection.id).toBe(first.selection.id);
+    expect(second.counts).toEqual(first.counts);
+    expect(second.filteredSummary).toEqual(first.filteredSummary);
+    expect(second.value.map(record => record.packages[0].id)).toEqual([packages[50].id]);
+    expect(second.page).toEqual({ limit: 50, nextCursor: null, previousCursor: "fixture-page:0" });
+    expect(inventorySelections.size).toBe(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("preserves licensed-user search and report filters across navigation without recapturing evidence", async () => {
@@ -1425,7 +1468,7 @@ export function sessionAndNavigationCases() {
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
         const page = structuredClone(unifiedPage);
         page.value[0].displayName = `Published agent ${version}`;
-        return Response.json(page);
+        return Response.json(selectedInventoryPage(input, page));
       }
       return base(input, init);
     });
@@ -1534,13 +1577,60 @@ export function sessionAndNavigationCases() {
     await act(async () => automatic.resolve(Response.json(automaticRefreshResponse())));
     if (order === "observer-first") await act(async () => page.resolve(new Response()));
     expect(screen.getByText(agent.displayName)).toBeVisible();
+    const initialSelection = inventorySelections.get(currentInventorySelection(transport.fetchMock))!.selection;
     await act(() => vi.advanceTimersByTimeAsync(11 * 60_000));
     expect(count("/api/agent-inventory/selections")).toBe(2);
     expect(count("/api/agent-inventory")).toBe(2);
+    const renewedSelection = inventorySelections.get(currentInventorySelection(transport.fetchMock))!.selection;
+    expect(Date.parse(renewedSelection.validatedAt)).toBeGreaterThan(Date.parse(initialSelection.validatedAt));
+    expect(Date.parse(renewedSelection.expiresAt)).toBeGreaterThan(Date.now());
     expect(count("/api/data-sync/auto-refresh")).toBe(12);
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(screen.getByText(agent.displayName)).toBeVisible();
     expect(screen.queryByText(/Showing previously loaded saved inventory/)).not.toBeInTheDocument();
+  });
+
+  it.each(["/sync", "/agents?search=Sensitive"])("renews the saved selection for Sync exports after starting on %s", async route => {
+    vi.useFakeTimers();
+    window.history.replaceState({}, "", route);
+    const saved = verifiedSavedAgentPage();
+    saved.selection = { ...saved.selection, validatedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 90_000).toISOString() };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: saved });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    if (route.startsWith("/agents")) {
+      fireEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+    }
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const exportButton = screen.getByRole("button", { name: "Export PP agent inventory CSV" });
+    expect(exportButton).toBeEnabled();
+    let previousSelection = currentInventorySelection(transport.fetchMock);
+    const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections");
+    expect(captures()).toHaveLength(1);
+
+    for (let renewal = 1; renewal <= 2; renewal += 1) {
+      await act(() => vi.advanceTimersByTimeAsync(90_001));
+      expect(captures()).toHaveLength(renewal + 1);
+      const renewedSelection = currentInventorySelection(transport.fetchMock);
+      expect(renewedSelection).not.toBe(previousSelection);
+      const capture = inventorySelections.get(renewedSelection)!;
+      expect(capture.query).toEqual(inventorySelections.get(previousSelection)?.query);
+      expect(capture.selection.validatedAt).toBe(new Date().toISOString());
+      expect(Date.parse(capture.selection.expiresAt)).toBeGreaterThan(Date.now());
+      expect(exportButton).toBeEnabled();
+      previousSelection = renewedSelection;
+    }
+    fireEvent.click(exportButton);
+    await act(() => vi.advanceTimersByTimeAsync(0));
+    expect(inventoryExportRequest(transport.fetchMock)).toMatchObject({
+      selectionId: previousSelection, kind: "power_platform_agents",
+    });
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(transport.fetchMock.mock.calls.some(([input, init]) =>
+      input === "/api/inventory/refresh-jobs" && init?.method === "POST")).toBe(false);
   });
 
   it("retires a pending pinned page before a publication reload without flashing errors or losing rows", async () => {
@@ -1609,7 +1699,7 @@ export function sessionAndNavigationCases() {
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
         const page = structuredClone(unifiedPage);
         page.value[0].displayName = `Saved agent revision ${version}`;
-        return Response.json(page);
+        return Response.json(selectedInventoryPage(input, page));
       }
       return base(input, init);
     });
@@ -2019,7 +2109,7 @@ export function sessionAndNavigationCases() {
         revisions: { ...automaticRefreshResponse().revisions, graph_packages: (removed ? "4" : "1").repeat(64) },
       }));
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
-        return Response.json(removed ? unifiedRecordsPage([]) : unifiedPage);
+        return Response.json(selectedInventoryPage(input, removed ? unifiedRecordsPage([]) : unifiedPage));
       }
       if (isPackageDetailRequest(input, agent.id)) return removed
         ? Response.json({ code: "package_target_stale_or_absent", detail: "Selected agent is no longer in the saved inventory." }, { status: 409 })
@@ -2100,7 +2190,7 @@ export function sessionAndNavigationCases() {
         revisions: { ...automaticRefreshResponse().revisions, graph_packages: String(version).repeat(64) },
       }));
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
-        return Response.json({ ...unifiedPage, revision: String(version).repeat(64) });
+        return Response.json(selectedInventoryPage(input, unifiedPage));
       }
       if (input === `/api/agents/${agent.id}/refresh-jobs`) return pending.promise;
       return base(input, init);
@@ -2269,7 +2359,10 @@ export function sessionAndNavigationCases() {
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         revisions: { ...automaticRefreshResponse().revisions, graph_packages: (refreshing ? "4" : "1").repeat(64) },
       }));
-      if (refreshing && new URL(input, "http://localhost").pathname === "/api/agent-inventory") return pending.promise;
+      if (refreshing && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        return pending.promise.then(async response =>
+          Response.json(selectedInventoryPage(input, await response.json() as UnifiedAgentInventoryPage)));
+      }
       if (input === `/api/agents/${action}` && init?.method === "POST") return Response.json({
         code: "missing_permission", detail: "Microsoft denied the package operation. Review your assigned permissions.",
       }, { status: 403 });
@@ -2311,14 +2404,17 @@ export function sessionAndNavigationCases() {
   it("confirms and submits 5000 all-matching package targets without loading IDs or walking inventory pages", async () => {
     const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
-        ...unifiedPage, count: 6001, counts: { total: 6001, scoped: 6001, filtered: 6001, packageTargets: 5000 },
-        selection: { ...unifiedPage.selection, id: "server-filtered-selection", revision: "1", expiresAt: new Date(Date.now() + 60_000).toISOString() },
-        page: { limit: 50, nextCursor: "more-6001-agents", previousCursor: null },
-      });
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
+        ...unifiedPage, counts: { total: 5000, scoped: 5000, filtered: 5000, packageTargets: 5000 },
+        page: { limit: 50, nextCursor: "more-5000-agents", previousCursor: null },
+      }));
       if (input === "/api/agents/mutation-preview") {
+        const request = JSON.parse(String(init?.body)) as { selectionId: string };
+        expect(request.selectionId).toBe(currentInventorySelection(transport.fetchMock));
+        expect(inventorySelections.has(request.selectionId)).toBe(true);
         const result = await (await base(input, init)).json();
-        return Response.json({ ...result, summary: { ...result.summary, targetCount: 5000, additionalTargetCount: 4999 } });
+        return Response.json({ ...result, selectionId: request.selectionId,
+          summary: { ...result.summary, targetCount: 5000, additionalTargetCount: 4999 } });
       }
       if (input === "/api/agents/block") return Response.json({ code: "missing_permission", detail: "No synthetic provider write is permitted." }, { status: 403 });
       return base(input, init);
@@ -2335,26 +2431,29 @@ export function sessionAndNavigationCases() {
     expect(await screen.findByRole("alert")).toHaveTextContent("No synthetic provider write is permitted.");
     const preview = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-preview")!;
     const submit = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/block")!;
-    expect(JSON.parse(String(preview[1]?.body))).toEqual({ action: "block", selectionId: "server-filtered-selection", mutationScope: "bulk" });
-    expect(JSON.parse(String(submit[1]?.body))).toEqual({ selectionId: "server-filtered-selection", confirmationHash: "a".repeat(64) });
+    const selectionId = currentInventorySelection(transport.fetchMock);
+    expect(JSON.parse(String(preview[1]?.body))).toEqual({ action: "block", selectionId, mutationScope: "bulk" });
+    expect(JSON.parse(String(submit[1]?.body))).toEqual({ selectionId, confirmationHash: "a".repeat(64) });
     expect(transport.fetchMock.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname === "/api/agent-inventory")).toHaveLength(1);
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1);
-    expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("cursor=more-6001"))).toBe(false);
+    expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("cursor=more-5000"))).toBe(false);
   });
 
   it("confirms a complete logical package group without expanding its primary-package preview", async () => {
     const transport = accessEditorTransport(), base = transport.fetchMock.getMockImplementation()!;
     const id = "agent:11111111-1111-4111-8111-111111111111";
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
         ...unifiedPage, value: [{ ...unifiedPage.value[0], id, packageCount: 40, packagesComplete: false, memberCount: 40 }],
         counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
-        selection: { ...unifiedPage.selection, id: "group-read-selection", revision: "1", expiresAt: new Date(Date.now() + 60_000).toISOString() },
         page: { limit: 50, nextCursor: null, previousCursor: null },
-      });
+      }));
       if (input === "/api/agents/mutation-preview") {
+        const request = JSON.parse(String(init?.body)) as { selectionId: string };
+        expect(request.selectionId).toBe(currentInventorySelection(transport.fetchMock));
+        expect(inventorySelections.has(request.selectionId)).toBe(true);
         const result = await (await base(input, init)).json();
-        return Response.json({ ...result, selectionId: "reviewed-group-selection",
+        return Response.json({ ...result, selectionId: request.selectionId,
           summary: { ...result.summary, targetCount: 40, additionalTargetCount: 39 } });
       }
       if (input === "/api/agents/mutation-selection") return Response.json({ count: 40 });
@@ -2373,12 +2472,13 @@ export function sessionAndNavigationCases() {
     const preview = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-preview")!;
     const submit = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/block")!;
     const counted = transport.fetchMock.mock.calls.find(([input]) => input === "/api/agents/mutation-selection")!;
-    expect(JSON.parse(String(counted[1]?.body))).toEqual({ selectionId: "group-read-selection", recordIds: [id] });
+    const selectionId = currentInventorySelection(transport.fetchMock);
+    expect(JSON.parse(String(counted[1]?.body))).toEqual({ selectionId, recordIds: [id] });
     expect(JSON.parse(String(preview[1]?.body))).toEqual({
-      action: "block", selectionId: "group-read-selection", recordIds: [id], mutationScope: "bulk",
+      action: "block", selectionId, recordIds: [id], mutationScope: "bulk",
     });
     expect(JSON.parse(String(submit[1]?.body))).toEqual({
-      selectionId: "reviewed-group-selection", recordIds: [id], confirmationHash: "a".repeat(64),
+      selectionId, recordIds: [id], confirmationHash: "a".repeat(64),
     });
     expect(transport.fetchMock.mock.calls.some(([input]) => /\/members|\/children/.test(input))).toBe(false);
   });
@@ -2400,8 +2500,11 @@ export function sessionAndNavigationCases() {
       await userEvent.click(exact);
       if (role === "AgentControl.Admin") {
         await waitFor(() => expect(new URLSearchParams(window.location.search).get("selectionState")).toBe("session"));
+      } else {
+        expect(storePackageSelection({ ...viewer, roles: [role] }, ["single-package"])).toBe(true);
       }
-      const storedCount = Number(new URLSearchParams(window.location.search).get("selectionCount"));
+      const storedCount = Number(new URLSearchParams(window.location.search).get("selectionCount") ?? "1");
+      expect(restorePackageSelection({ ...viewer, roles: [role] }, storedCount).status).toBe("restored");
       await userEvent.click(screen.getByRole("button", { name: "Export agent inventory CSV" }));
       const dialog = screen.getByRole("dialog", { name: "Export agent inventory" });
       await userEvent.click(within(dialog).getByRole("button", { name: "Clear selection" }));
@@ -2505,9 +2608,9 @@ export function sessionAndNavigationCases() {
           status: category === "missing_permission" ? "missing_permission" : "unknown", evidence: { category } };
         return Response.json(capabilities);
       }
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
         ...unifiedPage, identityCollection: { checkedPackages: 0, pendingPackages: 1 },
-      });
+      }));
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         run: {
           id: "partially-authorized-run", automatic: true, mode: "incremental", status: "partial",
@@ -3104,8 +3207,16 @@ export function sessionAndNavigationCases() {
         expect(transport.meCalls()).toBe(1);
         deny = false;
         if (deniedSource === "refresh history") {
-          await userEvent.click(screen.getByRole("button", { name: "Reload saved inventory" }));
+          const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+          expect(receipt.queryByRole("alert")).not.toBeInTheDocument();
+          const recoveryStart = transport.fetchMock.mock.calls.length;
+          await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
           await waitFor(() => expect(screen.queryAllByText(/Saved agent access denied/)).toHaveLength(0));
+          const recoveryRequests = transport.fetchMock.mock.calls.slice(recoveryStart);
+          expect(recoveryRequests.filter(([path]) => path === "/api/inventory/refresh-jobs")).toHaveLength(1);
+          expect(recoveryRequests.filter(([path]) => path === "/api/agent-inventory/health")).toHaveLength(1);
+          expect(recoveryRequests.filter(([path, init]) => path !== "/api/agent-inventory/selections"
+            && init?.method && init.method !== "GET")).toEqual([]);
           await userEvent.click(screen.getByRole("button", { name: "Agents" }));
         } else {
           await userEvent.click(await screen.findByRole("button", { name: "Reload saved agent inventory" }));
@@ -3297,6 +3408,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("uses the automatic due check to replace duplicate source rows without a second identity scanner", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=all");
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", agent.displayName);
     const merged: UnifiedAgentRecord = {
       ...native, presence: "both", packages: [agent],
@@ -3306,22 +3418,37 @@ export function sessionAndNavigationCases() {
     const transport = initialCatalogTransport();
     transport.page = packagePage;
     const base = transport.fetchMock.getMockImplementation()!;
+    const automatic = deferredResponse();
     let collected = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
-        ...unifiedRecordsPage(collected ? [merged] : [unifiedPage.value[0], native]),
-        identityCollection: { checkedPackages: collected ? 1 : 0, pendingPackages: collected ? 0 : 1 },
-      });
-      if (input === "/api/data-sync/auto-refresh") {
-        collected = true;
-        return Response.json(automaticRefreshResponse());
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
+        const summary = { total: collected ? 1 : 2, linked: collected ? 1 : 0, graphOnly: collected ? 0 : 1,
+          powerPlatformOnly: collected ? 0 : 1, ambiguous: 0, conflicting: 0 };
+        return Response.json(selectedInventoryPage(input, {
+          ...unifiedRecordsPage(collected ? [merged] : [unifiedPage.value[0], native]),
+          inventoryScope: "all", summary, scopeSummary: summary, filteredSummary: summary,
+          identityCollection: { checkedPackages: collected ? 1 : 0, pendingPackages: collected ? 0 : 1 },
+        }));
       }
+      if (input === "/api/data-sync/auto-refresh") return automatic.promise;
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<StrictMode><App /></StrictMode>);
-    await waitFor(() => expect(collected).toBe(true));
+    await waitFor(() => expect(within(screen.getByRole("region", { name: "Unified agents" })).getAllByText(agent.displayName)).toHaveLength(2));
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    const initialSelection = currentInventorySelection(transport.fetchMock);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
+    collected = true;
+    transport.session.publish("graph_packages");
+    await act(async () => automatic.resolve(Response.json(automaticRefreshResponse({
+      revisions: transport.session.publicationRevisions,
+    }))));
     await waitFor(() => expect(within(screen.getByRole("region", { name: "Unified agents" })).getAllByText(agent.displayName)).toHaveLength(1));
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(2);
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(initialSelection);
+    expect(inventorySelections.size).toBe(2);
+    expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1);
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.find(([input]) => input === "/api/data-sync/auto-refresh")?.[1]).toMatchObject({ method: "POST", body: "{}" });
     expect(screen.getAllByRole("checkbox", { name: `Select ${agent.displayName}` })).toHaveLength(1);
@@ -3339,10 +3466,10 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     let finished = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
         ...unifiedRecordsPage(unifiedPage.value),
         identityCollection: { checkedPackages: finished ? 1 : 0, pendingPackages: finished ? 0 : 1 },
-      });
+      }));
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         detailJob: { id: "details-1", status: finished ? "succeeded" : "running", updatedAt: String(finished) },
         revisions: { ...automaticRefreshResponse().revisions, graph_packages: (finished ? "4" : "1").repeat(64) },
@@ -3377,10 +3504,10 @@ export function sessionAndNavigationCases() {
     let completed = false;
     let reads = 0;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
         ...unifiedRecordsPage(unifiedPage.value),
         identityCollection: { checkedPackages: completed ? 1 : 0, pendingPackages: completed ? 0 : 1 },
-      });
+      }));
       if (input === "/api/data-sync/auto-refresh") {
         reads += 1;
         return Response.json(automaticRefreshResponse({
@@ -3419,7 +3546,9 @@ export function sessionAndNavigationCases() {
     transport.readAuthorized = false;
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json({ ...unifiedRecordsPage(unifiedPage.value), identityCollection: { checkedPackages: 0, pendingPackages: 1 } });
+      if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Response.json(selectedInventoryPage(input, {
+        ...unifiedRecordsPage(unifiedPage.value), identityCollection: { checkedPackages: 0, pendingPackages: 1 },
+      }));
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         detailJob: transport.failRefresh ? { id: "failed-details", status: "failed", updatedAt: "now" } : null,
       }));
@@ -3854,7 +3983,7 @@ export function sessionAndNavigationCases() {
     const second = { ...agent, id: "package-alternate", displayName: "Second publication", version: "2" };
     const merged = { ...unifiedPage.value[0], packages: [agent, second] };
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (/^\/api\/agent-inventory(?:\?|$)/.test(input)) return Promise.resolve(Response.json(unifiedRecordsPage([merged])));
+      if (/^\/api\/agent-inventory(?:\?|$)/.test(input)) return Response.json(selectedInventoryPage(input, unifiedRecordsPage([merged])));
       if (isPackageDetailRequest(input, second.id)) return Promise.resolve(Response.json({ ...second, longDescription: "Second publication description" }));
       if (input === `/api/agents/${second.id}/refresh-jobs`) return Response.json({
         ...completedRefreshJob(), id: "alternate-access", scopeKind: "exact", requestedIds: [second.id],
@@ -3907,6 +4036,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("preserves one exact quarantine target when reconciliation changes the canonical row ID", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=all");
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Reconciled agent");
     const initial = { ...native, id: "agent:33333333-3333-4333-8333-333333333333" };
     const merged: UnifiedAgentRecord = {
@@ -3917,7 +4047,7 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     let reconciled = false;
     transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
-      ? Response.json(unifiedRecordsPage([reconciled ? merged : initial]))
+      ? Response.json(selectedInventoryPage(input, { ...unifiedRecordsPage([reconciled ? merged : initial]), inventoryScope: "all" }))
       : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -3938,6 +4068,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("does not renew retained quarantine proof when newly linked packages are selected", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=all");
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Snapshot-bound merged agent");
     const merged: UnifiedAgentRecord = {
       ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both", packages: [agent],
@@ -3950,7 +4081,7 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     let reconciled = false;
     transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
-      ? Response.json(unifiedRecordsPage([reconciled ? merged : native]))
+      ? Response.json(selectedInventoryPage(input, { ...unifiedRecordsPage([reconciled ? merged : native]), inventoryScope: "all" }))
       : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -3968,6 +4099,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("does not merge a case-changed opaque resource GUID into the saved quarantine selection", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=all");
     const nativeId = "abcdefab-2222-4222-8222-222222222222";
     const native = powerPlatformRecord(nativeId, "Case-stable target");
     const replacement = powerPlatformRecord(nativeId.toUpperCase(), native.displayName);
@@ -3975,7 +4107,7 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     let changed = false;
     transport.fetchMock.mockImplementation(async (input, init) => new URL(input, "http://localhost").pathname === "/api/agent-inventory"
-      ? Response.json(unifiedRecordsPage([changed ? replacement : native]))
+      ? Response.json(selectedInventoryPage(input, { ...unifiedRecordsPage([changed ? replacement : native]), inventoryScope: "all" }))
       : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -4027,6 +4159,7 @@ export function sessionAndNavigationCases() {
   });
 
   it("reconciles an open native-only detail through its canonical alias when package identities arrive", async () => {
+    window.history.replaceState({}, "", "/agents?inventory=all");
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Reconciled detail");
     const initial = { ...native, id: "agent:33333333-3333-4333-8333-333333333333" };
     const merged: UnifiedAgentRecord = {
@@ -4041,10 +4174,11 @@ export function sessionAndNavigationCases() {
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (unifiedDetailId(input) === initial.id) return Response.json(reconciled ? merged : initial);
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
-        return Response.json({
+        return Response.json(selectedInventoryPage(input, {
           ...unifiedRecordsPage(reconciled ? [merged] : [unifiedPage.value[0], initial]),
+          inventoryScope: "all",
           identityCollection: { checkedPackages: reconciled ? 1 : 0, pendingPackages: reconciled ? 0 : 1 },
-        });
+        }));
       }
       if (input === "/api/data-sync/auto-refresh") return refresh.promise;
       return base(input, init);
@@ -4434,7 +4568,10 @@ export function sessionAndNavigationCases() {
     const pending = deferredResponse();
     transport.fetchMock.mockImplementation(async (input, init) => {
       const url = selectedInventoryUrl(input);
-      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("sortBy") === "hosts") return pending.promise;
+      if (url.pathname === "/api/agent-inventory" && url.searchParams.get("sortBy") === "hosts") {
+        return pending.promise.then(async response =>
+          Response.json(selectedInventoryPage(input, await response.json() as UnifiedAgentInventoryPage)));
+      }
       return base(input, init);
     });
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -4651,6 +4788,36 @@ export function sessionAndNavigationCases() {
     expect(screen.queryByText("Optional directory-role hint")).not.toBeInTheDocument();
   });
 
+  it("shows active detail publication as automatic progress on Agents and Sync instead of an attention warning", async () => {
+    const page = verifiedSavedAgentPage();
+    const error = { source: "graph_packages" as const, code: "snapshot_stale" as const,
+      message: "The selected saved source is stale or no longer authoritative. Refresh it in Data sync." };
+    page.partial = true;
+    page.freshness.state = "reconciling";
+    page.errors = [error];
+    page.sources.graphPackages = { state: "partial",
+      observation: { ...page.sources.graphPackages.observation!, current: false }, error };
+    page.identityCollection = { checkedPackages: 120, pendingPackages: 890 };
+    page.verification = { ...createUnifiedVerification(page.verification, { sourceScopes: false },
+      undefined, page.identityCollection), status: "updating" };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.getByText("Updating saved agent inventory. Results will appear automatically.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Inventory needs attention/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    const health = screen.getByRole("region", { name: "Inventory health" });
+    expect(await within(health).findByText("Updating", { exact: true })).toBeVisible();
+    expect(within(health).getByRole("status")).toHaveTextContent("updates appear automatically");
+    expect(screen.queryByText("What needs attention")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByText("Saved inventory updating")).toBeVisible();
+    expect(screen.queryByText("Saved inventory needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText(error.message)).not.toBeInTheDocument();
+  });
+
   it("does not send admins from Agents to Sync for expired package details alone", async () => {
     const page = verifiedSavedAgentPage();
     page.identityCollection = {
@@ -4825,6 +4992,148 @@ export function sessionAndNavigationCases() {
 }
 
 export function savedInventoryCases() {
+  it.each([3, 5])("summarizes saved transport memberships and identity states for %s rows", count => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Native agent");
+    const page = unifiedRecordsPage([
+      { ...unifiedPage.value[0], identity: { ...unifiedPage.value[0].identity, state: "conflicting" } },
+      { ...native, identity: { ...native.identity, state: "ambiguous" } },
+      {
+        ...powerPlatformRecord("33333333-3333-4333-8333-333333333333", "Linked agent"),
+        presence: "both", packages: [{ ...agent, id: "linked-package" }],
+        identity: { state: "matched", evidence: [], packageEvidence: [], reason: "Exact saved native association." },
+      },
+    ], count);
+    expect(page.summary).toEqual({
+      total: count, linked: 1, graphOnly: count - 2, powerPlatformOnly: 1, ambiguous: 1, conflicting: 1,
+    });
+    expect(page.scopeSummary).toEqual(page.summary);
+    expect(page.filteredSummary).toEqual(page.summary);
+    page.summary.linked = 0;
+    expect(page.scopeSummary.linked).toBe(1);
+    expect(page.filteredSummary.linked).toBe(1);
+  });
+
+  it("rejects unsupported saved transport endpoints instead of returning an inventory page", async () => {
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const page = await getUnifiedAgents();
+    if (!("value" in page)) throw new Error("Expected selected saved inventory.");
+    const response = await fetch(`/api/agent-inventory/not-a-supported-fixture-endpoint?selectionId=${page.selection.id}`);
+    expect(response.status).toBe(500);
+    expect(await response.json()).toMatchObject({ code: "unexpected_test_request" });
+  });
+
+  it.each([
+    ["graph_packages", ["graph_packages:package-private", "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]],
+    ["power_platform", ["power_platform:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222", "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]],
+    ["both", ["agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]],
+  ] as const)("filters saved transport rows for the raw %s source enum", async (source, expectedIds) => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Native agent");
+    const linked: UnifiedAgentRecord = {
+      ...powerPlatformRecord("33333333-3333-4333-8333-333333333333", "Linked agent"),
+      id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      presence: "both", packages: [{ ...agent, id: "linked-package" }],
+      identity: { state: "matched", evidence: [], packageEvidence: [], reason: "Exact saved native association." },
+    };
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([unifiedPage.value[0], native, linked]),
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const page = await getUnifiedAgents({ inventoryScope: "all", source });
+    if (!("value" in page)) throw new Error("Expected selected saved inventory.");
+    expect(page.value.map(record => record.id)).toEqual(expectedIds);
+    expect(page.counts.filtered).toBe(expectedIds.length);
+    expect(page.summary).toEqual({ total: 3, linked: 1, graphOnly: 1, powerPlatformOnly: 1, ambiguous: 0, conflicting: 0 });
+    expect(page.scopeSummary).toEqual(page.summary);
+    expect(page.filteredSummary).toEqual({
+      total: expectedIds.length, linked: 1, graphOnly: source === "graph_packages" ? 1 : 0,
+      powerPlatformOnly: source === "power_platform" ? 1 : 0, ambiguous: 0, conflicting: 0,
+    });
+    expect(inventorySelections.get(page.selection.id)?.query.source).toBe(source);
+    expect(selectedInventoryUrl(agentListRequests(transport.fetchMock)[0][0]).searchParams.get("source")).toBe(source);
+  });
+
+  it("filters saved transport rows to an explicitly unknown environment", async () => {
+    const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Known native environment");
+    const knownPackage = {
+      ...unifiedPage.value[0], id: "graph_packages:known-environment", environmentId: native.environmentId,
+      packages: [{ ...agent, id: "known-environment" }],
+    };
+    const linked: UnifiedAgentRecord = {
+      ...powerPlatformRecord("33333333-3333-4333-8333-333333333333", "Linked agent"),
+      id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      presence: "both", packages: [{ ...agent, id: "linked-package" }],
+      identity: { state: "matched", evidence: [], packageEvidence: [], reason: "Exact saved native association." },
+    };
+    const transport = appTransport({
+      revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([unifiedPage.value[0], knownPackage, native, linked]),
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    const page = await getUnifiedAgents({ inventoryScope: "all", environmentId: null });
+    if (!("value" in page)) throw new Error("Expected selected saved inventory.");
+    expect(page.value.map(record => record.id)).toEqual([unifiedPage.value[0].id]);
+    expect(page.counts.filtered).toBe(1);
+    expect(inventorySelections.get(page.selection.id)?.query.environmentId).toBe(encodeInventoryFacet(null));
+  });
+
+  it.each(["filtered", "selected"] as const)("renews the %s saved transport usage context with its captured selection lease", async shape => {
+    vi.useFakeTimers();
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    if (shape === "selected") transport.fetchMock.mockImplementation(async (input, init) =>
+      new URL(input, "http://localhost").pathname === "/api/agent-inventory"
+        ? Response.json(selectedInventoryPage(input, unifiedPage)) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    vi.setSystemTime(Date.now() + 60_000);
+    const page = await getUnifiedAgents();
+    if (!("value" in page)) throw new Error("Expected selected saved inventory.");
+    expect(Date.parse(page.selection.expiresAt)).toBeGreaterThan(Date.parse(unifiedPage.selection.expiresAt));
+    expect(page.usageContext?.revision).toBe(page.selection.id);
+    expect(page.usageContext?.expiresAt).toBe(page.selection.expiresAt);
+  });
+
+  it.each(["capture", "page"] as const)("keeps a successful health receipt independent of a failed browsing %s", async phase => {
+    window.history.replaceState({}, "", "/agents");
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: verifiedSavedAgentPage() });
+    const base = transport.fetchMock.getMockImplementation()!;
+    const path = phase === "capture" ? "/api/agent-inventory/selections" : "/api/agent-inventory";
+    const message = "The saved browsing selection could not be read.";
+    let fail = true;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      if (fail && new URL(input, "http://localhost").pathname === path) {
+        return Response.json({ code: "saved_read_failed", detail: message }, { status: 500 });
+      }
+      return base(input, init);
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByText(message);
+    await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+    const health = within(await screen.findByRole("region", { name: "Inventory health" }));
+    await health.findByText("Verified", { exact: true });
+    expect(health.queryByText("Needs attention", { exact: true })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    const receipt = within(screen.getByRole("region", { name: "Saved agent inventory verification" }));
+    expect(receipt.getByText("Saved inventory verified")).toBeVisible();
+    expect(receipt.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    const exportButton = screen.getByRole("button", { name: "Export PP agent inventory CSV" });
+    expect(exportButton).toBeDisabled();
+    expect(exportButton).toHaveAttribute("title", "Reload saved agent browsing inventory to use selected targets or saved export filters.");
+
+    fail = false;
+    const beforeRetry = transport.fetchMock.mock.calls.length;
+    await userEvent.click(receipt.getByRole("button", { name: "Verify saved inventory" }));
+    await waitFor(() => expect(exportButton).toBeEnabled());
+    await receipt.findByText("Saved inventory verified");
+    expect(screen.queryByText(message)).not.toBeInTheDocument();
+    const retryRequests = transport.fetchMock.mock.calls.slice(beforeRetry);
+    expect(retryRequests.some(([input]) => input === "/api/agent-inventory/health")).toBe(true);
+    expect(retryRequests.some(([input]) => input === "/api/agent-inventory/selections")).toBe(true);
+    expect(retryRequests.filter(([input, init]) => input !== "/api/agent-inventory/selections"
+      && init?.method && init.method !== "GET")).toEqual([]);
+  });
+
   it.each(["filter", "scope", "departure"] as const)(
     "retires an independent pending health verification before %s and ignores its late denial", async boundary => {
       window.history.replaceState({}, "", "/sync");
@@ -7935,17 +8244,18 @@ export function savedInventoryCases() {
       await waitFor(() => expect(refresh).toBeEnabled());
       await userEvent.click(refresh);
       const receipt = within(dialog).getByRole("region", { name: "Saved agent inventory verification" });
-      await waitFor(() => expect(within(receipt).getByRole("alert"))
+      await waitFor(() => expect(within(dialog).getByRole("alert"))
         .toHaveTextContent("The saved inventory selection is no longer available. Reload saved inventory."));
+      expect(within(receipt).queryByRole("alert")).not.toBeInTheDocument();
       expect(within(dialog).getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
       expect(attempts).toHaveLength(1);
 
       const captures = () => transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agent-inventory/selections").length;
       const before = captures();
       const recoveryStart = transport.fetchMock.mock.calls.length;
-      await userEvent.click(within(receipt).getByRole("button", { name: "Reload saved inventory" }));
+      await userEvent.click(within(receipt).getByRole("button", { name: "Verify saved inventory" }));
       await waitFor(() => expect(captures()).toBeGreaterThan(before));
-      await waitFor(() => expect(within(receipt).queryByRole("alert")).not.toBeInTheDocument());
+      await waitFor(() => expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument());
       expect(within(dialog).getByRole("button", { name: "Refresh matching details" })).toBeDisabled();
       expect(transport.fetchMock.mock.calls.slice(recoveryStart)
         .filter(([path, init]) => init?.method === "POST" && path !== "/api/agent-inventory/selections")).toEqual([]);
@@ -7976,15 +8286,19 @@ export function savedInventoryCases() {
         displayName: freshAgent.displayName,
         packages: [freshAgent],
       };
-      const combinedPackagePage = { ...packagePage, value: [agent, freshAgent], count: 2 };
       const combinedUnifiedPage = unifiedRecordsPage([unifiedPage.value[0], freshRecord], 2);
+      const publishedName = "Fresh published agent";
+      const publishedPage = unifiedRecordsPage([unifiedPage.value[0], {
+        ...freshRecord, displayName: publishedName, packages: [{ ...freshAgent, displayName: publishedName }],
+      }], 2);
       const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: combinedUnifiedPage });
       const base = transport.fetchMock.getMockImplementation()!;
+      let published = false;
       let releaseRefresh!: (response: Response) => void;
       const delayedRefresh = new Promise<Response>(resolve => { releaseRefresh = resolve; });
       transport.fetchMock.mockImplementation(async (input, init) => {
         const url = new URL(input, "http://localhost");
-        if (url.pathname === "/api/capabilities") {
+        if (url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check") {
           const definitions = capabilityDefinitions.filter(item =>
             item.id === "graph.package.read.delegated"
             || item.id === "powerPlatform.inventory.read");
@@ -8003,9 +8317,7 @@ export function savedInventoryCases() {
             },
           })) });
         }
-        if (url.pathname === "/api/agents" && (!init?.method || init.method === "GET")) {
-          return Response.json(filterPackageResponse(combinedPackagePage, input));
-        }
+        if (published && url.pathname === "/api/agent-inventory") return Response.json(filterUnifiedResponse(publishedPage, input));
         if (
           refreshKind === "matching details"
           && input === "/api/agents/refresh-selection"
@@ -8031,25 +8343,36 @@ export function savedInventoryCases() {
       expect(await screen.findByText(freshAgent.displayName)).toBeInTheDocument();
       await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
       await userEvent.click(screen.getByText("View diagnostics"));
-      await userEvent.click(screen.getByRole("button", {
+      const refresh = screen.getByRole("button", {
         name: refreshKind === "matching details" ? "Refresh matching details" : "Refresh PP agent inventory",
-      }));
+      });
+      await waitFor(() => expect(refresh).toBeEnabled());
+      await userEvent.click(refresh);
+      const refreshPath = refreshKind === "matching details" ? "/api/agents/refresh-selection" : "/api/inventory/refresh-jobs";
+      expect(transport.fetchMock.mock.calls.filter(([input, init]) => input === refreshPath && init?.method === "POST")).toHaveLength(1);
 
+      const readsBeforeCompletion = agentListRequests(transport.fetchMock).length;
+      const previousSelection = currentInventorySelection(transport.fetchMock);
+      published = true;
+      transport.publish(refreshKind === "matching details" ? "graph_packages" : "power_platform");
       await act(async () => releaseRefresh(Response.json(
         refreshKind === "matching details"
           ? completedRefreshJob()
           : inventoryRefreshJob("succeeded"),
       )));
-      await waitFor(() => {
-        const inventoryRequests = transport.fetchMock.mock.calls
-          .map(([path]) => selectedInventoryUrl(String(path)))
-          .filter(url => url.pathname === "/api/agent-inventory");
-        expect(inventoryRequests.at(-1)?.searchParams.get("search")).toBe("Fresh");
-      });
+      await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(readsBeforeCompletion + 1));
+      expect(selectedInventoryUrl(agentListRequests(transport.fetchMock).at(-1)![0]).searchParams.get("search")).toBe("Fresh");
+      expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
       await userEvent.click(screen.getByRole("button", { name: "Agents" }));
       expect(screen.getByRole("searchbox", { name: "Search" })).toHaveValue("Fresh");
-      expect(screen.getByText(freshAgent.displayName)).toBeInTheDocument();
+      expect(await screen.findByText(publishedName)).toBeVisible();
+      expect(screen.queryByText(freshAgent.displayName)).not.toBeInTheDocument();
       expect(within(screen.getByRole("region", { name: "Unified agents" })).queryByText(agent.displayName)).not.toBeInTheDocument();
+      if (refreshKind === "matching details") {
+        expect(new URLSearchParams(window.location.search).getAll("selected")).toEqual([agent.id]);
+        await userEvent.clear(screen.getByRole("searchbox", { name: "Search" }));
+        expect(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` })).toBeChecked();
+      }
     },
   );
 
@@ -8069,11 +8392,12 @@ export function savedInventoryCases() {
       const url = new URL(input, "http://localhost");
       if (url.pathname === "/api/inventory/refresh-jobs/restored-running") {
         exactPolls += 1;
-        return Response.json(inventoryRefreshJob(exactPolls < 2 ? "running" : "succeeded", "restored-running"));
+        if (exactPolls === 3) transport.publish("power_platform");
+        return Response.json(inventoryRefreshJob(exactPolls < 3 ? "running" : "succeeded", "restored-running"));
       }
       if (input === "/api/inventory/refresh-jobs" && !init?.method) {
         return Response.json({
-          value: [inventoryRefreshJob(exactPolls < 2 ? "running" : "succeeded", "restored-running")],
+          value: [inventoryRefreshJob(exactPolls < 3 ? "running" : "succeeded", "restored-running")],
           lastAttemptAt: null,
           lastSuccessAt: null,
         });
@@ -8088,10 +8412,14 @@ export function savedInventoryCases() {
     await userEvent.clear(search);
     await userEvent.type(search, "Fresh");
     expect(await screen.findByText(freshAgent.displayName)).toBeInTheDocument();
+    const readsBeforeCompletion = agentListRequests(transport.fetchMock).length;
+    const previousSelection = currentInventorySelection(transport.fetchMock);
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
     await userEvent.click(screen.getByText("View diagnostics"));
     expect(await screen.findByText(/Latest agent refresh: succeeded/, {}, { timeout: 4_000 })).toBeVisible();
-    expect(exactPolls).toBe(2);
+    expect(exactPolls).toBe(3);
+    await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(readsBeforeCompletion + 1));
+    expect(currentInventorySelection(transport.fetchMock)).not.toBe(previousSelection);
     const inventoryRequests = transport.fetchMock.mock.calls
       .map(([path]) => selectedInventoryUrl(String(path)))
       .filter(url => url.pathname === "/api/agent-inventory");
@@ -8675,13 +9003,22 @@ export function commandsAndExportsCases() {
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
   });
 
-  it("preserves existing snapshots, including empty catalogs and filtered-empty results", async () => {
-    const transport = initialCatalogTransport();
-    transport.page = { ...packagePage, value: [], counts: { total: 0, scoped: 0, filtered: 0 } };
+  it.each(["empty catalog", "filtered-empty catalog"] as const)("preserves the saved %s without provider enumeration", async scenario => {
+    const filtered = scenario === "filtered-empty catalog";
+    if (filtered) window.history.replaceState({}, "", "/agents?q=no-saved-match");
+    const transport = initialCatalogTransport({ unifiedResponse: filtered ? unifiedPage : unifiedRecordsPage([]) });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
-    await waitFor(() => expect(screen.getByText(/Catalog collected/)).toBeInTheDocument());
+    expect(await screen.findByRole("heading", { name: filtered ? "No matching agents" : "No agents in this inventory" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: filtered ? "Agents 0 of 1" : "Agents 0" })).toBeVisible();
+    expect(screen.getByText(/Catalog collected/)).toBeInTheDocument();
+    expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    if (filtered) {
+      expect(inventorySelections.get(currentInventorySelection(transport.fetchMock))?.query.search).toBe("no-saved-match");
+    }
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+    expect(selectedRefreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
   });
 
@@ -11651,10 +11988,9 @@ export function commandsAndExportsCases() {
     },
   );
 
-  it.each([
-    ["unified", "success"],
-    ["unified", "failure"],
-  ] as const)("discards a delayed %s export %s after session revalidation", async (source, outcome) => {
+  it.each((["unified", "Power Platform"] as const).flatMap(source =>
+    (["success", "failure"] as const).map(outcome => ({ source, outcome })),
+  ))("discards a delayed $source export $outcome after session revalidation", async ({ source, outcome }) => {
     const transport = appTransport({
       revalidatedRoles: viewer.roles,
       unifiedResponse: unifiedRecordsPage(unifiedPage.value),
@@ -11665,7 +12001,7 @@ export function commandsAndExportsCases() {
     transport.fetchMock.mockImplementation(async (input, init) =>
       isExport(input) ? pending.promise : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
-    const { click: download } = mockCsvDownload();
+    const download = mockCsvDownload();
     render(<App />);
     await screen.findByText(agent.displayName);
     if (source === "unified") {
@@ -11679,11 +12015,19 @@ export function commandsAndExportsCases() {
       await userEvent.click(button);
     }
     await waitFor(() => expect(transport.fetchMock.mock.calls.some(([path]) => isExport(path))).toBe(true));
+    const creation = transport.fetchMock.mock.calls.find(([path, init]) => isExport(path) && init?.method === "POST")!;
+    expect(JSON.parse(String(creation[1]?.body))).toMatchObject({
+      kind: source === "unified" ? "unified_agents" : "power_platform_agents",
+      selectionId: currentInventorySelection(transport.fetchMock),
+    });
     await revalidateTransportSession(transport);
+    expect(creation[1]?.signal?.aborted).toBe(true);
     await act(async () => pending.resolve(outcome === "success"
       ? Response.json({ id: "old-session-export" })
       : Response.json({ code: "export_failed", detail: "Old session export failed" }, { status: 500 })));
-    expect(download).not.toHaveBeenCalled();
+    expect(download.click).not.toHaveBeenCalled();
+    expect(download.createObjectURL).not.toHaveBeenCalled();
+    expect(screen.queryByRole("link", { name: "Download CSV" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Old session export failed/)).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/data-exports/old-session-export")).toBe(false);
   });
@@ -12720,7 +13064,11 @@ function appTransport({
       }
       if (input === "/api/agent-inventory/selections" && init?.method === "POST") {
         const { query } = JSON.parse(String(init.body)) as { query: Record<string, string> };
-        const selection = { ...unifiedResponse.selection, id: crypto.randomUUID(), publicationRevisions: { ...transport.publicationRevisions } };
+        const capturedAt = Date.now();
+        const lifetime = Date.parse(unifiedResponse.selection.expiresAt) - Date.parse(unifiedResponse.selection.validatedAt);
+        const selection = { ...unifiedResponse.selection, id: crypto.randomUUID(),
+          evaluatedAt: new Date(capturedAt).toISOString(), validatedAt: new Date(capturedAt).toISOString(),
+          expiresAt: new Date(capturedAt + lifetime).toISOString(), publicationRevisions: { ...transport.publicationRevisions } };
         inventorySelections.set(selection.id, { selection, query });
         return Response.json(selection, { status: 201 });
       }
@@ -12747,7 +13095,7 @@ function appTransport({
         const values = inventoryFacets[field as keyof typeof inventoryFacets] ?? [];
         return Response.json({ value: values, total: values.length, nextCursor: null });
       }
-      return Response.json(filterUnifiedResponse(unifiedResponse, input));
+      if (url.pathname === "/api/agent-inventory") return Response.json(filterUnifiedResponse(unifiedResponse, input));
     }
     if (input === "/api/inventory/refresh-jobs") {
       return Response.json({ value: [], lastAttemptAt: null, lastSuccessAt: null });
@@ -12824,32 +13172,34 @@ function filterUnifiedResponse(response: UnifiedAgentInventoryPage, input: strin
     : inventoryScope === "power_platform_only" ? record.packages.length === 0 && record.powerPlatformResource !== null : true);
   const recordId = url.searchParams.get("recordId");
   const search = url.searchParams.get("search")?.toLowerCase();
-  const source = url.searchParams.has("source") ? decodeInventoryFacet(url.searchParams.get("source")!) : undefined;
+  const source = url.searchParams.get("source") ?? undefined;
   const environmentId = url.searchParams.has("environmentId") ? decodeInventoryFacet(url.searchParams.get("environmentId")!) : undefined;
   const offset = Number(url.searchParams.get("cursor")?.replace(/^fixture-page:/, "") ?? 0);
   const limit = Number(url.searchParams.get("limit") ?? response.page.limit);
   let value = scoped.filter(record =>
     (!recordId || record.id === recordId || record.packages.some(item => item.id === recordId))
     && (!search || JSON.stringify(record).toLowerCase().includes(search))
-    && (!source || source === "all" || record.presence === source)
-    && (!environmentId || record.environmentId === environmentId),
+    && (!source || source === "all" || record.presence === source
+      || (source === "graph_packages" || source === "power_platform") && record.presence === "both")
+    && (environmentId === undefined || (record.environmentId || null) === environmentId),
   );
-  const count = recordId || search || (source && source !== "all") || environmentId || scoped.length !== response.value.length
-    ? value.length
-    : response.counts.filtered;
+  const filtered = Boolean(recordId || search || (source && source !== "all") || environmentId !== undefined || scoped.length !== response.value.length);
+  const count = filtered ? value.length : response.counts.filtered;
+  const packageTargets = filtered
+    ? value.reduce((total, record) => total + (record.packageCount ?? record.packages.length), 0)
+    : response.counts.packageTargets;
+  const filteredSummary = filtered ? unifiedRecordSummary(value) : response.filteredSummary;
+  const scopeSummary = inventoryScope === "catalog"
+    ? unifiedRecordSummary(scoped, response.summary.total - response.summary.powerPlatformOnly)
+    : inventoryScope === "power_platform_only" ? unifiedRecordSummary(scoped, response.summary.powerPlatformOnly) : response.summary;
   if (value.length > limit || offset > 0) {
     value = value.slice(offset, offset + limit);
   }
-  const scopeSummary = inventoryScope === "catalog"
-    ? { ...response.summary, total: response.summary.total - response.summary.powerPlatformOnly, powerPlatformOnly: 0 }
-    : inventoryScope === "power_platform_only"
-      ? { total: response.summary.powerPlatformOnly, linked: 0, graphOnly: 0, powerPlatformOnly: response.summary.powerPlatformOnly, ambiguous: 0, conflicting: 0 }
-      : response.summary;
-  return { ...response, selection: selected.selection, inventoryScope, scopeSummary,
+  return { ...response, selection: selected.selection, inventoryScope, scopeSummary, filteredSummary,
     freshness: { ...response.freshness, capturedRevision: selected.selection.revision },
-    usageContext: { ...response.usageContext, revision: selected.selection.id },
+    usageContext: { ...response.usageContext, revision: selected.selection.id, expiresAt: selected.selection.expiresAt },
     value,
-    counts: { ...response.counts, scoped: scopeSummary.total, filtered: count },
+    counts: { ...response.counts, scoped: scopeSummary.total, filtered: count, packageTargets },
     page: { limit, nextCursor: offset+limit<count ? `fixture-page:${offset+limit}` : null,
       previousCursor: offset ? `fixture-page:${Math.max(0, offset-limit)}` : null } };
 }
@@ -12891,7 +13241,7 @@ function selectedInventoryPage(input: string, page: UnifiedAgentInventoryPage) {
   if (!capture) throw new Error("Unknown synthetic inventory selection");
   return { ...page, selection: capture.selection,
     freshness: { ...page.freshness, capturedRevision: capture.selection.revision },
-    usageContext: { ...page.usageContext, revision: capture.selection.id } };
+    usageContext: { ...page.usageContext, revision: capture.selection.id, expiresAt: capture.selection.expiresAt } };
 }
 
 function selectedInventoryUrl(input: string) {
@@ -12900,7 +13250,7 @@ function selectedInventoryUrl(input: string) {
   const selected = inventorySelections.get(url.searchParams.get("selectionId") ?? "");
   if (!selected) throw new Error("Unknown selected inventory criteria");
   for (const [key, value] of Object.entries(selected.query)) {
-    const decoded = ["type", "publisher", "host", "platform", "environmentId", "source", "linkState", "availableTo"].includes(key)
+    const decoded = ["type", "publisher", "host", "platform", "environmentId", "availableTo"].includes(key)
       ? decodeInventoryFacet(value) : value;
     url.searchParams.set(key, typeof decoded === "string" ? decoded : JSON.stringify(decoded));
   }
@@ -12957,15 +13307,21 @@ function initialCatalogTransport(options: Partial<Parameters<typeof appTransport
     if (response.ok && new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
       if (transport.catalogResponse) return transport.catalogResponse();
       if (options.unifiedResponse) return response;
-      return Response.json({
-        ...filterUnifiedResponse(unifiedPage, input),
-        value: (transport.page?.value ?? []).map(item => ({ ...unifiedPage.value[0], id: `graph_packages:${item.id}`, displayName: item.displayName, packages: [item] })),
-        counts: { ...transport.page?.counts, total: transport.page?.counts.total ?? 0,
+      const total = transport.page?.counts.total ?? 0;
+      const records = (transport.page?.value ?? []).map(item => ({
+        ...unifiedPage.value[0], id: `graph_packages:${item.id}`, displayName: item.displayName, packages: [item],
+      }));
+      return Response.json(filterUnifiedResponse({
+        ...unifiedPage,
+        value: records,
+        counts: { ...transport.page?.counts, total,
           scoped: transport.page?.counts.scoped ?? 0, filtered: transport.page?.counts.filtered ?? 0,
           packageTargets: transport.page?.counts.filtered ?? 0 },
+        summary: unifiedRecordSummary(records, total),
+        filteredSummary: unifiedRecordSummary(records, transport.page?.counts.filtered ?? 0),
         sources: { ...unifiedPage.sources, graphPackages: transport.page ? unifiedPage.sources.graphPackages
           : { state: "unavailable", observation: null, error: { source: "graph_packages", code: "snapshot_unavailable", message: "No saved package catalog." } } },
-      });
+      }, input));
     }
     return response;
   });
