@@ -13,8 +13,10 @@ import { streamOfficialReport } from "../services/officialReportStream.js";
 import type { ReportEndpoint, ReportQuery } from "../types/officialReportData.js";
 import type { UserSourceMetadata } from "../types/userSources.js";
 import { reportQueryString } from "../../../frontend/src/api/reportData.js";
+import { adoptionDepartmentPage, adoptionSummaryPage } from "../../../frontend/src/test/reportDataFixture.js";
 import { createOfficialReportDataRouter } from "./officialReportData.js";
 import * as adoptionHistory from "../services/adoptionHistory.js";
+import * as adoptionDepartments from "../services/adoptionDepartments.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -135,6 +137,43 @@ function allowPage() {
   });
   return vi.spyOn(reports, "page");
 }
+
+describe("department adoption HTTP contract", () => {
+  it.each(["AgentControl.Viewer", "AgentControl.Admin"])("serves aggregate saved departments to %s", async role => {
+    roles = [role];
+    const read = vi.spyOn(adoptionDepartments, "readAdoptionDepartments").mockResolvedValue({
+      ...adoptionDepartmentPage(),
+      value: [], counts: { total: 0, filtered: 0 }, page: { limit: 8, nextCursor: null, previousCursor: null },
+      directory: source("directory"),
+      selection: context("adoption_departments").selection, reports: context("adoption_departments").report,
+    });
+    expect(await request("GET", "/copilot-usage/adoption/departments?company=~string%3AContoso&limit=8")).toMatchObject({ status: 200 });
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "adoption_departments",
+      reportQuery("adoption_departments", { company: "Contoso" }));
+    expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, expect.objectContaining({ endpoint: "adoption_departments",
+      query: expect.objectContaining({ sort: "adoptionRate", order: "desc" }) }), { limit: 8 });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("reads organization metrics separately without allowing department filters or cursors", async () => {
+    const read = vi.spyOn(adoptionDepartments, "readAdoptionSummary").mockResolvedValue(adoptionSummaryPage());
+    expect(await request("GET", "/copilot-usage/adoption/summary?limit=1")).toMatchObject({ status: 200 });
+    expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, expect.objectContaining({ endpoint: "adoption" }));
+    for (const query of ["company=Contoso", "cursor=next", "order=asc"]) {
+      expect(await request("GET", `/copilot-usage/adoption/summary?${query}`)).toMatchObject({ status: 400 });
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("retains normal authentication and rejects unrelated filters", async () => {
+    signedIn = false;
+    expect(await request("GET", "/copilot-usage/adoption/summary")).toMatchObject({ status: 401 });
+    expect(await request("GET", "/copilot-usage/adoption/departments")).toMatchObject({ status: 401 });
+    signedIn = true;
+    expect(await request("GET", "/copilot-usage/adoption/summary?cohort=licensed")).toMatchObject({ status: 400 });
+    expect(await request("GET", "/copilot-usage/adoption/departments?sort=name")).toMatchObject({ status: 400 });
+  });
+});
 
 describe("retained adoption history HTTP contract", () => {
   let read: ReturnType<typeof vi.spyOn<typeof adoptionHistory, "readAdoptionHistory">>;

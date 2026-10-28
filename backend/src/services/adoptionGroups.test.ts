@@ -8,6 +8,7 @@ import { OfficialReportImports } from "../db/officialReportImports.js";
 import { schemaRegistry } from "./officialReportFields.js";
 import { LargeTenantUsersReports, reportQuery } from "./largeTenantUsersReports.js";
 import { readAdoptionGroups } from "./adoptionGroups.js";
+import { readAdoptionDepartments, readAdoptionSummary } from "./adoptionDepartments.js";
 import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
 import type { ReportQuery } from "../types/officialReportData.js";
 import { DataSyncRepository } from "../db/dataSync.js";
@@ -51,8 +52,14 @@ describe("read-only adoption groups", () => {
     return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
   }
   it("rejects the bounded group-row sentinel instead of extracting an unbounded cohort or returning a partial success", async () => {
-    const { read } = await setup(Array.from({ length: 16_385 }, (_, index) => user(index + 1)));
+    const { identity, reader, read } = await setup(Array.from({ length: 16_385 }, (_, index) => user(index + 1)));
     await expect(read()).rejects.toMatchObject({ status: 413, code: "adoption_page_too_large" });
+    const selection = await reader.capture(identity, "delegated", "adoption_departments");
+    const departments = await reader.read(selection.id, identity, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 8 }));
+    expect(departments.value).toMatchObject([{ company: "Contoso", department: "HR", people: 16_385, activePeople: null }]);
+    expect(departments).not.toHaveProperty("organization");
+    expect(departments).not.toHaveProperty("champions");
   }, 60000);
   it("normalizes organization fields, keeps missing departments, and includes users without paid Copilot", async () => {
     const { read } = await setup([user(1), user(2, " contoso ", " hr "), user(3, "Contoso", null)]);
@@ -409,5 +416,85 @@ describe("read-only adoption groups", () => {
     expect(() => reportQuery("adoption", { sort: "responses" })).toThrow("invalid_cursor");
     expect(() => reportQuery("copilot_users", { adoptionChamps: "with" })).toThrow("invalid_cursor");
     expect(() => reportQuery("official_users", { adoptionAgents: "with" })).toThrow("invalid_cursor");
+  });
+
+  it("aggregates department participation with exact matched identities and company-scoped denominators", async () => {
+    const { identity, reader } = await setup([
+      user(1), user(2, " contoso ", " hr "), user(3, "Contoso", "Finance"),
+      user(4, "Fabrikam", "HR"), user(5, null, null),
+    ]);
+    const today = new Date().toISOString().slice(0, 10);
+    await publish(identity, {
+      users: [`user1@example.invalid,User 1,1,0,${today}`, `user3@example.invalid,User 3,1,5,${today}`,
+        `user4@example.invalid,User 4,0,0,${today}`, `unmatched@example.invalid,Unmatched,1,10,${today}`],
+      agents: [`Used,Used,Microsoft,0,0,15,${today}`],
+      userAgents: [`Used,Used,Microsoft,user1@example.invalid,10,${today}`,
+        `Used,Used,Microsoft,user3@example.invalid,5,${today}`],
+    });
+    async function read(company?: string | null) {
+      const selected = await reader.capture(identity, "delegated", "adoption_departments", company === undefined ? {} : { company });
+      return reader.read(selected.id, identity, (client, context) =>
+        readAdoptionDepartments(client, reader, context, { limit: 8 }));
+    }
+    const all = await read();
+    expect(all.counts).toEqual({ total: 4, filtered: 4 });
+    expect(all.value.find(group => group.company === "Contoso" && group.department === "HR")).toMatchObject({ people: 2, activePeople: 1 });
+    expect(all.value.find(group => group.company === "Fabrikam")).toMatchObject({ people: 1, activePeople: 0 });
+    expect(all.value.find(group => group.company === null)).toMatchObject({ department: null, people: 1, activePeople: 0 });
+    const summarySelection = await reader.capture(identity, "delegated", "adoption");
+    const summary = await reader.read(summarySelection.id, identity, (client, context) =>
+      readAdoptionSummary(client, reader, context));
+    expect(summary.value[0].champions).toBe(2);
+    expect(summary.value[0].organization.unresolvedIdentities).toBe(1);
+    expect(summary.page).toEqual({ limit: 1, nextCursor: null, previousCursor: null });
+    const filteredSelection = await reader.capture(identity, "delegated", "adoption", { company: "Contoso" });
+    await expect(reader.read(filteredSelection.id, identity, (client, context) =>
+      readAdoptionSummary(client, reader, context))).rejects.toMatchObject({ code: "invalid_cursor" });
+    const contoso = await read(" contoso ");
+    expect(contoso.counts).toEqual({ total: 4, filtered: 2 });
+    expect(contoso.value.map(group => group.company)).toEqual(["Contoso", "Contoso"]);
+    expect(contoso).not.toHaveProperty("organization");
+    expect((await read(null)).value).toMatchObject([{ company: null, department: null, people: 1, activePeople: 0 }]);
+    expect((await read("missing")).value).toEqual([]);
+  });
+
+  it.each(["asc", "desc"] as const)("pages department summaries %s without losing groups or crossing cursor contracts", async order => {
+    const { identity, reader } = await setup([user(1, "A", "A"), user(2, "A", "B"), user(3, "B", "A")]);
+    const selected = await reader.capture(identity, "delegated", "adoption_departments", { order });
+    const read = (cursor?: string) => reader.read(selected.id, identity, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 1, cursor }));
+    const first = await read(), second = await read(first.page.nextCursor!), third = await read(second.page.nextCursor!);
+    expect(new Set([first, second, third].flatMap(page => page.value.map(group => group.id))).size).toBe(3);
+    expect(third.page.nextCursor).toBeNull();
+    expect((await read(third.page.previousCursor!)).value).toEqual(second.value);
+    expect((await read(second.page.previousCursor!)).value).toEqual(first.value);
+    await expect(reader.read(selected.id, identity, (client, context) =>
+      readAdoptionGroups(client, reader, context, { limit: 1, cursor: first.page.nextCursor! }))).rejects.toThrow("invalid_cursor");
+    expect(first.value[0].activePeople).toBeNull();
+  });
+
+  it.each(["asc", "desc"] as const)("sorts the entire department cohort by exact adoption rate %s before paging", async order => {
+    const groups = [
+      { department: "Zero", people: 2, active: 0 }, { department: "Low", people: 3, active: 1 },
+      { department: "High A", people: 5, active: 4 }, { department: "High B", people: 10, active: 8 },
+      { department: "Full", people: 1, active: 1 },
+    ];
+    let index = 0;
+    const users = groups.flatMap(group => Array.from({ length: group.people }, () => user(++index, "Contoso", group.department)));
+    const { identity, reader } = await setup(users);
+    const today = new Date().toISOString().slice(0, 10);
+    index = 0;
+    await publish(identity, { users: groups.flatMap(group => Array.from({ length: group.people }, (_, offset) =>
+      `user${++index}@example.invalid,User ${index},${offset < group.active ? 1 : 0},${offset < group.active ? 1 : 0},${today}`)),
+    agents: [`Used,Used,Microsoft,0,0,14,${today}`], userAgents: [] });
+    const selected = await reader.capture(identity, "delegated", "adoption_departments", { company: "Contoso", order });
+    const read = (cursor?: string) => reader.read(selected.id, identity, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 2, cursor }));
+    const first = await read(), second = await read(first.page.nextCursor!), third = await read(second.page.nextCursor!);
+    expect([first, second, third].flatMap(page => page.value.map(group => group.department))).toEqual(order === "desc"
+      ? ["Full", "High A", "High B", "Low", "Zero"] : ["Zero", "Low", "High A", "High B", "Full"]);
+    expect((await read(third.page.previousCursor!)).value).toEqual(second.value);
+    expect((await read(second.page.previousCursor!)).value).toEqual(first.value);
+    expect(first.counts.filtered).toBe(5);
   });
 });

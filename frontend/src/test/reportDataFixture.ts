@@ -1,7 +1,7 @@
 import type { CombinedUser, ReportAgent, ReportHistorySet, ReportMetadata, ReportOverviewAgent, ReportPage, ReportSummary, ReportUser } from "../../../backend/src/types/officialReportData";
 import type { UserSourceMetadata } from "../../../backend/src/types/userSources";
 import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
-import type { AdoptionSnapshot } from "../../../backend/src/types/adoptionDashboard";
+import type { AdoptionDepartmentPage, AdoptionSnapshot, AdoptionSummaryPage } from "../../../backend/src/types/adoptionDashboard";
 export const reportSetId = "10000000-0000-4000-8000-000000000001";
 export const selectionId = "20000000-0000-4000-8000-000000000002";
 const capturedAt = Date.now();
@@ -90,6 +90,18 @@ export function adoptionSnapshot(index = 1, overrides: Partial<AdoptionSnapshot>
   return { id: set.id, reportingStart: set.reportingStart, reportingEnd: set.reportingEnd, periodProvenance: "activity_range",
     acceptedAt: set.acceptedAt, activeUsers: 300, activeAgents: 244, responses: 9693,
     userReportActiveUsers: 300, relationshipActiveUsers: 300, userReportResponses: 9697, relationshipResponses: 9693, ...overrides };
+}
+export function adoptionDepartmentPage(overrides: Partial<AdoptionDepartmentPage> = {}): AdoptionDepartmentPage {
+  const page = reportPage([
+    { id: "finance", company: "Contoso", department: "Finance", people: 40, activePeople: 30 },
+    { id: "engineering", company: "Contoso", department: "Engineering", people: 100, activePeople: 50 },
+    { id: "hr", company: "Fabrikam", department: "HR", people: 20, activePeople: 5 },
+  ]);
+  return { ...page, directory: source("directory"), ...overrides };
+}
+export function adoptionSummaryPage(overrides: Partial<AdoptionSummaryPage> = {}): AdoptionSummaryPage {
+  return { ...reportPage([{ organization: summary, champions: 6 }]),
+    page: { limit: 1, nextCursor: null, previousCursor: null }, ...overrides };
 }
 export function overviewAgent(index = 1, overrides: Partial<ReportOverviewAgent> = {}): ReportOverviewAgent {
   return { agentId: `agent-${index}`, agentName: `Agent ${index}`, observationCount: 32, hasResponses: true,

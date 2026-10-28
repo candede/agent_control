@@ -3506,8 +3506,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           && initialAgentReadOwner !== principalKey
           ? <WorkspaceSkeleton view="agents" showSummary={canReadSensitiveUsage} />
         : visibleActiveView === "dashboard" ? <AdoptionDashboard key={`dashboard:${principalKey}`}
-          revision={officialUsageDashboardRevision} baselineId={dashboardRoute.baselineId}
-          onBaselineChange={baselineId => handleDashboardRouteChange({ baselineId })} />
+          revision={officialUsageDashboardRevision} baselineId={dashboardRoute.baselineId} company={dashboardRoute.company}
+          onBaselineChange={baselineId => handleDashboardRouteChange({ ...dashboardRoute, baselineId })}
+          onCompanyChange={company => handleDashboardRouteChange({ ...dashboardRoute, company })} />
         : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>

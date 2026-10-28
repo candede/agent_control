@@ -1,22 +1,25 @@
 import { useId } from "react";
-import { ArrowDownRight, ArrowUpRight, Bot, Minus, Users } from "lucide-react";
+import { ArrowDownRight, ArrowUpRight, Bot, ChartNoAxesCombined, Minus, Sparkles, Users } from "lucide-react";
 import type { AdoptionSnapshot } from "../../../backend/src/types/adoptionDashboard";
 import { adoptionChange, adoptionDirection, adoptionSnapshotLabel, orderedAdoptionSnapshots, type AdoptionMetric } from "../adoptionTrends";
 import { useAdoptionHistory } from "../useAdoptionHistory";
 import { isValidUsageCount, usageCount, usageDate, usageDateRange } from "../usageInsights";
 import { ReportReadStatus } from "./ReportPageControls";
+import { DashboardInsights, DashboardPanelHeading } from "./DashboardInsights";
 import "./adoptionDashboard.css";
 
-export function AdoptionDashboard({ revision, baselineId, onBaselineChange }: {
+export function AdoptionDashboard({ revision, baselineId, onBaselineChange, company, onCompanyChange }: {
   revision: number; baselineId?: string; onBaselineChange: (id: string) => void;
+  company?: string | null; onCompanyChange: (company: string | null | undefined) => void;
 }) {
   const history = useAdoptionHistory(revision);
   const snapshots = history.snapshots;
   return <section className="adoption-dashboard" aria-labelledby="adoption-dashboard-title">
     <header className="dashboard-header">
-      <div><p className="eyebrow">Dashboard</p><h2 id="adoption-dashboard-title">Adoption trends</h2>
-        <p>Where agent adoption started, where it is now, and its recent direction.</p></div>
-      <a className="secondary dashboard-link" href="/sync?reports=manage">Saved reports</a>
+      <div><p className="eyebrow"><Sparkles size={15} aria-hidden="true" /> Adoption insights</p>
+        <h2 id="adoption-dashboard-title">Understand adoption. Empower your people.</h2>
+        <p>See who is getting involved, where to focus, and who is leading the way.</p></div>
+      <a className="secondary dashboard-link" href="/sync?reports=manage">View saved reports</a>
     </header>
     <ReportReadStatus read={history.read} />
     {!snapshots && !history.read.error && !history.read.leaseEnded ? <p role="status">
@@ -26,12 +29,14 @@ export function AdoptionDashboard({ revision, baselineId, onBaselineChange }: {
       <h3>No saved usage reports yet</h3><p>Import the three companion Microsoft 365 CSV reports in Sync.
         Each retained report adds an observation to this long-term view. Automatic inventory sync remains independent.</p>
       <a href="/sync">Open Sync</a>
-    </div> : snapshots ? <DashboardResults snapshots={snapshots} baselineId={baselineId} onBaselineChange={onBaselineChange} /> : null}
+    </div> : snapshots ? <DashboardResults snapshots={snapshots} baselineId={baselineId} onBaselineChange={onBaselineChange}
+      revision={revision} company={company} onCompanyChange={onCompanyChange} /> : null}
   </section>;
 }
 
-function DashboardResults({ snapshots, baselineId, onBaselineChange }: {
+function DashboardResults({ snapshots, baselineId, onBaselineChange, revision, company, onCompanyChange }: {
   snapshots: AdoptionSnapshot[]; baselineId?: string; onBaselineChange: (id: string) => void;
+  revision: number; company?: string | null; onCompanyChange: (company: string | null | undefined) => void;
 }) {
   const baselineInput = useId();
   const ordered = orderedAdoptionSnapshots(snapshots);
@@ -42,7 +47,6 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange }: {
   const baseline = baselines.find(snapshot => snapshot.id === baselineId) ?? dated[0];
   const visible = baseline ? dated.slice(dated.indexOf(baseline)) : [];
   const missingBaseline = Boolean(baselineId && !baselines.some(snapshot => snapshot.id === baselineId));
-  const unverified = dated.some(snapshot => snapshot.periodProvenance === "activity_range");
   return <>
     <div className="dashboard-context">
       <div><strong>{usageCount(snapshots.length)} saved report snapshots</strong>
@@ -58,32 +62,32 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange }: {
     </div>
     {missingBaseline ? <p className="dashboard-notice" role="status">The bookmarked baseline is not available as a dated retained report.
       Showing the earliest dated report instead.</p> : null}
-    <p className="dashboard-notice">{unverified
-      ? "Snapshot comparison: observed activity dates are not verified reporting windows. Changes describe saved reports, not a daily or monthly growth rate."
-      : "Counts describe each report's stated window. Overlapping periods are compared, never added."}
-      {" "}Report source refresh times are not established by import dates.</p>
-    {latest ? <>
-      <div className="dashboard-headlines">
-        <AdoptionMetricCard label="Active users" metric="activeUsers" latest={latest} baseline={baseline} previous={previous} />
-        <AdoptionMetricCard label="Active agents" metric="activeAgents" latest={latest} baseline={baseline} previous={previous} />
-      </div>
-      <section className="dashboard-direction" aria-labelledby="dashboard-direction-title">
-        <h3 id="dashboard-direction-title">Recent direction</h3>
-        <p><strong>Users:</strong> {adoptionDirection(previous, latest, "activeUsers")}.
-          {" "}<strong>Agents:</strong> {adoptionDirection(previous, latest, "activeAgents")}.</p>
-        <small>Observed report-to-report movement, not a forecast. A single report establishes a baseline, not a trend.</small>
+    <div className="dashboard-overview-grid">
+      <section className="dashboard-panel dashboard-panel-blue" aria-labelledby="dashboard-trends-title">
+        <DashboardPanelHeading id="dashboard-trends-title" icon={ChartNoAxesCombined} title="Adoption over time"
+          description="How agent usage is changing across saved reports." />
+        {latest ? <>
+          <div className="dashboard-trend-tiles">
+            {(["activeUsers", "activeAgents"] as const).map(metric => {
+              const label = metric === "activeUsers" ? "Active users" : "Active agents";
+              return <div key={metric} className={`dashboard-trend-tile dashboard-trend-${metric}`}>
+                <AdoptionMetricCard label={label} metric={metric} latest={latest} baseline={baseline} previous={previous} />
+                <AdoptionChart snapshots={visible} metric={metric} label={label} />
+              </div>;
+            })}
+          </div>
+          <div className="dashboard-direction">
+            <h4>Recent direction</h4>
+            <p><strong>Users:</strong> {adoptionDirection(previous, latest, "activeUsers")}.
+              {" "}<strong>Agents:</strong> {adoptionDirection(previous, latest, "activeAgents")}.</p>
+            <small>Report-to-report movement, not a forecast.</small>
+          </div>
+        </> : <p className="dashboard-notice">Saved counts are available below, but dates are missing.
+          Import order is not usage chronology, so no direction or latest-activity claim is shown.</p>}
       </section>
-      <div className="dashboard-charts">
-        <AdoptionChart snapshots={visible} metric="activeUsers" label="Active users" />
-        <AdoptionChart snapshots={visible} metric="activeAgents" label="Active agents" />
-      </div>
-      <section className="dashboard-volume" aria-label="Supporting response volume">
-        <div><span>Agent responses in latest report</span><strong>{usageCount(latest.responses)}</strong></div>
-        <p>{adoptionChange(baseline?.id === latest.id ? undefined : baseline, latest, "responses").label} versus baseline.
-          {" "}Agents export only; response volume supports, but does not replace, adoption counts.</p>
-      </section>
-    </> : <p className="dashboard-notice">Saved counts are available below, but dates are missing.
-      Import order is not usage chronology, so no direction or latest-activity claim is shown.</p>}
+      <DashboardInsights key={latest?.id ?? undated.at(-1)!.id} snapshot={latest ?? undated.at(-1)!}
+        baseline={baseline} revision={revision} company={company} onCompanyChange={onCompanyChange} />
+    </div>
     <SnapshotTable snapshots={[...visible].reverse()} heading="Report snapshots and comparisons" />
     {undated.length ? <SnapshotTable snapshots={undated} heading="Reports without activity dates" /> : null}
     <details className="dashboard-definitions">
@@ -99,6 +103,10 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange }: {
           Missing reports are gaps, not zero use. Counts across overlapping snapshots must not be summed.</li>
         <li><strong>Creation is separate:</strong> an agent's creation or publication date is not evidence that anyone used it.
           Historical license and inventory denominators are not inferred from today's inventory.</li>
+        <li><strong>Departments:</strong> active, unambiguously matched people divided by saved directory members in each
+          company / department. This is not a workforce census or historical membership. Unmatched report identities are excluded.</li>
+        <li><strong>Copilot champions:</strong> up to three people per company / department, ranked by reported responses,
+          then agents used. These are usage-based suggestions, not assigned roles or measures of productivity.</li>
       </ul>
     </details>
   </>;
@@ -125,14 +133,14 @@ function AdoptionChart({ snapshots, metric, label }: { snapshots: AdoptionSnapsh
   const title = useId(), caption = useId();
   const maximum = Math.max(1, ...snapshots.map(snapshot => isValidUsageCount(snapshot[metric]) ? snapshot[metric] : 0));
   const first = Date.parse(snapshots[0].reportingEnd!), last = Date.parse(snapshots.at(-1)!.reportingEnd!);
-  const x = (snapshot: AdoptionSnapshot) => first === last ? 340 : 64 + (Date.parse(snapshot.reportingEnd!) - first) / (last - first) * 548;
-  const y = (snapshot: AdoptionSnapshot) => 184 - (isValidUsageCount(snapshot[metric]) ? snapshot[metric] : 0) / maximum * 146;
+  const x = (snapshot: AdoptionSnapshot) => first === last ? 190 : 44 + (Date.parse(snapshot.reportingEnd!) - first) / (last - first) * 292;
+  const y = (snapshot: AdoptionSnapshot) => 154 - (isValidUsageCount(snapshot[metric]) ? snapshot[metric] : 0) / maximum * 118;
   return <section className="dashboard-chart" aria-labelledby={title}>
     <h3 id={title}>{label} over saved reports</h3>
-    <svg viewBox="0 0 660 236" role="img" aria-labelledby={title} aria-describedby={caption}>
+    <svg viewBox="0 0 360 210" role="img" aria-labelledby={title} aria-describedby={caption}>
       {[0, 0.5, 1].map(fraction => <g key={fraction}>
-        <line x1="64" x2="612" y1={184 - fraction * 146} y2={184 - fraction * 146} className="dashboard-grid" />
-        <text x="54" y={188 - fraction * 146} textAnchor="end">{(maximum * fraction).toLocaleString(undefined, { maximumFractionDigits: 1, notation: "compact" })}</text>
+        <line x1="44" x2="336" y1={154 - fraction * 118} y2={154 - fraction * 118} className="dashboard-grid" />
+        <text x="36" y={158 - fraction * 118} textAnchor="end">{(maximum * fraction).toLocaleString(undefined, { maximumFractionDigits: 1, notation: "compact" })}</text>
       </g>)}
       {snapshots.map((snapshot, index) => {
         const previous = snapshots[index - 1];
@@ -145,9 +153,9 @@ function AdoptionChart({ snapshots, metric, label }: { snapshots: AdoptionSnapsh
           </circle> : null}
         </g>;
       })}
-      <text x="64" y="208">{usageDate(snapshots[0].reportingEnd)}</text>
-      {first !== last ? <text x="612" y="208" textAnchor="end">{usageDate(snapshots.at(-1)!.reportingEnd)}</text> : null}
-      <text x="338" y="230" textAnchor="middle">Report end / latest observed activity (UTC)</text>
+      <text x="44" y="178">{usageDate(snapshots[0].reportingEnd)}</text>
+      {first !== last ? <text x="336" y="178" textAnchor="end">{usageDate(snapshots.at(-1)!.reportingEnd)}</text> : null}
+      <text x="190" y="203" textAnchor="middle">Report observations (UTC)</text>
     </svg>
     <p id={caption}>One point per saved report, from the selected baseline. {snapshots.length === 1 ? "One observation is not a trend. " : ""}
       No daily values or missing periods are estimated. Exact counts appear below.</p>

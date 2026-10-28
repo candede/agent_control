@@ -79,6 +79,14 @@ describe("workbench routing", () => {
     expect(dashboardRouteSearch({ baselineId: "invalid" }).toString()).toBe("");
   });
 
+  it("round trips dashboard company filters including explicit missing companies", () => {
+    for (const company of ["Contoso & Partners", null]) {
+      const state = { baselineId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", company };
+      expect(parseDashboardRoute(`?${dashboardRouteSearch(state)}`)).toEqual(state);
+    }
+    expect(parseDashboardRoute("?company=~string:Contoso").company).toBe("Contoso");
+  });
+
   it("does not recognize an unregistered path", () => {
     const path = "/not-a-current-page";
     expect(isWorkbenchPath(path)).toBe(false);

@@ -14,7 +14,7 @@ export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaul
 
 export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions";
 
-export type DashboardRouteState = { baselineId?: string };
+export type DashboardRouteState = { baselineId?: string; company?: string | null };
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
@@ -125,13 +125,16 @@ export function workbenchUrl(
 }
 
 export function parseDashboardRoute(search: string): DashboardRouteState {
-  const baseline = routeParams(search).get("baseline");
-  return { baselineId: isGraphGuid(baseline) ? baseline!.toLowerCase() : undefined };
+  const params = routeParams(search), baseline = params.get("baseline");
+  const company = routeFacet(params, "company", 256);
+  return { baselineId: isGraphGuid(baseline) ? baseline!.toLowerCase() : undefined,
+    ...(company !== undefined ? { company } : {}) };
 }
 
 export function dashboardRouteSearch(state: DashboardRouteState): URLSearchParams {
   const params = new URLSearchParams();
   if (isGraphGuid(state.baselineId)) params.set("baseline", state.baselineId!.toLowerCase());
+  if (state.company !== undefined) params.set("company", encodeInventoryFacet(state.company));
   return params;
 }
 

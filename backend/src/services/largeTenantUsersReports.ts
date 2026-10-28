@@ -25,6 +25,7 @@ export const reportQueryFields = ["setId", "scope", "search", "company", "depart
   "lowResponseThreshold", "inactiveDays", "activityWindowDays", "adoptionChamps", "adoptionAgents", "sort", "order"] as const;
 const sorts = {
   adoption: ["name"],
+  adoption_departments: ["adoptionRate"],
   adoption_history: [],
   copilot_users: ["name", "upn", "company", "department", "service", "appActivity", "responses", "agentsUsed", "lastActivity"],
   official_users: ["name", "responses", "agentsUsed", "lastActivity"],
@@ -70,15 +71,16 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
     query[key] ??= fallback;
   }
   if (query.sort !== undefined && !(sorts[endpoint] as readonly string[]).includes(query.sort)) throw new SelectionError("invalid_cursor");
-  query.sort ??= endpoint === "history" ? "reportingPeriod" : endpoint === "official_agents" ? "responses" : "name";
-  query.order ??= endpoint === "history" || endpoint === "official_agents" ? "desc" : "asc";
+  query.sort ??= endpoint === "history" ? "reportingPeriod" : endpoint === "official_agents" ? "responses"
+    : endpoint === "adoption_departments" ? "adoptionRate" : "name";
+  query.order ??= ["history", "official_agents", "adoption_departments"].includes(endpoint) ? "desc" : "asc";
   if (query.search !== undefined) query.search = reportSearch(query.search);
   // A accepted filter must be meaningful on the chosen endpoint, never ignored.
   const organization = ["company", "department", "entitlement", "serviceState", "appActivity", "cohort", "licenseCohort"];
   if (endpoint !== "adoption" && ("adoptionChamps" in input || "adoptionAgents" in input)) throw new SelectionError("invalid_cursor");
-  if (endpoint === "adoption" && ["entitlement", "serviceState", "appActivity", "cohort", "licenseCohort", "creatorType",
+  if (["adoption", "adoption_departments"].includes(endpoint) && ["entitlement", "serviceState", "appActivity", "cohort", "licenseCohort", "creatorType",
     "agentId", "username", "responsesOnly", "reportActivity", "startDate", "endDate"].some(key => key in input)) throw new SelectionError("invalid_cursor");
-  if (!["copilot_users", "official_users", "adoption"].includes(endpoint) && organization.some(key => key in input)
+  if (!["copilot_users", "official_users", "adoption", "adoption_departments"].includes(endpoint) && organization.some(key => key in input)
     || endpoint === "official_users" && ("appActivity" in input || ["licensed", "using_agents", "no_agent_activity", "needs_attention", "unknown_metrics"].includes(input.cohort ?? ""))
     || endpoint !== "overview" && "scope" in input
     || ["history", "overview", "unresolved", "plans", "observations"].includes(endpoint) && ["creatorType", "agentId", "username", "responsesOnly", "reportActivity"].some(key => key in input)) throw new SelectionError("invalid_cursor");
@@ -799,6 +801,7 @@ export function reportSearchSql(expression: string) {
   return `normalize(lower(normalize(${expression},NFKC) COLLATE "default"),NFKC)`;
 }
 function sortKey(sort: NonNullable<ReportQuery["sort"]>, endpoint: ReportEndpoint) {
+  if (sort === "adoptionRate") throw new SelectionError("invalid_cursor");
   const keys = { name: 'lower(normalize(name,NFKC) COLLATE "default")', upn: "upn_key", company: 'lower(normalize(company,NFKC) COLLATE "default")',
     department: 'lower(normalize(department,NFKC) COLLATE "default")', service: "service_state", appActivity: "last_activity_date::text",
     responses: "lpad(responses::text,16,'0')", agentsUsed: "lpad(agents_used::text,16,'0')",

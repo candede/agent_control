@@ -1,7 +1,7 @@
 import type { OfficialUsageAvailability, OfficialUsageReportKind, OfficialUsageReportBase } from "./officialReportRecords.js";
 import type { UserSourceFacts, UserSourceFilter, UserSourceMetadata, UserSourcePage, UserSourcePlan } from "./userSources.js";
 
-export type ReportEndpoint = "copilot_users" | "adoption" | "adoption_history" | "official_agents" | "official_users" | "relationships" | "history" | "overview" | "unresolved" | "plans" | "observations";
+export type ReportEndpoint = "copilot_users" | "adoption" | "adoption_departments" | "adoption_history" | "official_agents" | "official_users" | "relationships" | "history" | "overview" | "unresolved" | "plans" | "observations";
 export type ReportQuery = {
   setId?: string; scope?: "history" | "selected"; search?: string;
   company?: string | null; department?: string | null;
@@ -13,7 +13,7 @@ export type ReportQuery = {
   licenseCohort?: "active_without_paid"; creatorType?: string; agentId?: string; username?: string;
   responsesOnly?: boolean; startDate?: string; endDate?: string;
   lowResponseThreshold?: number; inactiveDays?: number; activityWindowDays?: number;
-  sort?: "name" | "upn" | "company" | "department" | "service" | "appActivity" | "responses" | "agentsUsed" | "lastActivity" | "creatorType" | "activeUsers" | "licensedUsers" | "unlicensedUsers" | "acceptedAt" | "reportingPeriod";
+  sort?: "name" | "upn" | "company" | "department" | "service" | "appActivity" | "responses" | "agentsUsed" | "lastActivity" | "creatorType" | "activeUsers" | "licensedUsers" | "unlicensedUsers" | "acceptedAt" | "reportingPeriod" | "adoptionRate";
   order?: "asc" | "desc";
 };
 export type ReportMetadata = {

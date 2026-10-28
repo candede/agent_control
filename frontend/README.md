@@ -39,6 +39,29 @@ does not establish live browser or provider behavior.
 
 ## Main user flows
 
+- **Dashboard**: compare retained report observations and explore colorful
+  department, engagement, and agent panels. The company dropdown filters only
+  department participation; the six overview cards remain organization-wide.
+  The department header contains the company selector; its menu matches the
+  control width and wraps long company names. Type a prefix to find a company
+  or repeat its first letter to cycle matches; closing the menu clears the
+  typed prefix. Department participation is
+  sortable by percentage, highest first by default, across the full filtered
+  cohort before pagination. Organization metrics have their own unpaged read;
+  navigating departments neither reloads nor clears people/champion totals.
+  The current validated department page and paging controls remain visible and
+  marked busy while a new page loads. Read errors and invalidations still
+  withdraw unusable evidence rather than displaying stale success.
+  Baseline and company selections survive reloads and browser back/forward.
+  Department links open the existing Adoption view with the exact company,
+  department, and report. Department summaries are server-aggregated and paged,
+  without loading member lists. Percentages divide positively active,
+  unambiguously matched people by saved directory members, not a workforce census.
+  Missing evidence shows **Unknown**, not zero. Paid-user and attention metrics
+  reuse the existing user-source definitions; entitlement/app observations are
+  not historical license evidence. Champions are up to three usage-based
+  suggestions per company / department, not assigned roles. All panels use saved
+  data and require no extra provider calls, approvals, or synchronization steps.
 - **Agents**: browse inventory, inspect details and usage, manage package access,
   and review activity.
 - **Users**: review licenses, activity, and agent relationships.
@@ -220,6 +243,9 @@ affected evidence.
 If a failed page's selection expires, its error remains visible and recovery
 restarts the selection (or its parent) instead of retrying expired evidence.
 Expiry notices describe previously loaded data only when that data is displayed.
+Facet option failures follow the same rule: an expired retry renews the parent
+selection, even before an expiry timer runs. Routine facet expiry is not a source
+rejection and does not invalidate the parent's previously loaded data.
 
 ## Frontend structure
 

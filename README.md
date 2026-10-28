@@ -66,8 +66,11 @@ from **Sync > Add CSV reports**. See the
 [usage import guide](docs/official-usage-import.md).
 
 **Dashboard** compares active users and active agents across retained reports,
-with a selectable baseline and recent report-to-report direction. It does not
-estimate daily activity or treat import dates as usage dates.
+with a selectable baseline and recent report-to-report direction. Company-filtered
+department participation, people and engagement, and agents and champions panels
+show where to focus support. Department percentages use saved directory members,
+not a full workforce census. It does not estimate daily activity or treat import
+dates as usage dates.
 
 ## Common commands
 

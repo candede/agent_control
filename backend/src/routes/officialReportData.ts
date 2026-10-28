@@ -19,6 +19,7 @@ import { abortableRead, createExportPublicationValidator } from "../services/csv
 import { operationalLog } from "../services/telemetry.js";
 import { readAdoptionGroups } from "../services/adoptionGroups.js";
 import { readAdoptionHistory } from "../services/adoptionHistory.js";
+import { readAdoptionDepartments, readAdoptionSummary } from "../services/adoptionDepartments.js";
 import { SavedReadContracts } from "../services/savedReadContracts.js";
 import type { AgentRelationship } from "../types/savedReadContracts.js";
 
@@ -172,6 +173,19 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     const context = await selected(request, "adoption", false, false, false, false, ["anchor", "pageNumber"]);
     response.json(await reports.read(context.id, context.identity, (client, read) =>
       readAdoptionGroups(client, reports, read, { ...pageOptions(request.query), anchor, pageNumber })));
+  }));
+  route("get", "/copilot-usage/adoption/summary", "read", failSafe(async (request, response) => {
+    if (Object.keys(request.query).some(key => !["selectionId", "setId", "limit"].includes(key))) {
+      throw new AppError(400, "invalid_usage_query", "Organization adoption summaries are unfiltered and not pageable.");
+    }
+    const context = await selected(request, "adoption");
+    response.json(await reports.read(context.id, context.identity, (client, read) =>
+      readAdoptionSummary(client, reports, read)));
+  }));
+  route("get", "/copilot-usage/adoption/departments", "read", failSafe(async (request, response) => {
+    const context = await selected(request, "adoption_departments");
+    response.json(await reports.read(context.id, context.identity, (client, read) =>
+      readAdoptionDepartments(client, reports, read, pageOptions(request.query))));
   }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));

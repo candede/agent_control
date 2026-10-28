@@ -6,7 +6,8 @@ import * as api from "../api/reportData";
 import { CapabilityContext, type useCapabilityContext } from "../capabilityContext";
 import { createSavedQueryClient } from "../savedQueries";
 import { deferred } from "../test/deferred";
-import { combinedUser, reportPage, reportUser, selectionId } from "../test/reportDataFixture";
+import { combinedUser, reportPage, reportSelection, reportUser, selectionId } from "../test/reportDataFixture";
+import { useReportPage } from "../useReportPage";
 import { CopilotUsersView } from "./CopilotUsersView";
 import { ReportFacet } from "./ReportFacet";
 
@@ -38,6 +39,7 @@ it("keeps compact option search visible across loading, short pages and empty re
   vi.mocked(api.readReportFacet).mockReturnValueOnce(pending.promise).mockResolvedValue({
     ...facetPage([]), counts: { total: 1, filtered: 0 },
   });
+
   render(<ReportFacet compact alwaysShowSearch path="copilot-usage/adoption" selectionId={selectionId}
     field="company" onChange={vi.fn()} onRestartSelection={vi.fn()} />);
   const search = screen.getByRole("searchbox", { name: "Search company options" });
@@ -51,6 +53,240 @@ it("keeps compact option search visible across loading, short pages and empty re
   expect(screen.getByText("No company options match this search.")).toHaveClass("sr-only");
   expect(screen.getByRole("searchbox")).toBe(search);
   expect(search).toBeVisible();
+});
+
+it("supports keyboard selection and Escape in a matched-width company dropdown", async () => {
+  vi.mocked(api.readReportFacet).mockResolvedValue(facetPage(["Contoso", "Fabrikam with a long company name"]));
+  const onChange = vi.fn();
+  render(<ReportFacet compact dropdown path="copilot-usage/adoption" selectionId={selectionId}
+    field="company" onChange={onChange} onRestartSelection={vi.fn()} />);
+  const control = screen.getByRole("combobox", { name: "Company" });
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+  control.focus();
+  fireEvent.keyDown(control, { key: "ArrowDown" });
+  expect(screen.getByRole("listbox", { name: "Company options" })).toBeVisible();
+  fireEvent.keyDown(control, { key: "End" });
+  fireEvent.keyDown(control, { key: "Enter" });
+  expect(onChange).toHaveBeenCalledWith("Fabrikam with a long company name");
+  expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  expect(control).toHaveFocus();
+  fireEvent.click(control);
+  fireEvent.keyDown(control, { key: "Escape" });
+  expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+});
+
+it("decodes the stable typeahead match and repeated-initial choices in the company dropdown", async () => {
+  vi.spyOn(performance, "now").mockReturnValue(1000);
+  vi.mocked(api.readReportFacet).mockResolvedValue(facetPage(["Contoso", "Contoso Holdings", "Copper"]));
+  const onChange = vi.fn();
+  render(<ReportFacet compact dropdown path="copilot-usage/adoption" selectionId={selectionId}
+    field="company" onChange={onChange} onRestartSelection={vi.fn()} />);
+  const control = screen.getByRole("combobox", { name: "Company" });
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+  fireEvent.keyDown(control, { key: "c" });
+  fireEvent.keyDown(control, { key: "o" });
+  expect(onChange).not.toHaveBeenCalled();
+  fireEvent.keyDown(control, { key: "Enter" });
+  expect(onChange).toHaveBeenNthCalledWith(1, "Contoso");
+  fireEvent.keyDown(control, { key: "c" });
+  fireEvent.keyDown(control, { key: "c" });
+  fireEvent.keyDown(control, { key: "Enter" });
+  expect(onChange).toHaveBeenNthCalledWith(2, "Contoso Holdings");
+  expect(onChange).toHaveBeenCalledTimes(2);
+});
+
+it("pages dropdown options without changing the filter or losing focus while loading", async () => {
+  const pending = deferred<FacetPage>(), onChange = vi.fn();
+  vi.mocked(api.readReportFacet).mockResolvedValueOnce(facetPage(["Contoso"], { nextCursor: "next" }))
+    .mockReturnValueOnce(pending.promise);
+  render(<ReportFacet compact dropdown path="copilot-usage/adoption" selectionId={selectionId}
+    field="company" onChange={onChange} onRestartSelection={vi.fn()} />);
+  const control = screen.getByRole("combobox", { name: "Company" });
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+  control.focus();
+  fireEvent.keyDown(control, { key: "End" });
+  fireEvent.keyDown(control, { key: "Enter" });
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "true"));
+  expect(api.readReportFacet).toHaveBeenLastCalledWith("copilot-usage/adoption", selectionId, "company",
+    expect.objectContaining({ cursor: "next" }));
+  expect(control).toHaveFocus();
+  expect(control).not.toBeDisabled();
+  fireEvent.click(control);
+  fireEvent.keyDown(control, { key: "Enter" });
+  expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  expect(api.readReportFacet).toHaveBeenCalledTimes(2);
+  expect(onChange).not.toHaveBeenCalled();
+  await act(async () => pending.resolve(facetPage(["Last"], { previousCursor: "previous" })));
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+  fireEvent.click(control);
+  expect(screen.queryByRole("option", { name: "Contoso" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("option", { name: "Last" }));
+  expect(onChange).toHaveBeenCalledExactlyOnceWith("Last");
+  expect(control).toHaveFocus();
+});
+
+it.each(["revalidation", "rejection"] as const)("rejects a dropdown choice before cache %s reaches React", async boundary => {
+  const client = createSavedQueryClient(), pending = deferred<FacetPage>(), onChange = vi.fn();
+  const view = render(<QueryClientProvider client={client}>
+    <ReportFacet compact dropdown path="copilot-usage/adoption" selectionId={selectionId}
+      field="company" onChange={onChange} onRestartSelection={vi.fn()} />
+  </QueryClientProvider>);
+  const control = screen.getByRole("combobox", { name: "Company" });
+  await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+  fireEvent.click(control);
+  const option = screen.getByRole("option", { name: "Contoso" });
+  vi.mocked(api.readReportFacet).mockReturnValue(pending.promise);
+  act(() => {
+    if (boundary === "revalidation") void client.invalidateQueries({ queryKey: ["saved", "report-facet"] });
+    else {
+      const query = client.getQueryCache().find({ queryKey: ["saved", "report-facet"], exact: false })!;
+      query.setState({ error: new ApiError(409, "selection_invalidated", "Selection retired"), status: "error" });
+    }
+    fireEvent.click(option);
+  });
+  expect(onChange).not.toHaveBeenCalled();
+  if (boundary === "revalidation") {
+    await act(async () => pending.resolve(facetPage(["Current"])));
+    await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+    fireEvent.click(control);
+    expect(screen.getByRole("option", { name: "Current" })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "Contoso" })).not.toBeInTheDocument();
+  } else {
+    await screen.findByRole("button", { name: "Restart selection" });
+    expect(control).toHaveAttribute("aria-disabled", "true");
+  }
+  view.unmount();
+  client.clear();
+});
+
+describe.each([
+  ["expanded select", false, false],
+  ["compact select", true, false],
+  ["compact dropdown", true, true],
+] as const)("%s expiry recovery", (_mode, compact, dropdown) => {
+  it.each(["timer", "retry"] as const)("preserves read failures and restarts expired evidence at a %s boundary", async boundary => {
+    vi.useFakeTimers();
+    const saved = facetPage(["Contoso"]), client = createSavedQueryClient();
+    saved.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    const onChange = vi.fn(), onRestartSelection = vi.fn(), onSelectionInvalidated = vi.fn();
+    vi.mocked(api.readReportFacet).mockResolvedValueOnce(saved)
+      .mockRejectedValue(new ApiError(503, "read_failed", "Options unavailable"));
+    const view = render(<QueryClientProvider client={client}>
+      <ReportFacet compact={compact} dropdown={dropdown} path="copilot-usage/adoption" selectionId={selectionId}
+        field="company" onChange={onChange} onRestartSelection={onRestartSelection} onSelectionInvalidated={onSelectionInvalidated} />
+    </QueryClientProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByRole("combobox")).toHaveAttribute("aria-disabled", "false");
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["saved", "report-facet"] });
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Options unavailable");
+    expect(onRestartSelection).not.toHaveBeenCalled();
+    if (boundary === "timer") {
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      expect(screen.getByRole("alert")).toHaveTextContent("Options unavailable");
+      expect(screen.queryByText("Refreshing saved options...")).not.toBeInTheDocument();
+      expect(onRestartSelection).not.toHaveBeenCalled();
+    } else {
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 1001);
+    }
+    fireEvent.click(screen.getByRole("button", { name: boundary === "timer" ? "Restart selection" : "Retry options" }));
+    expect(onRestartSelection).toHaveBeenCalledOnce();
+    expect(api.readReportFacet).toHaveBeenCalledTimes(2);
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onSelectionInvalidated).not.toHaveBeenCalled();
+    view.unmount();
+    client.clear();
+  });
+
+  it.each(["choice", "page", "search", "retry"] as const)("renews cache expiry before a %s reaches React without rejecting the selection", async action => {
+    const client = createSavedQueryClient(), onChange = vi.fn(), onRestartSelection = vi.fn(), onSelectionInvalidated = vi.fn();
+    if (action === "retry") vi.mocked(api.readReportFacet).mockRejectedValueOnce(new Error("Options unavailable"));
+    const view = render(<QueryClientProvider client={client}>
+      <ReportFacet compact={compact} dropdown={dropdown} path="copilot-usage/adoption" selectionId={selectionId}
+        field="company" value="Contoso" onChange={onChange} onRestartSelection={onRestartSelection} onSelectionInvalidated={onSelectionInvalidated} />
+    </QueryClientProvider>);
+    const control = screen.getByRole("combobox");
+    if (action === "retry") await screen.findByRole("button", { name: "Retry options" });
+    else await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+    if (dropdown && (action === "choice" || action === "page")) fireEvent.click(control);
+    act(() => {
+      const query = client.getQueryCache().find({ queryKey: ["saved", "report-facet"], exact: false })!;
+      query.setState({ status: "error", error: new ApiError(409, "selection_invalidated", "Selection expired",
+        { details: { reason: "expired" } }) });
+      if (action === "retry") fireEvent.click(screen.getByRole("button", { name: "Retry options" }));
+      else if (action === "search") fireEvent.change(screen.getByRole("searchbox"), { target: { value: "New search" } });
+      else if (dropdown) fireEvent.click(screen.getByRole("option", { name: action === "choice" ? "Contoso" : "More options..." }));
+      else if (action === "choice") fireEvent.change(control, { target: { value: "~string:Contoso" } });
+      else if (compact) fireEvent.change(control, { target: { value: "next-options" } });
+      else fireEvent.click(screen.getByRole("button", { name: "Next company options" }));
+    });
+    await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "true"));
+    expect(onSelectionInvalidated).not.toHaveBeenCalled();
+    expect(onRestartSelection).toHaveBeenCalledOnce();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(api.readReportFacet).toHaveBeenCalledOnce();
+    view.unmount();
+    client.clear();
+  });
+
+  it.each(["failed retry", "server expiry"] as const)("adopts the parent replacement after %s while preserving the option search", async boundary => {
+    const client = createSavedQueryClient(), onChange = vi.fn(), pending = deferred<ReturnType<typeof reportPage>>();
+    const initial = reportPage([combinedUser(1)]), replacement = reportPage([combinedUser(1)], { selection: reportSelection(3) });
+    const options = facetPage(["Contoso"], { nextCursor: "next" });
+    options.selection.expiresAt = new Date(Date.now() + 20_000).toISOString();
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.readReportFacet).mockImplementation(async (_path, id) => ({
+      ...options, value: [{ value: id === selectionId ? "Contoso" : "Fabrikam", count: 10 }],
+      selection: { ...options.selection, id },
+    }));
+    function ParentFacet() {
+      const read = useReportPage("copilot-usage/users");
+      return <ReportFacet compact={compact} dropdown={dropdown} path="copilot-usage/users" selectionId={read.selectedData?.selection.id}
+        field="company" value="Contoso" onChange={onChange} onRestartSelection={read.restart} onSelectionInvalidated={read.invalidateSelection} />;
+    }
+    const view = render(<QueryClientProvider client={client}><ParentFacet /></QueryClientProvider>);
+    const control = screen.getByRole("combobox");
+    await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: " Contoso " } });
+    await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+    if (boundary === "failed retry") {
+      vi.mocked(api.readReportFacet).mockRejectedValueOnce(new Error("Options unavailable"));
+      await act(async () => { await client.invalidateQueries({ queryKey: ["saved", "report-facet"] }); });
+      const retry = await screen.findByRole("button", { name: "Retry options" });
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 20_001);
+      fireEvent.click(retry);
+    } else {
+      act(() => {
+        const query = client.getQueryCache().getAll().find(query => query.queryKey[1] === "report-facet" && query.getObserversCount())!;
+        query.setState({ status: "error", error: new ApiError(409, "selection_invalidated", "Selection expired",
+          { details: { reason: "expired" } }) });
+        fireEvent.change(screen.getByRole("searchbox"), { target: { value: " Fabrikam " } });
+      });
+    }
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const search = boundary === "failed retry" ? " Contoso " : " Fabrikam ";
+    expect(screen.getByRole("searchbox")).toHaveValue(search);
+    expect(api.readReportFacet).toHaveBeenCalledTimes(boundary === "failed retry" ? 3 : 2);
+    expect(onChange).not.toHaveBeenCalled();
+    await act(async () => pending.resolve(replacement));
+    await waitFor(() => expect(control).toHaveAttribute("aria-disabled", "false"));
+    expect(screen.getByRole("searchbox")).toHaveValue(search);
+    expect(api.readReportFacet).toHaveBeenLastCalledWith("copilot-usage/users", replacement.selection.id, "company",
+      expect.objectContaining({ search: search.trim().toLowerCase(), cursor: undefined }));
+    if (dropdown) {
+      expect(control).toHaveTextContent("Contoso");
+      fireEvent.click(control);
+      fireEvent.click(screen.getByRole("option", { name: "Fabrikam" }));
+    } else {
+      expect(control).toHaveValue("~string:Contoso");
+      fireEvent.change(control, { target: { value: "~string:Fabrikam" } });
+    }
+    expect(onChange).toHaveBeenCalledExactlyOnceWith("Fabrikam");
+    view.unmount();
+    client.clear();
+  });
 });
 
 describe.each([false, true])("report facet boundaries (compact=%s)", compact => {

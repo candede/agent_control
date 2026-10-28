@@ -37,7 +37,7 @@ import { createInventoryVerification, createUnifiedVerification, inventoryPageMe
 import { responsibilityFixture, responsibilityOwnerId } from "./agentResponsibilityFixture";
 import { unifiedAgentInventoryScopes } from "../../../backend/src/types/unifiedAgents";
 import { decodeInventoryFacet, encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets";
-import { adoptionSnapshot, reportPage } from "./reportDataFixture";
+import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportPage } from "./reportDataFixture";
 
 mockNativeDialogs();
 
@@ -368,6 +368,19 @@ export function sessionAndNavigationCases() {
       if (new URL(input, "http://localhost").pathname === "/api/official-usage/history/adoption") {
         return Promise.resolve(Response.json(reportPage([latest, second, first])));
       }
+      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/adoption/summary") {
+        const data = adoptionSummaryPage();
+        return Promise.resolve(Response.json({ ...data, reports: { ...data.reports, setId: latest.id } }));
+      }
+      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/adoption/departments") {
+        const data = adoptionDepartmentPage();
+        return Promise.resolve(Response.json({ ...data, reports: { ...data.reports, setId: latest.id } }));
+      }
+      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/adoption/facets") {
+        const data = adoptionDepartmentPage();
+        return Promise.resolve(Response.json({ value: [{ value: "Contoso", count: 2 }], selection: data.selection,
+          counts: { total: 1, filtered: 1 }, page: data.page }));
+      }
       if (input === "/api/data-sync/state") return pendingSetup.promise;
       return base(input, init);
     });
@@ -396,7 +409,7 @@ export function sessionAndNavigationCases() {
     render(<App />);
     await screen.findByRole("button", { name: "Sign out" });
     expect(screen.queryByRole("button", { name: "Dashboard" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Adoption trends" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Understand adoption. Empower your people." })).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname === "/api/official-usage/history/adoption")).toBe(false);
   });
 

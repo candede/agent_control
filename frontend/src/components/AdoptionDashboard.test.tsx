@@ -5,12 +5,17 @@ import { ApiError } from "../api/client";
 import { adoptionSnapshot, reportPage, reportSelection } from "../test/reportDataFixture";
 import { AdoptionDashboard } from "./AdoptionDashboard";
 
+vi.mock("./DashboardInsights", async original => ({
+  ...await original<typeof import("./DashboardInsights")>(), DashboardInsights: () => null,
+}));
+
 const first = adoptionSnapshot(1, { reportingStart: "2026-08-14", reportingEnd: "2026-09-12" });
 const second = adoptionSnapshot(2, { reportingStart: "2026-09-09", reportingEnd: "2026-10-08", activeUsers: 344, activeAgents: 325 });
 const latest = adoptionSnapshot(3, { reportingStart: "2026-09-27", reportingEnd: "2026-10-26", activeUsers: 306, activeAgents: 317,
   responses: 11616, userReportActiveUsers: 306, relationshipActiveUsers: 304, userReportResponses: 11642, relationshipResponses: 11616 });
 const all = [latest, second, first];
-const renderDashboard = (baselineId?: string) => render(<AdoptionDashboard revision={0} baselineId={baselineId} onBaselineChange={vi.fn()} />);
+const renderDashboard = (baselineId?: string) => render(<AdoptionDashboard revision={0} baselineId={baselineId}
+  onBaselineChange={vi.fn()} onCompanyChange={vi.fn()} />);
 const usersCard = () => within(screen.getByRole("region", { name: "Active users" }));
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
@@ -24,7 +29,7 @@ describe("adoption dashboard", () => {
     expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
     expect(usersCard().getByText("-38 (-11%)")).toBeVisible();
     expect(screen.getAllByRole("img")).toHaveLength(2);
-    expect(screen.getByText(/observed activity dates are not verified reporting windows/i)).toBeVisible();
+    expect(screen.queryByText(/Snapshot comparison: observed activity dates/i)).not.toBeInTheDocument();
     expect(screen.getByText(/Users 306; Users & agents 304/)).toBeVisible();
     expect(screen.getAllByRole("link", { name: "Inspect report" })[0]).toHaveAttribute("href", `/sync?reports=snapshot&snapshot=${latest.id}`);
     expect(screen.queryByText(/per week|per month|forecast:/i)).not.toBeInTheDocument();
@@ -34,11 +39,11 @@ describe("adoption dashboard", () => {
     const fetcher = vi.fn().mockResolvedValue(Response.json(reportPage(all)));
     vi.stubGlobal("fetch", fetcher);
     const onBaselineChange = vi.fn();
-    const view = render(<AdoptionDashboard revision={0} onBaselineChange={onBaselineChange} />);
+    const view = render(<AdoptionDashboard revision={0} onBaselineChange={onBaselineChange} onCompanyChange={vi.fn()} />);
     const selector = await screen.findByRole("combobox", { name: "Compare latest with baseline" });
     fireEvent.change(selector, { target: { value: second.id } });
     expect(onBaselineChange).toHaveBeenCalledWith(second.id);
-    view.rerender(<AdoptionDashboard revision={0} baselineId={second.id} onBaselineChange={onBaselineChange} />);
+    view.rerender(<AdoptionDashboard revision={0} baselineId={second.id} onBaselineChange={onBaselineChange} onCompanyChange={vi.fn()} />);
     expect(usersCard().getAllByText("-38 (-11%)")).toHaveLength(2);
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(screen.getAllByRole("link", { name: "Inspect report" })).toHaveLength(2);
@@ -137,6 +142,75 @@ describe("adoption dashboard", () => {
     expect(usersCard().getByText("306")).toBeVisible();
     expect(screen.getByRole("heading", { name: "Reports without activity dates" })).toBeVisible();
     expect(screen.getByText("99,999")).toBeVisible();
+  });
+
+  it("keeps undated-only history readable without inferring chronology from imports", async () => {
+    const snapshots = [
+      adoptionSnapshot(4, { reportingStart: null, reportingEnd: null, activeUsers: 99999 }),
+      adoptionSnapshot(5, { reportingStart: null, reportingEnd: null, activeUsers: 88888 }),
+    ];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage(snapshots))));
+    renderDashboard();
+    const table = within(await screen.findByRole("region", { name: "Reports without activity dates" }));
+    expect(table.getByText("99,999")).toBeVisible();
+    expect(table.getByText("88,888")).toBeVisible();
+    expect(table.getAllByRole("link", { name: "Inspect report" })).toHaveLength(2);
+    expect(screen.getByText("No dated observations")).toBeVisible();
+    expect(screen.getByText(/Import order is not usage chronology/)).toBeVisible();
+    expect(screen.queryByRole("region", { name: "Active users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { reportingStart: "2026-09-01", reportingEnd: "2026-09-31" },
+    { reportingStart: "2026-11-02", reportingEnd: "2026-11-01" },
+  ])("excludes invalid activity ranges %j from the latest observation", async dates => {
+    const invalid = adoptionSnapshot(4, { ...dates, activeUsers: 99999 });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage([invalid, ...all]))));
+    renderDashboard();
+    await screen.findByRole("region", { name: "Active users" });
+    expect(usersCard().getByText("306")).toBeVisible();
+    expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
+    const undated = within(screen.getByRole("region", { name: "Reports without activity dates" }));
+    expect(undated.getByText("99,999")).toBeVisible();
+    expect(undated.getByRole("link", { name: "Inspect report" })).toHaveAttribute("href", `/sync?reports=snapshot&snapshot=${invalid.id}`);
+  });
+
+  it("plots measured zero but neither plots nor bridges an unavailable count", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage([
+      { ...latest, activeUsers: 0 }, { ...second, activeUsers: NaN }, first,
+    ]))));
+    renderDashboard();
+    await screen.findByRole("region", { name: "Active users" });
+    expect(usersCard().getByText("0")).toBeVisible();
+    expect(usersCard().getByText("-300 (-100%)")).toBeVisible();
+    expect(usersCard().getByText("Count unavailable")).toBeVisible();
+    const chart = screen.getByRole("img", { name: "Active users over saved reports" });
+    const points = chart.querySelectorAll("circle.dashboard-trend-point");
+    expect(points).toHaveLength(2);
+    expect(points[1]).toHaveAttribute("cy", "154");
+    expect(chart.querySelectorAll("line.dashboard-trend-line")).toHaveLength(0);
+  });
+
+  it("withdraws completed comparisons when focus revalidation fails and recovers on saved-only retry", async () => {
+    let failed = false;
+    const fetcher = vi.fn(() => Promise.resolve(failed
+      ? Response.json({ code: "temporarily_unavailable", detail: "Saved history could not be refreshed." }, { status: 503 })
+      : Response.json(reportPage(all))));
+    vi.stubGlobal("fetch", fetcher);
+    renderDashboard();
+    await screen.findByRole("region", { name: "Active users" });
+    failed = true;
+    fireEvent.focus(window);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Saved history could not be refreshed.");
+    expect(screen.queryByRole("region", { name: "Active users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "No saved usage reports yet" })).not.toBeInTheDocument();
+    failed = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    await screen.findByRole("region", { name: "Active users" });
+    expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
+    expect(fetcher).toHaveBeenCalledTimes(3);
   });
 
   it("shows only a baseline, not a directional conclusion, for one dated report", async () => {
