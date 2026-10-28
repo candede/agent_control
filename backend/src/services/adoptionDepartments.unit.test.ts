@@ -67,53 +67,68 @@ describe("department participation selected reads", () => {
   it.each(["asc", "desc"] as const)("projects bounded %s aggregates without loading group members", async order => {
     const saved = context("adoption_departments", { company: "O'Brien", order });
     const { client, query } = fixture(saved);
-    query.mockResolvedValueOnce(result([{ ...department(1), company: null, department: null, active_people: "0" }]))
-      .mockResolvedValueOnce(result([{ total: "4", filtered: "1" }]));
+    query.mockResolvedValueOnce(result([{ total: "4", filtered: "1" }]))
+      .mockResolvedValueOnce(result([{ ...department(1), company: null, department: null, active_people: "0" }]));
     const page = await readAdoptionDepartments(client, reports, saved, { limit: 8 });
     expect(page.value).toEqual([{ id: department(1).identity, company: null, department: null, people: 5, activePeople: 0 }]);
     expect(page.counts).toEqual({ total: 4, filtered: 1 });
-    expect(page.page).toEqual({ limit: 8, nextCursor: null, previousCursor: null });
+    expect(page.page).toEqual({ limit: 8, number: 1, offset: 0, nextCursor: null, previousCursor: null });
     expect(Object.keys(page).sort()).toEqual(["counts", "directory", "page", "reports", "selection", "value"]);
     expect(page.directory).toEqual(saved.metadata.directory);
     expect(page.reports).toEqual(saved.report);
     expect(page.selection).toEqual(saved.selection);
-    const [sql, values] = query.mock.calls[0];
+    const [sql, values] = query.mock.calls[1];
     expect(sql).toContain("FROM matching_groups g JOIN adoption_users u ON u.group_id=g.identity");
     expect(sql).toContain("count(*) FILTER(WHERE u.has_activity)::numeric / NULLIF(count(*),0)");
     expect(sql).toContain(`ORDER BY adoption_rate ${order.toUpperCase()} NULLS LAST,sort_key COLLATE "C",identity COLLATE "C"`);
     expect(sql).toContain("ORDER BY position ASC LIMIT $10");
     expect(sql).not.toContain("O'Brien");
-    expect(values).toEqual([...adoptionDataset(reports, saved).values, null, 9]);
-    expect(query.mock.calls[1][1]).toEqual(adoptionDataset(reports, saved).values);
+    expect(values).toEqual([...adoptionDataset(reports, saved).values, 0, 8]);
+    expect(query.mock.calls[0][1]).toEqual(adoptionDataset(reports, saved).values);
     expect(query).toHaveBeenCalledTimes(2);
   });
 
   it.each(["asc", "desc"] as const)("round-trips %s pages including a partial final page", async order => {
     const saved = context("adoption_departments", { order }), { client, query } = fixture(saved);
     const rows = Array.from({ length: 5 }, (_, index) => department(index + 1));
-    const enqueue = (items: pg.QueryResultRow[]) => query.mockResolvedValueOnce(result(items))
-      .mockResolvedValueOnce(result([{ total: "5", filtered: "5" }]));
+    const enqueue = (items: pg.QueryResultRow[]) => query.mockResolvedValueOnce(result([{ total: "5", filtered: "5" }]))
+      .mockResolvedValueOnce(result(items));
     const read = (cursor?: string) => readAdoptionDepartments(client, reports, saved, { limit: 2, cursor });
-    enqueue(rows.slice(0, 3));
+    enqueue(rows.slice(0, 2));
     const first = await read();
-    enqueue(rows.slice(2, 5));
+    enqueue(rows.slice(2, 4));
     const second = await read(first.page.nextCursor!);
     enqueue(rows.slice(4));
     const last = await read(second.page.nextCursor!);
     expect([first, second, last].flatMap(page => page.value.map(row => row.id))).toEqual(rows.map(row => row.identity));
     expect(first.page.previousCursor).toBeNull();
     expect(last.page.nextCursor).toBeNull();
+    expect([first, second, last].map(page => [page.page.number, page.page.offset])).toEqual([[1, 0], [2, 2], [3, 4]]);
     expect(reports.codec.decode(first.page.nextCursor!, cursorContract(saved, 2)).boundary)
       .toEqual({ key: "2", id: rows[1].identity, nullRank: 0 });
-    enqueue([rows[3], rows[2], rows[1]]);
+    enqueue(rows.slice(2, 4));
     const back = await read(last.page.previousCursor!);
     expect(back.value).toEqual(second.value);
-    enqueue([rows[1], rows[0]]);
+    enqueue(rows.slice(0, 2));
     expect((await read(back.page.previousCursor!)).value).toEqual(first.value);
-    expect(query.mock.calls[2][1]?.slice(-2)).toEqual(["2", 3]);
-    expect(query.mock.calls[6][0]).toContain("position < $9::bigint");
-    expect(query.mock.calls[6][0]).toContain("ORDER BY position DESC LIMIT $10");
-    expect(query.mock.calls[6][1]?.slice(-2)).toEqual(["5", 3]);
+    expect(query.mock.calls[3][1]?.slice(-2)).toEqual([2, 2]);
+    expect(query.mock.calls[7][0]).toContain("position > $9::bigint");
+    expect(query.mock.calls[7][0]).toContain("ORDER BY position ASC LIMIT $10");
+    expect(query.mock.calls[7][1]?.slice(-2)).toEqual([2, 2]);
+  });
+
+  it.each([1, 2, 3, 99, Number.MAX_SAFE_INTEGER])("reads page %s directly and clamps to the available results", async requested => {
+    const { client, query, saved } = fixture();
+    const number = Math.min(requested, 3), offset = (number - 1) * 2;
+    const rows = Array.from({ length: Math.min(2, 5 - offset) }, (_, index) => department(offset + index + 1));
+    query.mockResolvedValueOnce(result([{ total: "5", filtered: "5" }])).mockResolvedValueOnce(result(rows));
+    const page = await readAdoptionDepartments(client, reports, saved, { limit: 2, pageNumber: requested });
+    expect(page.value.map(row => row.id)).toEqual(rows.map(row => row.identity));
+    expect(page.page).toMatchObject({ limit: 2, number, offset });
+    expect(Boolean(page.page.previousCursor)).toBe(number > 1);
+    expect(Boolean(page.page.nextCursor)).toBe(number < 3);
+    expect(query.mock.calls[1][1]?.slice(-2)).toEqual([offset, 2]);
+    expect(query).toHaveBeenCalledTimes(2);
   });
 
   it.each([
@@ -123,27 +138,41 @@ describe("department participation selected reads", () => {
     const { client, query, saved } = fixture();
     saved.metadata.directory.state = state;
     saved.report.lineages = saved.report.lineages.filter(lineage => lineage.kind === kind);
-    query.mockResolvedValueOnce(result([{ ...department(1), active_people: "0" }]))
-      .mockResolvedValueOnce(result([{ total: "1", filtered: "1" }]));
+    query.mockResolvedValueOnce(result([{ total: "1", filtered: "1" }]))
+      .mockResolvedValueOnce(result([{ ...department(1), active_people: "0" }]));
     expect((await readAdoptionDepartments(client, reports, saved, { limit: 8 })).value[0].activePeople)
       .toBe(measured ? 0 : null);
-    expect(query.mock.calls[0][0]).toContain(measured
+    expect(query.mock.calls[1][0]).toContain(measured
       ? "count(*) FILTER(WHERE u.has_activity)::numeric / NULLIF(count(*),0) AS adoption_rate"
       : "NULL::numeric AS adoption_rate");
   });
 
   it("returns an empty filtered cohort without fabricating navigation", async () => {
     const { client, query, saved } = fixture(context("adoption_departments", { company: "missing" }));
-    query.mockResolvedValueOnce(result([])).mockResolvedValueOnce(result([{ total: "4", filtered: "0" }]));
+    query.mockResolvedValueOnce(result([{ total: "4", filtered: "0" }])).mockResolvedValueOnce(result([]));
     expect(await readAdoptionDepartments(client, reports, saved, { limit: 100 })).toMatchObject({
-      value: [], counts: { total: 4, filtered: 0 }, page: { limit: 100, nextCursor: null, previousCursor: null },
+      value: [], counts: { total: 4, filtered: 0 }, page: { limit: 100, number: 1, offset: 0, nextCursor: null, previousCursor: null },
     });
-    expect(query.mock.calls[0][1]?.at(-1)).toBe(101);
+    expect(query.mock.calls[1][1]?.slice(-2)).toEqual([0, 100]);
   });
 
   it.each([0, -1, 101, 1.5, NaN, Infinity])("rejects invalid limit %s before querying", async limit => {
     const { client, query, saved } = fixture();
     await expect(readAdoptionDepartments(client, reports, saved, { limit })).rejects.toMatchObject({ code: "invalid_cursor" });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])("rejects invalid page number %s before querying", async pageNumber => {
+    const { client, query, saved } = fixture();
+    await expect(readAdoptionDepartments(client, reports, saved, { limit: 10, pageNumber }))
+      .rejects.toMatchObject({ code: "invalid_cursor" });
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("rejects simultaneous numbered and cursor positions before querying", async () => {
+    const { client, query, saved } = fixture();
+    await expect(readAdoptionDepartments(client, reports, saved, { limit: 10, pageNumber: 2, cursor: "next" }))
+      .rejects.toMatchObject({ code: "invalid_cursor" });
     expect(query).not.toHaveBeenCalled();
   });
 
@@ -180,16 +209,16 @@ describe("department participation selected reads", () => {
 
   it.each(["people", "active_people", "total", "filtered"])("rejects an unsafe %s count explicitly", async field => {
     const { client, query, saved } = fixture();
-    query.mockResolvedValueOnce(result([{ ...department(1), [field]: "9007199254740992" }]))
-      .mockResolvedValueOnce(result([{ total: "1", filtered: "1",
-        ...(["total", "filtered"].includes(field) ? { [field]: "9007199254740992" } : {}) }]));
+    query.mockResolvedValueOnce(result([{ total: "1", filtered: "1",
+      ...(["total", "filtered"].includes(field) ? { [field]: "9007199254740992" } : {}) }]))
+      .mockResolvedValueOnce(result([{ ...department(1), [field]: "9007199254740992" }]));
     await expect(readAdoptionDepartments(client, reports, saved, { limit: 8 }))
       .rejects.toMatchObject({ status: 409, code: "official_usage_total_limit" });
   });
 
   it("enforces the complete response byte limit", async () => {
     const { client, query, saved } = fixture();
-    query.mockResolvedValueOnce(result([department(1)])).mockResolvedValueOnce(result([{ total: "1", filtered: "1" }]));
+    query.mockResolvedValueOnce(result([{ total: "1", filtered: "1" }])).mockResolvedValueOnce(result([department(1)]));
     saved.metadata.directory.message = "x".repeat(1_048_576);
     await expect(readAdoptionDepartments(client, reports, saved, { limit: 8 }))
       .rejects.toMatchObject({ status: 413, code: "data_response_bytes" });
@@ -265,7 +294,7 @@ describe("adoption aggregate failures", () => {
     const { client, query, saved } = fixture(), error = new Error("Synthetic selected query failure");
     query.mockRejectedValueOnce(error);
     await expect(readAdoptionDepartments(client, reports, saved, { limit: 8 })).rejects.toBe(error);
-    query.mockResolvedValueOnce(result([department(1)])).mockRejectedValueOnce(error);
+    query.mockResolvedValueOnce(result([{ total: "1", filtered: "1" }])).mockRejectedValueOnce(error);
     await expect(readAdoptionDepartments(client, reports, saved, { limit: 8 })).rejects.toBe(error);
     query.mockRejectedValueOnce(error);
     await expect(readAdoptionSummary(client, reports, context("adoption"))).rejects.toBe(error);

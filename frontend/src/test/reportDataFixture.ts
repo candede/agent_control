@@ -97,7 +97,8 @@ export function adoptionDepartmentPage(overrides: Partial<AdoptionDepartmentPage
     { id: "engineering", company: "Contoso", department: "Engineering", people: 100, activePeople: 50 },
     { id: "hr", company: "Fabrikam", department: "HR", people: 20, activePeople: 5 },
   ]);
-  return { ...page, directory: source("directory"), ...overrides };
+  return { ...page, page: { limit: 10, number: 1, offset: 0, nextCursor: null, previousCursor: null },
+    directory: source("directory"), ...overrides };
 }
 export function adoptionSummaryPage(overrides: Partial<AdoptionSummaryPage> = {}): AdoptionSummaryPage {
   return { ...reportPage([{ organization: summary, champions: 6 }]),

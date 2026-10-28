@@ -131,6 +131,40 @@ describe("report page controls", () => {
       expect(goToPage).not.toHaveBeenCalled();
     });
     it.each([
+      { number: 1, expected: [1, 2, 3, 4, 20] },
+      { number: 12, expected: [1, 11, 12, 13, 20] },
+      { number: 20, expected: [1, 17, 18, 19, 20] },
+    ])("offers compact numbered navigation at page $number without a jump form", ({ number, expected }) => {
+      const goToPage = vi.fn(() => true);
+      render(<ReportPageControls data={numberedPage(number)} previous={vi.fn()} next={vi.fn()}
+        goToPage={goToPage} label="departments" compact showPageNumbers />);
+      const controls = within(screen.getByRole("navigation", { name: "departments pages" }));
+      expect(within(controls.getByRole("list", { name: "Page numbers" })).getAllByRole("button")
+        .map(button => Number(button.textContent))).toEqual(expected);
+      expect(controls.getByRole("status")).toHaveTextContent("100 matching departments; 5 on this page");
+      expect(controls.getByRole("button", { name: `Page ${number}` })).toHaveAttribute("aria-current", "page");
+      expect(controls.queryByRole("spinbutton")).not.toBeInTheDocument();
+      expect(controls.queryByText("Previous")).not.toBeInTheDocument();
+      expect(controls.queryByText("Next")).not.toBeInTheDocument();
+      fireEvent.click(controls.getByRole("button", { name: number === 20 ? "Page 1" : "Page 20" }));
+      expect(goToPage).toHaveBeenCalledExactlyOnceWith(number === 20 ? 1 : 20);
+    });
+    it.each(["missing", "loading", "disabled", "expired"] as const)("blocks compact numbered navigation while %s", async state => {
+      const previous = vi.fn(), next = vi.fn(), goToPage = vi.fn(() => true);
+      render(<ReportPageControls data={state === "missing" ? undefined : numberedPage(3)}
+        previous={previous} next={next} goToPage={goToPage} compact showPageNumbers
+        loading={state === "loading"} disabled={state === "disabled"} leaseEnded={state === "expired"} />);
+      for (const button of screen.getAllByRole("button")) {
+        expect(button).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(button);
+        button.focus();
+        await userEvent.keyboard("{Enter} ");
+      }
+      expect(previous).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+      expect(goToPage).not.toHaveBeenCalled();
+    });
+    it.each([
       { number: 1, total: 0, previousDisabled: true, nextDisabled: true },
       { number: 1, total: 5, previousDisabled: true, nextDisabled: true },
       { number: 1, total: 571, previousDisabled: true, nextDisabled: false },

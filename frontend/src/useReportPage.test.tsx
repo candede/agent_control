@@ -34,13 +34,13 @@ beforeEach(() => { vi.mocked(api.readReportPage).mockResolvedValue(page("initial
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.useRealTimers(); vi.restoreAllMocks(); vi.resetAllMocks(); });
 
 describe("report page selection lifetimes", () => {
-  it("admits one direct adoption page jump and rejects stale, duplicate, or out-of-range actions", async () => {
+  it.each(["copilot-usage/adoption", "copilot-usage/adoption/departments"])("admits one direct %s page jump and rejects stale, duplicate, or out-of-range actions", async path => {
     const initial = { ...page("initial"), counts: { total: 25, filtered: 25 },
       page: { limit: 5, number: 1, offset: 0, anchor: "group-1", nextCursor: "next", previousCursor: null } };
     const third = { ...initial, page: { ...initial.page, number: 3, offset: 10, anchor: "group-11", previousCursor: "previous" } };
     const pending = deferred<typeof third>();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValueOnce(pending.promise);
-    const { result } = renderHook(() => useReportPage<string>("copilot-usage/adoption", { limit: 5 }), { wrapper: sharedQueries() });
+    const { result } = renderHook(() => useReportPage<string>(path, { limit: 5 }), { wrapper: sharedQueries() });
     await waitFor(() => expect(result.current.data).toBe(initial));
     const jump = result.current.goToPage!;
     act(() => {
@@ -49,7 +49,7 @@ describe("report page selection lifetimes", () => {
       expect(jump(5)).toBe(false);
     });
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(api.readReportPage).toHaveBeenLastCalledWith("copilot-usage/adoption",
+    expect(api.readReportPage).toHaveBeenLastCalledWith(path,
       { limit: 5, selectionId: "initial", pageNumber: 3 }, expect.any(AbortSignal));
     expect(result.current.data).toBe(initial);
     await act(async () => pending.resolve(third));

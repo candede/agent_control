@@ -26,6 +26,22 @@
 .report-page-jump input { flex: 0 0 76px; width: 76px; min-height: 40px; padding: 6px 10px; font-size: 13px; }
 .report-page-jump button { padding-inline: 14px; }
 
+.copilot-users-pagination.report-pagination-condensed {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+}
+.report-pagination-condensed .report-pagination-actions { margin-left: auto; gap: 4px; }
+.report-pagination-condensed button { min-height: 32px; }
+.report-pagination-condensed .report-page-number { min-width: 32px; padding-inline: 6px; }
+.report-pagination-condensed .report-page-direction { min-width: 32px; padding-inline: 0; }
+.report-pagination-condensed .report-page-gap { min-width: 12px; height: 32px; }
+
 .report-pagination-compact { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .report-pagination-compact > [role="status"] { font-variant-numeric: tabular-nums; }
 .report-pagination-compact > button.secondary { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 32px; width: 32px; min-width: 32px; height: 32px; min-height: 32px; padding: 0; border-radius: 7px; }

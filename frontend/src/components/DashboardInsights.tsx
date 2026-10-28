@@ -87,7 +87,7 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
   const title = useId();
   const [order, setOrder] = useState<"asc" | "desc">("desc");
   const read = useReportPage<AdoptionDepartment, AdoptionDepartmentPage>("copilot-usage/adoption/departments", {
-    setId: snapshot.id, company, sort: "adoptionRate", order, limit: 8,
+    setId: snapshot.id, company, sort: "adoptionRate", order, limit: 10,
   }, revision);
   const data = read.selectedData;
   const SortIcon = order === "desc" ? ArrowDownWideNarrow : ArrowUpNarrowWide;
@@ -95,7 +95,7 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
     <div className="dashboard-department-heading">
       <DashboardPanelHeading id={title} icon={Building2} title="Adoption by department"
         description="See where participation is taking hold, one company at a time." />
-      <ReportFacet path="copilot-usage/adoption" field="company" compact dropdown selectionId={base.selectedData?.selection.id}
+      <ReportFacet path="copilot-usage/adoption" field="company" compact dropdown hideLabel selectionId={base.selectedData?.selection.id}
         value={company} onChange={onCompanyChange} onRestartSelection={base.restart} onSelectionInvalidated={base.invalidateSelection} />
     </div>
     <div className="dashboard-department-columns">
@@ -133,6 +133,6 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
         {" "}Directory observed: {usageDate(data.directory.observedAt)}. Report: {adoptionSnapshotLabel(snapshot)}.</p>
     </> : null}
     <ReportPageControls data={data} previous={read.previous} next={read.next} loading={read.loading}
-      leaseEnded={read.leaseEnded} label="departments" compact />
+      leaseEnded={read.leaseEnded} goToPage={read.goToPage} label="departments" compact showPageNumbers />
   </section>;
 }

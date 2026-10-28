@@ -468,6 +468,14 @@ describe("read-only adoption groups", () => {
     expect(third.page.nextCursor).toBeNull();
     expect((await read(third.page.previousCursor!)).value).toEqual(second.value);
     expect((await read(second.page.previousCursor!)).value).toEqual(first.value);
+    const jumped = await reader.read(selected.id, identity, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 1, pageNumber: 3 }));
+    expect(jumped.value).toEqual(third.value);
+    expect(jumped.page).toMatchObject({ number: 3, offset: 2 });
+    const clamped = await reader.read(selected.id, identity, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 1, pageNumber: Number.MAX_SAFE_INTEGER }));
+    expect(clamped.value).toEqual(third.value);
+    expect(clamped.page).toMatchObject({ number: 3, offset: 2 });
     await expect(reader.read(selected.id, identity, (client, context) =>
       readAdoptionGroups(client, reader, context, { limit: 1, cursor: first.page.nextCursor! }))).rejects.toThrow("invalid_cursor");
     expect(first.value[0].activePeople).toBeNull();

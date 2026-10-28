@@ -9,7 +9,7 @@ import { acceptSelectedRead, isExpiredSelection, selectedReadRemaining, useSelec
 import type { PublishedSelectedRead } from "../../../backend/src/types/dataSelection";
 import { FacetDropdown } from "./FacetDropdown";
 
-export function ReportFacet({ path, selectionId: requestedSelectionId, field, value, onChange, onRestartSelection, onSelectionInvalidated, compact = false, alwaysShowSearch = false, dropdown = false }: {
+export function ReportFacet({ path, selectionId: requestedSelectionId, field, value, onChange, onRestartSelection, onSelectionInvalidated, compact = false, alwaysShowSearch = false, dropdown = false, hideLabel = false }: {
   path: string; selectionId?: string; field: "company" | "department" | "creatorType"; value?: string | null;
   onChange: (value: string | null | undefined) => void;
   onRestartSelection: () => void;
@@ -17,6 +17,7 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
   compact?: boolean;
   alwaysShowSearch?: boolean;
   dropdown?: boolean;
+  hideLabel?: boolean;
 }) {
   const principal = useReportPrincipalScope();
   const scope = JSON.stringify([principal, path, field]);
@@ -166,8 +167,8 @@ export function ReportFacet({ path, selectionId: requestedSelectionId, field, va
     {options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
   </select>;
   if (compact) return <div className="inventory-facet" role="group" aria-label={`${label} options`}>
-    {dropdown ? <div className="report-facet-control"><span>{label}</span>{control}</div>
-      : <label><span>{label}</span>{control}</label>}
+    {dropdown ? <div className="report-facet-control"><span className={hideLabel ? "sr-only" : undefined}>{label}</span>{control}</div>
+      : <label><span className={hideLabel ? "sr-only" : undefined}>{label}</span>{control}</label>}
     {alwaysShowSearch || searchOpened || search || cursor || data?.page.nextCursor ? <label><span className="sr-only">Search {label.toLowerCase()} options</span>
       <input type="search" placeholder="Search options" value={search} maxLength={256}
         onFocus={() => changeSearch(search)} onChange={event => changeSearch(event.target.value)} /></label> : null}

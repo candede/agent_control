@@ -143,7 +143,7 @@ describe("department adoption HTTP contract", () => {
     roles = [role];
     const read = vi.spyOn(adoptionDepartments, "readAdoptionDepartments").mockResolvedValue({
       ...adoptionDepartmentPage(),
-      value: [], counts: { total: 0, filtered: 0 }, page: { limit: 8, nextCursor: null, previousCursor: null },
+      value: [], counts: { total: 0, filtered: 0 }, page: { limit: 8, number: 1, offset: 0, nextCursor: null, previousCursor: null },
       directory: source("directory"),
       selection: context("adoption_departments").selection, reports: context("adoption_departments").report,
     });
@@ -153,6 +153,29 @@ describe("department adoption HTTP contract", () => {
     expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, expect.objectContaining({ endpoint: "adoption_departments",
       query: expect.objectContaining({ sort: "adoptionRate", order: "desc" }) }), { limit: 8 });
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("passes direct page requests through the same saved department selection", async () => {
+    saved = context("adoption_departments");
+    const read = vi.spyOn(adoptionDepartments, "readAdoptionDepartments").mockResolvedValue({
+      ...adoptionDepartmentPage(), selection: saved.selection, reports: saved.report,
+      page: { limit: 10, number: 7, offset: 60, nextCursor: "next", previousCursor: "previous" },
+    });
+    expect(await request("GET", `/copilot-usage/adoption/departments?selectionId=${selectionId}&pageNumber=7&limit=10`))
+      .toMatchObject({ status: 200, body: { page: { number: 7, offset: 60 } } });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(reports.read).toHaveBeenCalledWith(selectionId, identity, expect.any(Function));
+    expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, saved, { limit: 10, pageNumber: 7 });
+  });
+
+  it.each(["pageNumber=0", "pageNumber=-1", "pageNumber=2.5", "pageNumber=text", "pageNumber=",
+    "pageNumber=9007199254740992", "pageNumber[]=2", "pageNumber=1&pageNumber=2",
+    "pageNumber=1&cursor=next"])("rejects invalid department position %s before capturing data", async query => {
+    const read = vi.spyOn(adoptionDepartments, "readAdoptionDepartments");
+    expect(await request("GET", `/copilot-usage/adoption/departments?${query}`)).toMatchObject({ status: 400 });
+    expect(reports.capture).not.toHaveBeenCalled();
+    expect(reports.read).not.toHaveBeenCalled();
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("reads organization metrics separately without allowing department filters or cursors", async () => {

@@ -27,6 +27,7 @@ export type AdoptionDepartment = {
 };
 
 export type AdoptionDepartmentPage = ReportListPage<AdoptionDepartment> & {
+  page: ReportListPage<AdoptionDepartment>["page"] & { number: number; offset: number };
   directory: UserSourceMetadata;
 };
 

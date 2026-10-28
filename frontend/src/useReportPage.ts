@@ -298,7 +298,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     },
     next: () => data?.page.number !== undefined ? goToPage(data.page.number + 1) : move(data?.page.nextCursor),
     previous: () => data?.page.number !== undefined ? goToPage(data.page.number - 1) : move(data?.page.previousCursor),
-    goToPage: path === "copilot-usage/adoption" ? goToPage : undefined,
+    goToPage: path === "copilot-usage/adoption" || path === "copilot-usage/adoption/departments" ? goToPage : undefined,
     restartable: !query.selectionId || Boolean(restartParent),
     restart: () => {
       if (renewing) return;

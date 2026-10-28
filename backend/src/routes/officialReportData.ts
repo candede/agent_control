@@ -47,6 +47,14 @@ function pageOptions(query: Record<string, unknown>) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new AppError(400, "invalid_usage_query", "Page limit must be 1..100.");
   return { limit, ...(query.cursor === undefined ? {} : { cursor: scalar(query.cursor) }) };
 }
+function pageNumberOption(value: unknown) {
+  if (value === undefined) return undefined;
+  const text = scalar(value, 16), pageNumber = Number(text);
+  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(pageNumber)) {
+    throw new AppError(400, "invalid_usage_query", "Page number must be a positive safe integer.");
+  }
+  return pageNumber;
+}
 function requestQuery(endpoint: ReportEndpoint, query: Record<string, unknown>): ReportQuery {
   const values: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(query)) {
@@ -161,11 +169,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   }));
   route("get", "/copilot-usage/adoption", "read", failSafe(async (request, response) => {
     const anchor = request.query.anchor === undefined ? undefined : scalar(request.query.anchor, 64);
-    const pageText = request.query.pageNumber === undefined ? undefined : scalar(request.query.pageNumber, 16);
-    const pageNumber = pageText === undefined ? undefined : Number(pageText);
-    if (pageText !== undefined && (!/^[1-9]\d*$/.test(pageText) || !Number.isSafeInteger(pageNumber))) {
-      throw new AppError(400, "invalid_usage_query", "Page number must be a positive safe integer.");
-    }
+    const pageNumber = pageNumberOption(request.query.pageNumber);
     if (anchor !== undefined && !/^[a-f0-9]{64}$/.test(anchor)
       || [anchor, pageNumber, request.query.cursor].filter(value => value !== undefined).length > 1) {
       throw new AppError(400, "invalid_usage_query", "Use one position: a page number, group anchor, or selected cursor.");
@@ -183,9 +187,14 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       readAdoptionSummary(client, reports, read)));
   }));
   route("get", "/copilot-usage/adoption/departments", "read", failSafe(async (request, response) => {
-    const context = await selected(request, "adoption_departments");
+    const pageNumber = pageNumberOption(request.query.pageNumber);
+    if (pageNumber !== undefined && request.query.cursor !== undefined) {
+      throw new AppError(400, "invalid_usage_query", "Use one position: a page number or selected cursor.");
+    }
+    const context = await selected(request, "adoption_departments", false, false, false, false, ["pageNumber"]);
     response.json(await reports.read(context.id, context.identity, (client, read) =>
-      readAdoptionDepartments(client, reports, read, pageOptions(request.query))));
+      readAdoptionDepartments(client, reports, read, { ...pageOptions(request.query),
+        ...(pageNumber === undefined ? {} : { pageNumber }) })));
   }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));

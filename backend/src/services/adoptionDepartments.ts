@@ -7,10 +7,12 @@ import { SelectionError } from "./dataSelections.js";
 import { bounded, type LargeTenantUsersReports, type ReportReadContext } from "./largeTenantUsersReports.js";
 
 export async function readAdoptionDepartments(client: pg.PoolClient, reports: LargeTenantUsersReports,
-  context: ReportReadContext, options: { limit: number; cursor?: string }): Promise<AdoptionDepartmentPage> {
+  context: ReportReadContext, options: { limit: number; cursor?: string; pageNumber?: number }): Promise<AdoptionDepartmentPage> {
   const { limit } = options;
   if (context.endpoint !== "adoption_departments" || context.query.sort !== "adoptionRate"
-    || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+    || !Number.isInteger(limit) || limit < 1 || limit > 100
+    || options.pageNumber !== undefined && (!Number.isSafeInteger(options.pageNumber) || options.pageNumber < 1)
+    || options.pageNumber !== undefined && options.cursor !== undefined) {
     throw new SelectionError("invalid_cursor");
   }
   const { values, relations } = adoptionDataset(reports, context);
@@ -19,8 +21,15 @@ export async function readAdoptionDepartments(client: pg.PoolClient, reports: La
   const cursor = options.cursor ? reports.codec.decode(options.cursor, expected) : undefined;
   if (cursor && (cursor.boundary.key === null || !/^[1-9]\d{0,15}$/.test(cursor.boundary.key)
     || !Number.isSafeInteger(Number(cursor.boundary.key)) || cursor.boundary.nullRank !== 0)) throw new SelectionError("invalid_cursor");
+  const counts = (await client.query(`${relations} SELECT
+    (SELECT count(*)::text FROM adoption_groups) AS total,
+    (SELECT count(*)::text FROM matching_groups) AS filtered`, values)).rows[0];
+  const total = officialReportCount(counts.total), filtered = officialReportCount(counts.filtered);
+  const cursorOffset = cursor ? Number(cursor.boundary.key) - (cursor.direction === "previous" ? limit + 1 : 0) : 0;
+  const pageNumber = Math.min(options.pageNumber ?? Math.floor(Math.max(0, cursorOffset) / limit) + 1,
+    Math.max(1, Math.ceil(filtered / limit)));
+  const offset = (pageNumber - 1) * limit;
   const order = context.query.order === "desc" ? "DESC" : "ASC";
-  const previous = cursor?.direction === "previous";
   const measured = context.metadata.directory.state === "available"
     && context.report.lineages.some(lineage => lineage.kind === "users" || lineage.kind === "userAgents");
   const rows = (await client.query(`${relations}, department_counts AS (
@@ -33,23 +42,18 @@ export async function readAdoptionDepartments(client: pg.PoolClient, reports: La
     SELECT *,row_number() OVER(ORDER BY adoption_rate ${order} NULLS LAST,sort_key COLLATE "C",identity COLLATE "C") AS position
     FROM department_counts
   ) SELECT * FROM ordered_departments
-    WHERE $9::bigint IS NULL OR position ${previous ? "<" : ">"} $9::bigint
-    ORDER BY position ${previous ? "DESC" : "ASC"} LIMIT $10`,
-  [...values, cursor?.boundary.key ?? null, limit + 1])).rows;
-  const counts = (await client.query(`${relations} SELECT
-    (SELECT count(*)::text FROM adoption_groups) AS total,
-    (SELECT count(*)::text FROM matching_groups) AS filtered`, values)).rows[0];
-  const more = rows.length > limit, page = rows.slice(0, limit);
-  if (previous) page.reverse();
+    WHERE position > $9::bigint
+    ORDER BY position ASC LIMIT $10`,
+  [...values, offset, limit])).rows;
   const encode = (row: pg.QueryResultRow, direction: "next" | "previous") => reports.codec.encode({ ...expected, direction,
     boundary: { key: String(row.position), id: row.identity, nullRank: 0 } });
   return bounded({
-    value: page.map(row => ({ id: row.identity, company: row.company, department: row.department,
+    value: rows.map(row => ({ id: row.identity, company: row.company, department: row.department,
       people: officialReportCount(row.people), activePeople: measured ? officialReportCount(row.active_people) : null })),
-    counts: { total: officialReportCount(counts.total), filtered: officialReportCount(counts.filtered) },
-    page: { limit,
-      nextCursor: page.length && (previous ? Boolean(cursor) : more) ? encode(page.at(-1)!, "next") : null,
-      previousCursor: page.length && (previous ? more : Boolean(cursor)) ? encode(page[0], "previous") : null },
+    counts: { total, filtered },
+    page: { limit, number: pageNumber, offset,
+      nextCursor: rows.length && offset + rows.length < filtered ? encode(rows.at(-1)!, "next") : null,
+      previousCursor: rows.length && offset > 0 ? encode(rows[0], "previous") : null },
     reports: context.report, selection: context.selection, directory: context.metadata.directory,
   });
 }

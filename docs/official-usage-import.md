@@ -177,6 +177,15 @@ existing saved `selectionId`, `cursor` and `limit` parameters and returns
 cursor-paged snapshot metrics. It does not change the selected shared report or
 call Microsoft providers.
 
+The dashboard's **Adoption by department** panel shows ten departments per page.
+Its company dropdown keeps an accessible label without a visible heading.
+Numbered buttons, ellipses, and previous/next arrows allow direct page navigation
+while retaining the current rows and organization-wide metrics during loading.
+`GET /api/copilot-usage/adoption/departments` returns `page.number` and `page.offset`
+and accepts `pageNumber` within the same saved selection. Page numbers are positive
+safe integers; requests beyond the available pages resolve to the last page.
+Use either `pageNumber` or a signed `cursor`, not both.
+
 ### Retained report interpretation
 
 The **Sync** page presents **CSV usage reports** separately from automatic sync and sync history. Its compact summary shows the saved-set count, **Observed activity dates (UTC)** across all retained complete sets, and last import time. The dates include all three CSV kinds and older reports, regardless of current selection or pagination; they are not administrator-supplied reporting windows. Undated reports show **No dates found in imported reports**. Dates are never inferred from import time, and the bounds do not imply continuous coverage or additive response totals.

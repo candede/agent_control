@@ -16,10 +16,16 @@ function fixture(data = adoptionDepartmentPage(), summary = adoptionSummaryPage(
     if (url.pathname === "/api/copilot-usage/adoption/summary") return Response.json(summary);
     if (url.pathname !== "/api/copilot-usage/adoption/departments") throw new Error(`Unexpected request: ${input}`);
     const company = url.searchParams.get("company");
-    const ordered = url.searchParams.get("order") === "asc" ? [...data.value].reverse() : data.value;
-    return Response.json(company === "~string:Fabrikam" ? { ...data, value: data.value.slice(2), counts: { total: 3, filtered: 1 } }
-      : company === "~null" ? { ...data, value: [{ id: "missing", company: null, department: null, people: 2, activePeople: 0 }],
-        counts: { total: 3, filtered: 1 } } : { ...data, value: ordered });
+    const matching = company === "~null" ? [{ id: "missing", company: null, department: null, people: 2, activePeople: 0 }]
+      : company ? data.value.filter(row => row.company === company.slice(8)) : data.value;
+    const ordered = url.searchParams.get("order") === "asc" ? [...matching].reverse() : matching;
+    const limit = Number(url.searchParams.get("limit") ?? data.page.limit);
+    const number = Math.min(Number(url.searchParams.get("pageNumber") ?? 1), Math.max(1, Math.ceil(ordered.length / limit)));
+    const offset = (number - 1) * limit;
+    return Response.json({ ...data, value: ordered.slice(offset, offset + limit),
+      counts: { total: data.value.length, filtered: ordered.length },
+      page: { limit, number, offset, previousCursor: offset > 0 ? "previous" : null,
+        nextCursor: offset + limit < ordered.length ? "next" : null } });
   });
   vi.stubGlobal("fetch", fetcher);
   return { data, fetcher };
@@ -58,6 +64,7 @@ describe("dashboard insights", () => {
     const view = render(<DashboardInsights {...props} />);
     await screen.findByRole("list", { name: "Department adoption" });
     const company = screen.getByRole("combobox", { name: "Company" });
+    expect(screen.getByText("Company", { exact: true })).toHaveClass("sr-only");
     await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
     fireEvent.click(company);
     fireEvent.click(screen.getByRole("option", { name: "Fabrikam" }));
@@ -77,6 +84,46 @@ describe("dashboard insights", () => {
     expect(await within(departments).findByText("0%")).toBeVisible();
     const missing = new URL(within(departments).getByRole("link", { name: "Department not provided" }).getAttribute("href")!, "http://localhost");
     expect(missing.searchParams.get("company")).toBe("~null");
+  });
+
+  it("shows ten departments and jumps directly between numbered pages, resetting for company and sort changes", async () => {
+    const value = Array.from({ length: 571 }, (_, index) => ({
+      id: `department-${index + 1}`, company: index >= 560 ? "Fabrikam" : "Contoso",
+      department: `Department ${index + 1}`, people: 10, activePeople: 5,
+    }));
+    const { fetcher } = fixture(adoptionDepartmentPage({ value }));
+    const props = { snapshot: adoptionSnapshot(), revision: 0, onCompanyChange: vi.fn() };
+    const view = render(<DashboardInsights {...props} />);
+    const departments = await screen.findByRole("list", { name: "Department adoption" });
+    expect(within(departments).getAllByRole("listitem")).toHaveLength(10);
+    const navigation = within(screen.getByRole("navigation", { name: "departments pages" }));
+    expect(navigation.getByRole("status")).toHaveTextContent("571 matching departments; 10 on this page");
+    expect(navigation.getByRole("button", { name: "Page 1" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(navigation.getByRole("button", { name: "Page 58" }));
+    expect(await within(departments).findByRole("link", { name: /Department 571/ })).toBeVisible();
+    expect(within(departments).getAllByRole("listitem")).toHaveLength(1);
+    expect(navigation.getByRole("status")).toHaveTextContent("571 matching departments; 1 on this page");
+    expect(navigation.getByRole("button", { name: "Page 58" })).toHaveAttribute("aria-current", "page");
+    expect(navigation.getByRole("button", { name: "Next departments" })).toHaveAttribute("aria-disabled", "true");
+    const requests = () => fetcher.mock.calls.map(([input]) => new URL(input, "http://localhost"))
+      .filter(url => url.pathname.endsWith("/departments"));
+    expect(requests().map(url => [url.searchParams.get("limit"), url.searchParams.get("pageNumber")]))
+      .toEqual([["10", null], ["10", "58"]]);
+    expect(requests()[1].searchParams.get("selectionId")).toBe(adoptionDepartmentPage().selection.id);
+    fireEvent.click(navigation.getByRole("button", { name: "Previous departments" }));
+    expect(await within(departments).findByRole("link", { name: /Department 561/ })).toBeVisible();
+    expect(navigation.getByRole("button", { name: "Page 57" })).toHaveAttribute("aria-current", "page");
+    fireEvent.click(screen.getByRole("button", { name: "Sort departments by adoption percentage, highest first" }));
+    await waitFor(() => expect(navigation.getByRole("button", { name: "Page 1" })).toHaveAttribute("aria-current", "page"));
+    expect(requests().at(-1)!.searchParams.has("pageNumber")).toBe(false);
+    fireEvent.click(navigation.getByRole("button", { name: "Page 58" }));
+    await waitFor(() => expect(navigation.getByRole("button", { name: "Page 58" })).toHaveAttribute("aria-current", "page"));
+    view.rerender(<DashboardInsights {...props} company="Fabrikam" />);
+    await waitFor(() => expect(navigation.getByRole("status")).toHaveTextContent("11 matching departments; 10 on this page"));
+    expect(navigation.getByRole("button", { name: "Page 1" })).toHaveAttribute("aria-current", "page");
+    expect(navigation.queryByRole("button", { name: "Page 58" })).not.toBeInTheDocument();
+    expect(requests().at(-1)!.searchParams.has("pageNumber")).toBe(false);
+    expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/summary"))).toHaveLength(1);
   });
 
   it("preserves unknown metrics instead of presenting missing evidence as zero", async () => {
@@ -123,9 +170,9 @@ describe("dashboard insights", () => {
     fetcher.mockImplementation(async (input: string) => {
       const url = new URL(input, "http://localhost");
       if (!url.pathname.endsWith("/departments")) return base(input);
-      if (url.searchParams.get("cursor") === "next") return pending.promise;
+      if (url.searchParams.get("pageNumber") === "2") return pending.promise;
       return Response.json({ ...data, value: [data.value[0]], counts: { total: 2, filtered: 2 },
-        page: { limit: 1, nextCursor: "next", previousCursor: null } });
+        page: { limit: 1, number: 1, offset: 0, nextCursor: "next", previousCursor: null } });
     });
     render(<DashboardInsights snapshot={adoptionSnapshot()} revision={0} onCompanyChange={vi.fn()} />);
     const department = screen.getByRole("region", { name: "Adoption by department" });
@@ -143,9 +190,9 @@ describe("dashboard insights", () => {
     expect(champion).toBeVisible();
     expect(within(screen.getByRole("region", { name: "Agents and champions" })).queryByText("Unknown")).not.toBeInTheDocument();
     await act(async () => pending.resolve(Response.json({ ...data, value: [data.value[1]], counts: { total: 2, filtered: 2 },
-      page: { limit: 1, nextCursor: null, previousCursor: "previous" } })));
+      page: { limit: 1, number: 2, offset: 1, nextCursor: null, previousCursor: "previous" } })));
     expect(await within(department).findByRole("link", { name: /Engineering/ })).toBeVisible();
-    const next = fetcher.mock.calls.map(([input]) => new URL(input, "http://localhost")).find(url => url.searchParams.has("cursor"))!;
+    const next = fetcher.mock.calls.map(([input]) => new URL(input, "http://localhost")).find(url => url.searchParams.get("pageNumber") === "2")!;
     expect(next.searchParams.get("selectionId")).toBe(data.selection.id);
     expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/summary"))).toHaveLength(1);
     expect(within(screen.getByRole("region", { name: "People and engagement" })).getByText("40,000")).toBeVisible();

@@ -28,11 +28,12 @@ export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<Re
 type PageControlsProps = {
   data?: Pick<ReportPage<unknown>, "page" | "counts" | "value">; previous: () => void; next: () => void;
   loading?: boolean; disabled?: boolean; leaseEnded?: boolean; label?: string; compact?: boolean;
+  showPageNumbers?: boolean;
   goToPage?: (page: number) => boolean;
 };
-export function ReportPageControls({ data, previous, next, loading = false, disabled = false, leaseEnded = false, label = "rows", compact = false, goToPage }: PageControlsProps) {
+export function ReportPageControls({ data, previous, next, loading = false, disabled = false, leaseEnded = false, label = "rows", compact = false, showPageNumbers = false, goToPage }: PageControlsProps) {
   if (goToPage) return <NumberedPageControls data={data} previous={previous} next={next} loading={loading}
-    disabled={disabled} leaseEnded={leaseEnded} label={label} compact={compact} goToPage={goToPage} />;
+    disabled={disabled} leaseEnded={leaseEnded} label={label} compact={compact} showPageNumbers={showPageNumbers} goToPage={goToPage} />;
   const previousDisabled = disabled || leaseEnded || loading || !data?.page.previousCursor, nextDisabled = disabled || leaseEnded || loading || !data?.page.nextCursor;
   return <nav className="copilot-users-pagination" aria-label={`${label} pages`} aria-busy={loading}>
     <span role="status">{usageCount(data?.counts.filtered)} matching {label}{data ? `; ${data.value.length} on this page` : ""}</span>
@@ -54,13 +55,13 @@ function visiblePages(current: number, total: number): (number | "start-gap" | "
     ...(end < total - 1 ? ["end-gap" as const] : []), total];
 }
 
-function NumberedPageControls({ data, previous, next, loading, disabled, leaseEnded, label = "rows", compact = false, goToPage }: PageControlsProps & { goToPage: (page: number) => boolean }) {
+function NumberedPageControls({ data, previous, next, loading, disabled, leaseEnded, label = "rows", compact = false, showPageNumbers = false, goToPage }: PageControlsProps & { goToPage: (page: number) => boolean }) {
   const inputId = useId();
   const input = useRef<HTMLInputElement>(null);
   const current = data?.page.number ?? 1;
   const total = data ? Math.max(1, Math.ceil(data.counts.filtered / data.page.limit)) : 1;
   const blocked = Boolean(disabled || leaseEnded || loading || !data);
-  if (compact) {
+  if (compact && !showPageNumbers) {
     const pageLabel = data ? `Page ${current.toLocaleString()} of ${total.toLocaleString()}`
       : loading ? `Loading ${label}...` : `${label} unavailable`;
     return <nav className="report-pagination-compact" aria-label={`${label} page shortcuts`} aria-busy={loading}>
@@ -79,18 +80,19 @@ function NumberedPageControls({ data, previous, next, loading, disabled, leaseEn
   }
   const start = data?.value.length ? (data.page.offset ?? 0) + 1 : 0;
   const end = data ? (data.page.offset ?? 0) + data.value.length : 0;
-  return <nav className="copilot-users-pagination report-pagination-numbered"
+  return <nav className={`copilot-users-pagination report-pagination-numbered${compact ? " report-pagination-condensed" : ""}`}
     aria-label={`${label} pages`} aria-busy={loading}>
     <div className="report-pagination-summary" role="status" aria-atomic="true">
-      <span>{data ? <>Showing <strong>{start.toLocaleString()}–{end.toLocaleString()}</strong> of{" "}
-        <strong>{data.counts.filtered.toLocaleString()}</strong> {label}</> : loading ? `Loading ${label}...` : `${label} unavailable`}</span>
-      <small>{data ? <>Page {current.toLocaleString()} of {total.toLocaleString()}</> : " "}</small>
+      <span>{compact ? <>{usageCount(data?.counts.filtered)} matching {label}{data ? `; ${data.value.length} on this page` : ""}</>
+        : data ? <>Showing <strong>{start.toLocaleString()}–{end.toLocaleString()}</strong> of{" "}
+          <strong>{data.counts.filtered.toLocaleString()}</strong> {label}</> : loading ? `Loading ${label}...` : `${label} unavailable`}</span>
+      {compact ? null : <small>{data ? <>Page {current.toLocaleString()} of {total.toLocaleString()}</> : " "}</small>}
       {loading && data ? <span className="sr-only">Updating {label}.</span> : null}
     </div>
     <div className="report-pagination-actions">
       <button type="button" className="secondary report-page-direction" aria-label={`Previous ${label}`}
         aria-disabled={blocked || current <= 1} onClick={() => { if (!blocked && current > 1) previous(); }}>
-        <ChevronLeft size={16} aria-hidden="true" /><span>Previous</span>
+        <ChevronLeft size={16} aria-hidden="true" />{compact ? null : <span>Previous</span>}
       </button>
       <ol className="report-page-numbers" aria-label="Page numbers">
         {visiblePages(current, total).map(item => <li key={item}>
@@ -103,10 +105,10 @@ function NumberedPageControls({ data, previous, next, loading, disabled, leaseEn
       </ol>
       <button type="button" className="secondary report-page-direction" aria-label={`Next ${label}`}
         aria-disabled={blocked || current >= total} onClick={() => { if (!blocked && current < total) next(); }}>
-        <span>Next</span><ChevronRight size={16} aria-hidden="true" />
+        {compact ? null : <span>Next</span>}<ChevronRight size={16} aria-hidden="true" />
       </button>
     </div>
-    {total > 7 ? <form className="report-page-jump" onSubmit={event => {
+    {!compact && total > 7 ? <form className="report-page-jump" onSubmit={event => {
       event.preventDefault();
       if (!blocked && event.currentTarget.reportValidity() && input.current) {
         if (goToPage(input.current.valueAsNumber)) event.currentTarget.reset();

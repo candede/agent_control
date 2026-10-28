@@ -68,6 +68,12 @@ test("Dashboard shows historical adoption, preserves baseline and company naviga
   await expect(users.getByText("-38 (-11%)", { exact: true })).toHaveCount(2);
   expect(reads).toHaveLength(readsBeforeBaseline);
   const company = page.getByRole("combobox", { name: "Company", exact: true });
+  await expect(departmentPanel.locator(".report-facet-control > span")).toHaveClass("sr-only");
+  if (testInfo.project.name === "desktop") {
+    const headingBounds = (await departmentPanel.locator(".dashboard-panel-heading").boundingBox())!;
+    const companyBounds = (await company.boundingBox())!;
+    expect(Math.abs(companyBounds.y + companyBounds.height / 2 - headingBounds.y - headingBounds.height / 2)).toBeLessThanOrEqual(1);
+  }
   await company.click();
   const companyMenu = page.getByRole("listbox", { name: "Company options" });
   await expect(companyMenu).toBeVisible();
@@ -102,6 +108,73 @@ test("Dashboard shows historical adoption, preserves baseline and company naviga
   expect(unexpected).toEqual([]);
 });
 
+test("Dashboard shows ten departments with direct numbered navigation and responsive page controls", async ({ page }, testInfo) => {
+  const unexpected = await mockLayoutApi(page);
+  const snapshot = adoptionSnapshot(), summary = adoptionSummaryPage();
+  const data = adoptionDepartmentPage({ value: Array.from({ length: 571 }, (_, index) => ({
+    id: `department-${index + 1}`, company: index >= 560 ? "Fabrikam" : "Contoso",
+    department: `Department ${index + 1}`, people: 10, activePeople: 5,
+  })) });
+  const reads: URLSearchParams[] = [];
+  await page.route(url => url.pathname === "/api/official-usage/history/adoption", route =>
+    route.fulfill({ json: reportPage([snapshot]) }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/summary", route =>
+    route.fulfill({ json: summary }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/facets", route =>
+    route.fulfill({ json: { value: [{ value: "Contoso", count: 560 }, { value: "Fabrikam", count: 11 }],
+      counts: { total: 2, filtered: 2 }, selection: summary.selection, page: summary.page } }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/departments", route => {
+    const query = new URL(route.request().url()).searchParams;
+    reads.push(query);
+    expect(query.get("limit")).toBe("10");
+    const matching = query.has("company") ? data.value.filter(row => `~string:${row.company}` === query.get("company")) : data.value;
+    const ordered = query.get("order") === "asc" ? [...matching].reverse() : matching;
+    const number = Math.min(Number(query.get("pageNumber") ?? 1), Math.max(1, Math.ceil(ordered.length / 10)));
+    const offset = (number - 1) * 10;
+    return route.fulfill({ json: { ...data, value: ordered.slice(offset, offset + 10),
+      counts: { total: data.value.length, filtered: ordered.length },
+      page: { limit: 10, number, offset, previousCursor: offset > 0 ? "previous" : null,
+        nextCursor: offset + 10 < ordered.length ? "next" : null } } });
+  });
+  await page.goto("/dashboard");
+  const panel = page.getByRole("region", { name: "Adoption by department" });
+  const list = panel.getByRole("list", { name: "Department adoption" });
+  const navigation = panel.getByRole("navigation", { name: "departments pages" });
+  await expect(list.getByRole("listitem")).toHaveCount(10);
+  await expect(navigation.getByRole("status")).toHaveText("571 matching departments; 10 on this page");
+  await expect(navigation.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  await page.screenshot({ path: testInfo.outputPath("department-first-page.png"), fullPage: true });
+  const beforeJump = reads.length;
+  await navigation.getByRole("button", { name: "Page 58", exact: true }).click();
+  await expect(list.getByRole("link", { name: /Department 571/ })).toBeVisible();
+  await expect(list.getByRole("listitem")).toHaveCount(1);
+  await expect(navigation.getByRole("status")).toHaveText("571 matching departments; 1 on this page");
+  await expect(navigation.getByRole("button", { name: "Next departments" })).toHaveAttribute("aria-disabled", "true");
+  expect(reads).toHaveLength(beforeJump + 1);
+  expect(reads.at(-1)!.get("pageNumber")).toBe("58");
+  expect(reads.at(-1)!.get("selectionId")).toBe(data.selection.id);
+  await page.screenshot({ path: testInfo.outputPath("department-last-page.png"), fullPage: true });
+  await navigation.getByRole("button", { name: "Page 1", exact: true }).click();
+  await expect(list.getByRole("listitem")).toHaveCount(10);
+  await expect(list.getByRole("link", { name: "Department 1 Contoso", exact: true })).toBeVisible();
+  await navigation.getByRole("button", { name: "Page 2", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(list.getByRole("link", { name: "Department 11 Contoso", exact: true })).toBeVisible();
+  await panel.getByRole("button", { name: "Sort departments by adoption percentage, highest first" }).click();
+  await expect(list.getByRole("link", { name: /Department 571/ })).toBeVisible();
+  await expect(navigation.getByRole("button", { name: "Page 1", exact: true })).toHaveAttribute("aria-current", "page");
+  expect(reads.at(-1)!.has("pageNumber")).toBe(false);
+  const company = panel.getByRole("combobox", { name: "Company", exact: true });
+  await company.click();
+  await page.getByRole("option", { name: "Fabrikam", exact: true }).click();
+  await expect(navigation.getByRole("status")).toHaveText("11 matching departments; 10 on this page");
+  await expect(navigation.getByRole("button", { name: "Page 58", exact: true })).toHaveCount(0);
+  await expect(navigation.getByRole("button", { name: "Page 2", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".dashboard-panel-teal").analyze()).violations).toEqual([]);
+  expect(unexpected).toEqual([]);
+});
+
 test("Dashboard works before any usage reports are imported without extra setup gates", async ({ page }) => {
   const unexpected = await mockLayoutApi(page);
   await page.route(url => url.pathname === "/api/official-usage/history/adoption", route =>
@@ -130,10 +203,11 @@ test("Department paging keeps the current page and organization metrics visible 
   await page.route(url => url.pathname === "/api/copilot-usage/adoption/facets", route =>
     route.fulfill({ json: { value: [], counts: { total: 0, filtered: 0 }, selection: summary.selection, page: summary.page } }));
   await page.route(url => url.pathname === "/api/copilot-usage/adoption/departments", async route => {
-    const next = new URL(route.request().url()).searchParams.get("cursor") === "next";
+    const next = new URL(route.request().url()).searchParams.get("pageNumber") === "2";
     if (next) await pending;
     return route.fulfill({ json: { ...data, value: [data.value[next ? 1 : 0]], counts: { total: 2, filtered: 2 },
-      page: { limit: 1, nextCursor: next ? null : "next", previousCursor: next ? "previous" : null } } });
+      page: { limit: 1, number: next ? 2 : 1, offset: next ? 1 : 0,
+        nextCursor: next ? null : "next", previousCursor: next ? "previous" : null } } });
   });
   try {
     await page.goto("/dashboard");
@@ -146,7 +220,7 @@ test("Department paging keeps the current page and organization metrics visible 
     const initialSummaryReads = summaryReads;
     expect(initialSummaryReads).toBeGreaterThan(0);
     await departments.getByRole("button", { name: "Next departments" }).click();
-    await expect(departments.getByRole("list")).toHaveAttribute("aria-busy", "true");
+    await expect(departments.getByRole("list", { name: "Department adoption" })).toHaveAttribute("aria-busy", "true");
     await expect(departments.getByRole("link", { name: /Finance/ })).toBeVisible();
     await expect(people.getByText("40,000", { exact: true })).toBeVisible();
     await expect(champions.getByText("6", { exact: true })).toBeVisible();
@@ -155,7 +229,7 @@ test("Department paging keeps the current page and organization metrics visible 
     expect(summaryReads).toBe(initialSummaryReads);
     release();
     await expect(departments.getByRole("link", { name: /Engineering/ })).toBeVisible();
-    await expect(departments.getByRole("list")).toHaveAttribute("aria-busy", "false");
+    await expect(departments.getByRole("list", { name: "Department adoption" })).toHaveAttribute("aria-busy", "false");
     expect(summaryReads).toBe(initialSummaryReads);
     expect(unexpected).toEqual([]);
   } finally { release(); }
