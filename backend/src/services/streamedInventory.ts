@@ -14,6 +14,7 @@ import { readPackageControls } from "../db/packageControls.js";
 import { AppError, isTimeoutError } from "../errors.js";
 import { compareInventoryTimestamps } from "./inventoryTimestamp.js";
 import { createRefreshExecutionSignal } from "./refreshExecution.js";
+import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 
 export async function storedInventoryRecord(client: pg.PoolClient, generationId: string, identity: string, purpose: "complete" | "canonical" = "complete") {
   return (await storedInventoryRecords(client, [{ generationId, identity }], purpose))[0];
@@ -84,9 +85,10 @@ function carryControlChildren(record: InventoryRecord, previous: { generation_id
   return record;
 }
 
-function carryPackageCollections(record: InventoryRecord, previous: { generation_id: string; identity: string }, collections: string[]) {
-  if (!collections.length) return;
-  const kinds = collections.flatMap(kind => kind === "elementDetails" ? ["element", "elementGroup"] : [kind]);
+function carryPackageCollections(record: InventoryRecord, previous: { generation_id: string; identity: string },
+  collections: string[], additionalKinds: string[] = []) {
+  if (!collections.length && !additionalKinds.length) return;
+  const kinds = [...additionalKinds, ...collections.flatMap(kind => kind === "elementDetails" ? ["element", "elementGroup"] : [kind])];
   record.factSource = { generationId: previous.generation_id, identity: previous.identity,
     kinds: ["collection", ...kinds], includeCollections: collections };
   record.facts = record.facts.filter(fact => fact.kind === "collection" ? !collections.includes(fact.value) : !kinds.includes(fact.kind));
@@ -330,14 +332,18 @@ export class StreamedInventory {
       }
       let result = value;
       let carriedCollections: string[] = [];
+      let carriedKinds: string[] = [];
       if (channel === "detail") {
         if (!previous) throw new Error("inventory_detail_target_missing");
         const catalog = previous.value as CopilotPackageDetail;
         result = projectPackageDetails(catalog, { package: { ...value, identityDetailsCollected: true },
-          observedAt: generation.observed_at.toISOString(), expiresAt: new Date(generation.observed_at.getTime() + 3600_000).toISOString(),
+          observedAt: generation.observed_at.toISOString(), expiresAt: new Date(generation.observed_at.getTime() + automaticDataSyncIntervalMs).toISOString(),
           catalogRevision: packageDetailRevision(catalog) }, false);
-        if (result.detailFreshness?.state === "invalidated") carriedCollections = ["categories", "allowedUsersAndGroups", "acquireUsersAndGroups"];
-        else {
+        carriedKinds = ["about:short"];
+        if (result.detailFreshness?.state === "invalidated") {
+          carriedCollections = ["categories", "allowedUsersAndGroups", "acquireUsersAndGroups", "sharedWithUsersAndGroups"];
+          carriedKinds.push("about:long");
+        } else {
           if (!packageDetailAccessScopesMatch(catalog.availableTo, value.availableTo)) carriedCollections.push("allowedUsersAndGroups");
           if (!packageDetailAccessScopesMatch(catalog.deployedTo, value.deployedTo)) carriedCollections.push("acquireUsersAndGroups");
         }
@@ -349,6 +355,7 @@ export class StreamedInventory {
             catalogRevision: packageDetailRevision(detail) } : undefined, false, Date.now(), generation.observed_at.getTime());
         if (detail && ["fresh", "stale"].includes(result.detailFreshness?.state ?? "")) {
           carriedCollections = ["categories", "elementDetails"];
+          carriedKinds = ["about:long"];
           const newerCatalog = compareInventoryTimestamps(generation.observed_at, detail.detailFreshness!.observedAt!) > 0;
           if (!(newerCatalog && value.sharedWithUsersAndGroups !== undefined)) carriedCollections.push("sharedWithUsersAndGroups");
           if (packageDetailAccessScopesMatch(value.availableTo, detail.availableTo)
@@ -358,7 +365,7 @@ export class StreamedInventory {
         }
       } else if (channel === "exact") {
         result = projectPackageDetails(value, { package: { ...value, identityDetailsCollected: true },
-          observedAt: generation.observed_at.toISOString(), expiresAt: new Date(generation.observed_at.getTime() + 3600_000).toISOString() }, true);
+          observedAt: generation.observed_at.toISOString(), expiresAt: new Date(generation.observed_at.getTime() + automaticDataSyncIntervalMs).toISOString() }, true);
       } else {
         if (!previous) throw new Error("inventory_control_source_missing");
         result = previous.value as CopilotPackageDetail;
@@ -372,7 +379,7 @@ export class StreamedInventory {
       if (channel === "control" && previous) {
         carryControlChildren(record, previous, ["allowedUsersAndGroups", "acquireUsersAndGroups"]
           .filter(kind => result[kind as "allowedUsersAndGroups" | "acquireUsersAndGroups"] !== undefined));
-      } else if (previous) carryPackageCollections(record, previous, carriedCollections);
+      } else if (previous) carryPackageCollections(record, previous, carriedCollections, carriedKinds);
       return { ...record, catalog_generation: channel === "detail" || channel === "control" ? previous?.catalog_generation ?? null : lease.id,
         detail_generation: result.detailFreshness?.state === "missing" ? null
           : channel === "catalog" || channel === "control" ? previous?.detail_generation ?? null : lease.id,

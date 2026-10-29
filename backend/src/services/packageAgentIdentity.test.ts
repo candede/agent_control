@@ -241,6 +241,20 @@ describe("explicit package-to-agent identity", () => {
     expect(withVerifiedControlIdentities([saved], links, {}, now)[0]).toBe(saved);
   });
 
+  it.each([null, undefined])("does not replace explicitly missing identity-detail proof with catalog freshness (%s)", identityDetails => {
+    const value = packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" } });
+    const saved = resource({ identifiers: [], details: { schemaName: "cr_agent" } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    expect(links[0]).toMatchObject({ status: "matched", controlBotId: cdsBotId });
+    const now = Date.parse("2026-09-16T12:00:00Z");
+    const fresh = { observedAt: "2026-09-16T11:00:00Z", expiresAt: "2026-09-16T13:00:00Z" };
+    const unqualified = withVerifiedControlIdentities([saved], links, { [value.id]: { ...fresh, identityDetails } }, now)[0];
+    expect(unqualified).toBe(saved);
+    expect(powerPlatformInventoryRecord(unqualified).facts.some(fact => fact.kind === "control:quarantine")).toBe(false);
+    expect(withVerifiedControlIdentities([saved], links, { [value.id]: { ...fresh, identityDetails: fresh } }, now)[0].identifiers)
+      .toContainEqual({ kind: "cds_bot_id", value: cdsBotId });
+  });
+
   it.each([
     { packageId: "__proto__", otherPackageId: "constructor" },
     { packageId: "constructor", otherPackageId: "toString" },
@@ -749,6 +763,48 @@ describe("explicit package-to-agent identity", () => {
     expect(resolvePackageAgentLinks("tenant-a", [values[0]], [resource({
       nativeId: entraAgentId, identifiers: [{ kind: "entra_agent_id", value: entraAgentId }],
     })])[0].status).toBe("unmatched");
+  });
+
+  it("retains successfully observed expired identity links without renewing live control proof", () => {
+    const now = Date.now(), observedAt = new Date(now - 120_000).toISOString(), expiresAt = new Date(now - 60_000).toISOString();
+    const value = { ...packaged({ SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" } }),
+      detailFreshness: { state: "stale" as const, observedAt, expiresAt } };
+    const saved = resource({ identifiers: [], details: { schemaName: "cr_agent" } });
+    const links = resolvePackageAgentLinks("tenant-a", [value], [saved]);
+    expect(links[0]).toMatchObject({ status: "matched", controlBotId: cdsBotId });
+    expect(withVerifiedControlIdentities([saved], links, {
+      [value.id]: { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+        identityDetails: { observedAt, expiresAt } },
+    }, now)[0]).toBe(saved);
+    const current = { observedAt: new Date(now).toISOString(), expiresAt: new Date(now + 60_000).toISOString() };
+    expect(withVerifiedControlIdentities([saved], links, {
+      [value.id]: { ...current, identityDetails: current },
+    }, now)[0].identifiers).toContainEqual({ kind: "cds_bot_id", value: cdsBotId });
+  });
+
+  it.each([
+    { observedAt: null, expiresAt: "9999-12-31T23:59:59Z" },
+    { observedAt: "2026-01-01T00:00:00Z", expiresAt: null },
+    { observedAt: "invalid", expiresAt: "9999-12-31T23:59:59Z" },
+    { observedAt: "2026-01-01T00:00:00Z", expiresAt: "invalid" },
+    { observedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-01T00:00:00Z" },
+    { observedAt: "9999-12-31T23:00:00Z", expiresAt: "9999-12-31T23:59:59Z" },
+  ])("does not trust a fresh label with invalid timestamps for links or match facts (%#)", freshness => {
+    const native = {
+      ...customEnginePackage("native", {
+        SourceIds: { EnvironmentId: environmentId, CdsBotId: cdsBotId, SchemaName: "cr_agent" },
+      }),
+      detailFreshness: { state: "fresh" as const, ...freshness },
+    };
+    const alias = customEnginePackage("alias");
+    const links = resolvePackageAgentLinks("tenant-a", [native, alias], [resource({ details: { schemaName: "cr_agent" } })]);
+    expect(links.map(link => link.status)).toEqual(["unmatched", "unmatched"]);
+    expect(links.every(link => !("grouping" in link))).toBe(true);
+    if (freshness.expiresAt === null || freshness.expiresAt === "invalid") {
+      expect(() => packageInventoryRecord(native)).toThrow(expect.objectContaining({ code: "saved_source_invalid" }));
+    } else {
+      expect(packageInventoryRecord(native).facts.filter(fact => fact.kind.startsWith("match:"))).toEqual([]);
+    }
   });
 
   it.each(["stale", "missing", "invalidated", "revalidation_required"] as const)(

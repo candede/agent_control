@@ -164,14 +164,14 @@ describe("saved inventory row structure", () => {
         catalogRevision: packageDetailRevision(catalog) }, false, Date.parse(observedAt));
       member.residual = packageInventoryRecord(projected).residual;
       Object.assign(raw.verificationCounts, {
-        checked_packages: 0, stale_packages: Number(state === "stale"), invalidated_packages: Number(state === "invalidated"),
+        checked_packages: Number(state === "stale"), stale_packages: 0, invalidated_packages: Number(state === "invalidated"),
       });
       const page = inventoryPresentation(raw);
       expect(page.identityCollection).toMatchObject({
-        checkedPackages: 0, pendingPackages: 1,
-        pendingDetails: { missing: 0, stale: Number(state === "stale"), invalidated: Number(state === "invalidated") },
+        checkedPackages: Number(state === "stale"), pendingPackages: Number(state === "invalidated"),
+        pendingDetails: { missing: 0, stale: 0, invalidated: Number(state === "invalidated") },
       });
-      expect(inventoryDetailsPending(page)).toBe(true);
+      expect(inventoryDetailsPending(page)).toBe(state === "invalidated");
       expect(page.value[0].packages[0].detailFreshness).toEqual(projected.detailFreshness);
       const exported = [...unifiedAgentExportRows(page)][0];
       expect(JSON.parse(exported.packageStates).map((value: { detailFreshness: unknown }) => value.detailFreshness))
@@ -322,12 +322,12 @@ describe("saved inventory row structure", () => {
     }
   });
 
-  it("preserves exact environment observations and ages them at the selected instant", () => {
+  it("preserves exact environment observations without treating age as loss of saved membership", () => {
     for (const [evaluation, current] of [
       ["2026-09-20T12:00:00.000000Z", false],
       ["2026-09-20T12:00:00.000001Z", true],
       ["2026-09-20T12:00:00.000002Z", true],
-      ["2026-09-20T12:00:00.000003Z", false],
+      ["2026-09-20T12:00:00.000003Z", true],
     ] as const) {
       const raw = environmentPage(), environment = raw.value[0].environment!;
       Object.assign(environment.observation, {
@@ -485,9 +485,20 @@ describe("saved inventory projection invariants", () => {
     expect(future.value[0].members[0].residual).not.toHaveProperty("identityDetailsCollected");
   });
 
-  it.each(["inventory_packages", "inventory_power_platform"])("does not certify an expired, future, incomplete, or superseded %s root", sourceName => {
+  it.each(["inventory_packages", "inventory_power_platform"])("retains complete aged %s snapshots with their original observation dates", sourceName => {
+    const raw = savedPage(0, 0);
+    Object.assign(raw.freshness.sources.find(source => source.source === sourceName)!,
+      { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt });
+    const page = inventoryPresentation(raw), source = sourceName === "inventory_packages" ? page.sources.graphPackages : page.sources.powerPlatform;
+    expect(source).toMatchObject({ state: "available", error: null, observation: {
+      observedAt: "2026-09-19T00:00:00Z", expiresAt: observedAt, current: true,
+    } });
+    expect(page.partial).toBe(false);
+    expect(inventoryAttentionReasons(page)).toEqual([]);
+  });
+
+  it.each(["inventory_packages", "inventory_power_platform"])("does not certify a future, incomplete, or superseded %s root", sourceName => {
     for (const changes of [
-      { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt },
       { observed_at: "2026-09-20T12:00:00.000001Z" },
       { catalog_complete: false }, { complete: false }, { current: false },
     ]) {
@@ -526,13 +537,11 @@ describe("saved inventory projection invariants", () => {
       verification: { status: "needs_attention", checks: { sourceScopes: false } } });
   });
 
-  it.each(["expired", "future", "incomplete", "limited", "missing", "accounting", "conflict", "invalid_metadata"] as const)(
+  it.each(["future", "incomplete", "limited", "missing", "accounting", "conflict", "invalid_metadata"] as const)(
     "keeps %s evidence actionable during reconciliation", problem => {
       const raw = savedPage(1, problem === "invalid_metadata" ? 1 : 0);
       raw.freshness.state = "reconciling";
       raw.freshness.sources[0].current = false;
-      if (problem === "expired") Object.assign(raw.freshness.sources[0],
-        { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt });
       if (problem === "future") raw.freshness.sources[0].observed_at = "2026-09-20T12:00:00.000001Z";
       if (problem === "incomplete") raw.freshness.sources[0].complete = false;
       if (problem === "limited") raw.freshness.sources[0].catalog_complete = false;
@@ -544,15 +553,15 @@ describe("saved inventory projection invariants", () => {
       expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
     });
 
-  it("does not hide an expired visible source member behind reconciliation progress", () => {
+  it("retains an aged visible source member while reconciliation progresses", () => {
     const raw = memberPage();
     raw.freshness.state = "reconciling";
     raw.value[0].members[0].catalog_observed_at = "2026-09-19T00:00:00Z";
     raw.value[0].members[0].catalog_expires_at = observedAt;
     const page = inventoryPresentation(raw);
-    expect(page.verification.status).toBe("needs_attention");
-    expect(page.value[0].observations.packageSnapshots["Package-Exact"].current).toBe(false);
-    expect(inventoryAttentionReasons(page).length).toBeGreaterThan(0);
+    expect(page.verification.status).toBe("updating");
+    expect(page.value[0].observations.packageSnapshots["Package-Exact"].current).toBe(true);
+    expect(inventoryAttentionReasons(page)).toEqual([]);
   });
 
   it.each(["packages", "power_platform"])("does not hide a %s member's missing selected source scope during reconciliation", domain => {
@@ -570,15 +579,13 @@ describe("saved inventory projection invariants", () => {
     }
   });
 
-  it.each(["expired", "future", "incomplete", "exact"] as const)(
+  it.each(["future", "incomplete", "exact"] as const)(
     "does not hide a visible member's %s native scope behind a healthy primary scope", problem => {
       for (const state of ["idle", "reconciling"]) {
         const raw = memberPage(true);
         raw.freshness.state = state;
         const source = { ...raw.freshness.sources[1], scope_id: "member-native-scope", generation_id: "member-native-root",
           catalog_observed_at: "2026-09-19T00:00:00Z" };
-        if (problem === "expired") Object.assign(source,
-          { observed_at: "2026-09-19T00:00:00Z", expires_at: observedAt });
         if (problem === "future") source.observed_at = "2026-09-20T12:00:00.000001Z";
         if (problem === "incomplete") source.complete = false;
         if (problem === "exact") Object.assign(source, { channel: "control", expected_count: null });
@@ -704,7 +711,7 @@ describe("saved inventory projection invariants", () => {
     { name: "invalid field provenance", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].residual.provenance = { id: {} }; } },
     { name: "non-JSON residual", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].residual.provenance = new Map(); } },
     { name: "unpaired details", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].detail_generation = null; } },
-    { name: "falsely certified details", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].residual.detailFreshness.state = "stale"; } },
+    { name: "falsely certified details", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].residual.identityDetailsCollected = false; } },
     { name: "invalid Date", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].expires_at = new Date(NaN); } },
     { name: "invalid calendar date", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].members[0].catalog_observed_at = "2026-02-30T00:00:00Z"; } },
     { name: "invalid usage date", change: (raw: ReturnType<typeof memberPage>) => { raw.value[0].lastActivity = ""; } },
@@ -758,14 +765,14 @@ describe("saved inventory projection invariants", () => {
     }
   });
 
-  it("rejects malformed calendar timestamps and distinguishes sub-millisecond expiry boundaries", () => {
+  it("rejects malformed timestamps without expiring valid saved observations at a sub-millisecond boundary", () => {
     for (const timestamp of ["2026-02-30T12:00:00Z", "2026-09-20", "2026-09-20T24:00:00Z"]) {
       expect(() => inventoryTimestamp(timestamp)).toThrow(expect.objectContaining({ code: "saved_source_invalid" }));
     }
     expect(inventoryObservation("id", "2026-09-20T12:00:00.000000Z", "2026-09-20T12:00:00.000002Z", true,
       "2026-09-20T12:00:00.000001Z").current).toBe(true);
     expect(inventoryObservation("id", "2026-09-20T12:00:00.000000Z", "2026-09-20T12:00:00.000002Z", true,
-      "2026-09-20T12:00:00.000002Z").current).toBe(false);
+      "2026-09-20T12:00:00.000002Z").current).toBe(true);
   });
 });
 
@@ -899,7 +906,7 @@ describe("saved inventory metadata verification", () => {
     });
   });
 
-  it("persists exact per-package evidence and exports every member with its own observation and child provenance", async () => {
+  it.each(["fresh", "aged", "future_catalog", "future_detail", "superseded"] as const)("persists exact per-package evidence and full-source provenance (%s)", async scenario => {
     const database = new pg.Pool({ max: 4 });
     vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition."));
     vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected unscoped query."));
@@ -915,15 +922,22 @@ describe("saved inventory metadata verification", () => {
         identifiers: [{ kind: "cds_bot_id", value: botId }, { kind: "entra_app_id", value: appId },
           { kind: "entra_agent_id", value: "55555555-5555-5555-5555-555555555555" }],
       };
+      const detailState = scenario === "aged" ? "stale" as const : "fresh" as const;
+      const detailObservedAt = scenario === "aged" ? "2026-09-20T11:00:00.000Z"
+        : scenario === "future_detail" ? "2026-09-20T12:00:00.001Z" : observedAt;
+      const detailExpiresAt = scenario === "aged" ? observedAt : expiresAt;
+      const current = scenario !== "future_catalog" && scenario !== "superseded";
+      const detailCurrent = current && scenario !== "future_detail";
       const packageValues = ["a", "z"].map(id => ({ ...allowlistedPackage({
         id, displayName: id, publisher: `${id}-publisher`, isBlocked: false, supportedHosts: [], longDescription: "detail-only-description",
         elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: `${id}-metadata`,
           definition: JSON.stringify(id === "a"
             ? { SourceIds: { EnvironmentId: environmentId, CdsBotId: botId }, AgentIdentityId: graphAgentId }
             : { SourceIds: { EnvironmentId: environmentId, EntraApplicationId: appId } }) }] }],
-      }), detailFreshness: { state: "fresh" as const, observedAt, expiresAt } }));
+      }), detailFreshness: { state: detailState, observedAt: detailObservedAt, expiresAt: detailExpiresAt } }));
       const packageScope = randomUUID(), nativeScope = randomUUID();
-      const catalogObservedAt = "2026-09-19T12:00:00.000Z", expiredCatalogAt = "2026-09-20T11:00:00.000Z";
+      const catalogObservedAt = scenario === "future_catalog" ? "2026-09-20T12:00:00.001Z" : "2026-09-19T12:00:00.000Z";
+      const expiredCatalogAt = scenario === "future_catalog" ? expiresAt : "2026-09-20T11:00:00.000Z";
       const rows = [...packageValues.map(packageInventoryRecord), powerPlatformInventoryRecord(native)].map((record, index) => ({
         ...record, domain: index < 2 ? "packages" : "power_platform", generation_id: randomUUID(),
         catalog_generation: randomUUID(), detail_generation: randomUUID(), scope_id: index < 2 ? packageScope : nativeScope,
@@ -960,8 +974,9 @@ describe("saved inventory metadata verification", () => {
       raw.filteredSummary = { ...raw.summary };
       Object.assign(raw.counts, { total: 1, scoped: 1, filtered: 1 });
       Object.assign(raw.verificationCounts, { native_agents: 1, represented: 3, unique_sources: 3 });
+      if (scenario === "future_detail") Object.assign(raw.verificationCounts, { checked_packages: 0, stale_packages: 2 });
       raw.reports.setId = "usage-report";
-      Object.assign(raw.freshness.sources[0], { scope_id: packageScope });
+      Object.assign(raw.freshness.sources[0], { scope_id: packageScope, current: scenario !== "superseded" });
       Object.assign(raw.freshness.sources[1], { scope_id: nativeScope, row_count: 1, agent_count: 1, expected_count: 1 });
       raw.value.push({
         id: projected.identity, nativeId: projected.native_id, domain: "canonical", resourceType: null, residual: null,
@@ -987,8 +1002,8 @@ describe("saved inventory metadata verification", () => {
       expect(presented.packagesComplete).toBe(false);
       expect(presented.observations.powerPlatform?.snapshotId).toBe(rows[2].generation_id);
       expect(presented.observations.packageSnapshots.a).toMatchObject({
-        snapshotId: rows[0].catalog_generation, observedAt: catalogObservedAt, expiresAt: expiredCatalogAt, current: false,
-        identityDetails: { snapshotId: rows[0].detail_generation, observedAt, expiresAt, current: false },
+        snapshotId: rows[0].catalog_generation, observedAt: catalogObservedAt, expiresAt: expiredCatalogAt, current,
+        identityDetails: { snapshotId: rows[0].detail_generation, observedAt: detailObservedAt, expiresAt: detailExpiresAt, current: detailCurrent },
       });
       const catalogTime = raw.value[0].members[0].catalog_observed_at;
       raw.value[0].members[0].catalog_observed_at = null;
@@ -1065,10 +1080,14 @@ describe("saved inventory metadata verification", () => {
       expect(JSON.parse(String(source.identityEvidence))).toEqual([{ packageId: "z", evidence: evidenceFor("z") }]);
       expect(JSON.parse(String(source.packageStates))[0]).toMatchObject({
         packageId: "z", snapshotId: rows[1].catalog_generation, observedAt: catalogObservedAt, supportedHosts: [],
-        detailFreshness: { state: "fresh", observedAt, expiresAt },
-        identityDetails: { snapshotId: rows[1].detail_generation, observedAt, expiresAt, current: true },
+        current,
+        detailFreshness: { state: scenario === "future_detail" ? "stale" : detailState, observedAt: detailObservedAt, expiresAt: detailExpiresAt },
+        identityDetails: { snapshotId: rows[1].detail_generation, observedAt: detailObservedAt, expiresAt: detailExpiresAt, current: detailCurrent },
         provenance: packageValues[1].provenance,
       });
+      const representativeSource = exported.find(row => row.recordType === "source" && row.sourceIdentity === "a")!;
+      expect(JSON.parse(String(representativeSource.packageStates))[0].identityDetails)
+        .toEqual(presented.observations.packageSnapshots.a.identityDetails);
       const nativeSourceRow = exported.find(row => row.recordType === "source" && row.sourceDomain === "power_platform")!;
       expect(JSON.parse(String(nativeSourceRow.sourceEvidence))).toEqual(evidenceFor(rows[2].identity));
       expect(nativeSourceRow).toMatchObject({ displayName: "Agent", publisher: null, source: "Power Platform" });
@@ -1203,7 +1222,9 @@ describe("saved inventory exact export selection", () => {
           expect(sql).not.toContain("c.expires_at");
           expect(sql).toContain("m.baseline_id=$1");
           expect(sql).toContain("m.valid_from_revision<=$2");
-          expect(sql).toContain("(r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3");
+          expect(sql).toContain("(r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3");
+          expect(sql).toContain("IN ('fresh','stale')");
+          expect(sql).not.toContain("(r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3");
           expect(values).toEqual([context.baselineId, context.revision, new Date(observedAt)]);
           return result([raw.verificationCounts]);
         }

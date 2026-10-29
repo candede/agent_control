@@ -4,7 +4,8 @@ import { useBrowserAvailability } from "./useBrowserAvailability";
 import { useSavedRead } from "./savedQueries";
 import { inventoryUpdating } from "./inventoryVerification";
 
-const checkIntervalMs = 30_000;
+const checkIntervalMs = 5 * 60_000;
+const retryIntervalMs = 30_000;
 const requestTimeoutMs = 30_000;
 type Receipt = { owner: string; revision: string; reload: number; inventory?: UnifiedAgentInventoryHealth; unavailable?: UnifiedAgentInventoryUnavailable; error?: string; loading: boolean };
 
@@ -49,8 +50,9 @@ export function useInventoryHealth(principalKey: string, enabled: boolean, revis
         invalidations = 0;
         setReceipt("state" in next ? { ...identity, unavailable: next, loading: false }
           : { ...identity, inventory: next, loading: false });
-        const updating = "state" in next ? next.state === "preparing" : ["catching_up", "reconciling", "stale"].includes(next.freshness.state);
-        schedule(updating ? 1_000 : checkIntervalMs);
+        const updating = "state" in next ? next.state === "preparing" || next.state === "not_collected"
+          : ["catching_up", "reconciling", "stale"].includes(next.freshness.state);
+        schedule(updating ? 1_000 : "state" in next ? retryIntervalMs : checkIntervalMs);
       } catch (reason) {
         if (!active) return;
         const failure = timedOut ? new Error("Workspace inventory health check timed out.") : reason;
@@ -64,7 +66,7 @@ export function useInventoryHealth(principalKey: string, enabled: boolean, revis
         if (failure instanceof ApiError && [401, 403].includes(failure.status)) denied.current?.(failure);
         else if (timedOut || failure instanceof ApiError
           && (failure.kind === "network" || [408, 429].includes(failure.status) || failure.status >= 500)) {
-          const delay = Math.max(checkIntervalMs, failure instanceof ApiError ? (failure.retryAfterSeconds ?? 0) * 1_000 : 0);
+          const delay = Math.max(retryIntervalMs, failure instanceof ApiError ? (failure.retryAfterSeconds ?? 0) * 1_000 : 0);
           retry.current = { ...identity, dueAt: Date.now() + delay };
           schedule(delay);
         }

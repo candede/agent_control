@@ -49,6 +49,8 @@ function InvestigationSession({ recordId, agentName, identity, revision, user }:
   const contextQueryKey = ["agent-investigation-context", contextScope, revision];
   const context = useQuery({
     queryKey: contextQueryKey,
+    staleTime: 0,
+    gcTime: 0,
     queryFn: async ({ signal }) => {
       const value = await getAgentInvestigationContext(recordId, { signal });
       if (value.recordId !== recordId) throw new Error("Investigation access does not match the selected agent.");

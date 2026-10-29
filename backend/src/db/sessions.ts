@@ -72,12 +72,12 @@ function sanitizedSession(data: SessionData, allowMissingClientId: boolean): Ses
 }
 
 export async function revokeAccountSessions(database: pg.Pool, tenantId: string, principalId: string) {
-  await new DataGenerations(database).revokePrincipal(tenantId, principalId);
+  await new DataGenerations(database).revokePrincipal(tenantId, principalId, { preserveSources: true });
   await database.query("DELETE FROM sessions WHERE tenant_id=$1 AND principal_id=$2", [tenantId, principalId]);
 }
 
 type SessionValidation = { key: string; generation: number; authority?: DelegatedCredentialSource };
-type AccountMutationState = { generation: number; revoked: boolean; bearerIssuedAfter: number; tail: Promise<void> };
+type AccountMutationState = { generation: number; revoked: boolean; bearerIssuedAfter: number; tail: Promise<void>; pending: number };
 const accountMutations = new Map<string, AccountMutationState>();
 let nextGeneration = 0;
 const maximumAccountMutationStates = 10_000;
@@ -160,10 +160,13 @@ export function activateAccountSession<T>(tenantId: string, principalId: string,
   const state = accountMutationState(accountMutationKey(tenantId, principalId));
   const generation = ++nextGeneration;
   state.generation = generation;
+  state.revoked = true;
   return enqueueAccountMutation(state, async () => {
     if (state.generation !== generation) throw AppError.unauthorized("The sign-in was superseded.");
+    const result = await operation();
+    if (state.generation !== generation) throw AppError.unauthorized("The sign-in was superseded.");
     state.revoked = false;
-    return operation();
+    return result;
   });
 }
 
@@ -182,11 +185,21 @@ function accountMutationKey(tenantId: string, principalId: string) {
 function accountMutationState(key: string) {
   let state = accountMutations.get(key);
   if (!state) {
-    state = { generation: ++nextGeneration, revoked: false, bearerIssuedAfter: 0, tail: Promise.resolve() };
+    state = { generation: ++nextGeneration, revoked: false, bearerIssuedAfter: 0, tail: Promise.resolve(), pending: 0 };
     accountMutations.set(key, state);
-    while (accountMutations.size > maximumAccountMutationStates) accountMutations.delete(accountMutations.keys().next().value!);
+    pruneAccountMutationStates(state);
   }
   return state;
+}
+
+function pruneAccountMutationStates(protectedState?: AccountMutationState) {
+  if (accountMutations.size <= maximumAccountMutationStates) return;
+  // Never split an account's queue while a save, sign-in or revocation is pending.
+  for (const [key, state] of accountMutations) {
+    if (state.pending || state === protectedState) continue;
+    accountMutations.delete(key);
+    if (accountMutations.size <= maximumAccountMutationStates) break;
+  }
 }
 
 export function clearAccountSessionMutationsForTest() {
@@ -195,7 +208,12 @@ export function clearAccountSessionMutationsForTest() {
 }
 
 function enqueueAccountMutation<T>(state: AccountMutationState, operation: () => Promise<T>) {
+  state.pending++;
   const result = state.tail.then(operation, operation);
-  state.tail = result.then(() => undefined, () => undefined);
+  const settled = () => {
+    state.pending--;
+    pruneAccountMutationStates();
+  };
+  state.tail = result.then(settled, settled);
   return result;
 }

@@ -19,7 +19,7 @@ export function projectPackageDetailAge<T extends CopilotPackageDetail>(value: T
   if (compareInventoryTimestamps(freshness.expiresAt ?? "", evaluation) > 0
     && compareInventoryTimestamps(freshness.observedAt ?? "", evaluation) <= 0) return value;
   const result = { ...value, detailFreshness: { ...freshness, state: "stale" as const } };
-  delete result.identityDetailsCollected;
+  if (compareInventoryTimestamps(freshness.observedAt ?? "", evaluation) > 0) delete result.identityDetailsCollected;
   return result;
 }
 
@@ -37,7 +37,7 @@ function packageDetailRevisionMatches(current: CopilotPackageDetail, detailed: C
 }
 
 function hasCollectedDetails(value: CopilotPackageDetail) {
-  // Expiry and control conflicts withdraw reusable identity, not a completed empty read's provenance.
+  // A completed empty read still has provenance.
   return value.identityDetailsCollected === true
     || value.detailFreshness?.state !== "missing" && typeof value.detailFreshness?.observedAt === "string"
       && typeof value.detailFreshness.expiresAt === "string";
@@ -120,7 +120,7 @@ export function projectPackageDetails(current: CopilotPackageDetail, saved: Save
     delete result.acquireUsersAndGroups;
     if (saved.package!.acquireUsersAndGroups !== undefined) result.acquireUsersAndGroups = saved.package!.acquireUsersAndGroups;
   }
-  if (state === "fresh" && !result.identityRevalidationRequired) result.identityDetailsCollected = true;
+  if (!result.identityRevalidationRequired && compareInventoryTimestamps(saved.observedAt, new Date(now)) <= 0) result.identityDetailsCollected = true;
   else delete result.identityDetailsCollected;
   return result;
 }

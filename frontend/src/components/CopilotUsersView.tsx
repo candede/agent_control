@@ -130,13 +130,19 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
             : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating..." : usageCount(data?.summary[metric])}</strong>
           <small title={description}>{description}</small></button>)}{reportContext}</div>
     {directoryProgress ? <p className="reported-users-note" role="status">{directoryProgress}</p>
-      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">{directoryFailure ?? `License data ${data.sources.directory.state}. Run Users sync in Sync or review Permissions.`}</p> : null}
+      : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">{directoryFailure
+        ?? (data.sources.directory.state === "stale" && data.sources.directory.generationId
+          ? `Showing saved license data collected ${usageDate(data.sources.directory.observedAt)}. Automatic collection runs every six hours.`
+          : data.sources.directory.state === "partial" ? "License data partial. Run Users sync in Sync or review Permissions."
+          : "License data unavailable. Automatic collection will populate it when authorized; review Sync or Permissions for progress.")}</p> : null}
     {data && !read.loading && data.reports.availability !== "active" ? <p className="copilot-users-notice" role="status">
       {data.reports.availability === "stale" ? "Reports are out of date." : "Agent reports unavailable."}{" "}
       <a href="/sync?reports=manage">Manage reports in Sync</a>.</p> : null}
     {appProgress && !directoryProgress ? <p className="reported-users-note" role="status">{appProgress}</p> : null}
     {!appProgress && data && !read.loading && ["stale", "unavailable"].includes(data.sources.app_activity.state) ? <p className="copilot-users-notice" role="status">
-      Office app activity {data.sources.app_activity.state === "stale" ? "is out of date. Run Users sync in Sync." : "unavailable. Review the connection in Permissions."}</p> : null}
+      {data.sources.app_activity.state === "stale"
+        ? `Showing saved Office app activity collected ${usageDate(data.sources.app_activity.observedAt)}. Automatic collection runs every six hours; provider reports can lag behind collection.`
+        : "Office app activity unavailable. Review the connection in Permissions."}</p> : null}
     <div className="agent-table-stack user-directory-table" aria-busy={read.loading}>
       <UserActivityFilters path="copilot-usage/users" selectionId={read.selectedData?.selection.id} onRestartSelection={restartSelection}
       onSelectionInvalidated={read.invalidateSelection}

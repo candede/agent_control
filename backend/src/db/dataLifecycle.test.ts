@@ -7,11 +7,14 @@ import { DataExports } from "../services/dataExports.js";
 import { canonicalQuery, DataSelections } from "../services/dataSelections.js";
 import { DataGenerations } from "./dataGenerations.js";
 import { retainRecordData } from "./dataRetention.js";
-import { inventoryBaseline } from "../../scripts/inventoryFixtures.js";
+import { inventoryBaseline, inventorySelectionFixture, nativeInventoryFixture, reconcileInventoryFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
 import { InventoryGenerations } from "./inventoryGenerations.js";
 import { InventoryQueries } from "./inventoryQueries.js";
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { flushDataWorkMetrics } from "../services/dataMetrics.js";
+import { revokeAccountSessions } from "./sessions.js";
+import { AgentPeopleRepository } from "./agentPeople.js";
+import { allowlistedPackage } from "../services/packageObservation.js";
 
 describe("cross-domain bounded lifecycle", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -59,6 +62,50 @@ describe("cross-domain bounded lifecycle", () => {
       fixture.runtime.off("acquire", acquire);
       for (const spy of spies) spy.mockRestore();
     }
+  });
+
+  it("retains complete sources across sign-out while fencing old readers and writers and allowing fresh publication", async () => {
+    const identity = { ...selectionIdentity, tenantId: "synthetic-tenant", principalId: randomUUID() };
+    const generations = new DataGenerations(fixture.runtime), selections = new DataSelections(fixture.runtime);
+    const input = generationInput({ scope: { ...generationInput().scope, ...identity } });
+    const saved = await generations.begin(input);
+    await generations.append(saved, "directory", 0, [directoryRecord()]);
+    await generations.validate(saved, { rows: 1, children: 0, batches: 1, pages: 0, wireRows: 0 });
+    await generations.publish(saved);
+    const roots = [{ kind: "generation" as const, scopeId: saved.scopeId, generationId: saved.id,
+      revision: "1", expiresAt: new Date(Date.now() + 600_000) }];
+    const old = await selections.capture(identity, "/users", { values: {}, allowed: [] }, roots);
+    const unfinished = await generations.begin({ ...input, scope: { ...input.scope, selector: "unfinished" } });
+    await inventoryBaseline(new InventoryGenerations(fixture.runtime), identity.principalId, 2);
+    const person = randomUUID();
+    await nativeInventoryFixture(fixture.runtime, identity, [{ nativeId: "retained-native", identifiers: [], createdBy: person }]);
+    const oldInventory = await inventorySelectionFixture(fixture.runtime, identity, {}, "packages");
+
+    await revokeAccountSessions(fixture.runtime, identity.tenantId, identity.principalId);
+    const renewed = { ...identity, sessionEpoch: await generations.sessionEpoch(identity.tenantId, identity.principalId) };
+    expect(renewed.sessionEpoch).not.toBe(identity.sessionEpoch);
+    await expect(selections.directoryPage(old.id, identity, saved.id, {})).rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(oldInventory.queries.page(oldInventory.selection.id, identity, { limit: 50 }))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    await expect(generations.begin(input)).rejects.toThrow("data_session_fenced");
+    await expect(generations.publish(unfinished)).rejects.toThrow("data_writer_fenced");
+    await generations.connections.run(client => retainRecordData(client));
+    await new InventoryRuntime(fixture.runtime, async () => {}).collect();
+
+    const current = await selections.capture(renewed, "/users", { values: {}, allowed: [] }, roots);
+    expect((await selections.directoryPage(current.id, renewed, saved.id, {})).value).toHaveLength(1);
+    expect((await inventorySelectionFixture(fixture.runtime, renewed, {}, "packages")).raw.value).toHaveLength(2);
+    expect(await new AgentPeopleRepository(fixture.runtime).referencedIds(renewed)).toContain(person);
+    const replacement = await generations.begin({ ...input, sessionEpoch: renewed.sessionEpoch });
+    await generations.append(replacement, "directory", 0, [directoryRecord("current-session-user")]);
+    await generations.validate(replacement, { rows: 1, children: 0, batches: 1, pages: 0, wireRows: 0 });
+    await generations.publish(replacement);
+    await streamedPackageFixture(fixture.runtime, renewed, [
+      allowlistedPackage({ id: "package-000000", displayName: "Refreshed after sign-in", isBlocked: false }),
+    ]);
+    expect(await reconcileInventoryFixture(fixture.runtime, renewed)).not.toBeNull();
+    expect((await inventorySelectionFixture(fixture.runtime, renewed)).raw.value.length).toBeGreaterThan(0);
+    expect((await selections.directoryPage(current.id, renewed, saved.id, {})).value).toHaveLength(1);
   });
 
   it("preserves a pinned reader/export across replacement, invalidates on clear, and collects at most 1 MiB per slice", async () => {

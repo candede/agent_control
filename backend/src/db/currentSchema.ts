@@ -3585,7 +3585,6 @@ CREATE VIEW inventory_live_sources
        AND scope.token_mode = CAST('delegated' AS text)
        AND scope.selector = CAST('complete' AS text)
        AND generation.scope_epoch = scope.epoch
-       AND generation.session_epoch = principal.epoch
        AND generation.session_epoch = scope.session_epoch
        AND generation.state = CAST('published' AS text)
        AND generation.validated
@@ -3978,7 +3977,7 @@ BEGIN
     JOIN public.data_generations source_generation ON source_generation.id=r.generation_id
     WHERE scope.tenant_id=NEW.tenant_id AND scope.principal_id=NEW.reviewed_by
       AND scope.source='inventory_canonical' AND scope.token_mode='delegated' AND scope.selector='complete'
-      AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch AND generation.session_epoch=principal.epoch
+      AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
       AND generation.state='published' AND generation.validated AND generation.expires_at>clock_timestamp()
       AND canonical.expires_at>clock_timestamp() AND r.expires_at>clock_timestamp()
       AND source_scope.tenant_id=scope.tenant_id AND source_scope.principal_id=scope.principal_id AND source_scope.token_mode='delegated'

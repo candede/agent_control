@@ -137,6 +137,8 @@ export function inventoryExportSource(inventory: InventoryQueries, identity: Sel
             const current = raw.freshness.sources.some(source => source.scope_id === member.scope_id
               && inventoryObservation(source.generation_id, source.observed_at, source.expires_at, source.current, raw.selection.evaluatedAt as string | Date).current);
             const detail = packageValue?.detailFreshness;
+            const catalogObservation = member.domain === "packages"
+              ? inventoryObservation(snapshotId, catalogObservedAt!, catalogExpiresAt!, current, evaluatedAt) : null;
             const sourceStatuses = inventorySourceStatuses(raw.freshness.sources.filter(source => source.scope_id === member.scope_id), raw.selection.evaluatedAt as string | Date);
             const packageObservation = sourceStatuses.graphPackages.observation;
             const nativeObservation = sourceStatuses.powerPlatform.observation && "roleScope" in sourceStatuses.powerPlatform.observation
@@ -159,16 +161,15 @@ export function inventoryExportSource(inventory: InventoryQueries, identity: Sel
               identity: { ...agent.identity, evidence: member.evidence,
                 packageEvidence: member.domain === "packages" ? [{ packageId: member.identity, evidence: member.evidence }] : [] },
               observations: { ...agent.observations,
-                graphPackages: member.domain === "packages" && packageObservation ? { ...packageObservation,
-                  ...inventoryObservation(snapshotId, catalogObservedAt!, catalogExpiresAt!, current, raw.selection.evaluatedAt as string | Date),
+                graphPackages: packageObservation && catalogObservation ? { ...packageObservation,
+                  ...catalogObservation,
                 } as typeof agent.observations.graphPackages : null,
-                packageSnapshots: member.domain === "packages" ? { [member.identity]: {
-                  ...inventoryObservation(snapshotId, catalogObservedAt!, catalogExpiresAt!, current, raw.selection.evaluatedAt as string | Date),
+                packageSnapshots: catalogObservation ? { [member.identity]: {
+                  ...catalogObservation,
                   scopeKind: member.source_channel === "catalog" ? "broad" as const : "exact" as const,
                   identityDetails: member.detail_generation && detail?.observedAt && detail.expiresAt
                     && ["fresh", "stale"].includes(detail.state) ? {
-                      ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, current && detail.state === "fresh",
-                        raw.selection.evaluatedAt as string | Date),
+                      ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, catalogObservation.current, evaluatedAt),
                     } : null,
                 } } : {},
                 powerPlatform: member.domain === "power_platform" && nativeObservation

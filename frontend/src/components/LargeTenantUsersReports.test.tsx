@@ -44,12 +44,12 @@ describe("selected users and reports client boundary", () => {
     const pending = deferred<typeof stale>();
     vi.mocked(api.readReportPage).mockResolvedValueOnce(stale).mockReturnValueOnce(pending.promise);
     render(<CopilotUsersView />);
-    await screen.findByText("Office app activity is out of date. Run Users sync in Sync.");
+    await screen.findByText(/Showing saved Office app activity collected.*Automatic collection runs every six hours/);
     act(() => window.dispatchEvent(new Event("focus")));
-    await waitFor(() => expect(screen.queryByText(/Office app activity is out of date/)).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText(/Showing saved Office app activity collected/)).not.toBeInTheDocument());
     expect(screen.getByRole("button", { name: "User 1" })).toBeVisible();
     await act(async () => pending.resolve({ ...stale, sources: { ...stale.sources, app_activity: { ...stale.sources.app_activity, state } } }));
-    await waitFor(() => expect(screen.queryByText(/Office app activity is out of date/) !== null).toBe(state === "stale"));
+    await waitFor(() => expect(screen.queryByText(/Showing saved Office app activity collected/) !== null).toBe(state === "stale"));
   });
   it.each(["company", "department"] as const)("keeps SQL null and every literal %s facet distinct through rendering, change and serialization", async field => {
     const values = [null, "null", "~null", "", "~string:", "~string:null"];

@@ -10,7 +10,7 @@ import { createBearerCredentials, createBrowserCredentials, DelegatedCredentialS
 import { account, browserAuthenticationResult, browserSession, epochAuthority, guest, guestHome, guestTenant, native, oboFetcher, sdkResponse, tenant, verifiedBearer } from "./authFoundationTestSupport.js";
 import { authExchangeTimeoutMs } from "./boundedAuth.js";
 import { browserRequestPrincipal } from "./requestPrincipal.js";
-import { withAuthority } from "./authorityContext.js";
+import { withAuthority, withReadAuthorityRefresh } from "./authorityContext.js";
 import { AppError } from "../errors.js";
 import { CapabilityRepository, type CapabilityEvidence } from "../db/capabilities.js";
 import { CapabilityService } from "../services/capabilities.js";
@@ -25,6 +25,118 @@ beforeEach(async () => {
 afterEach(() => { config.tenants = originalTenants; vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("ephemeral exact-principal delegated credentials", () => {
+  it("silently revalidates the initiating browser authority throughout a ten-minute read and stops when it ends", async () => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const original = source.principal;
+    const result = browserAuthenticationResult();
+    const revalidate = vi.spyOn(msal, "revalidateAuthenticatedUserResult")
+      .mockResolvedValue({ ...result, idTokenClaims: { ...result.idTokenClaims, roles: ["AgentControl.Viewer"] } });
+    const controller = new AbortController();
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const reading = withAuthority(source, () => withReadAuthorityRefresh(controller, async () => {
+      await gate;
+      source.assertCurrent();
+      return "published";
+    }));
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(revalidate).toHaveBeenCalledTimes(4);
+    expect(() => source.assertCurrent()).not.toThrow();
+    expect(source.principal).toMatchObject({
+      principalId: original.principalId, sessionEpoch: original.sessionEpoch, authorizationHash: original.authorizationHash,
+    });
+    finish();
+    await expect(reading).resolves.toBe("published");
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(revalidate).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["interaction", "role-change"] as const)("stops a long read when silent browser renewal reports %s", async failure => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const revalidate = vi.spyOn(msal, "revalidateAuthenticatedUserResult");
+    const interaction = new AppError(401, "interaction_required", "Microsoft requires fresh interaction.");
+    if (failure === "interaction") revalidate.mockRejectedValue(interaction);
+    else revalidate.mockResolvedValue(browserAuthenticationResult());
+    const controller = new AbortController();
+    const reading = withAuthority(source, () => withReadAuthorityRefresh(controller, () => new Promise<never>((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+    })));
+    const rejected = failure === "interaction" ? expect(reading).rejects.toBe(interaction)
+      : expect(reading).rejects.toMatchObject({ code: "unauthorized", message: "The initiating authorization changed." });
+    await vi.advanceTimersByTimeAsync(150_000);
+    await rejected;
+    expect(controller.signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(revalidate).toHaveBeenCalledOnce();
+  });
+
+  it("does not extend bearer role evidence while a read is running", async () => {
+    vi.useFakeTimers();
+    const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher() });
+    const revalidate = vi.spyOn(source, "revalidate");
+    let finish!: () => void;
+    const gate = new Promise<void>(resolve => { finish = resolve; });
+    const reading = withAuthority(source, () => withReadAuthorityRefresh(new AbortController(), async () => {
+      await gate;
+      source.assertCurrent();
+    }));
+    const rejected = expect(reading).rejects.toMatchObject({ code: "authorization_stale" });
+    await vi.advanceTimersByTimeAsync(300_000);
+    finish();
+    await rejected;
+    expect(revalidate).not.toHaveBeenCalled();
+  });
+
+  it("preserves cancellation and discards a pending silent renewal when its read is aborted", async () => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const original = source.principal, renewal = Promise.withResolvers<void>(), controller = new AbortController();
+    const revalidate = vi.spyOn(msal, "revalidateAuthenticatedUserResult").mockImplementation(async () => {
+      await renewal.promise;
+      return browserAuthenticationResult();
+    });
+    const reading = withAuthority(source, () => withReadAuthorityRefresh(controller, () => new Promise<never>((_resolve, reject) => {
+      controller.signal.addEventListener("abort", () => reject(controller.signal.reason), { once: true });
+    })));
+    await vi.advanceTimersByTimeAsync(150_000);
+    const cancellation = new Error("The initiating session was revoked.");
+    const rejected = expect(reading).rejects.toBe(cancellation);
+    controller.abort(cancellation);
+    await rejected;
+    renewal.resolve();
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(source.principal).toBe(original);
+    expect(revalidate).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a pending silent renewal when its read finishes without publishing late role evidence", async () => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const original = source.principal;
+    let release!: () => void;
+    const renewal = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(msal, "revalidateAuthenticatedUserResult").mockImplementation(async () => {
+      await renewal;
+      return browserAuthenticationResult();
+    });
+    let finish!: () => void;
+    const work = new Promise<void>(resolve => { finish = resolve; });
+    const reading = withAuthority(source, () => withReadAuthorityRefresh(new AbortController(), () => work));
+    await vi.advanceTimersByTimeAsync(150_000);
+    expect(msal.revalidateAuthenticatedUserResult).toHaveBeenCalledOnce();
+    finish();
+    await reading;
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(source.principal).toBe(original);
+  });
+
   it.each(["interaction_required", "authorization_expired"])("keeps browser authority current after capability-specific %s", async code => {
     const epochs = epochAuthority();
     const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);

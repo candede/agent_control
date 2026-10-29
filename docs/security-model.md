@@ -105,6 +105,12 @@ Role and tenant configuration changes require a new sign-in. Runtime checks also
 reject sessions whose tenant or application binding no longer matches current
 configuration.
 
+Sign-in opens the new account generation only after session persistence succeeds;
+failed or superseded sign-ins cannot reopen revoked authority. Account mutation
+queues remain serialized while work is pending, including under cache pressure.
+The 10,000-account cache limit evicts only idle entries; excess active entries
+are pruned as their queued work settles.
+
 ## Browser request protection
 
 State-changing browser requests require:
@@ -302,7 +308,7 @@ Inventory association candidates come only from the selected current private sna
 
 Automatic collection remains tenant/principal-private and does not share one user's delegated observations with another user. Fast catalog refresh and slower detail enrichment have independent admission and freshness. Cached identity details cannot override incompatible current inventory; missing metadata is not equivalent to an authoritative empty detail response. Cached access assignments never replace the existing live mutation prestate/readback checks. Backend source due checks and package detail admission deduplicate across tabs, apply bounded work/backoff, and preserve failed-attempt evidence. Restart recovery requires another signed-in request before any new automatic provider work.
 
-Agent environment context is selected only for exact IDs on authorized canonical agents, from current, unexpired, verified snapshots in the same tenant/principal partition. Environment observation timestamps are not borrowed from the agent snapshot; unrelated or expired environment records are not exposed. Connector operations are minimised allowlisted agent-embedded configuration, not recursive package-name/URL inference. The operation configuration creator is separate from agent responsibility. Connection IDs, credentials and callback URLs are discarded. Invoked-flow relationships remain explicitly unavailable from the synchronized sources; no Dataverse authorization or broad flow inventory is introduced. Official-console links are fixed allowlisted Microsoft landing URLs, never provider-supplied URLs. Overview reads saved people only; **Look up people** is an explicit capability- and CSRF-protected directory request.
+Agent environment context is selected only for exact IDs on authorized canonical agents, from current, validated saved snapshots with unchanged ownership in the same tenant/principal partition. Environment observation timestamps are not borrowed from the agent snapshot; unrelated, invalidated or unverified environment records are not exposed. Older retained observations preserve their original dates and do not establish live provider authority. Connector operations are minimised allowlisted agent-embedded configuration, not recursive package-name/URL inference. The operation configuration creator is separate from agent responsibility. Connection IDs, credentials and callback URLs are discarded. Invoked-flow relationships remain explicitly unavailable from the synchronized sources; no Dataverse authorization or broad flow inventory is introduced. Official-console links are fixed allowlisted Microsoft landing URLs, never provider-supplied URLs. Overview reads saved people only; **Look up people** is an explicit capability- and CSRF-protected directory request.
 
 Direct directory search/resolution and package access-principal validation pin the initiating session and directory capability generation before capability/token acquisition, propagate HTTP disconnects, and share a two-minute wall-clock deadline. Session/capability authority and provider admission are checked before each Graph dispatch, after response headers, and before returning labels or accepting resolved principals. Authority is also rechecked when authentication, transport or body parsing rejects, so stale authority takes precedence over upstream failures. Explicit agent people lookups and reference sync retain their initiating authority on rejected repository and authentication work as well; cached-only service resolutions remain provider-free. A response received under changed authority is cancelled before reading its body. Late authentication or provider results cannot start queued lookups or publish a response after cancellation. Each Graph request retains its ten-second body-inclusive deadline even if its transport ignores abort; late response bodies are cancelled and late transport rejections are observed. A failed search collection cancels its peer, and a failed resolution cancels peers and stops queued IDs. Received Graph error status and Retry-After survive an error-body deadline while authority remains current. Only exact object-ID 404s fall back to unknown labels; permission failures and malformed responses remain errors.
 
@@ -315,7 +321,8 @@ Directory principal IDs follow Microsoft Graph's hexadecimal 8-4-4-4-12 GUID syn
 - MSAL's token cache remains process-local. A restart requires token reacquisition; persisted application data and sessions remain governed by their own expiry rules.
 - Protected requests require recognized Viewer/Admin authority. Role-bound capability evidence is reacquired or revalidated under the current session/account fences; unsupported roles grant no protected access.
 - App roles are revalidated with Entra every five minutes. Revocation can therefore take up to that interval to affect an otherwise active session. Consent/account changes and logout are ordered against concurrent refreshes so stale role data cannot restore a revoked session.
-- Logout evicts the account cache, pauses its delegated jobs, deletes all server-side sessions for that tenant/account, and expires the browser cookie.
+- Long-running browser read-only sync revalidates the initiating identity before that role evidence expires. Already-cancelled browser reads are not dispatched. Concurrent identity revalidation cannot replace the initiating authorization: renewal checks and both successful and failed read completion recheck that binding, with cancellation or invalid authority taking precedence over provider results. Changed authorization, actual revalidation failures and session revocation stop the work; bearer assertion freshness is never extended.
+- Logout evicts the account cache, pauses its delegated jobs, advances the principal authorization epoch, cancels unfinished generations, deletes all server-side sessions for that tenant/account, and expires the browser cookie. Complete validated saved sources remain in the same tenant/principal partition for a newly authenticated session until replacement, explicit invalidation or deletion; observation age alone does not remove them. Old selections, exports and writers remain fenced.
 - Power Platform role-template IDs are allowlisted from validated ID-token role claims into sanitized session state. Only the six documented inventory role IDs are retained; raw claims are not persisted. Full, AI and unknown remain distinct diagnostic hints, not provider authorization or measured coverage. All supported hints request the same allowlisted agents and supporting environments; only the actual executed query and validated saved counts establish coverage.
 
 ## Browser mutation controls
@@ -324,9 +331,11 @@ Inventory read/export selection is available to Viewers, including bounded
 canonical group references whose full package membership is not downloaded.
 Mutation target counts, previews and controls remain Admin-only. Selection
 ownership still resets on tenant, principal, role or inventory-selection change.
-Retained already-stale optional detail evidence is readable as stale, not an
-active browser expiration dependency. Current details and the selected catalog
-deadline still expire normally. Independently, mutation staging and final
+Retained older saved evidence is readable with its original dates, not an
+active browser expiration dependency. Read-selection leases still expire
+normally and must be recaptured under current authority. Bounded TanStack Query
+caches are in-memory and cleared on logout or principal/role change; historical
+display data cannot certify a selected export or mutation. Independently, mutation staging and final
 dispatch require unexpired current inventory authority; a readable historical
 selection never grants permission to dispatch.
 

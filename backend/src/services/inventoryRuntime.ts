@@ -14,7 +14,7 @@ import { maintenanceActive } from "./maintenance.js";
 import { readOperationalState } from "./operationalState.js";
 import { operationalLog } from "./telemetry.js";
 import { StreamedInventory } from "./streamedInventory.js";
-import { currentAuthority, pruneAuthorities, withAuthority } from "../auth/authorityContext.js";
+import { currentAuthority, pruneAuthorities, withAuthority, withoutAuthority } from "../auth/authorityContext.js";
 import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 
 type Scope = { tenantId: string; principalId: string };
@@ -312,7 +312,7 @@ export class InventoryRuntime {
               JOIN data_generations g ON g.id=v.generation_id
               WHERE r.current AND s.tenant_id=scope.tenant_id AND s.principal_id=scope.principal_id
                 AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
-                AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()))`,
+                AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated))`,
       [scope.tenantId, scope.principalId]);
       signal.throwIfAborted();
       this.assertCurrent();
@@ -334,7 +334,7 @@ export class InventoryRuntime {
     if (this.running) return;
     this.controller = new AbortController();
     const signal = this.controller.signal;
-    this.running = (async () => {
+    this.running = withoutAuthority(async () => {
       do {
         this.requested = false;
         this.after = "";
@@ -342,7 +342,7 @@ export class InventoryRuntime {
           await delay(0, undefined, { signal });
         }
       } while (this.requested && !this.stopped && !signal.aborted && !maintenanceActive());
-    })().catch(error => operationalLog("error", "inventory_reconciliation_failed",
+    }).catch(error => operationalLog("error", "inventory_reconciliation_failed",
       errorTelemetry(error, "inventory_reconciliation_failed"))).finally(() => {
       this.running = undefined; this.controller = undefined;
       if (this.requested) this.wake();

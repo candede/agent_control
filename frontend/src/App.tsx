@@ -1634,16 +1634,25 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     };
   }, [groupCountRetryRevision, groupTargetKey]);
   const displayedUnifiedAgents = visibleUnifiedAgentPage?.value ?? [];
+  const selectedAgentSources = visibleUnifiedAgentPage
+    ? agentInventoryScope === "catalog" ? [visibleUnifiedAgentPage.sources.graphPackages]
+      : agentInventoryScope === "power_platform_only" ? [visibleUnifiedAgentPage.sources.powerPlatform]
+        : Object.values(visibleUnifiedAgentPage.sources)
+    : [];
+  const hasSelectedAgentSource = selectedAgentSources.some(source => source.state !== "unavailable");
+  const selectedAgentSourcesIncomplete = selectedAgentSources.some(source => source.state !== "available");
   const publishingAgentInventory = pendingDataSyncPublication?.owner === principalKey
-    && pendingDataSyncPublication.sources.some(source => source === "graph_packages" || source === "power_platform");
+    && pendingDataSyncPublication.sources.some(source => source === "graph_packages" || source === "power_platform")
+    || visibleUnifiedAgentPage?.freshness.state === "reconciling" || visibleUnifiedAgentPage?.freshness.state === "catching_up";
   const agentInventoryPending = loadingAgents || agentSearchPending || publishingAgentInventory;
-  const inventoryScopeCount = visibleUnifiedAgentPage
+  const inventoryScopeCount = visibleUnifiedAgentPage && hasSelectedAgentSource
     ? inventoryScopeAgentCount(visibleUnifiedAgentPage.summary, agentInventoryScope) : undefined;
   const nativeObservation = visibleUnifiedAgentPage?.sources.powerPlatform.observation;
   const inventoryCollectionText = publishingAgentInventory
-    ? "Publishing newly synced agents to the inventory. Results will appear automatically."
+    ? "Publishing synced agents to the inventory. Results will appear automatically."
     : inventoryUpdating(visibleUnifiedAgentPage) ? "Updating saved agent inventory. Results will appear automatically."
     : !visibleUnifiedAgentPage && agentInventoryPending ? "Loading saved agent inventory..."
+    : inventoryUnavailable ? inventoryUnavailable.message
     : !visibleUnifiedAgentPage && unifiedAgentReadError ? "Saved agent inventory unavailable." : [
     ...(agentInventoryScope !== "power_platform_only" ? [lastAgentListRefreshAt
       ? `Catalog collected ${formatRefreshTime(lastAgentListRefreshAt)}${packageSnapshotExpiresAt && visibleUnifiedAgentPage
@@ -2997,7 +3006,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setExportChoiceOpen(false);
     const cached = agentInventoryQueries.getCached(principalKey, {
       inventoryScope: scope, sortBy: agentSortBy, sortDirection: agentSortDirection, limit: agentDisplayPageSize,
-    });
+    }, true);
     setUnifiedAgentPage(cached);
     setLoadingAgents(!cached);
     setAgentDetail(undefined);
@@ -3532,7 +3541,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
           <div className="agent-catalog-heading">
             <div className="agent-catalog-title">
-              <h2 id="agents-heading" tabIndex={-1}>Agents <span>{visibleUnifiedAgentPage?.counts.filtered.toLocaleString() ?? "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
+              <h2 id="agents-heading" tabIndex={-1}>Agents <span>{hasSelectedAgentSource ? visibleUnifiedAgentPage?.counts.filtered.toLocaleString() : "—"}{hasActiveAgentFilters && inventoryScopeCount !== undefined ? ` of ${inventoryScopeCount.toLocaleString()}` : ""}</span></h2>
             </div>
             {canReadSensitiveUsage ? <AgentInventoryScopes
               inventory={unifiedAgentReadError ? undefined : unifiedAgentPage}
@@ -3541,7 +3550,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             <div className="agent-catalog-actions">
               <span className="last-refresh" aria-live="polite">
                 {refreshingAgents ? linkedPackageRefreshJob?.message ?? "Collecting agent identities and matching records; no agent settings are changed."
-                  : inventoryUnavailable?.message ?? inventoryCollectionText}
+                  : inventoryCollectionText}
               </span>
               {agentInventoryIssueSummary ? <button type="button" className="secondary inventory-attention"
                 aria-label="Inventory needs attention · Open Sync" onClick={() => navigateToView("sync")} title={agentInventoryIssueSummary}>
@@ -3648,7 +3657,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                 records={displayedUnifiedAgents}
                 loading={agentInventoryPending && displayedUnifiedAgents.length === 0}
                 loadingMessage={publishingAgentInventory
-                  ? "Publishing synced agents to the inventory..."
+                  ? inventoryCollectionText
                   : "Loading Copilot agents..."}
                 emptyState={inventoryUnavailable ? <div role="status">
                   <h2>{inventoryUnavailable.state === "preparing" ? "Preparing agent inventory"
@@ -3657,6 +3666,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   <button type="button" className="secondary" onClick={() => navigateToView("sync")}>Open Sync</button>
                 </div> : unifiedAgentReadError ? <>
                   <h2>Agent inventory unavailable</h2><p>Reload saved inventory or open Sync to review source status.</p>
+                </> : selectedAgentSourcesIncomplete ? <>
+                  <h2>{hasSelectedAgentSource ? "Agent inventory incomplete" : "Agent inventory unavailable"}</h2>
+                  <p>{selectedAgentSources.find(source => source.error)?.error?.message ?? inventoryCollectionText}</p>
+                  <button type="button" className="secondary" onClick={() => navigateToView("sync")}>Open Sync</button>
                 </> : !hasActiveAgentFilters ? <>
                   <h2>No agents in this inventory</h2><p>The saved inventory contains no agents in this scope.</p>
                 </> : undefined}
@@ -3673,7 +3686,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   options={{ platforms: platformOptions, availability: availableToOptions, hosts: hostOptions,
                     publishers: publisherOptions, environments: [],
                     types: [] }}
-                  matchingCount={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage?.counts.filtered}
+                  matchingCount={unifiedAgentReadError || !hasSelectedAgentSource ? undefined : visibleUnifiedAgentPage?.counts.filtered}
                   loading={agentInventoryPending}
                   onChange={handleAgentFilterChange} onClear={handleClearAgentFilters} onError={(message, readSelectionId) => {
                     if (readSelectionId === undefined || readSelectionId === inventoryNavigation.current.selectionId) setError(message);
@@ -3726,7 +3739,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
                   if (item) void handleAgentAction(item, blocked);
                 }}
               />
-              {visibleUnifiedAgentPage && !unifiedAgentReadError ? <nav aria-label="Agent inventory pages" className="agent-inventory-pagination" aria-busy={loadingAgents || agentSearchPending}>
+              {visibleUnifiedAgentPage && hasSelectedAgentSource && !unifiedAgentReadError ? <nav aria-label="Agent inventory pages" className="agent-inventory-pagination" aria-busy={loadingAgents || agentSearchPending}>
                 <span role="status">{visibleUnifiedAgentPage.value.length.toLocaleString()} shown · {visibleUnifiedAgentPage.counts.filtered.toLocaleString()} matching agents</span>
                 <div className="agent-inventory-page-actions">
                   <button type="button" className="secondary" disabled={agentLeaseEnded || loadingAgents || agentSearchPending || !visibleUnifiedAgentPage.page.previousCursor}

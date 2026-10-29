@@ -19,7 +19,7 @@ function result(rows: pg.QueryResultRow[] = []): pg.QueryResult {
   return { command: "SELECT", rowCount: rows.length, fields: [], oid: 0, rows };
 }
 
-function fixture() {
+function fixture(beforeRead?: () => void) {
   const database = new pg.Pool({ max: 4 });
   databases.push(database);
   vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition."));
@@ -54,14 +54,90 @@ function fixture() {
     if (statement.includes("inventory_association_revision")) return result([{ revision: "0" }]);
     return readQuery(statement, values);
   });
-  const read = vi.spyOn(inventory.selections, "read").mockImplementation(async (_id, _identity, work) =>
-    work(client, {
+  const read = vi.spyOn(inventory.selections, "read").mockImplementation(async (_id, _identity, work) => {
+    beforeRead?.();
+    await Promise.resolve();
+    return work(client, {
       selection: { revision: "revision", query_hash: "query", query_json: { inventoryQuery: digest("{}") },
         evaluated_at: at, validated_at: at, expires_at: new Date(at.getTime() + 60_000) },
       pins: [{ scope_id: "scope", generation_id: "baseline", revision: "1" }],
-    }));
-  return { inventory, read, query, readQuery };
+    });
+  });
+  return { inventory, read, query, readQuery, client, data };
 }
+
+describe("selected inventory request snapshots", () => {
+  it.each(["exact", "usage"] as const)("retains the bounded %s IDs while acquiring the selection", async method => {
+    const ids = ["original"];
+    const { inventory, readQuery } = fixture(() => {
+      ids.splice(0, 1, ...Array.from({ length: 101 }, (_, index) => `replacement-${index}`));
+    });
+    readQuery.mockImplementation((sql, values) => {
+      if (sql.startsWith("SET LOCAL")) return result();
+      const requested = (method === "exact" ? values?.[2] : values?.at(-1)) as string[];
+      if (method === "exact") return result(requested.slice(0, 100).map(id => ({
+        identity: id, generation_id: "generation", residual: {}, domain: "canonical", total_bytes: 100,
+      })));
+      return result(requested.slice(0, 100).map(id => ({
+        identity: id, responses: null, active_users: null, last_activity: null,
+      })));
+    });
+
+    const rows = await inventory[method]("selection", identity, ids);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject(method === "exact" ? { identity: "original" } : { id: "original" });
+    const [, parameters] = readQuery.mock.calls.at(-1)!;
+    expect(method === "exact" ? parameters?.[2] : parameters?.at(-1)).toEqual(["original"]);
+    expect(ids).toHaveLength(101);
+  });
+
+  it.each(["exact", "usage"] as const)("rejects an oversized %s request before acquiring a selection", method => {
+    const { inventory, read } = fixture();
+    expect(() => inventory[method]("selection", identity, Array.from({ length: 101 }, (_, index) => String(index))))
+      .toThrow(expect.objectContaining({ code: "data_exact_ids_limit" }));
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each(["unified_agents", "graph_packages", "power_platform_agents"] as const)(
+    "resolves submitted %s references rather than replacements made during acquisition", async kind => {
+    const original = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const references = [kind === "unified_agents" ? `agent:${original}` : original];
+    const submitted = [...references];
+    const { inventory, readQuery } = fixture(() => {
+      references[0] = kind === "unified_agents" ? "agent:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        : "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    });
+    readQuery.mockImplementation((_sql, values) => {
+      const requested = JSON.parse(String(values?.at(-1))) as { ordinal: number; native: string }[];
+      return result(requested.map(row => ({ ordinal: row.ordinal, id: row.native, count: 1, source_count: 1 })));
+    });
+
+    await expect(inventory.resolveExportReferences("selection", identity, references, kind)).resolves.toEqual(submitted);
+    expect(JSON.parse(String(readQuery.mock.calls[0][1]?.at(-1)))).toMatchObject([{ native: original }]);
+  });
+
+  it.each(["export", "control"] as const)("retains direct %s references between resolution batches", async kind => {
+    const references = Array.from({ length: 101 }, (_, index) =>
+      `agent:00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+    const submitted = [...references];
+    const { inventory, readQuery, client, data } = fixture();
+    const context: Parameters<InventoryQueries["resolveControlReferencesInRead"]>[1] = {
+      data, selectionId: "selection", expiresAt: at.getTime() + 60_000, scopeId: "scope",
+      baselineId: "baseline", revision: "1", source: "inventory_canonical", tokenMode: "delegated", query: {},
+    };
+    readQuery.mockImplementation((_sql, values) => {
+      const requested = JSON.parse(String(values?.at(-1))) as { ordinal: number; native: string }[];
+      references[100] = "agent:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      return result(requested.map(row => ({ ordinal: row.ordinal, id: row.native, count: 1, source_count: 1 })));
+    });
+
+    const resolved = kind === "export"
+      ? await inventory.resolveExportReferencesInRead(client, context, references, "unified_agents")
+      : await inventory.resolveControlReferencesInRead(client, context, references);
+    expect(resolved).toEqual(submitted);
+    expect(readQuery).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe("saved package detail reconstruction", () => {
   it.each([

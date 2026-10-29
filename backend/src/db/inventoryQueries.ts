@@ -386,6 +386,7 @@ export class InventoryQueries {
 
   resolveExportReferences(id: string, identity: SelectionIdentity, references: readonly string[],
     kind: NonNullable<PageOptions["exportKind"]> = "unified_agents") {
+    references = [...references];
     return this.read(id, identity, (client, context) => this.resolveExportReferencesInRead(client, context, references, kind));
   }
 
@@ -401,6 +402,7 @@ export class InventoryQueries {
   private async resolveReferencesInRead(client: pg.PoolClient, context: Context, references: readonly string[],
     kind: NonNullable<PageOptions["exportKind"]>, membership: "explicit" | "filtered") {
     if (!references.length || references.length > 5000) throw new AppError(400, "invalid_export_selection", "Select 1–5000 exact references.");
+    references = [...references];
     if (kind === "unified_agents" ? context.source !== "inventory_canonical" || context.tokenMode !== "delegated"
       : context.source !== "inventory_canonical" && context.source !== (kind === "graph_packages" ? "inventory_packages" : "inventory_power_platform")) {
       throw new AppError(400, "export_selection_kind", "Export kind does not match the selected inventory source.");
@@ -785,7 +787,7 @@ export class InventoryQueries {
         a.expected_count,CASE WHEN saved.catalog_complete THEN saved.catalog_page_count ELSE g.page_count END AS page_count,
         saved.catalog_omitted_fields AS unknown_field_count,g.wire_count,a.complete,
         saved.catalog_complete AS catalog_scope_complete,
-        (saved.catalog_complete AND saved.catalog_expires_at>$4) AS catalog_complete,
+        saved.catalog_complete AS catalog_complete,
         to_jsonb(saved.catalog_observed_at)#>>'{}' AS catalog_observed_at,
         to_jsonb(saved.catalog_expires_at)#>>'{}' AS catalog_expires_at,
         root.revision AS captured_revision,coalesce(current.baseline_id=root.baseline_id AND current.revision=root.revision,false) AS current
@@ -796,25 +798,25 @@ export class InventoryQueries {
       WHERE a.domain<>'canonical' ORDER BY s.source,
         CASE WHEN EXISTS(SELECT 1 FROM native_roots selected WHERE selected.scope_id=root.scope_id
           AND selected.kind='microsoft.copilotstudio/agents') THEN 0 ELSE 1 END,s.selector LIMIT 16`,
-    [context.scopeId, context.revision, context.baselineId, context.data.evaluatedAt])).rows;
+    [context.scopeId, context.revision, context.baselineId])).rows;
     const expiredIdentity = (await client.query(`SELECT EXISTS(${pendingInventoryIdentityExpirySql}) AS expired`, [context.scopeId])).rows[0].expired;
     const state = !current || current.baseline_id !== context.baselineId || current.revision !== context.revision ? "stale"
       : current.status === "running" ? "reconciling" : expiredIdentity || sources.some(source => !source.current) ? "catching_up" : current.status ?? "idle";
     const summaries = Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
       Object.fromEntries(Object.entries(value as Record<string, string>).map(([name, count]) => [name, exactCount(count)]))]));
+    const collectedIdentity = `r.residual->>'identityDetailsCollected'='true'
+      AND (r.residual->'detailFreshness'->>'state' IS NULL OR r.residual->'detailFreshness'->>'state' IN ('fresh','stale')
+        AND coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz
+          >(r.residual->'detailFreshness'->>'observedAt')::timestamptz
+          AND (r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3,false))`;
     const verificationCounts = cached?.verificationCounts ?? (await client.query(`SELECT count(*) FILTER(WHERE r.domain='packages')::int AS packages,
       count(*) FILTER(WHERE r.domain='power_platform' AND r.resource_type='microsoft.copilotstudio/agents')::int AS native_agents,
       count(*)::int AS represented,
       count(DISTINCT (r.domain,CASE WHEN r.domain='packages' THEN r.native_id ELSE ${normalizeNativeIdentitySql("r.native_id")} END,
         CASE WHEN r.domain='packages' THEN '' ELSE coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'') END))::int AS unique_sources,
-      count(*) FILTER(WHERE r.domain='packages' AND r.residual->>'identityDetailsCollected'='true'
-        AND (r.residual->'detailFreshness'->>'state' IS NULL OR r.residual->'detailFreshness'->>'state'='fresh'
-          AND coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3
-            AND (r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3,false)))::int AS checked_packages,
-      count(*) FILTER(WHERE r.domain='packages' AND (r.residual->'detailFreshness'->>'state'='stale'
-        OR r.residual->'detailFreshness'->>'state'='fresh' AND NOT coalesce(
-          (r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3
-          AND (r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3,false)))::int AS stale_packages,
+      count(*) FILTER(WHERE r.domain='packages' AND (${collectedIdentity}))::int AS checked_packages,
+      count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state' IN ('fresh','stale')
+        AND NOT coalesce(${collectedIdentity},false))::int AS stale_packages,
       count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state'='invalidated')::int AS invalidated_packages,
       count(*) FILTER(WHERE r.domain='packages' AND c.residual->'identity'->>'invalidMetadata'='true')::int AS invalid_packages
       FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
@@ -904,6 +906,7 @@ export class InventoryQueries {
 
   exact(id: string, identity: SelectionIdentity, ids: readonly string[]) {
     if (ids.length > 100) throw dataLimitError("data_exact_ids_limit", 100, ids.length);
+    ids = [...ids];
     return this.read(id, identity, async (client, context) => {
       await client.query("SET LOCAL jit=off; SET LOCAL enable_nestloop=on");
       const domain = context.source === "inventory_packages" ? "packages" : context.source === "inventory_power_platform" ? "power_platform" : "canonical";
@@ -941,9 +944,9 @@ export class InventoryQueries {
           JOIN data_generations generation ON generation.id=revision.generation_id
           WHERE root.current AND root.scope_id=selected.source_scope_id AND live.generation_id=selected.generation_id
             AND live.identity=selected.identity AND generation.scope_epoch=scope.epoch
-            AND generation.session_epoch=scope.session_epoch AND generation.expires_at>$5 AND selected.expires_at>$5) AS current
+            AND generation.session_epoch=scope.session_epoch AND generation.state='published' AND generation.validated) AS current
         FROM selected LIMIT 2`,
-      [context.baselineId, context.revision, nativeId, context.scopeId, context.data.evaluatedAt])).rows;
+      [context.baselineId, context.revision, nativeId, context.scopeId])).rows;
       encodeBatch(rows);
       if (!rows.length) throw new AppError(404, "inventory_record_not_found", "The exact package is absent from this inventory selection.");
       if (rows.length !== 1) throw new AppError(409, "inventory_identity_ambiguous", "The exact package has multiple selected memberships.");
@@ -1029,6 +1032,7 @@ export class InventoryQueries {
 
   usage(id: string, identity: SelectionIdentity, recordIds: readonly string[]) {
     if (recordIds.length > 100) throw dataLimitError("data_exact_ids_limit", 100, recordIds.length);
+    recordIds = [...recordIds];
     return this.read(id, identity, async (client, context) => {
       const { sql, values } = this.relation(context);
       values.push(recordIds);

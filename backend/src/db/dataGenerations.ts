@@ -118,7 +118,7 @@ export class DataGenerations {
       };
       await client.query(`INSERT INTO data_generations(id,scope_id,tenant_id,schema_version,scope_epoch,session_epoch,
         expected_revision,job_id,run_id,job_kind,owner,lease_version,lease_until,deadline_at,reserved_bytes,observed_at,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,clock_timestamp()+interval '60 seconds',$12,$13,$14,$15)`,
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,LEAST($12::timestamptz,clock_timestamp()+interval '60 seconds'),$12,$13,$14,$15)`,
       [lease.id, scope.id, s.tenantId, input.schemaVersion, scope.epoch, scope.session_epoch, head.revision,
         input.jobId, input.runId ?? null, input.jobKind, lease.owner, input.deadlineAt, input.reserveBytes, input.observedAt, input.expiresAt]);
       await this.fence(client, lease);
@@ -147,7 +147,7 @@ export class DataGenerations {
     });
   }
 
-  revokePrincipal(tenant: string, principal: string) {
+  revokePrincipal(tenant: string, principal: string, { preserveSources = false } = {}) {
     return this.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
       await this.principalEpoch(client, tenant, principal);
@@ -161,7 +161,9 @@ export class DataGenerations {
         if (!scopes.length) break;
         for (const scope of scopes) {
           await client.query("SELECT scope_id FROM data_generation_heads WHERE scope_id=$1 FOR UPDATE", [scope.id]);
-          await client.query("UPDATE data_scope_epochs SET epoch=epoch+1,session_epoch=$2 WHERE id=$1", [scope.id, epoch]);
+          if (!preserveSources) {
+            await client.query("UPDATE data_scope_epochs SET epoch=epoch+1,session_epoch=$2 WHERE id=$1", [scope.id, epoch]);
+          }
           await client.query(`UPDATE data_generations SET state='cancelled',cancellation=cancellation+1,reserved_bytes=byte_count
             WHERE scope_id=$1 AND state IN ('staging','validating')`, [scope.id]);
         }
@@ -285,7 +287,10 @@ export class DataGenerations {
         VALUES($1,$2,$3,$4,$5,$6)`, [lease.id, lease.scopeId, lease.tenantId, generation.page_count, digest(token), wireRows]);
       await client.query("UPDATE data_generations SET page_count=page_count+1,wire_count=wire_count+$2 WHERE id=$1", [lease.id, wireRows]);
     }).catch(async error => {
-      if (error?.code === "23505") await this.abort(lease);
+      if (error?.code === "23505") {
+        try { await this.abort(lease); }
+        catch (failure) { throw new AggregateError([error, failure], "data_poison_fence_failed"); }
+      }
       throw error;
     });
   }

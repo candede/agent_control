@@ -3,14 +3,14 @@ import { hashKey, useQuery, type QueryClient, type QueryKey } from "@tanstack/re
 import { CapabilityContext } from "./capabilityContext";
 import { ApiError } from "./api/client";
 import { readReportPage, type ReportPageRequest } from "./api/reportData";
-import { useSavedQueryClient } from "./savedQueries";
+import { savedQueryPrincipalScope, savedQueryRetention, useSavedQueryClient } from "./savedQueries";
 import type { ReportListPage, ReportPage } from "../../backend/src/types/officialReportData";
 import { acceptSelectedRead, canReuseSelectedRead, isExpiredSelection, selectedReadRemaining, useSelectedReadLease, withdrawsSelectedRead } from "./selectedRead";
 import { PublicationContext } from "./publicationContext";
 
-const cohortCacheMs = 30_000;
 const retainedPagePaths = new Set([
   "copilot-usage/users", "official-usage/users", "official-usage/overview", "official-usage/history/options",
+  "copilot-usage/adoption", "copilot-usage/adoption/summary", "copilot-usage/adoption/departments",
 ]);
 // Cache-owned key objects keep retirement alive across responses, but not beyond query collection.
 const retiredCaptures = new WeakMap<QueryKey, { rejectedSelectionId?: string }>();
@@ -57,7 +57,7 @@ async function readCurrentReportPage<T, Page extends ReportListPage<T>>(path: st
 
 export function useReportPrincipalScope() {
   const capability = useContext(CapabilityContext), user = capability?.user;
-  return JSON.stringify([user?.tenantId, user?.homeAccountId, [...(user?.roles ?? [])].sort()]);
+  return savedQueryPrincipalScope(user);
 }
 
 export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>(path: string, input: ReportPageRequest = {}, revision = 0, enabled = true, restartParent?: () => void, revalidateOnFocus = true, freshCaptureOnMount = false) {
@@ -72,18 +72,20 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   const key = hashKey([scope, path, query, query.selectionId ? undefined : revision]);
   const [highestRevision, setHighestRevision] = useState(revision);
   const [navigation, setNavigation] = useState<{ key: string; liveKey: string; cursor?: string; anchor?: string; pageNumber?: number; selectionId?: string; restart: number; shared?: boolean; publication?: string; renewal?: string }>({ key, liveKey, restart: 0, shared: !freshCaptureOnMount });
-  const [captured, setCaptured] = useState<{ key: string; restart: number; id: string; data: Page; live: boolean; pageNumber?: number }>();
+  const [captured, setCaptured] = useState<{ key: string; liveKey: string; restart: number; id: string; data: Page; live: boolean; pageNumber?: number }>();
   const [rejected, setRejected] = useState<{ key: string; restart: number }>();
   const [manualRetry, setManualRetry] = useState<{ key: string; token: object }>();
   const reusablePage = retainedPagePaths.has(path) && !query.selectionId;
   const pendingPageNumber = navigation.pageNumber !== captured?.pageNumber ? navigation.pageNumber : undefined;
-  const current = navigation.key === key ? navigation : { key, liveKey, restart: navigation.restart + 1, shared: reusablePage || revision > highestRevision,
+  const current = navigation.key === key ? navigation : { key, liveKey, restart: navigation.restart + 1,
+    shared: reusablePage || revision > highestRevision || Boolean(client.getQueryCache().find({
+      queryKey: ["saved", "record-page", key, revision, 0], exact: false, predicate: candidate => candidate.getObserversCount() > 0,
+    })),
     ...(!query.selectionId && navigation.liveKey === liveKey
       ? pendingPageNumber !== undefined ? { pageNumber: pendingPageNumber } : { anchor: captured?.data.page.anchor ?? navigation.anchor } : {}) };
   if (revision > highestRevision) setHighestRevision(revision);
   if (navigation.key !== key) {
     setNavigation(current);
-    if (captured) setCaptured(undefined);
   }
   const locallyInvalidated = rejected?.key === key && rejected.restart === current.restart;
   const selectionId = current.selectionId ?? (captured?.key === key && captured.restart === current.restart ? captured.id : undefined);
@@ -127,6 +129,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
       });
     },
     enabled: cached => enabled && !locallyInvalidated
+      && (!request.selectionId || !cached.state.data || selectedReadRemaining(cached.state.data.selection) > 0)
       && (!request.selectionId || !captured || captured.key !== key || captured.restart !== current.restart
         || selectedReadRemaining(captured.data.selection) > 0)
       && !(cached.state.error instanceof ApiError && (cached.state.error.code === "selection_invalidated" || [401, 403].includes(cached.state.error.status))),
@@ -138,7 +141,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     refetchOnMount: cached => retain && (retiredCaptures.has(cached.queryKey)
       || !cached.state.data || !canReuseSelectedRead(cached.state.data.selection)) ? "always" : false,
     structuralSharing: false,
-    gcTime: retain ? cohortCacheMs : 0,
+    gcTime: retain ? savedQueryRetention.gcTime : 0,
     meta: { retainReportPage: retain, liveReportKey: liveKey },
   }, client);
   const refetch = read.refetch;
@@ -172,7 +175,7 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
   }, [cachedKey, client, enabled, selected, externallyInvalidated, refetch, revalidateOnFocus]);
   const retiredCapture = awaitingCapture && Boolean(retirement);
   if (read.data && !read.isError && !read.isFetching && !retiredCapture && (awaitingCapture || captured?.data !== read.data)) {
-    setCaptured({ key, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data, pageNumber: current.pageNumber,
+    setCaptured({ key, liveKey, restart: current.restart, id: read.data.selection.id.toLowerCase(), data: read.data, pageNumber: current.pageNumber,
       live: leaseActive || captured?.key === key && captured.restart === current.restart
         && captured.id === read.data.selection.id.toLowerCase() && captured.live });
   }
@@ -182,10 +185,14 @@ export function useReportPage<T, Page extends ReportListPage<T> = ReportPage<T>>
     ? new ApiError(409, "selection_invalidated", "The report selection changed or expired. Load a new selection.") : read.error
       ?? (incompleteRead && !expired ? new Error(pendingRead ? "The saved-data read was cancelled. Retry saved data." : "Saved data needs reloading. Retry saved data.") : null);
   const invalidated = error instanceof ApiError && error.code === "selection_invalidated" && !isExpiredSelection(error);
-  const revalidatingCache = retain && awaitingCapture && read.isFetching && !read.isPlaceholderData;
-  const historical = isExpiredSelection(error) && !awaitingCapture ? captured?.data : undefined;
-  const data = read.isError && !isExpiredSelection(read.error) || withdrawsSelectedRead(read.error) || !enabled || externallyInvalidated || retiredCapture || revalidatingCache || incompleteRead && !expired || manualRetry?.key === retryKey ? undefined : historical ?? read.data;
-  const selectedData = enabled && !externallyInvalidated && !retiredCapture && (!error || isExpiredSelection(error))
+  const unavailable = reusablePage && !query.inventorySelectionId && !path.startsWith("official-usage/history")
+    && (read.error instanceof ApiError
+      ? !["invalid_response", "saved_source_invalid"].includes(read.error.code)
+        && (read.error.kind === "network" || [408, 429].includes(read.error.status) || read.error.status >= 500)
+      : read.error instanceof Error && read.error.name !== "AbortError");
+  const historical = isExpiredSelection(error) && !awaitingCapture || unavailable && captured?.liveKey === liveKey ? captured?.data : undefined;
+  const data = read.isError && !isExpiredSelection(read.error) && !unavailable || withdrawsSelectedRead(read.error) || !enabled || externallyInvalidated || retiredCapture || incompleteRead && !expired || manualRetry?.key === retryKey ? undefined : historical ?? read.data;
+  const selectedData = enabled && !expired && !externallyInvalidated && !retiredCapture && !error
     && manualRetry?.key !== retryKey ? data ?? (!awaitingCapture ? captured?.data : undefined) : undefined;
   const publication = useContext(PublicationContext);
   const admitPublication = publication?.admit;

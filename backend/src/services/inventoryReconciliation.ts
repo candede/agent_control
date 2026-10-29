@@ -34,12 +34,12 @@ export class InventoryReconciliation {
     if (count >= 20) throw dataAdmissionError("inventory_queue_admission");
   }
 
-  private async outputRoot(client: pg.PoolClient, scopeId: string, sessionEpoch: string) {
+  private async outputRoot(client: pg.PoolClient, scopeId: string) {
     return (await client.query(`SELECT r.* FROM inventory_roots r
       JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
       JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=r.scope_id
       WHERE r.scope_id=$1 AND r.current AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-        AND g.session_epoch=$2 AND g.expires_at>clock_timestamp()`, [scopeId, sessionEpoch])).rows[0];
+        AND g.state IN ('published','retired') AND g.validated`, [scopeId])).rows[0];
   }
 
   async request(input: BeginGeneration, inputs: readonly InventoryRoot[], assertCurrent?: () => void, signal?: AbortSignal) {
@@ -66,7 +66,7 @@ export class InventoryReconciliation {
         const current = (await client.query(`SELECT r.domain,r.baseline_id,r.revision,g.expires_at FROM inventory_roots r
           JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision JOIN data_generations g ON g.id=v.generation_id
           WHERE r.scope_id=$1 AND r.current AND g.scope_epoch=$2 AND g.session_epoch=$3
-            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, root.epoch, input.sessionEpoch])).rows[0];
+            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, root.epoch, scope.session_epoch])).rows[0];
         if (!current || !["packages", "power_platform"].includes(current.domain)) throw new Error("inventory_input_fenced");
         captured.push({ ...root, tenantId: input.scope.tenantId, baselineId: current.baseline_id, revision: current.revision,
           domain: current.domain, expiresAt: current.expires_at.toISOString() });
@@ -77,7 +77,7 @@ export class InventoryReconciliation {
         && old.baselineId === root.baselineId && old.revision === root.revision && old.epoch === root.epoch))) {
         const expired = !existing.active_id && !existing.pending_inputs
           && (await client.query(`SELECT EXISTS(${pendingInventoryIdentityExpirySql}) AS expired`, [output])).rows[0].expired;
-        const reusable = existing.active_id || existing.pending_inputs || await this.outputRoot(client, output, input.sessionEpoch);
+        const reusable = existing.active_id || existing.pending_inputs || await this.outputRoot(client, output);
         if (!expired && reusable) return { scopeId: output as string, active: existing.active_id as string | null, pendingSequence: existing.pending_sequence as string };
       }
       await this.admit(client, input.scope.tenantId, output);
@@ -120,13 +120,13 @@ export class InventoryReconciliation {
         const current = (await client.query(`SELECT r.baseline_id,r.revision,epoch.epoch,g.expires_at FROM inventory_roots r
           JOIN data_scope_epochs epoch ON epoch.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
           JOIN data_generations g ON g.id=v.generation_id WHERE r.scope_id=$1 AND r.current AND epoch.tenant_id=$2
-            AND epoch.principal_id=$3 AND epoch.token_mode='delegated' AND g.scope_epoch=epoch.epoch AND g.session_epoch=$4
-            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, s.tenantId, s.principalId, input.sessionEpoch])).rows[0];
+            AND epoch.principal_id=$3 AND epoch.token_mode='delegated' AND g.scope_epoch=epoch.epoch AND g.session_epoch=epoch.session_epoch
+            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, s.tenantId, s.principalId])).rows[0];
         if (!current) throw new Error("inventory_input_fenced");
         Object.assign(root, { baselineId: current.baseline_id, revision: current.revision, epoch: current.epoch, expiresAt: current.expires_at.toISOString() });
       }
       const prior = state.published_inputs as CapturedRoot[] | null;
-      const reusable = await this.outputRoot(client, scope.id, input.sessionEpoch);
+      const reusable = await this.outputRoot(client, scope.id);
       if (reusable && !state.pending_inputs && !state.active_id && prior && roots.every(root => prior.some(old => old.scopeId === root.scopeId
         && old.baselineId === root.baselineId && old.revision === root.revision && old.epoch === root.epoch))) return undefined;
       await this.admit(client, s.tenantId, scope.id);
@@ -164,7 +164,7 @@ export class InventoryReconciliation {
           for (;;) {
             abort.throwIfAborted();
             if (await this.reconcileIsolated(lease, claim, input.observedAt)) continue;
-            if (await this.reconcilePairs(lease, claim, input.observedAt)) continue;
+            if (await this.reconcileSmallComponents(lease, claim, input.observedAt)) continue;
             const component = await this.expand(lease, claim);
             if (!component) break;
             await this.reconcileComponent(lease, claim, component, input.observedAt);
@@ -173,12 +173,12 @@ export class InventoryReconciliation {
           await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
           await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}:${input.scope.principalId}`]);
           for (const scopeId of [claim.scopeId, ...claim.inputRoots.map(root => root.scopeId)].sort()) await lockDataScope(client, scopeId, input.scope.tenantId);
-          if (!claim.broad && !await this.outputRoot(client, claim.scopeId, input.sessionEpoch)) throw new Error("inventory_reconciliation_fenced");
+          if (!claim.broad && !await this.outputRoot(client, claim.scopeId)) throw new Error("inventory_reconciliation_fenced");
           if ((await client.query(`UPDATE inventory_reconciliation SET active_until=clock_timestamp()+interval '60 seconds'
             WHERE scope_id=$1 AND active_id=$2 AND active_until>clock_timestamp()`, [claim.scopeId, claim.job])).rowCount !== 1) throw new Error("inventory_reconciliation_fenced");
           for (const root of claim.inputRoots) {
             const scope = await lockDataScope(client, root.scopeId, root.tenantId);
-            if (scope.epoch !== root.epoch || scope.session_epoch !== input.sessionEpoch) throw new Error("inventory_input_fenced");
+            if (scope.epoch !== root.epoch) throw new Error("inventory_input_fenced");
             if ((await client.query(`SELECT 1 FROM inventory_worker_pins p JOIN inventory_roots r ON r.baseline_id=p.baseline_id
               WHERE p.worker_id=$1 AND p.scope_id=$2 AND p.expires_at>clock_timestamp() AND r.collected_before<=p.revision`,
             [claim.job, root.scopeId])).rowCount !== 1) throw new Error("inventory_input_fenced");
@@ -399,7 +399,7 @@ export class InventoryReconciliation {
     return components.length;
   }
 
-  private async reconcilePairs(lease: GenerationLease,
+  private async reconcileSmallComponents(lease: GenerationLease,
     claim: { job: string; roots: CapturedRoot[]; old: PreviousRoot | undefined }, evaluatedAt: Date) {
     const loaded = await this.stages.generations.connections.run(async client => {
       await this.stages.fence(client, lease);
@@ -414,7 +414,8 @@ export class InventoryReconciliation {
           FROM inventory_frontier WHERE worker_id=$1 AND component IS NULL ORDER BY source_scope_id,identity LIMIT 50
         )
         SELECT seed.*,m.generation_id,adjacent.neighbors,
-          CASE WHEN jsonb_array_length(adjacent.neighbors)=1 THEN EXISTS(
+          CASE WHEN jsonb_array_length(adjacent.neighbors)=0 THEN false
+          WHEN jsonb_array_length(adjacent.neighbors)=1 THEN EXISTS(
             WITH source_facts AS MATERIALIZED (
               SELECT kind,value FROM inventory_facts
               WHERE generation_id=(adjacent.neighbors->0->>'generation')::uuid
@@ -480,7 +481,7 @@ export class InventoryReconciliation {
       const seen = new Set<string>();
       for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
-        if (Number(candidate.ordinal) !== index + 1 || candidate.neighbors.length !== 1 || candidate.external_edge
+        if (Number(candidate.ordinal) !== index + 1 || candidate.neighbors.length > 1 || candidate.external_edge
           || candidate.previous.length > 2) break;
         const vertices = [{ scope: candidate.source_scope_id, identity: candidate.identity, generation: candidate.generation_id },
           ...candidate.neighbors] as Pair["vertices"];

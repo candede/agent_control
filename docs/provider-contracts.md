@@ -99,6 +99,15 @@ denial. Availability checking does not select a bot or execute/resume/reconcile
 a mutation. Existing exact status/write responses are authoritative; optional
 [mutation diagnostics](mutation-canaries.md) do not gate normal controls.
 
+Compatible saved package identity details can retain inventory links after
+expiry, but cannot renew live control proof. Both fresh and stale detail
+annotations require valid timestamps, an observation no later than evaluation,
+and an expiry strictly after observation before their identity evidence is used.
+Adding a package-derived CDS bot ID
+requires fresh catalog and identity-detail observations. When a separate
+identity-detail observation is explicitly missing, catalog freshness alone
+cannot substitute for it.
+
 ## Purview and Defender
 
 Purview uses the selected Graph v1.0 query lifecycle, singular `serviceFilter`,

@@ -2,7 +2,15 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { parse } from "csv-parse/sync";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { seedSelectedInventory, selectedInventoryCsv, type SelectedInventoryFixtureInput } from "../../scripts/selectedInventoryFixture.js";
-import { fixtureDirectoryUser } from "../../scripts/userSourceFixture.js";
+import { fixtureDirectoryUser, publishFixtureDirectory } from "../../scripts/userSourceFixture.js";
+import { DataGenerations } from "../db/dataGenerations.js";
+import { InventoryRuntime } from "./inventoryRuntime.js";
+import { LiveInventory } from "../db/liveInventory.js";
+import { InventoryGenerations } from "../db/inventoryGenerations.js";
+import { UserSourcesRepository } from "../db/userSources.js";
+import { AgentPeopleRepository } from "../db/agentPeople.js";
+import { retainRecordData } from "../db/dataRetention.js";
+import { revokeAccountSessions } from "../db/sessions.js";
 import type { InventoryQuery } from "../db/inventoryQueries.js";
 import { inventoryPresentation } from "./inventoryPresentation.js";
 import { buildRecords } from "./inventoryComponent.js";
@@ -143,6 +151,62 @@ afterAll(async () => { await database?.close(); });
 afterEach(async () => {
   for (const scenario of [scoped, quick, sortable]) await scenario?.releaseSelections();
 });
+
+  it("retains saved inventory and its current-source proof across sign-out without reusing old reader authority", async () => {
+    const scenario = await seedSelectedInventory(database.runtime, {
+      packages: [packageValue("retained-after-sign-out")], resources: [resource(environmentA)],
+    });
+    const old = await scenario.select();
+    const nativeId = old.page!.value.find(value => value.powerPlatformResource)?.id;
+    expect(nativeId).toBeDefined();
+    const live = new LiveInventory(database.runtime);
+    const previous = await live.record(scenario.scope, nativeId!);
+    await revokeAccountSessions(database.runtime, scenario.scope.tenantId, scenario.scope.principalId);
+    const generations = new DataGenerations(database.runtime);
+    const identity = { ...scenario.identity,
+      sessionEpoch: await generations.sessionEpoch(scenario.scope.tenantId, scenario.scope.principalId) };
+    await expect(scenario.queries.page(old.selection.id, scenario.identity, { limit: 50 })).rejects.toMatchObject({ code: "selection_invalidated" });
+    const selected = await scenario.queries.capture(identity, scenario.canonical.scopeId, {});
+    expect(inventoryPresentation(await scenario.queries.page(selected.id, identity, { limit: 50 })).value).toHaveLength(2);
+    expect(await live.record(scenario.scope, nativeId!)).toEqual(previous);
+    await generations.revokePrincipal(scenario.scope.tenantId, scenario.scope.principalId);
+    await expect(live.record(scenario.scope, nativeId!)).rejects.toMatchObject({ code: "agent_not_found" });
+  });
+
+  it("keeps aged complete inventory, directory counts and people readable without recollection or renewing live authority", async () => {
+    const observedAt = new Date(Date.now() - 31 * 86_400_000), expiresAt = new Date(Date.now() + 5_000);
+    const scenario = await seedSelectedInventory(database.runtime, {
+      packages: [packageValue("aged-saved-package")], resources: [resource(environmentA)], observedAt, expiresAt,
+    });
+    await publishFixtureDirectory(database.runtime, scenario.identity, [fixtureDirectoryUser(ownerA)], { observedAt, expiresAt });
+    await new Promise(resolve => setTimeout(resolve, Math.max(0, expiresAt.getTime() - Date.now() + 20)));
+    expect((await database.operator.query(`SELECT g.observed_at,g.expires_at,g.expires_at<=clock_timestamp() AS expired
+      FROM inventory_revisions v JOIN data_generations g ON g.id=v.generation_id WHERE v.scope_id=$1 AND v.revision=$2`,
+      [scenario.canonical.scopeId, scenario.canonical.revision])).rows).toEqual([
+      { observed_at: observedAt, expires_at: expiresAt, expired: true },
+    ]);
+    const store = new InventoryGenerations(database.runtime);
+    await store.generations.connections.run(client => retainRecordData(client));
+    await store.gcMetadataSlice(scenario.canonical.scopeId, scenario.scope.tenantId);
+    const selected = await scenario.select();
+    expect(selected.page!.value).toHaveLength(2);
+    for (const source of Object.values(selected.page!.sources)) {
+      expect(source).toMatchObject({ state: "available", observation: { current: true }, error: null });
+      expect(new Date(source.observation!.observedAt)).toEqual(observedAt);
+      expect(new Date(source.observation!.expiresAt)).toEqual(expiresAt);
+    }
+    const users = new UserSourcesRepository(database.runtime, "synthetic-retained-user-snapshot-key");
+    const userSelection = await users.capture(scenario.identity, "delegated");
+    const people = await users.page(userSelection.id, scenario.identity);
+    expect(people).toMatchObject({ value: [{ directory: { objectId: ownerA } }],
+      sources: { directory: { state: "stale" } }, summary: { checkedUsers: 1, licensedUsers: 0, unknownLicenseUsers: 1 } });
+    expect(await new AgentPeopleRepository(database.runtime).directoryIds(scenario.scope, [ownerA])).toEqual([ownerA]);
+    await new InventoryRuntime(database.runtime, async () => {}).enqueue(scenario.scope);
+    expect((await database.runtime.query("SELECT revision FROM inventory_roots WHERE scope_id=$1 AND current",
+      [scenario.canonical.scopeId])).rows[0].revision).toBe(scenario.canonical.revision);
+    const nativeId = selected.page!.value.find(value => value.powerPlatformResource)!.id;
+    await expect(new LiveInventory(database.runtime).record(scenario.scope, nativeId)).rejects.toMatchObject({ code: "agent_not_found" });
+  }, 20_000);
 
   it.each(["displayName", "publisher", "versions"] as const)(
     "preserves the existing English base-sensitivity and numeric-version comparator for %s", async sortBy => {
@@ -313,14 +377,17 @@ afterEach(async () => {
     expect(await pages(scenario, selected, 1)).toHaveLength(3);
   });
 
-  it.each(["stale", "invalidated"] as const)("does not authorize canonical matching with %s identity details", async state => {
+  it.each(["stale", "invalidated"] as const)("preserves saved identity matching on age, but not invalidation: %s", async state => {
     const value = packageValue("withdrawn", "Same displayed name", true);
     const scenario = await seedSelectedInventory(database.runtime, { packages: [{ ...value,
       detailFreshness: { state, observedAt: new Date(Date.now() - 60_000).toISOString(), expiresAt: new Date(Date.now() - 1).toISOString() },
       ...(state === "invalidated" ? { identityRevalidationRequired: true } : {}) }], resources: [resource(environmentA)] });
     const selected = await scenario.select();
-    expect(selected.page!.summary).toMatchObject({ total: 2, linked: 0, graphOnly: 1, powerPlatformOnly: 1 });
-    expect(selected.page!.identityCollection).toMatchObject({ checkedPackages: 0, pendingPackages: 1 });
+    expect(selected.page!.summary).toMatchObject(state === "stale"
+      ? { total: 1, linked: 1, graphOnly: 0, powerPlatformOnly: 0 }
+      : { total: 2, linked: 0, graphOnly: 1, powerPlatformOnly: 1 });
+    expect(selected.page!.identityCollection).toMatchObject(state === "stale"
+      ? { checkedPackages: 1, pendingPackages: 0 } : { checkedPackages: 0, pendingPackages: 1 });
   });
 
   it.each(["full", "ai", "unknown"] as const)("uses proven agent-query coverage rather than the %s role hint", async roleScope => {

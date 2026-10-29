@@ -1,6 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage } from "../test/reportDataFixture";
+import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportSelection } from "../test/reportDataFixture";
+import { createSavedQueryClient } from "../savedQueries";
 import { deferred } from "../test/deferred";
 import { DashboardInsights } from "./DashboardInsights";
 
@@ -32,6 +34,49 @@ function fixture(data = adoptionDepartmentPage(), summary = adoptionSummaryPage(
 }
 
 describe("dashboard insights", () => {
+  it("does not reuse a cleaned-up selection for facets while a remounted summary refreshes", async () => {
+    const summary = adoptionSummaryPage(), fresh = { ...summary, selection: reportSelection(3) };
+    const { fetcher } = fixture(adoptionDepartmentPage(), summary), base = fetcher.getMockImplementation()!;
+    const pending = deferred<Response>(), client = createSavedQueryClient();
+    let resumed = false;
+    fetcher.mockImplementation(async input => {
+      const url = new URL(input, "http://localhost");
+      if (resumed && url.pathname.endsWith("/summary")) return pending.promise;
+      if (resumed && url.pathname.endsWith("/facets")) {
+        if (url.searchParams.get("selectionId") === summary.selection.id) {
+          return Response.json({ code: "selection_invalidated", detail: "Selection no longer exists." }, { status: 409 });
+        }
+        return Response.json({ value: [{ value: "Contoso", count: 2 }],
+          counts: { total: 1, filtered: 1 }, page: fresh.page, selection: fresh.selection });
+      }
+      return base(input);
+    });
+    const panel = () => <QueryClientProvider client={client}>
+      <DashboardInsights snapshot={adoptionSnapshot()} revision={0} onCompanyChange={vi.fn()} />
+    </QueryClientProvider>;
+    const initial = render(panel());
+    try {
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "false"));
+      initial.unmount();
+      resumed = true;
+      vi.spyOn(performance, "now").mockReturnValue(performance.now() + 40 * 60_000);
+      render(panel());
+      await waitFor(() => expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/summary"))).toHaveLength(2));
+      expect(within(screen.getByRole("region", { name: "People and engagement" })).getByText("40,000")).toBeVisible();
+      expect(within(screen.getByRole("region", { name: "Agents and champions" })).getByText("6")).toBeVisible();
+      expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/facets"))).toHaveLength(1);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      await act(async () => pending.resolve(Response.json(fresh)));
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Company" })).toHaveAttribute("aria-disabled", "false"));
+      const facets = fetcher.mock.calls.map(([input]) => new URL(input, "http://localhost")).filter(url => url.pathname.endsWith("/facets"));
+      expect(facets.map(url => url.searchParams.get("selectionId"))).toEqual([summary.selection.id, fresh.selection.id]);
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      cleanup();
+      client.clear();
+    }
+  });
+
   it("shows measured department percentages and six evidence-based organization metrics", async () => {
     const { fetcher } = fixture();
     render(<DashboardInsights snapshot={adoptionSnapshot()} baseline={adoptionSnapshot(2, {

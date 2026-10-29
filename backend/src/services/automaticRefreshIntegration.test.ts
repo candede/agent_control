@@ -114,6 +114,7 @@ it("publishes initial inventory/users independently, then queues a same-selector
     const initial = await service.automaticRefresh(user);
     expect(initial.run).toMatchObject({ automatic: true });
     await waitForRun(scope, initial.run!.id, "completed");
+    expect(await service.state(user)).toMatchObject({ onboardingRequired: false });
     expect(list).toHaveBeenCalledOnce();
     expect(details.mock.calls.length).toBeLessThanOrEqual(1);
     expect(sources.mock.calls.map(([, input]) => input.scope.source).sort()).toEqual(["app_activity", "directory"]);
@@ -129,9 +130,9 @@ it("publishes initial inventory/users independently, then queues a same-selector
     const enriching = await service.automaticRefresh(user);
     expect(enriching.detailJob).toMatchObject({ status: "running" });
     await vi.waitFor(() => expect(details).toHaveBeenCalledOnce(), { timeout: 10_000 });
-    await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
       WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
-    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '6 hours 1 minute'
       WHERE run_id=$1 AND source_id='graph_packages'`, [initial.run!.id]);
     const next = await service.automaticRefresh(user);
     expect(next.run?.id).not.toBe(initial.run!.id);

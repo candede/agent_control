@@ -17,7 +17,7 @@ export async function streamedPackageFixture(database: pg.Pool, scope: { tenantI
   if (values.length > 20) throw new Error("tiny_streamed_package_fixture_limit");
   const provider = new GraphPackagesClient(async url => {
     const path = new URL(String(url)).pathname;
-    if (path.endsWith("/packages")) return Response.json({ value: values, "@odata.count": values.length });
+    if (path === "/v1.0/copilot/admin/catalog/packages") return Response.json({ value: values, "@odata.count": values.length });
     const id = decodeURIComponent(path.split("/").at(-1)!);
     const value = values.find(record => record.id === id);
     return value ? Response.json(value) : Response.json({ error: { code: "notFound" } }, { status: 404 });
@@ -36,11 +36,13 @@ export async function streamedPackageFixture(database: pg.Pool, scope: { tenantI
 }
 
 export async function reconcileInventoryFixture(database: pg.Pool, scope: { tenantId: string; principalId: string },
-  options: { reserveBytes?: number } = {}) {
+  options: { reserveBytes?: number; observedAt?: Date; expiresAt?: Date } = {}) {
   const runtime = new InventoryRuntime(database, async () => {});
   const input = inventoryInput(scope.principalId, "canonical");
   input.scope.tenantId = scope.tenantId;
   if (options.reserveBytes !== undefined) input.reserveBytes = options.reserveBytes;
+  if (options.observedAt !== undefined) input.observedAt = options.observedAt;
+  if (options.expiresAt !== undefined) input.expiresAt = options.expiresAt;
   input.sessionEpoch = await new DataGenerations(database).sessionEpoch(scope.tenantId, scope.principalId);
   await runtime.publishControls(scope);
   await runtime.publishNativeControls(scope);
@@ -123,7 +125,9 @@ export async function nativeInventoryFixture(database: pg.Pool, scope: { tenantI
   }, { authorize: async () => {} });
 }
 export async function inventoryBaseline(store: InventoryGenerations, principal: string, count: number, observedAt = new Date(), expiresAt?: Date) {
-  return store.execute({ ...inventoryInput(principal), observedAt, ...expiresAt ? { expiresAt } : {} }, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
+  const input = { ...inventoryInput(principal), observedAt, ...expiresAt ? { expiresAt } : {} };
+  input.sessionEpoch = await store.generations.sessionEpoch(input.scope.tenantId, principal);
+  return store.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
     let page = 0;
     for (let offset = 0; offset < count || offset === 0; offset += 100) {
       await store.visit(lease, `${offset}`);
@@ -136,7 +140,9 @@ export async function inventoryBaseline(store: InventoryGenerations, principal: 
 }
 export async function inventoryDelta(store: InventoryGenerations, principal: string, count = 20,
   after?: (lease: GenerationLease) => Promise<void>) {
-  return store.execute(inventoryInput(principal), { domain: "packages", mode: "delta", channel: "exact",
+  const input = inventoryInput(principal);
+  input.sessionEpoch = await store.generations.sessionEpoch(input.scope.tenantId, principal);
+  return store.execute(input, { domain: "packages", mode: "delta", channel: "exact",
     targets: Array.from({ length: count }, (_, index) => packageRecord(index).native_id) }, async lease => {
     await store.appendBounded(lease, Array.from({ length: count }, (_, index) => packageRecord(index, `Changed ${index}`)));
     await after?.(lease);

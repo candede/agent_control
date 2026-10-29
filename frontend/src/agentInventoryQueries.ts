@@ -2,6 +2,7 @@ import { hashKey, isCancelledError, QueryClient, type QueryKey } from "@tanstack
 import { ApiError, getUnifiedAgents, type UnifiedAgentInventoryPage, type UnifiedAgentInventoryQuery, type UnifiedAgentInventoryUnavailable } from "./api/client";
 import { isInventoryTimestamp } from "../../backend/src/types/inventoryTimestamp";
 import { acceptSelectedRead, canReuseSelectedRead } from "./selectedRead";
+import { savedQueryRetention } from "./savedQueries";
 
 type InventoryRead = UnifiedAgentInventoryPage | UnifiedAgentInventoryUnavailable;
 type InventoryOutcome = { epoch: number; family?: InventoryFamily } & ({ data: InventoryRead } | { error: unknown });
@@ -16,7 +17,7 @@ export class AgentInventoryQueries {
   private readonly positions = new Map<string, number>();
   private readonly client = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, staleTime: Infinity, gcTime: 60_000, networkMode: "always", structuralSharing: false },
+      queries: { retry: false, staleTime: Infinity, gcTime: savedQueryRetention.gcTime, networkMode: "always", structuralSharing: false },
     },
   });
 
@@ -32,13 +33,13 @@ export class AgentInventoryQueries {
     return alias?.queryKey ?? ["agent-inventory", principalKey, family, query];
   }
 
-  getCached(principalKey: string, query: UnifiedAgentInventoryQuery): UnifiedAgentInventoryPage | undefined {
+  getCached(principalKey: string, query: UnifiedAgentInventoryQuery, allowExpired = false): UnifiedAgentInventoryPage | undefined {
     if (this.owner !== principalKey) return;
     const saved = this.client.getQueryCache().find({ queryKey: this.queryKey(principalKey, query), exact: true });
     const data = saved?.state.data as InventoryRead | undefined;
     if (saved?.state.status === "success" && !saved.state.isInvalidated && data && !("state" in data)
       && (!query.selectionId || data.selection.id === query.selectionId)
-      && canReuseSelectedRead(data.selection)) return data;
+      && (allowExpired || canReuseSelectedRead(data.selection))) return data;
   }
 
   private removeFamily(family: string) {

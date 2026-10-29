@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { isPublicationRevisions, type SelectedRead } from "../../backend/src/types/dataSelection";
 import { compareInventoryInstants, isInventoryTimestamp } from "../../backend/src/types/inventoryTimestamp";
 import { ApiError } from "./api/client";
+import { savedQueryRetention } from "./savedQueries";
 
 const timings = new WeakMap<SelectedRead, { leaseUntil: number; reuseUntil: number }>();
-const savedReadCacheMs = 30_000;
 
 export function acceptSelectedRead<T extends { selection: SelectedRead }>(data: T, startedAt: number, published = true): T {
   const selection = data.selection;
@@ -19,7 +19,7 @@ export function acceptSelectedRead<T extends { selection: SelectedRead }>(data: 
   // Charge the entire round trip, including time before DB validation. Calendar skew
   // cannot extend a lease; a slow successful response is still readable history.
   const leaseUntil = startedAt + inventoryDurationMilliseconds(selection.expiresAt, selection.validatedAt);
-  if (!timings.has(selection)) timings.set(selection, { leaseUntil, reuseUntil: Math.min(leaseUntil, startedAt + savedReadCacheMs) });
+  if (!timings.has(selection)) timings.set(selection, { leaseUntil, reuseUntil: Math.min(leaseUntil, startedAt + savedQueryRetention.staleTime) });
   return data;
 }
 

@@ -122,15 +122,17 @@ describe("report licensing reconciliation after failed verification", () => {
     "counts active identities requiring a license check with %s directory evidence", async state => {
       const saved = context("official_users"), client = Object.assign(new pg.Client(), { release: vi.fn() });
       saved.query.licenseCohort = "active_without_paid";
-      Object.assign(saved.metadata.directory, { state, generationId: "22222222-2222-4222-8222-222222222222",
-        rowCount: 2, attemptStatus: state === "partial" ? "failed" : "available" });
+      const savedDirectory = state !== "unavailable";
+      Object.assign(saved.metadata.directory, { state,
+        generationId: savedDirectory ? "22222222-2222-4222-8222-222222222222" : null,
+        rowCount: savedDirectory ? 2 : null, attemptStatus: state === "partial" ? "failed" : "available" });
       saved.report.setId = "33333333-3333-4333-8333-333333333333";
       const totals = { directory_counts: null, unresolved: "1", unpaid: "1", paid: "1", unknown_license: "1", active_users: "3",
         responses: null, bridge: null, users: null, licensed: null, unlicensed: null };
       mockQuery(client).mockResolvedValue(result([totals]));
       const summary = await reports.summaryInRead(client, saved);
-      expect(summary).toMatchObject({ unknownLicenseActiveReportUsers: state === "available" ? 1 : 3,
-        activeWithoutPaidUsers: state === "available" ? 1 : null, paidActiveReportUsers: state === "available" ? 1 : null,
+      expect(summary).toMatchObject({ unknownLicenseActiveReportUsers: savedDirectory ? 1 : 3,
+        activeWithoutPaidUsers: savedDirectory ? 1 : null, paidActiveReportUsers: savedDirectory ? 1 : null,
         distinctActiveReportUsers: 3 });
     },
   );

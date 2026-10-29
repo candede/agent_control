@@ -35,7 +35,8 @@ const api = vi.hoisted(() => ({
   openPermissions: vi.fn(),
 }));
 
-vi.mock("../capabilityContext", () => ({
+vi.mock("../capabilityContext", async importOriginal => ({
+  ...await importOriginal<typeof import("../capabilityContext")>(),
   useCapabilityContext: () => ({ openPermissions: api.openPermissions }),
 }));
 
@@ -265,6 +266,27 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it("does not mistake a completed historical run for saved inventory during automatic recovery", async () => {
+    const historical = automaticSources();
+    const sources = historical.map(saved => saved.source === "users" ? saved : {
+      ...saved, status: "not_started" as const, message: "The previously saved source is no longer available.",
+    });
+    api.getState.mockResolvedValue(syncState({ sources, run: run("completed", historical) }));
+    api.start.mockResolvedValue(run("running", sources.filter(source => source.source !== "users")
+      .map(source => ({ ...source, status: "queued" }))));
+    const onSetupStatusChange = vi.fn();
+    renderPanel({ active: false, onOpenSync: vi.fn(), onSetupStatusChange,
+      automaticRefresh: automaticStatus({ paused: false }) });
+    const notice = await screen.findByRole("dialog", { name: "Set up your workspace" });
+    expect(within(notice).getByRole("status")).toHaveTextContent("1 of 3 sources saved");
+    expect(within(notice).getAllByText("Complete", { exact: true })).toHaveLength(1);
+    expect(onSetupStatusChange).toHaveBeenLastCalledWith("required");
+    await userEvent.click(within(notice).getByRole("button", { name: "Retry incomplete sources" }));
+    expect(api.start.mock.calls[0]?.[0]).toMatchObject({
+      mode: "initial", sources: ["graph_packages", "power_platform"],
+    });
   });
 
   it.each([

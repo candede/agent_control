@@ -7,6 +7,63 @@ import { activateAccountSession, assertAccountSessionValidation, beginAccountSes
 
 afterEach(() => vi.restoreAllMocks());
 
+describe("data sync run completion", () => {
+  it.each([
+    { status: "succeeded", aggregate: "completed", terminal: true },
+    { status: "failed", aggregate: "partial", terminal: true },
+    { status: "waiting_authorization", aggregate: "waiting", terminal: false },
+    { status: "permission_required", aggregate: "waiting", terminal: false },
+  ] as const)(
+    "reconciles a retained upload without reopening provider work that is $status", async ({ status, aggregate, terminal }) => {
+      const database = new pg.Pool({ max: 4 });
+      const client = Object.assign(new pg.Client(), { release: vi.fn() });
+      vi.spyOn(database, "connect").mockImplementation(async () => client);
+      vi.spyOn(database, "query").mockRejectedValue(new Error("Unit tests must not access a database."));
+      const repository = new DataSyncRepository(database);
+      vi.spyOn(repository, "getRun").mockResolvedValue(undefined);
+      const runId = randomUUID();
+      const scope = { tenantId: "synthetic-run-completion", principalId: "synthetic-viewer" };
+      const acceptedAt = new Date("2026-09-15T10:00:00.000Z");
+      const query = vi.spyOn(client, "query").mockImplementation(async sql => {
+        if (typeof sql !== "string") throw new Error("Unexpected query shape.");
+        const rows = sql.startsWith("SELECT status FROM data_sync_run_sources")
+          ? [{ status: "succeeded" }, { status }]
+          : sql.startsWith("UPDATE data_sync_run_sources source")
+            ? [{ count: 0, last_success_at: acceptedAt }] : [];
+        return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
+      });
+
+      try {
+        await repository.updateSource(scope, runId, "usage_reports", {
+          status: "succeeded", count: 0, lastSuccessAt: acceptedAt.toISOString(),
+          message: "Accepted a complete zero-row usage bundle.", canRetry: false,
+        });
+        const publication = query.mock.calls.find(([sql]) => typeof sql === "string" && sql.startsWith("UPDATE data_sync_run_sources source"));
+        expect(publication?.[0]).toContain(
+          "OR run.status='partial' AND source.source_id='usage_reports' AND source.status='awaiting_upload' AND $5='succeeded'",
+        );
+        expect(query).toHaveBeenCalledWith(
+          expect.stringContaining("INSERT INTO data_sync_success_markers"),
+          [scope.tenantId, scope.principalId, "usage_reports", 0, acceptedAt],
+        );
+        expect(query).toHaveBeenCalledWith(
+          expect.stringContaining("completed_at=CASE WHEN $5"),
+          [runId, scope.tenantId, scope.principalId, aggregate, terminal],
+        );
+        const finalization = query.mock.calls.find(([sql]) => typeof sql === "string" && sql.startsWith("UPDATE data_sync_runs SET status=$4"));
+        expect(finalization?.[0]).toContain(
+          "AND (status IN ('running','waiting') OR status='partial' AND $4='completed')",
+        );
+        expect(finalization?.[0]).toContain(
+          "CASE WHEN status='partial' THEN clock_timestamp() ELSE COALESCE(completed_at,clock_timestamp()) END",
+        );
+        expect(query).toHaveBeenCalledWith("COMMIT");
+        expect(client.release).toHaveBeenCalledOnce();
+      } finally { await database.end(); }
+    },
+  );
+});
+
 describe("Users sync transaction authority", () => {
   it.each((["progress", "success", "attach"] as const).flatMap(operation =>
     (["session", "cancelled", "admission"] as const).map(boundary => ({ operation, boundary })),

@@ -78,7 +78,7 @@ describe.sequential("Data sync repository", () => {
     await repository.cancel(owner, usersOnly.run.id);
   });
 
-  it("keeps explicit legacy four-source runs waiting for manual usage and accepts a complete zero-row bundle", async () => {
+  it("releases explicit four-source workers and reconciles a later complete zero-row usage bundle", async () => {
     const owner = { ...scope, principalId: "manual-usage" };
     const { run } = await repository.submit(owner, {
       mode: "full", sources: ["users", "graph_packages", "power_platform", "usage_reports"],
@@ -86,14 +86,56 @@ describe.sequential("Data sync repository", () => {
     for (const source of run.sources) await repository.updateSource(owner, run.id, source.source, source.source === "usage_reports"
       ? { status: "awaiting_upload", count: null, message: "Waiting for official reports.", canRetry: false }
       : { status: "succeeded", count: 0, message: "Saved a valid zero-row source.", canRetry: false });
+    expect(await repository.getRun(owner, run.id)).toMatchObject({ status: "waiting", completedAt: null });
+    await repository.finishRun(owner, run.id);
+    await repository.finishRun(owner, run.id);
     const retained = new DataSyncRepository(fixture.runtime);
-    expect(await retained.getRun(owner, run.id)).toMatchObject({ status: "waiting", sources: expect.any(Array) });
+    expect(await retained.getRun(owner, run.id)).toMatchObject({
+      status: "partial", completedAt: expect.any(String),
+      sources: expect.arrayContaining([expect.objectContaining({ source: "usage_reports", status: "awaiting_upload" })]),
+    });
+    const automatic = await retained.submitDue(owner);
+    expect(automatic).toMatchObject({ created: true, run: { automatic: true, status: "running" } });
+    expect(automatic.run?.sources.some(source => source.source === "usage_reports")).toBe(false);
     await retained.updateSource(owner, run.id, "usage_reports", {
       status: "succeeded", count: 0, message: "Accepted a complete zero-row usage bundle.", canRetry: false,
     });
-    expect((await retained.getRun(owner, run.id))?.status).toBe("completed");
+    const completed = (await retained.getRun(owner, run.id))!;
+    expect(completed.status).toBe("completed");
+    expect(Date.parse(completed.completedAt!))
+      .toBeGreaterThanOrEqual(Date.parse(completed.sources.find(source => source.source === "usage_reports")!.lastSuccessAt!));
     expect((await retained.listMarkers(owner)).every(marker => marker.status === "succeeded" && marker.count === 0)).toBe(true);
+    expect((await retained.getRun(owner, automatic.run!.id))?.status).toBe("running");
   });
+
+  it.each(["failed", "waiting_authorization", "permission_required"] as const)(
+    "reconciles a retired upload without reopening a %s provider source", async status => {
+      const owner = { ...scope, principalId: `retained-upload-${status}` };
+      const { run } = await repository.submit(owner, { mode: "initial", sources: ["users", "usage_reports"] });
+      await repository.updateSource(owner, run.id, "users", {
+        status, message: "Directory collection did not finish.", canRetry: true,
+      });
+      await repository.updateSource(owner, run.id, "usage_reports", {
+        status: "awaiting_upload", message: "Waiting for official reports.", canRetry: false,
+      });
+      await repository.finishRun(owner, run.id);
+      const before = (await repository.getRun(owner, run.id))!;
+      expect(before.status).toBe("partial");
+      const automatic = await repository.submitDue(owner);
+      expect(automatic.created).toBe(true);
+      await repository.updateSource(owner, run.id, "usage_reports", {
+        status: "succeeded", count: 0, message: "Accepted a complete zero-row usage bundle.", canRetry: false,
+      });
+      const reconciled = (await repository.getRun(owner, run.id))!;
+      expect(reconciled).toMatchObject({
+        status: "partial", completedAt: before.completedAt,
+        sources: expect.arrayContaining([expect.objectContaining({ source: "usage_reports", status: "succeeded", count: 0 })]),
+      });
+      expect(reconciled.sources.find(source => source.source === "users"))
+        .toEqual(before.sources.find(source => source.source === "users"));
+      expect((await repository.getRun(owner, automatic.run!.id))?.status).toBe("running");
+    },
+  );
 
   it("starts new and retried counts unknown, preserves completed sources and markers, and fences old progress", async () => {
     const owner = { ...scope, principalId: "observed-counts" };

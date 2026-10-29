@@ -49,7 +49,7 @@ export class AgentPeopleRepository {
     const rows = await this.database.query<{ identity: string }>(`SELECT d.identity FROM directory_user_rows d
       JOIN data_scope_epochs s ON s.id=d.scope_id AND s.tenant_id=d.tenant_id
       JOIN data_generation_heads h ON h.scope_id=s.id AND h.generation_id=d.generation_id
-      JOIN data_generations g ON g.id=d.generation_id AND g.expires_at>clock_timestamp() AND g.state='published'
+      JOIN data_generations g ON g.id=d.generation_id AND g.state='published' AND g.validated
         AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
       WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='directory'
         AND d.identity=ANY($3::text[]) LIMIT 100`, [scope.tenantId, scope.principalId, requested]);
@@ -81,6 +81,6 @@ export class AgentPeopleRepository {
         context.generation.scopeEpoch, context.generation.sessionEpoch])).rows[0];
       if (!current) throw new SelectionError("selection_invalidated");
       if (context.publication) await requireUserPublication(client, scope, context.publication);
-    });
+    }, { signal: context.signal, beforeCommit: context.fence });
   }
 }

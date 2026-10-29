@@ -15,6 +15,7 @@ import { assertCurrentMutationTargets } from "./inventoryMutationAuthority.js";
 import { inventoryPresentation } from "../services/inventoryPresentation.js";
 import { verifySchema } from "./schema.js";
 import { initializeSchema } from "../../scripts/database.js";
+import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET ??= "synthetic-staged-mutation-secret-long"; });
 
@@ -147,14 +148,14 @@ describe("record-store mutation staging", () => {
     const scope = newUsageScope(), expiresAt = new Date(Date.now() + 2_000);
     const input = inventoryInput(scope.principalId);
     input.scope.tenantId = scope.tenantId;
-    input.observedAt = new Date(expiresAt.getTime() - 3_600_001);
+    input.observedAt = new Date(expiresAt.getTime() - automaticDataSyncIntervalMs - 1);
     const value = { id: "aging", displayName: "Aging", isBlocked: false, version: "1",
       lastModifiedDateTime: input.observedAt.toISOString(),
       elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "identity", definition: "{}" }] }] };
     const stream = new StreamedInventory(fixture.runtime, new GraphPackagesClient(async url =>
       Response.json(new URL(url).pathname.endsWith("/aging") ? value : { value: [value] }), { minimumReadIntervalMs: 0, maxAttempts: 1 }));
     await stream.graphCatalog(input, "synthetic", { authorize: async () => {} });
-    const source = await stream.details({ ...input, jobId: randomUUID(), observedAt: new Date(expiresAt.getTime() - 3_600_000) },
+    const source = await stream.details({ ...input, jobId: randomUUID(), observedAt: new Date(expiresAt.getTime() - automaticDataSyncIntervalMs) },
       "synthetic", ["aging"], { authorize: async () => {} });
     const canonical = inventoryInput(scope.principalId, "canonical");
     canonical.scope.tenantId = scope.tenantId;
@@ -163,7 +164,9 @@ describe("record-store mutation staging", () => {
     await reconciliation.runNext(canonical, async () => {});
     const identity = await usageIdentity(fixture.runtime, scope), selectionId = await stages.currentSelection(identity);
     const initiallyReadable = inventoryPresentation(await stages.queries.page(selectionId, identity));
-    expect(initiallyReadable.value[0].packages[0].detailFreshness?.state).toBe("fresh");
+    expect(initiallyReadable.value[0].packages[0].detailFreshness).toMatchObject({
+      state: "fresh", expiresAt: expiresAt.toISOString(),
+    });
     expect(initiallyReadable.value[0].observations.packageSnapshots.aging.identityDetails?.current).toBe(true);
     const intent = { ...usageAudit(scope), action: "block" as const, scope: "single" as const };
     const preview = await stages.preview(identity, selectionId, intent, ["aging"]);
@@ -202,7 +205,7 @@ describe("record-store mutation staging", () => {
     const currentRead = await stages.currentSelection(identity);
     const page = inventoryPresentation(await stages.queries.page(currentRead, identity));
     expect(page.value[0].packages[0].detailFreshness?.state).toBe("stale");
-    expect(page.value[0].observations.packageSnapshots.aging.identityDetails?.current).toBe(false);
+    expect(page.value[0].observations.packageSnapshots.aging.identityDetails?.current).toBe(true);
   });
   it("acceptance: a staged multi-target job settles its own readbacks without rebinding the remaining source targets", async () => {
     const scope = newUsageScope(), input = inventoryInput(scope.principalId);

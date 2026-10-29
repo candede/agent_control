@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { allowlistedPackage } from "./packageObservation.js";
-import { parsePackageIdentityDefinition, readPackageAgentMetadata, readPackageCustomEngineBotIdentity, validatePackageAgentMetadata } from "./packageAgentMetadata.js";
+import { hasSavedPackageIdentityDetails, parsePackageIdentityDefinition, readPackageAgentMetadata, readPackageCustomEngineBotIdentity, validatePackageAgentMetadata } from "./packageAgentMetadata.js";
 import { dataLimits } from "../db/dataBounds.js";
 
 const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -14,7 +14,36 @@ function input(definition: string, elementType = "AgentMetadatas") {
   };
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+describe.each(["fresh", "stale"] as const)("saved %s package identity evidence", state => {
+  it.each([
+    { observedAt: null, expiresAt: "2026-10-29T13:00:00Z" },
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: null },
+    { observedAt: "2026-02-30T11:00:00Z", expiresAt: "2026-10-29T13:00:00Z" },
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: "invalid" },
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: "2026-10-29T11:00:00Z" },
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: "2026-10-29T10:00:00Z" },
+    { observedAt: "2026-10-29T12:00:00.000000001Z", expiresAt: "2026-10-29T13:00:00Z" },
+    { observedAt: "2026-10-29T14:00:00.000000001+02:00", expiresAt: "2026-10-29T13:00:00Z" },
+  ])("rejects malformed or future observations (%#)", freshness => {
+    vi.useFakeTimers({ now: new Date("2026-10-29T12:00:00Z") });
+    expect(hasSavedPackageIdentityDetails({ ...input("{}"), detailFreshness: { state, ...freshness } })).toBe(false);
+  });
+
+  it.each([
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: "2026-10-29T13:00:00Z" },
+    { observedAt: "2026-10-29T10:00:00Z", expiresAt: "2026-10-29T11:00:00Z" },
+    { observedAt: "2026-10-29T14:00:00+02:00", expiresAt: "2026-10-29T13:00:00Z" },
+    { observedAt: "2026-10-29T11:00:00Z", expiresAt: "2026-10-29T11:00:00.000000001Z" },
+  ])("retains valid identity evidence independently of expiry (%#)", freshness => {
+    vi.useFakeTimers({ now: new Date("2026-10-29T12:00:00Z") });
+    expect(hasSavedPackageIdentityDetails({ ...input("{}"), detailFreshness: { state, ...freshness } })).toBe(true);
+  });
+});
 
 describe("bounded package identity projection", () => {
   it("extracts complete typed identity fields and preserves connected services after the old 32 KB boundary", () => {

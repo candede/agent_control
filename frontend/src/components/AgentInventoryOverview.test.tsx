@@ -209,7 +209,7 @@ describe("inventory dashboard exact report context", () => {
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
   });
 
-  it("withdraws failed background evidence and clears its stale error during retry", async () => {
+  it("retains saved counts after a failed background read without authorizing selected actions", async () => {
     render(<AgentInventoryOverview revision={0} inventory={inventory} onUsageChange={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Show reported used agents" });
     await waitFor(() => expect(button).toHaveTextContent("50,000"));
@@ -217,7 +217,8 @@ describe("inventory dashboard exact report context", () => {
     act(() => window.dispatchEvent(new Event("focus")));
     await screen.findByRole("alert");
     expect(button).toBeDisabled();
-    expect(button).not.toHaveTextContent("50,000");
+    expect(button).toHaveTextContent("50,000");
+    expect(button).toHaveTextContent("Last saved report evidence");
     const pending = deferred<ReportPage<ReportOverviewAgent>>();
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
     fireEvent.click(screen.getByRole("button", { name: "Retry activity evidence" }));

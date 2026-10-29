@@ -5,7 +5,7 @@ import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 import { powerPlatformAuthoringTool } from "../types/powerPlatformInventory.js";
 import { inventoryLimits, type InventoryClassification } from "../types/inventoryRecords.js";
 import { allowlistedSavedPackage } from "./packageObservation.js";
-import { isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName, readPackageAgentMetadata, readPackageCustomEngineBotIdentity } from "./packageAgentMetadata.js";
+import { hasSavedPackageIdentityDetails, isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName, readPackageAgentMetadata, readPackageCustomEngineBotIdentity } from "./packageAgentMetadata.js";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "./inventoryIdentity.js";
 import { buildRecords } from "./inventoryComponent.js";
 import { resolvePackageAgentLinks } from "./packageAgentIdentity.js";
@@ -66,7 +66,7 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   const checked = allowlistedSavedPackage(observation);
   const value: CopilotPackageDetail = { ...checked, ...structuredClone(Object.fromEntries(
     retainedFields.filter(key => key !== "provenance" && Object.hasOwn(input, key)).map(key => [key, input[key]]))),
-    provenance: { ...checked.provenance, ...input.provenance } };
+    provenance: { ...checked.provenance, ...(Object.hasOwn(input, "provenance") ? structuredClone(input.provenance) : {}) } };
   const facts: InventoryFact[] = [];
   const fact = (kind: string, value: string, payload: Record<string, unknown> = {}) => facts.push({ kind, value, payload });
   for (const kind of ["supportedHosts", "elementTypes", "categories"] as const) {
@@ -84,7 +84,7 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   }
   const metadata = readPackageAgentMetadata(value);
   const identity = metadata.identity;
-  if (!value.identityRevalidationRequired && (!value.detailFreshness || value.detailFreshness.state === "fresh")) {
+  if (!value.identityRevalidationRequired && hasSavedPackageIdentityDetails(value)) {
     const environment = identity?.environmentId;
     if (environment) {
       if (identity.cdsBotId) {
@@ -99,8 +99,8 @@ export function packageInventoryRecord(input: CopilotPackageDetail): InventoryRe
   }
   const declarativeCount = value.elementDetails?.reduce((count, group) =>
     count + (isPackageElementType(group.elementType, "DeclarativeCopilots") ? group.elements.length : 0), 0) ?? 0;
-  const catalogManifest = !value.detailFreshness || value.detailFreshness.state === "fresh"
-    || value.detailFreshness.state !== "invalidated" && !value.elementDetails?.some(group => isPackageElementType(group.elementType, "AgentMetadatas"));
+  const catalogManifest = hasSavedPackageIdentityDetails(value)
+    || value.detailFreshness?.state !== "invalidated" && !value.elementDetails?.some(group => isPackageElementType(group.elementType, "AgentMetadatas"));
   if (!value.identityRevalidationRequired && catalogManifest && metadata.status !== "conflicting"
     && !(metadata.status === "unmatched" && metadata.invalidMetadata) && declarativeCount <= 1
     && (declarativeCount > 0 || value.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots")))

@@ -223,6 +223,15 @@ describe("inventory HTTP selected-read boundary", () => {
       AND source='inventory_canonical'`, [input.scope.tenantId, freshPrincipal])).rows[0].id;
     await new DataGenerations(fixture.runtime).invalidate(scopeId, input.scope.tenantId);
     await expectUnavailable("unavailable", 1);
+    await reconciliation.request(canonical, [source]);
+    await expectUnavailable("preparing", 1);
+    await reconciliation.runNext(canonical, async () => {});
+    const recovered = await capture();
+    expect(recovered.status, await recovered.clone().text()).toBe(201);
+    const recoveredSelection = await recovered.json();
+    const recoveredPage = await fetch(`${base}/agent-inventory?selectionId=${recoveredSelection.id}`, { headers });
+    expect(recoveredPage.status, await recoveredPage.clone().text()).toBe(200);
+    expect(await recoveredPage.json()).toMatchObject({ value: [], sources: { graphPackages: { state: "available" } } });
   });
   it("serves an exact counted page without source-wide reads or GET reconciliation", async () => {
     for (const module of ["packageInventory", "powerPlatformInventory", "unifiedAgentRegistry", "unifiedInventoryRevision"]) {

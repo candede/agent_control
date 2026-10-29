@@ -53,10 +53,12 @@ describe("server-validated saved reads", () => {
     expect(result.value).toEqual(["old root"]);
   });
 
-  it("limits reuse to thirty monotonic seconds even with a long server lease", () => {
+  it("limits reuse to fifteen monotonic minutes without extending a longer server lease", () => {
     vi.useFakeTimers();
-    const data = acceptSelectedRead(reportPage(["saved"]), performance.now());
-    vi.advanceTimersByTime(29_999);
+    const data = reportPage(["saved"]);
+    data.selection.expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+    acceptSelectedRead(data, performance.now());
+    vi.advanceTimersByTime(15 * 60_000 - 1);
     expect(canReuseSelectedRead(data.selection)).toBe(true);
     vi.advanceTimersByTime(1);
     expect(canReuseSelectedRead(data.selection)).toBe(false);

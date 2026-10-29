@@ -33,8 +33,7 @@ export function inventoryObservation(id: string, observed: string | Date, expire
   if (compareInventoryTimestamps(observedAt, expiresAt) >= 0) return invalid("Saved inventory observation expires before it was observed.");
   const evaluation = inventoryTimestamp(evaluatedAt);
   return { id, snapshotId: id, observedAt, expiresAt,
-    current: authority && compareInventoryTimestamps(observedAt, evaluation) <= 0
-      && compareInventoryTimestamps(expiresAt, evaluation) > 0 };
+    current: authority && compareInventoryTimestamps(observedAt, evaluation) <= 0 };
 }
 
 function status(source: Source | undefined, kind: "graph_packages" | "power_platform", evaluatedAt: string | Date): UnifiedAgentSourceStatus {
@@ -198,7 +197,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
             scopeKind: member.source_channel === "catalog" ? "broad" as const : "exact" as const,
             identityDetails: member.detail_generation && detail?.observedAt && detail.expiresAt
               && ["fresh", "stale"].includes(detail.state) ? {
-                ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, catalogObservation.current && detail.state === "fresh", evaluatedAt),
+                ...inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, catalogObservation.current, evaluatedAt),
               } : null,
           }];
         })),
@@ -207,7 +206,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
   });
   const visiblePending = page.value.flatMap(row => row.members.filter(member => member.domain === "packages")).filter(member => {
     const detail = member.residual.detailFreshness;
-    return member.residual.identityDetailsCollected !== true || detail && (detail.state !== "fresh"
+    return member.residual.identityDetailsCollected !== true || detail && (!["fresh", "stale"].includes(detail.state)
       || !inventoryObservation(member.detail_generation, detail.observedAt, detail.expiresAt, true, evaluatedAt).current);
   }).length;
   if (visiblePending > pendingPackages || counts.invalid_packages === 0 && value.some(row => row.identity.invalidMetadata)) {

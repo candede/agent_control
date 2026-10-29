@@ -1,14 +1,17 @@
 import { useEffect, useEffectEvent, useState } from "react";
 import type { AdoptionHistoryPage, AdoptionSnapshot } from "../../backend/src/types/adoptionDashboard";
 import { useReportPage, useReportPrincipalScope } from "./useReportPage";
+import { isExpiredSelection } from "./selectedRead";
 
 type Collection = { owner: string; selectionId?: string; pages: AdoptionHistoryPage[] };
 
 export function useAdoptionHistory(revision: number) {
   const read = useReportPage<AdoptionSnapshot, AdoptionHistoryPage>("official-usage/history/adoption", { limit: 100 }, revision);
   const scope = useReportPrincipalScope();
+  const historyScope = JSON.stringify([scope, revision]);
   const owner = JSON.stringify([scope, revision, read.selectionRevision]);
   const [collected, setCollected] = useState<Collection>({ owner, pages: [] });
+  const [completed, setCompleted] = useState<{ scope: string; collection: Collection }>();
   let current = collected.owner === owner ? collected : { owner, pages: [] };
   const data = read.data;
   if (data && !read.loading && !read.error && !read.leaseEnded) {
@@ -35,9 +38,13 @@ export function useAdoptionHistory(revision: number) {
   }, [data, read.loading, read.error, read.leaseEnded, inconsistent]);
   const complete = Boolean(data && !data.page.nextCursor && !read.loading && !read.error && !read.leaseEnded && !issue
     && snapshots.length === total);
+  const rejected = issue || read.invalidated || read.error && !isExpiredSelection(read.error);
+  if (complete && completed?.collection !== current) setCompleted({ scope: historyScope, collection: current });
+  else if (completed && (rejected || completed.scope !== historyScope)) setCompleted(undefined);
+  const retained = !rejected && completed?.scope === historyScope ? completed.collection : undefined;
   return {
     read: issue ? { ...read, error: issue, retry: read.restart } : read,
-    snapshots: complete ? snapshots : undefined,
+    snapshots: complete ? snapshots : retained?.pages.flatMap(page => page.value),
     loaded: snapshots.length,
     total,
   };

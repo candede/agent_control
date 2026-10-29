@@ -1,8 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdoptionHistoryPage } from "../../../backend/src/types/adoptionDashboard";
 import { ApiError } from "../api/client";
 import { adoptionSnapshot, reportPage, reportSelection } from "../test/reportDataFixture";
+import { deferred } from "../test/deferred";
 import { AdoptionDashboard } from "./AdoptionDashboard";
 
 vi.mock("./DashboardInsights", async original => ({
@@ -21,6 +22,57 @@ const usersCard = () => within(screen.getByRole("region", { name: "Active users"
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("adoption dashboard", () => {
+  it.each([false, true])("keeps complete comparisons mounted while an idle history selection renews (multiple pages=%s)", async multiplePages => {
+    vi.useFakeTimers();
+    const initial = reportPage(all, { selection: reportSelection(2, Date.now()) });
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    const pending = deferred<Response>(), older = deferred<Response>();
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json(initial)).mockReturnValueOnce(pending.promise).mockReturnValueOnce(older.promise);
+    vi.stubGlobal("fetch", fetcher);
+    renderDashboard();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    const card = screen.getByRole("region", { name: "Active users" });
+    const baseline = screen.getByRole("combobox", { name: "Compare latest with baseline" });
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("region", { name: "Active users" })).toBe(card);
+    expect(screen.getByRole("combobox", { name: "Compare latest with baseline" })).toBe(baseline);
+    expect(usersCard().getByText("306")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
+    const selection = reportSelection(3, Date.now());
+    await act(async () => {
+      pending.resolve(Response.json(reportPage(multiplePages ? [latest] : all, { selection,
+        counts: { total: 3, filtered: 3 },
+        page: { limit: 100, nextCursor: multiplePages ? "older" : null, previousCursor: null } })));
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.getByRole("region", { name: "Active users" })).toBe(card);
+    if (multiplePages) {
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
+      await act(async () => {
+        older.resolve(Response.json(reportPage([second, first], { selection, counts: { total: 3, filtered: 3 },
+          page: { limit: 100, nextCursor: null, previousCursor: "newer" } })));
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(screen.getByRole("region", { name: "Active users" })).toBe(card);
+      expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
+    }
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each([401, 403, 409])("withdraws retained comparisons when history revalidation returns %s", async status => {
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json(reportPage(all)))
+      .mockResolvedValueOnce(Response.json({ code: status === 409 ? "selection_invalidated" : "access_denied", detail: "History unavailable." }, { status }));
+    vi.stubGlobal("fetch", fetcher);
+    renderDashboard();
+    await screen.findByRole("region", { name: "Active users" });
+    fireEvent.focus(window);
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("region", { name: "Active users" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "No saved usage reports yet" })).not.toBeInTheDocument();
+  });
+
   it("shows baseline, latest, recent direction, independent source totals, and inspect links", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage(all))));
     renderDashboard();

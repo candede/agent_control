@@ -238,6 +238,20 @@ describe("current schema source contracts", () => {
     expect(sources).toContain("WHEN r.domain = CAST('power_platform' AS text)");
     expect(sources).toContain("ELSE r.native_id");
   });
+
+  it.each([
+    { owner: "live sources", pattern: /CREATE VIEW inventory_live_sources[\s\S]*?(?=\nCREATE )/ },
+    { owner: "reviewed associations", pattern: /CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?END\$\$/ },
+  ])("keeps retained publications independent of sign-out in $owner without relaxing source fences", ({ pattern }) => {
+    const definition = schemaSql.match(pattern)?.[0];
+    expect(definition).toBeDefined();
+    expect(definition).toMatch(/generation\.scope_epoch\s*=\s*scope\.epoch/);
+    expect(definition).toMatch(/generation\.session_epoch\s*=\s*scope\.session_epoch/);
+    expect(definition).toMatch(/source_generation\.session_epoch\s*=\s*source_scope\.session_epoch/);
+    expect(definition).toContain("generation.validated");
+    expect(definition).toMatch(/epoch\.epoch IS DISTINCT FROM input\.epoch/);
+    expect(definition).not.toMatch(/generation\.session_epoch\s*=\s*principal\.epoch/);
+  });
 });
 
 describe("schema verification without a database", () => {

@@ -29,9 +29,34 @@ it("does not persist inherited identity or control observation annotations", () 
   }
 });
 
+it("does not read inherited provenance when projecting own package observations", () => {
+  const { provenance: expected, ...observation } = allowlistedPackage({
+    id: "own-provenance", displayName: "Fixture", isBlocked: false,
+  });
+  const getter = vi.fn(() => ({ id: { sourceSystem: "graph_packages", path: "inherited", maturity: "observed" } }));
+  const input = Object.assign(Object.create(Object.defineProperty({}, "provenance", { get: getter })), observation);
+  const projected = packageInventoryRecord(input);
+  expect(getter).not.toHaveBeenCalled();
+  expect(projected.residual.provenance).toEqual(expected);
+});
+
+it("isolates nested package provenance from caller mutations in both directions", () => {
+  const input = allowlistedPackage({ id: "isolated-provenance", displayName: "Fixture", isBlocked: false });
+  input.provenance.id.path = "value[0].id";
+  input.provenance.id.maturity = "observed";
+  const expected = structuredClone(input.provenance);
+  const record = packageInventoryRecord(input);
+  expect(record.residual.provenance).toEqual(expected);
+  input.provenance.id.path = "caller-mutated";
+  expect(record.residual.provenance).toEqual(expected);
+  const projected = record.residual.provenance as typeof input.provenance;
+  projected.displayName.path = "projection-mutated";
+  expect(input.provenance.displayName).toEqual(expected.displayName);
+});
+
 it("rejects source and local annotation accessors without invoking them during inventory projection", () => {
   const input = allowlistedPackage({ id: "own-observations", displayName: "Fixture", isBlocked: false });
-  for (const field of ["manifestId", "identityDetailsCollected"]) {
+  for (const field of ["manifestId", "identityDetailsCollected", "provenance"]) {
     const getter = vi.fn(() => "untrusted-identity");
     const accessor = { ...input };
     Object.defineProperty(accessor, field, { get: getter, enumerable: true });

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
 import type { InventoryRoot } from "../types/inventoryRecords.js";
 import { dataLimits } from "../db/dataBounds.js";
+import { inventoryReconciliationAdmissionSql } from "../db/inventoryReconciliationAdmissionSchema.js";
 import { InventoryReconciliation } from "./inventoryReconciliation.js";
 import { packageInventoryRecord, type InventoryRecord } from "./inventoryRecordProjection.js";
 import { allowlistedPackage } from "./packageObservation.js";
@@ -138,6 +139,30 @@ function fixture(records: InventoryRecord[], factsError?: Error,
 }
 
 describe("bounded isolated reconciliation without a database", () => {
+  it.each([19, 20])("preserves admission at %i queued jobs when retained source observations have aged", async queued => {
+    const f = fixture([], undefined, { reusable: false, unchanged: true });
+    f.input.observedAt = new Date(Date.now() - 2 * 86_400_000);
+    f.input.expiresAt = new Date(Date.now() - 86_400_000);
+    const query = vi.mocked(f.client.query).getMockImplementation()!;
+    vi.mocked(f.client.query).mockImplementation((...args) => {
+      if (args[0] === inventoryReconciliationAdmissionSql) {
+        return Promise.resolve({ command: "SELECT", rows: [{ count: queued }], rowCount: 1, fields: [], oid: 0 });
+      }
+      return query(...args);
+    });
+
+    const request = f.reconciliation.request(f.input, [f.root]);
+    if (queued < 20) await expect(request).resolves.toMatchObject({ pendingSequence: "2" });
+    else {
+      await expect(request).rejects.toMatchObject({ code: "inventory_queue_admission" });
+      expect(f.statements.some(sql => sql.startsWith("INSERT INTO inventory_reconciliation("))).toBe(false);
+    }
+    expect(f.client.query).toHaveBeenCalledWith(inventoryReconciliationAdmissionSql, [f.root.tenantId, expect.any(String)]);
+    expect(inventoryReconciliationAdmissionSql).toContain("pending_deadline>clock_timestamp()");
+    expect(inventoryReconciliationAdmissionSql).toContain("s.epoch IS DISTINCT FROM input.epoch");
+    expect(inventoryReconciliationAdmissionSql).not.toContain('input."expiresAt"');
+  });
+
   it("rolls back queued work when its initiating sweep is cancelled during admission", async () => {
     const controller = new AbortController();
     const reason = new Error("Synthetic inventory shutdown.");

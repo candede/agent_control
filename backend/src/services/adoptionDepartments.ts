@@ -30,7 +30,7 @@ export async function readAdoptionDepartments(client: pg.PoolClient, reports: La
     Math.max(1, Math.ceil(filtered / limit)));
   const offset = (pageNumber - 1) * limit;
   const order = context.query.order === "desc" ? "DESC" : "ASC";
-  const measured = context.metadata.directory.state === "available"
+  const measured = context.metadata.directory.generationId !== null
     && context.report.lineages.some(lineage => lineage.kind === "users" || lineage.kind === "userAgents");
   const rows = (await client.query(`${relations}, department_counts AS (
     SELECT g.identity,g.company,g.department,g.sort_key,count(*)::text AS people,
@@ -65,7 +65,7 @@ export async function readAdoptionSummary(client: pg.PoolClient, reports: LargeT
     throw new SelectionError("invalid_cursor");
   }
   const { values, relations } = adoptionDataset(reports, context);
-  const measured = context.metadata.directory.state === "available"
+  const measured = context.metadata.directory.generationId !== null
     && context.report.lineages.some(lineage => lineage.kind === "users" || lineage.kind === "userAgents");
   const champions = measured ? officialReportCount((await client.query(
     `${relations} SELECT count(*)::text AS champions FROM adoption_champions`, values)).rows[0].champions) : null;

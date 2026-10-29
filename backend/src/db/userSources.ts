@@ -6,6 +6,7 @@ import { dataConnections } from "./dataConnections.js";
 import { dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
 import { CursorCodec, DataSelections, SelectionError, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "../services/dataSelections.js";
 import { isCopilotAppActivityFresh, isGraphGuid } from "../types/copilotUsage.js";
+import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 import type { AgentPersonObservation } from "./agentPeople.js";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { agentPersonLabel } from "../types/agentPresentation.js";
@@ -180,7 +181,7 @@ export class UserSourcesRepository {
     const metadata = Object.fromEntries(rows.map(row => {
       const available = row.generation_id !== null;
       const state = !available ? "unavailable"
-        : row.expires_at <= evaluatedAt
+        : row.expires_at <= evaluatedAt || evaluatedAt.getTime() - row.observed_at.getTime() >= automaticDataSyncIntervalMs
           || row.source === "app_activity" && row.report_refresh_date !== null && !isCopilotAppActivityFresh(row.report_refresh_date, evaluatedAt) ? "stale"
           : row.source === "app_activity" && row.report_refresh_date === null ? "partial"
           : row.attempt_status === "available" || row.attempt_status === "running" ? "available" : "partial";
@@ -297,7 +298,7 @@ export class UserSourcesRepository {
       count(*) FILTER(WHERE entitlement='paid_active' AND activity_state='active')::text AS active_app,
       count(*) FILTER(WHERE entitlement='paid_active' AND activity_state='unknown')::text AS unknown_app
       FROM facts WHERE ${where}`, parameters)).rows[0];
-    const current = context.metadata.directory.state === "available";
+    const current = context.metadata.directory.generationId !== null;
     return { checkedUsers: context.metadata.directory.rowCount,
       licensedUsers: current ? exactCount(row.paid) : null, inactivePaidUsers: current ? exactCount(row.inactive) : null,
       noPaidUsers: current ? exactCount(row.no_paid) : null, unknownLicenseUsers: current ? exactCount(row.unknown) : null,
@@ -405,7 +406,8 @@ export class UserSourcesRepository {
     });
   }
 
-  async savePeople(identity: SelectionIdentity, observations: readonly AgentPersonObservation[], fence: (client: pg.PoolClient) => Promise<void>) {
+  async savePeople(identity: SelectionIdentity, observations: readonly AgentPersonObservation[], fence: (client: pg.PoolClient) => Promise<void>,
+    options: { signal?: AbortSignal; beforeCommit?: () => void } = {}) {
     if (!observations.length) return;
     const ids = userSourceObjectIds(observations.map(row => row.objectId));
     if (ids.length !== observations.length) throw new AppError(400, "invalid_agent_people", "Duplicate people observations.");
@@ -445,7 +447,7 @@ export class UserSourcesRepository {
             ELSE agent_people_cache.resolved_at END ELSE EXCLUDED.resolved_at END
         WHERE agent_people_cache.checked_at<=EXCLUDED.checked_at`, [identity.tenantId, identity.principalId, batch.json]);
       await fence(client);
-    });
+    }, false, options.signal, undefined, options.beforeCommit);
   }
 
   private async cursor(client: pg.PoolClient, cursor: string | undefined, identity: SelectionIdentity, context: UserSourceReadContext,

@@ -8,15 +8,22 @@ import {
   type QueryKey,
   type UseQueryOptions,
 } from "@tanstack/react-query";
-import { ApiError } from "./api/client";
+import { ApiError, type SessionUser } from "./api/client";
+import { CapabilityContext } from "./capabilityContext";
+
+export const savedQueryRetention = { staleTime: 15 * 60_000, gcTime: 60 * 60_000 };
+const principals = new WeakMap<QueryClient, string>();
+
+export function savedQueryPrincipalScope(user: SessionUser | undefined) {
+  return JSON.stringify([user?.tenantId, user?.homeAccountId, [...(user?.roles ?? [])].sort()]);
+}
 
 export function createSavedQueryClient() {
   const client = new QueryClient({
     defaultOptions: {
       queries: {
         retry: false,
-        staleTime: 0,
-        gcTime: 0,
+        ...savedQueryRetention,
         refetchOnWindowFocus: false,
         refetchOnReconnect: false,
         networkMode: "always",
@@ -38,23 +45,29 @@ export function createSavedQueryClient() {
       .filter(query => query !== incomingQuery && query.meta?.retainReportPage && query.getObserversCount() === 0
         && query.state.status !== "pending" && query.state.fetchStatus === "idle")
       .sort((left, right) => right.state.dataUpdatedAt - left.state.dataUpdatedAt);
-    for (const query of idle.slice(4)) client.removeQueries({ queryKey: query.queryKey, exact: true });
+    for (const query of idle.slice(16)) client.removeQueries({ queryKey: query.queryKey, exact: true });
   });
   return client;
 }
 
 export function useSavedQueryClient() {
   const shared = useContext<QueryClient | undefined>(QueryClientContext);
+  const capability = useContext(CapabilityContext);
   // Standalone panels own an isolated client; the signed-in workbench shares one.
   const [owned] = useState(() => shared ? undefined : createSavedQueryClient());
   useEffect(() => () => owned?.clear(), [owned]);
   const client = shared ?? owned;
   if (!client) throw new Error("Saved reads require a query client.");
+  if (capability?.user) {
+    const principal = savedQueryPrincipalScope(capability.user), previous = principals.get(client);
+    principals.set(client, principal);
+    if (previous !== undefined && previous !== principal) client.clear();
+  }
   return client;
 }
 
 export function useSavedQuery<T>(options: UseQueryOptions<T, Error, T, QueryKey>) {
-  return useQuery(options, useSavedQueryClient());
+  return useQuery({ staleTime: 0, gcTime: 0, ...options }, useSavedQueryClient());
 }
 
 /**
@@ -85,6 +98,7 @@ export function readSavedQuery<T>(
       },
       enabled: () => !settled,
       staleTime: 0,
+      gcTime: 0,
       ...retention,
       refetchOnMount: retention ? true : "always",
     });

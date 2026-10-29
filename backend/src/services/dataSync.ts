@@ -18,14 +18,15 @@ import { operationalLog } from "./telemetry.js";
 import { AgentPeopleService } from "./agentPeople.js";
 import { config } from "../config.js";
 import { temporaryAgentSharingDiagnostic, type AgentSharingDiagnosticContext } from "./temporaryAgentSharingDiagnostic.js";
+import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
 
 type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
 type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>>;
 
 type DataSyncDependencies = {
   repository: Pick<DataSyncRepository,
-    "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listMarkers" | "attachJob" | "updateSource"
-    | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted" | "submitDue" | "automaticRevisions" | "finishAutomatic">;
+    "submit" | "getRun" | "getLatestRun" | "listRuns" | "getSourceAttempt" | "listSavedSources" | "attachJob" | "updateSource"
+    | "recordSuccessMarker" | "retry" | "cancel" | "pausePrincipal" | "recoverInterrupted" | "submitDue" | "automaticRevisions" | "finishRun">;
   officialUsage: Pick<OfficialReportStatusRepository, "read">;
   packages: Pick<PackageInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization" | "refreshDueDetails" | "startDetailSync">;
   powerPlatform: Pick<PowerPlatformInventoryService, "submit" | "start" | "get" | "cancel" | "waitForPrincipalAuthorization">;
@@ -86,14 +87,14 @@ export class DataSyncService {
     if (run) {
       run = await this.reconcileRun(user, scope, run, published);
       if (run.automatic && run.sources.every(source => ["succeeded", "partial", "failed", "cancelled"].includes(source.status))) {
-        await this.dependencies.repository.finishAutomatic(scope, run.id);
+        await this.dependencies.repository.finishRun(scope, run.id);
         run = (await this.dependencies.repository.getRun(scope, run.id)) ?? run;
       }
     }
     if (hasAcceptedUsage(published)) {
       await this.dependencies.repository.recordSuccessMarker(scope, "usage_reports", usageRowCount(published), usageAcceptedAt(published));
     }
-    const markers = await this.dependencies.repository.listMarkers(scope);
+    const markers = await this.dependencies.repository.listSavedSources(scope);
     const usageImportRequired = !hasAcceptedUsage(published);
     const sources = reconcileUsageMarker(markers, published);
     return {
@@ -113,9 +114,10 @@ export class DataSyncService {
     return this.admit(user, undefined, async (owner, authorization) => {
       const previous = await this.dependencies.repository.getLatestRun(owner);
       assertCurrentSync(authorization);
-      if (previous?.automatic && previous.status !== "running" && !this.active.has(previous.id)) {
+      if (previous && previous.status !== "running" && !this.active.has(previous.id)) {
         const failures = await this.cancelChildJobs(user, previous);
         if (failures.length) throw failures[0];
+        await commitSync(authorization, () => this.dependencies.repository.finishRun(owner, previous.id));
       }
       const submitted = await commitSync(authorization, () => this.dependencies.repository.submitDue(owner, signedInAt,
         () => assertCurrentSync(authorization)));
@@ -137,7 +139,7 @@ export class DataSyncService {
           ...(detailJob.errorCode ? { errorCode: detailJob.errorCode } : {}),
           ...(detailJob.message ? { message: detailJob.message } : {}) } : null,
         revisions,
-        nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+        nextCheckAt: new Date(Date.now() + (run?.status === "running" || detailJob?.status === "running" ? 60_000 : 5 * 60_000)).toISOString(),
       };
     });
   }
@@ -212,15 +214,20 @@ export class DataSyncService {
     try {
       const before = await this.dependencies.repository.getRun(scope, id);
       if (!before) throw new AppError(404, "not_found", "Data sync run was not found.");
+      const running = before.status === "running" || before.status === "waiting";
+      const retrying = [...this.admissions].some(admission => admission.runId === id);
+      if (!running && before.status !== "cancelled" && !retrying) {
+        throw new AppError(409, "data_sync_run_state", "Only an active data sync run can be cancelled.");
+      }
       const reason = new AppError(409, "read_job_cancelled", "Data sync was cancelled.");
-      const admissions = this.stopAdmissions(reason, scope, id);
+      const admissions = this.stopAdmissions(reason, scope, id, running);
       const active = this.active.get(id);
       const tracker = active ?? this.cleanupPending.get(id) ?? childTracker(id, scope, user);
       tracker.controller.abort(reason);
       this.trackPersistedChildren(tracker, before);
       const admissionResults = await Promise.allSettled([admissions]);
       const [cancellation] = await Promise.allSettled([
-        before.status === "cancelled" ? Promise.resolve(before) : this.dependencies.repository.cancel(scope, id),
+        before.status === "cancelled" && !admissions ? Promise.resolve(before) : this.dependencies.repository.cancel(scope, id),
       ]);
       await this.cleanupTrackedChildren(tracker);
       const [operation] = await Promise.allSettled(active ? [active.operation] : []);
@@ -339,10 +346,10 @@ export class DataSyncService {
     return admission.operation;
   }
 
-  private stopAdmissions(reason: AppError, scope?: DataSyncScope, runId?: string) {
+  private stopAdmissions(reason: AppError, scope?: DataSyncScope, runId?: string, includeUnassigned = true) {
     const admissions = [...this.admissions].filter(admission =>
       (!scope || admission.scope.tenantId === scope.tenantId && admission.scope.principalId === scope.principalId)
-      && (!runId || !admission.runId || admission.runId === runId));
+      && (!runId || admission.runId === runId || includeUnassigned && !admission.runId));
     if (!admissions.length) return;
     for (const admission of admissions) admission.controller.abort(reason);
     return Promise.allSettled(admissions.map(admission => admission.operation)).then(results => {
@@ -390,7 +397,8 @@ export class DataSyncService {
     };
     this.active.set(runId, activeRun);
     const operation = Promise.resolve()
-      .then(() => this.run(user, scope, runId, sources, incompleteOnly, activeRun, automatic, signedInAt))
+      .then(() => withReadAuthorityRefresh(controller,
+        () => this.run(user, scope, runId, sources, incompleteOnly, activeRun, automatic, signedInAt)))
       .catch(async error => {
         operationalLog("error", "data_sync_worker_failed", { runId, ...errorTelemetry(error) });
         const current = await this.dependencies.repository.getRun(scope, runId);
@@ -406,7 +414,7 @@ export class DataSyncService {
       })
       .finally(async () => {
         try {
-          if (automatic) await this.dependencies.repository.finishAutomatic(scope, runId);
+          await this.dependencies.repository.finishRun(scope, runId);
           this.throwIfCleanupFailed(runId, activeRun);
         } finally {
           if (activeRun.cleanupFailures.size) this.cleanupPending.set(runId, activeRun);

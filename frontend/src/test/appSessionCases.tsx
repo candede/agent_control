@@ -10540,13 +10540,17 @@ export function commandsAndExportsCases() {
     expect(window.location.search).toBe("?inventory=all");
   });
 
-  it("does not present Power Platform inventory as a known catalog count when the catalog is unavailable", async () => {
+  it.each(["idle", "catching_up", "reconciling"] as const)(
+    "does not present a missing captured catalog as an empty inventory during %s publication", async state => {
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Additional native agent");
     const page = unifiedRecordsPage([native]);
     page.sources.graphPackages = { state: "unavailable", observation: null, error: {
       source: "graph_packages", code: "snapshot_unavailable", message: "No saved package catalog.",
     } };
     page.partial = true;
+    page.freshness = { ...page.freshness, state };
+    page.verification = { ...page.verification, status: "needs_attention",
+      checks: { ...page.verification.checks, sourceScopes: false } };
     const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page, inventoryReadAuthorized: true });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
@@ -10555,9 +10559,41 @@ export function commandsAndExportsCases() {
     expect(overview.getByText("Agents in catalog").parentElement).toHaveTextContent("Unknown");
     expect(overview.getByText("Admin-permitted agents").parentElement).toHaveTextContent("Unknown");
     expect(screen.queryByText(native.displayName)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "No agents in this inventory" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/0 shown · 0 matching agents/)).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Agents —" })).toBeVisible();
+    if (state === "idle") {
+      expect(screen.getByRole("heading", { name: "Agent inventory unavailable" })).toBeVisible();
+    } else {
+      expect(screen.getAllByText("Publishing synced agents to the inventory. Results will appear automatically.")).toHaveLength(2);
+      expect(screen.queryByText(/No saved package catalog observation/)).not.toBeInTheDocument();
+    }
     await userEvent.click(screen.getByRole("button", { name: "Additional Power Platform agents" }));
     await screen.findByText(native.displayName);
     expect(overview.getByText(/Catalog matching is incomplete/)).toBeVisible();
+  });
+
+  it("lists the saved catalog while optional package details are still syncing", async () => {
+    const page = unifiedRecordsPage([unifiedPage.value[0]]);
+    page.identityCollection = { checkedPackages: 0, pendingPackages: 1, invalidPackages: 0,
+      pendingDetails: { missing: 1, stale: 0, invalidated: 0 } };
+    page.verification = { ...page.verification, status: "details_pending",
+      checks: { ...page.verification.checks, packageMetadata: false } };
+    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: page, inventoryReadAuthorized: true });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/data-sync/auto-refresh"
+      ? Promise.resolve(Response.json(automaticRefreshResponse({ detailJob: {
+        id: "automatic-detail-enrichment", status: "running", updatedAt: new Date().toISOString(),
+        message: "Package detail collection is still running.",
+      } }))) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText(agent.displayName)).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Agents 1" })).toBeVisible();
+    expect(screen.getByText(/Catalog collected/)).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "No agents in this inventory" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Publishing synced agents to the inventory/)).not.toBeInTheDocument();
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
   });
 
   it("ignores a superseded inventory-scope response even when the transport ignores cancellation", async () => {

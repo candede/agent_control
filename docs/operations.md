@@ -63,12 +63,24 @@ Sync shows current-attempt observations separately from last saved counts and
 last successful publication. A running count is not a provider total or ETA.
 Failed/partial attempts do not replace a complete saved source.
 
-Inventory health shows **Updating** while complete, unexpired saved sources are
+Normal sign-out revokes session authority and unfinished writes, not complete
+saved sources. A fresh sign-in can capture new reads over those retained sources;
+observation age alone does not remove them.
+An exhausted manual or automatic authorization-waiting run releases its active
+slot, so a fresh sign-in can automatically retry eligible sources without
+manually resuming that run. Live provider-authorization handoffs are still joined,
+and automatic recovery never replays a destructive saved-data reset.
+Finished provider workers also release runs with pending CSV uploads, so those
+uploads cannot block automatic collection. A later accepted bundle updates the
+retained report source and completes the run if every source succeeded, without
+restarting incomplete provider work.
+
+Inventory health shows **Updating** while complete, validated saved sources are
 being reconciled or newly synced package details are being published. Previous
 results remain usable and updates appear automatically; no manual start or
 approval is needed. **Details pending** means exact package details are still
 being collected or refreshed, not that agents are missing. **Needs attention**
-is reserved for actual source, authorization, expiry, accounting or identity
+is reserved for actual source, authorization, ownership, accounting or identity
 problems. Reconciliation does not hide those problems or certify an older
 selection as current.
 
@@ -76,11 +88,25 @@ Retained run links use `/sync?syncRun=<id>`. Opening history, a job detail or
 another tab does not resubmit provider work. Explicit refresh starts only the
 selected supported sources. Automatic work obeys pause, visibility, online,
 backoff and initiating-session fences.
+Cancelling retained history affects only that run and any retry already bound
+to it; it does not interrupt a new synchronization awaiting admission.
+
+Routine source collection is due every six hours, not on every page visit or
+saved-data read. Ordinary failed attempts wait one hour before an automatic
+retry; real provider backoff and newer-sign-in recovery remain authoritative.
+Missing or invalidated current sources are collected automatically without
+waiting for the six-hour interval, even when historical syncs succeeded recently.
+Setup readiness checks usable saved publications, not historical success markers;
+last successful counts and dates remain visible. Real failed-attempt cooldowns
+still apply.
+Healthy idle checks run every five minutes. Initial collection and active work
+use faster status checks, and genuinely unavailable inventory retries after
+thirty seconds. None of these status checks recollects Microsoft data by itself.
 
 When a report becomes active, automatic Users refresh and explicit
 incomplete-source retries check its exact report identities even if the saved
-directory is still within its normal 15-minute
-freshness window, without recollecting fresh app activity or treating unknown
+directory is still within its routine six-hour collection window, without
+recollecting fresh app activity or treating unknown
 licensing as unpaid. A report changed during collection remains due until a
 collection starts with that report active. It joins active work and rechecks
 after publication when required. Completed run history does not consume an
@@ -119,17 +145,39 @@ and retry action. Cancelled/superseded reads are not false collection failures.
 Export/selection actions remain revision-bound.
 
 Authorized complete publications remain readable while successors run slowly
-or fail. Source/selection revocation or expiry still applies. Search, people
+or fail, with their original collection dates. Source ownership, explicit
+invalidation and actual selected-read lease deadlines still apply. Search, people
 ordering, detail and exports retain the exact evidence required by their
 contracts. A fresh read may adopt a new publication; a cursor cannot silently
 mix generations. Current mutation authority is stricter than historical read
 authority.
 
+The browser retains bounded, principal/role-scoped saved pages in memory for up
+to fifteen minutes of reuse and one hour of inactive retention. The actual
+server read lease, at most ten minutes, remains the earlier boundary. Navigation
+and transient failures can display the last successful rows while PostgreSQL
+recaptures a selection; errors remain visible, and historical display rows
+cannot authorize actions. Logout clears the cache. Focus checks and read-lease
+renewal read PostgreSQL, not Microsoft. Exact administrative/detail queries and
+live access/progress evidence retain their separate current-read contracts.
+
 Catalog refresh and exact/detail enrichment are independent. Catalog collection
 does not fan out detail reads; detail collection does not relist the catalog.
+Published catalog rows remain listable while optional matching and sharing
+details are collected. Compatible catalog refreshes retain saved detail
+descriptions, including large descriptions stored as child facts, whether fresh
+or stale. A new exact/detail read replaces or clears that description; a changed
+catalog revision invalidates reuse. Canonical publication batches independent
+records even when they have identity metadata. A missing source in an older canonical
+publication is not an empty catalog: Agents reports publication in progress
+while that work runs, or the actual source unavailability when it is not running.
+Available rows remain visible during publication.
 Sync labels detail progress as **targets checked**, including exact 404
 absences, versus catalog **packages observed**. Collection completion does not
 by itself prove publication.
+Cancelling a detail batch keeps unrelated automatic checks from claiming another
+batch, even while the previous collector is stopping. Starting detail collection
+explicitly can resume work after cancellation.
 
 ### Agent inventory views and portal count comparison
 

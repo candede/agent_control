@@ -17,6 +17,7 @@ import { requireProviderAdmissions } from "./operationalState.js";
 import { StreamedInventory } from "./streamedInventory.js";
 import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
 import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
+import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
 
 type PackageRefreshDependencies = {
   delegatedToken: typeof acquireAuthorizedToken;
@@ -127,7 +128,8 @@ export class PackageInventoryService {
       return latestCurrentJob();
     }
     const history = await latestCurrentJob();
-    if (history?.status === "cancelled" && !this.detailCollections.has(collectionKey)) return history;
+    if (history?.status === "cancelled"
+      && (!signal || this.detailCollections.get(collectionKey)?.controller.signal !== signal)) return history;
     const job = await commitAccountSessionValidation(validation, async () => {
       assertCurrent();
       return this.repository.claimDueDetails(scope, user.homeAccountId, signedInAt);
@@ -381,7 +383,8 @@ export class PackageInventoryService {
     const executionDuration = current.autoDetails ? 5 * 60_000 : packageRefreshExecutionDeadlineMs;
     const executionDeadlineAt = Date.now() + executionDuration;
     const execution = createRefreshExecutionSignal(signal, executionDuration);
-    const operation = withTelemetryContext({ jobId: id }, () => this.run(actor, scope, current, id, token, execution.signal, executionDeadlineAt, validation, validateCapability))
+    const operation = withTelemetryContext({ jobId: id }, () => withReadAuthorityRefresh(controller,
+      () => this.run(actor, scope, current, id, token, execution.signal, executionDeadlineAt, validation, validateCapability)))
       .finally(() => {
         execution.dispose();
         if (this.active.get(id)?.operation === operation) this.active.delete(id);

@@ -14,6 +14,7 @@ import { operationalLog, withTelemetryContext } from "./telemetry.js";
 import { requireProviderAdmissions } from "./operationalState.js";
 import { StreamedInventory } from "./streamedInventory.js";
 import { completeInventoryJob, inventoryJobInput, inventoryRuntime } from "./inventoryRuntime.js";
+import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
 
 type InventoryRefreshDependencies = {
   delegatedToken: typeof acquireAuthorizedToken;
@@ -162,7 +163,8 @@ export class PowerPlatformInventoryService {
         requestedTypeCount: current.requestedTypes.length, environmentScoped: Boolean(current.environmentScope),
       });
       stage = "dispatch";
-      const operation = withTelemetryContext({ jobId: id }, () => this.run(scope, current, id, token, signal, validation, validateCapability))
+      const operation = withTelemetryContext({ jobId: id }, () => withReadAuthorityRefresh(controller,
+        () => this.run(scope, current, id, token, signal, validation, validateCapability)))
         .finally(() => {
           execution?.dispose();
           if (this.active.get(id)?.operation === operation) this.active.delete(id);

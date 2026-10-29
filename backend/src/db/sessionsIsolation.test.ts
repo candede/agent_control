@@ -143,7 +143,7 @@ describe("configured tenant session persistence", () => {
   it("revokes only the exact tenant and principal, even for a shared account ID", async () => {
     const revoke = vi.spyOn(DataGenerations.prototype, "revokePrincipal").mockResolvedValueOnce("2");
     await revokeAccountSessions(database, otherTenant.tenantId, "same-account");
-    expect(revoke).toHaveBeenCalledExactlyOnceWith(otherTenant.tenantId, "same-account");
+    expect(revoke).toHaveBeenCalledExactlyOnceWith(otherTenant.tenantId, "same-account", { preserveSources: true });
     expect(database.query).toHaveBeenCalledExactlyOnceWith(
       "DELETE FROM sessions WHERE tenant_id=$1 AND principal_id=$2", [otherTenant.tenantId, "same-account"],
     );

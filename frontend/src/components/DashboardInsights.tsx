@@ -89,7 +89,7 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
   const read = useReportPage<AdoptionDepartment, AdoptionDepartmentPage>("copilot-usage/adoption/departments", {
     setId: snapshot.id, company, sort: "adoptionRate", order, limit: 10,
   }, revision);
-  const data = read.selectedData;
+  const data = read.data;
   const SortIcon = order === "desc" ? ArrowDownWideNarrow : ArrowUpNarrowWide;
   return <section className="dashboard-panel dashboard-panel-teal" aria-labelledby={title}>
     <div className="dashboard-department-heading">

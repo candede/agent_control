@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import session from "express-session";
 import { config } from "../config.js";
-import { withAuthority } from "../auth/authorityContext.js";
+import { currentAuthority, withAuthority } from "../auth/authorityContext.js";
 import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
 import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -132,6 +132,52 @@ describe("inventory sweep cancellation and retention", () => {
     await f.runtime.pass();
     expect(publish).toHaveBeenCalledTimes(2);
     expect(native).toHaveBeenCalledOnce();
+  });
+
+  it.each(["start", "wake"] as const)("isolates background retention from the authority that requested %s", async trigger => {
+    const f = fixture();
+    const initiatingSource = await retain(f, "first");
+    const secondSource = await retain(f, "second");
+    vi.mocked(f.database.query).mockResolvedValue({ command: "SELECT", rows: [
+      { tenant_id: f.root.tenantId, principal_id: "first", id: "1" },
+      { tenant_id: f.root.tenantId, principal_id: "second", id: "2" },
+    ], rowCount: 2, fields: [], oid: 0 });
+    const publish = vi.spyOn(f.runtime, "publishControls").mockResolvedValue(0);
+    publish.mockImplementationOnce(async () => {
+      expect(currentAuthority()).toBe(initiatingSource);
+      initiatingSource.revoke();
+      return 0;
+    }).mockImplementationOnce(async () => {
+      expect(currentAuthority()).toBe(secondSource);
+      return 0;
+    });
+    vi.spyOn(f.runtime, "publishNativeControls").mockResolvedValue(0);
+    vi.spyOn(f.runtime, "enqueue").mockResolvedValue(false);
+    const collect = vi.spyOn(f.runtime, "collect");
+    const pass = f.runtime.pass.bind(f.runtime);
+    const finished = Promise.withResolvers<void>();
+    const failures: unknown[] = [];
+    vi.spyOn(f.runtime, "pass").mockImplementation(async signal => {
+      try { await pass(signal); }
+      catch (error) { failures.push(error); }
+      finally { finished.resolve(); }
+      return false;
+    });
+
+    try {
+      withAuthority(initiatingSource, () => {
+        f.runtime[trigger]();
+        expect(currentAuthority()).toBe(initiatingSource);
+      });
+      await finished.promise;
+      expect(failures).toEqual([]);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(collect).toHaveBeenCalledOnce();
+      expect(f.roots).toHaveBeenCalledOnce();
+      expect(f.query).toHaveBeenCalledWith("COMMIT");
+    } finally {
+      await f.runtime.drain();
+    }
   });
 
   it("does not enqueue canonical work when the sweep is cancelled during a source read", async () => {
@@ -356,7 +402,9 @@ describe("inventory sweep cancellation and retention", () => {
       let pending = false;
       if (statement.includes("FROM inventory_reconciliation work")) {
         pending = !statement.includes("g.scope_epoch=s.epoch")
-          || !statement.includes("g.session_epoch=s.session_epoch") || !statement.includes("g.expires_at>clock_timestamp()");
+          || !statement.includes("g.session_epoch=s.session_epoch")
+          || !statement.includes("g.state IN ('published','retired')") || !statement.includes("g.validated");
+        expect(statement).not.toContain("g.expires_at>clock_timestamp()");
         if (pending) controller.abort(new Error("Settlement waited on unavailable source work."));
       }
       return { command: "SELECT", rows: pending ? [{}] : [], rowCount: pending ? 1 : 0, fields: [], oid: 0 };

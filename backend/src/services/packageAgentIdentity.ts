@@ -4,7 +4,7 @@ import { AppError } from "../errors.js";
 import { normalizeNativeIdentity, powerPlatformAgentKey } from "./inventoryIdentity.js";
 import { compareInventoryTimestamps } from "./inventoryTimestamp.js";
 import {
-  isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName,
+  hasSavedPackageIdentityDetails, isPackageElementType, normalizedEnvironmentId, normalizedGuid, normalizedSchemaName,
   readPackageAgentMetadata, readPackageCustomEngineBotIdentity, supplied, type PackageAgentMetadata,
 } from "./packageAgentMetadata.js";
 
@@ -87,7 +87,7 @@ export function resolvePackageAgentLinks(
     if (observation.status === "conflicting" || observation.status === "unmatched" && observation.invalidMetadata) {
       return { packageId: value.id, ...observation };
     }
-    if (value.detailFreshness && value.detailFreshness.state !== "fresh") {
+    if (value.detailFreshness && !hasSavedPackageIdentityDetails(value)) {
       const catalogManifest = value.detailFreshness.state !== "invalidated" && normalizedGuid(value.manifestId)
         && value.elementTypes?.some(type => isPackageElementType(type, "DeclarativeCopilots"))
         && !value.elementDetails?.some(group => isPackageElementType(group.elementType, "AgentMetadatas"))
@@ -95,10 +95,8 @@ export function resolvePackageAgentLinks(
           .flatMap(group => group.elements).length ?? 0) <= 1;
       if (!catalogManifest) return {
         packageId: value.id, status: "unmatched",
-        reason: "Package identity details are missing, expired, or changed. Refresh this package's identity before linking it to a Power Platform agent.",
+        reason: "Package identity details are missing or changed. Refresh this package's identity before linking it to a Power Platform agent.",
       };
-      // Current catalog manifest/type evidence is independent of hourly detail freshness.
-      // Never reuse expired detail IDs, environment constraints, or control proof.
       value = { ...value, elementDetails: undefined, identityDetailsCollected: undefined };
       observation = readPackageAgentMetadata(value);
     }
@@ -272,7 +270,7 @@ function linkCustomEngineRepresentations(
   ]));
   const groups = new Map<string, Array<{ packageId: string; elementIds: string[] }>>();
   for (const value of packages) {
-    if (value.identityRevalidationRequired || value.detailFreshness && value.detailFreshness.state !== "fresh") continue;
+    if (value.identityRevalidationRequired || !hasSavedPackageIdentityDetails(value)) continue;
     const bot = readPackageCustomEngineBotIdentity(value);
     if (!bot) continue;
     const group = groups.get(bot.botApplicationId) ?? [];
@@ -374,7 +372,7 @@ export function withVerifiedControlIdentities(
     if (!observation || typeof observation !== "object" || Array.isArray(observation)) continue;
     const identityDetails = Object.getOwnPropertyDescriptor(observation, "identityDetails");
     if (identityDetails && !Object.hasOwn(identityDetails, "value")) continue;
-    const identityObservation = identityDetails?.value ?? observation;
+    const identityObservation = identityDetails ? identityDetails.value : observation;
     if (!freshControlObservation(identityObservation, now, maximumAgeMs)
       || !freshControlObservation(observation, now, maximumAgeMs)) continue;
     verified.set(powerPlatformAgentKey(link.resource.environmentId, link.resource.nativeId), link.controlBotId);

@@ -10,6 +10,12 @@ import type { CopilotUsageRefreshResult, CopilotUsageService } from "./copilotUs
 import type { PackageInventoryService } from "./packageInventory.js";
 import { DataSyncService } from "./dataSync.js";
 import * as operationalState from "./operationalState.js";
+import { config } from "../config.js";
+import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
+import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
+import { authorityUser, withAuthority } from "../auth/authorityContext.js";
+import { account, browserAuthenticationResult, browserSession, epochAuthority, tenant as testTenant } from "../auth/authFoundationTestSupport.js";
+import * as msal from "../auth/msal.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: { options: { max: 4 },
@@ -33,6 +39,46 @@ describe("DataSyncService", () => {
     await operationalState.loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{
       mode: "normal",
     }] }) });
+  });
+
+  it("automatically completes a ten-minute Users sync without expiring the signed-in browser authority", async () => {
+    vi.useFakeTimers();
+    const tenants = config.tenants;
+    config.tenants = [testTenant];
+    const authentication = browserAuthenticationResult();
+    const revalidate = vi.spyOn(msal, "revalidateAuthenticatedUserResult").mockResolvedValue({
+      ...authentication, idTokenClaims: { ...authentication.idTokenClaims, roles: ["AgentControl.Viewer"] },
+    });
+    const harness = serviceHarness(), collection = Promise.withResolvers<void>();
+    try {
+      await activateAccountSession(testTenant.tenantId, account().homeAccountId, async () => {});
+      const epochs = epochAuthority();
+      const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+      const actor = authorityUser(source);
+      harness.run.sources = harness.run.sources.filter(value => value.source === "users");
+      const collect = harness.copilotUsage.refreshUsers.getMockImplementation()!;
+      harness.copilotUsage.refreshUsers.mockImplementation(async (...args) => {
+        await collection.promise;
+        source.assertCurrent();
+        return { ...await collect(...args), count: 4063 };
+      });
+      await withAuthority(source, () => harness.service.automaticRefresh(actor, source.principal.authenticatedAt));
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledOnce();
+      expect(revalidate).toHaveBeenCalledTimes(4);
+      collection.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(harness.run).toMatchObject({
+        status: "completed", automatic: true, sources: [{ source: "users", status: "succeeded", count: 4063 }],
+      });
+      expect(harness.repository.finishRun).toHaveBeenCalledOnce();
+    } finally {
+      collection.resolve();
+      await harness.service.drain();
+      revalidate.mockRestore();
+      config.tenants = tenants;
+      vi.useRealTimers();
+    }
   });
 
   it("checks derived retry sources before reopening provider work", async () => {
@@ -142,7 +188,7 @@ describe("DataSyncService", () => {
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.objectContaining({ automatic: true }));
     expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(user, expect.any(AbortSignal), expect.any(Object),
       { incompleteOnly: false, useCache: true });
-    await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalled());
+    await vi.waitFor(() => expect(harness.repository.finishRun).toHaveBeenCalled());
   });
 
   it("does not relaunch fresh or already admitted automatic collection", async () => {
@@ -183,6 +229,92 @@ describe("DataSyncService", () => {
     expect((await request).error).toBeUndefined();
   });
 
+  it.each((["manual", "automatic"] as const).flatMap(mode =>
+    (["cancelled", "completed", "partial"] as const).map(status => ({ mode, status })),
+  ))(
+    "does not abort an uncommitted $mode admission when cancelling a $status historical run",
+    async ({ mode, status }) => {
+      const harness = serviceHarness();
+      const previous = { ...dataSyncRun(), status, sources: [] };
+      harness.repository.getRun.mockImplementation(async (_scope, id) => id === previous.id ? previous : harness.run);
+      harness.repository.getLatestRun.mockResolvedValue(previous);
+      const admitted = deferred<void>();
+      const submit = harness.repository.submit.getMockImplementation()!;
+      const submitDue = harness.repository.submitDue.getMockImplementation()!;
+      harness.repository.submit.mockImplementation(async (...args) => {
+        await admitted.promise;
+        return submit(...args);
+      });
+      harness.repository.submitDue.mockImplementation(async (...args) => {
+        await admitted.promise;
+        return submitDue(...args);
+      });
+      const request = (mode === "manual"
+        ? harness.service.start(user, { mode: "initial", sources: ["users"] })
+        : harness.service.automaticRefresh(user)).then(
+        value => ({ value, error: undefined }), error => ({ value: undefined, error }),
+      );
+      await vi.waitFor(() => expect(harness.repository[mode === "manual" ? "submit" : "submitDue"]).toHaveBeenCalledOnce());
+      let cancelled = false;
+      const cancellation = harness.service.cancel(user, previous.id).then(
+        value => { cancelled = true; return { value, error: undefined }; },
+        error => { cancelled = true; return { value: undefined, error }; },
+      );
+      try {
+        await vi.waitFor(() => expect(cancelled).toBe(true));
+        if (status === "cancelled") expect((await cancellation).error).toBeUndefined();
+        else expect((await cancellation).error).toMatchObject({ code: "data_sync_run_state" });
+        expect(harness.repository.cancel).not.toHaveBeenCalled();
+      } finally {
+        admitted.resolve();
+        await Promise.all([request, cancellation]);
+        if (!(await request).error) await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
+        await harness.service.drain();
+      }
+      expect((await request).error).toBeUndefined();
+      expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["manual", "automatic"] as const)(
+    "cancels a committed %s admission before its run ID is returned",
+    async mode => {
+      const harness = serviceHarness(), acknowledged = deferred<void>();
+      harness.repository.getRun.mockImplementation(async () => structuredClone(harness.run));
+      const submit = harness.repository.submit.getMockImplementation()!;
+      const submitDue = harness.repository.submitDue.getMockImplementation()!;
+      harness.repository.submit.mockImplementation(async (...args) => {
+        const submitted = await submit(...args);
+        await acknowledged.promise;
+        return submitted;
+      });
+      harness.repository.submitDue.mockImplementation(async (...args) => {
+        const submitted = await submitDue(...args);
+        await acknowledged.promise;
+        return submitted;
+      });
+      const request = (mode === "manual"
+        ? harness.service.start(user, { mode: "initial", sources: ["users"] })
+        : harness.service.automaticRefresh(user)).catch(error => error);
+      await vi.waitFor(() => expect(harness.repository[mode === "manual" ? "submit" : "submitDue"]).toHaveBeenCalledOnce());
+      let cancelled = false;
+      const cancellation = harness.service.cancel(user, harness.run.id).then(() => { cancelled = true; });
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(cancelled).toBe(false);
+      } finally {
+        acknowledged.resolve();
+        await Promise.all([request, cancellation]);
+        await harness.service.drain();
+      }
+      expect(await request).toMatchObject({ code: "read_job_cancelled" });
+      expect(harness.run.status).toBe("cancelled");
+      expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+      expect(harness.packages.submit).not.toHaveBeenCalled();
+      expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["graph_packages", "power_platform"] as const)(
     "retains failed automatic %s terminal cleanup so shutdown retries it",
     async sourceId => {
@@ -198,7 +330,7 @@ describe("DataSyncService", () => {
       }
       provider.cancel.mockRejectedValue(new Error("Child cleanup temporarily unavailable."));
       await harness.service.automaticRefresh(user);
-      await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalled());
+      await vi.waitFor(() => expect(harness.repository.finishRun).toHaveBeenCalled());
       await new Promise<void>(resolve => setImmediate(resolve));
       const attempts = provider.cancel.mock.calls.length;
       expect(attempts).toBeGreaterThan(0);
@@ -360,7 +492,7 @@ describe("DataSyncService", () => {
     expect(harness.copilotUsage.refreshUsers.mock.calls[0][2]).not.toHaveProperty("automatic");
     expect(harness.agentPeople.refreshReferences).toHaveBeenCalledWith(user, expect.any(AbortSignal),
       expect.any(Object), { incompleteOnly: true });
-    await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(harness.repository.finishRun).toHaveBeenCalledOnce());
   });
 
   it.each(["graph_packages", "power_platform"] as const)(
@@ -672,6 +804,28 @@ describe("DataSyncService", () => {
     expect(state.run?.sources).toHaveLength(1);
   });
 
+  it("does not mistake historical sync success for currently available saved sources", async () => {
+    const harness = serviceHarness();
+    for (const marker of harness.markers) {
+      if (marker.source !== "usage_reports") Object.assign(marker, {
+        status: "succeeded", count: 10, lastSuccessAt: harness.run.startedAt,
+      });
+    }
+    harness.run.sources = harness.run.sources.map(source => ({ ...source, status: "succeeded" }));
+    harness.run.status = "completed";
+    const unavailable = harness.markers.map(marker => marker.source === "graph_packages" || marker.source === "power_platform"
+      ? { ...marker, status: "not_started" as const, message: "The previously saved source is no longer available." } : marker);
+    harness.repository.listSavedSources.mockResolvedValue(unavailable);
+    const state = await harness.service.state(user);
+    expect(state.onboardingRequired).toBe(true);
+    expect(state.sources.filter(source => source.source !== "usage_reports")).toEqual(
+      unavailable.filter(source => source.source !== "usage_reports"),
+    );
+    expect(harness.repository.listSavedSources).toHaveBeenCalledWith({
+      tenantId: user.tenantId, principalId: user.homeAccountId,
+    });
+  });
+
   it.each(["partial", "failed", "cancelled"] as const)("retains saved counts while the newer Users attempt is %s", async status => {
     const harness = serviceHarness();
     Object.assign(harness.markers[0], { status: "succeeded", count: 40, lastSuccessAt: harness.run.startedAt });
@@ -909,11 +1063,11 @@ describe("DataSyncService", () => {
     ]);
   });
 
-  it("reconciles an accepted upload when polling an exact run without first loading global state", async () => {
+  it.each(["waiting", "partial"] as const)("reconciles an accepted upload when polling an exact %s run", async status => {
     const harness = serviceHarness();
     harness.run.sources = [harness.run.sources.find(source => source.source === "usage_reports")!];
     harness.run.sources[0].status = "awaiting_upload";
-    harness.run.status = "waiting";
+    harness.run.status = status;
     harness.officialUsage.read.mockResolvedValue(acceptedUsage());
     const exact = await harness.service.getRun(
       { tenantId: user.tenantId!, principalId: user.homeAccountId },
@@ -924,9 +1078,31 @@ describe("DataSyncService", () => {
       status: "succeeded",
       count: 3,
     });
+    expect(exact.status).toBe("completed");
     expect(harness.repository.getLatestRun).not.toHaveBeenCalled();
     expect(harness.packages.get).not.toHaveBeenCalled();
     expect(harness.powerPlatform.get).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a retained upload without reopening incomplete provider work", async () => {
+    const harness = serviceHarness();
+    harness.run.sources = harness.run.sources.filter(source => ["users", "usage_reports"].includes(source.source));
+    Object.assign(harness.run.sources.find(source => source.source === "users")!, {
+      status: "waiting_authorization", canRetry: true,
+    });
+    harness.run.sources.find(source => source.source === "usage_reports")!.status = "awaiting_upload";
+    harness.run.status = "partial";
+    const before = structuredClone(harness.run.sources.find(source => source.source === "users")!);
+    harness.officialUsage.read.mockResolvedValue(acceptedUsage());
+    const exact = await harness.service.getRun(
+      { tenantId: user.tenantId!, principalId: user.homeAccountId }, harness.run.id,
+    );
+    expect(exact.status).toBe("partial");
+    expect(exact.sources.find(source => source.source === "users")).toEqual(before);
+    expect(exact.sources.find(source => source.source === "usage_reports")).toMatchObject({ status: "succeeded", count: 3 });
+    expect(harness.copilotUsage.refreshUsers).not.toHaveBeenCalled();
+    expect(harness.packages.submit).not.toHaveBeenCalled();
+    expect(harness.powerPlatform.submit).not.toHaveBeenCalled();
   });
 
   it("keeps a cancelled historical run immutable when later usage is accepted", async () => {
@@ -1177,9 +1353,9 @@ describe("DataSyncService", () => {
   it("keeps automatic finalization owned until shutdown joins its persistence", async () => {
     const harness = serviceHarness();
     const finished = deferred<void>();
-    harness.repository.finishAutomatic.mockReturnValueOnce(finished.promise);
+    harness.repository.finishRun.mockReturnValueOnce(finished.promise);
     await harness.service.automaticRefresh(user);
-    await vi.waitFor(() => expect(harness.repository.finishAutomatic).toHaveBeenCalled());
+    await vi.waitFor(() => expect(harness.repository.finishRun).toHaveBeenCalled());
     let stopped = false;
     const draining = harness.service.drain().then(() => { stopped = true; });
     await new Promise<void>(resolve => setImmediate(resolve));
@@ -1266,12 +1442,13 @@ describe("DataSyncService", () => {
     }
   });
 
-  it("cancels a retry still waiting for durable admission before it can launch", async () => {
+  it.each(["partial", "cancelled"] as const)("cancels a %s run's retry still waiting for durable admission before it can launch", async status => {
     const harness = serviceHarness();
+    harness.repository.getRun.mockImplementation(async () => structuredClone(harness.run));
     const source = harness.run.sources[0];
     harness.run.sources = [source];
     Object.assign(source, { status: "failed", canRetry: true });
-    harness.run.status = "partial";
+    harness.run.status = status;
     const gate = deferred<void>();
     harness.repository.retry.mockImplementation(async () => {
       await gate.promise;
@@ -1497,7 +1674,7 @@ function serviceHarness() {
       run.sources = run.sources.filter(source => source.source !== "usage_reports");
       return { run, created: true };
     }),
-    finishAutomatic: vi.fn(async (): Promise<void> => undefined),
+    finishRun: vi.fn(async (): Promise<void> => undefined),
     automaticRevisions: vi.fn(async () => ({ users: "users-revision", graph_packages: "inventory-revision", power_platform: "inventory-revision" })),
     submit: vi.fn(async (_scope, input, beforeCommit?: () => void) => {
       beforeCommit?.();
@@ -1510,22 +1687,25 @@ function serviceHarness() {
     getLatestRun: vi.fn(async (): Promise<DataSyncRun | undefined> => run),
     listRuns: vi.fn(async () => [run]),
     getSourceAttempt: vi.fn(async () => 1),
-    listMarkers: vi.fn(async () => markers),
+    listSavedSources: vi.fn(async () => markers),
     attachJob: vi.fn(async (_scope, _runId, source: DataSyncSourceId, jobId: string, beforeCommit?: () => void) => {
       beforeCommit?.();
       run.sources.find(value => value.source === source)!.jobId = jobId;
     }),
     updateSource: vi.fn(async (_scope, _runId, source: DataSyncSourceId, update: Partial<DataSyncSourceStatus>, beforeCommit?: () => void): Promise<DataSyncRun | undefined> => {
       const current = run.sources.find(value => value.source === source)!;
-      if (!["running", "waiting"].includes(run.status) || current.status === "succeeded"
+      const retainedUpload = run.status === "partial" && source === "usage_reports"
+        && current.status === "awaiting_upload" && update.status === "succeeded";
+      if ((!["running", "waiting"].includes(run.status) && !retainedUpload) || current.status === "succeeded"
         || (update.jobId && current.jobId && update.jobId !== current.jobId)) return run;
       beforeCommit?.();
       Object.assign(current, update, { updatedAt: new Date().toISOString() });
       if (update.status === "succeeded") saveMarker(source, current.count, current.lastSuccessAt ?? current.updatedAt!);
       const statuses = run.sources.map(value => value.status);
-      run.status = statuses.some(status => ["queued", "running"].includes(status)) ? "running"
+      const status = statuses.some(status => ["queued", "running"].includes(status)) ? "running"
         : statuses.some(status => ["waiting_authorization", "permission_required", "awaiting_upload"].includes(status)) ? "waiting"
           : statuses.every(status => status === "succeeded") ? "completed" : "partial";
+      if (run.status !== "partial" || status === "completed") run.status = status;
       return run;
     }),
     recordSuccessMarker: vi.fn(async (_scope, source: DataSyncSourceId, count: number | null, lastSuccessAt: string) => saveMarker(source, count, lastSuccessAt)),

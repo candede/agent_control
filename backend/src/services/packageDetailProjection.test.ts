@@ -67,7 +67,7 @@ describe("separate package detail projection", () => {
     }
     expect(projectPackageDetailAge(value, value.detailFreshness.expiresAt))
       .toMatchObject({ detailFreshness: { state: "stale" } });
-    expect(projectPackageDetailAge(value, value.detailFreshness.expiresAt)).not.toHaveProperty("identityDetailsCollected");
+    expect(projectPackageDetailAge(value, value.detailFreshness.expiresAt)).toHaveProperty("identityDetailsCollected", true);
     expect(projectPackageDetailAge(value, "2026-09-24T09:59:59.999999998Z")).not.toHaveProperty("identityDetailsCollected");
     expect(value.identityDetailsCollected).toBe(true);
   });
@@ -182,7 +182,7 @@ describe("separate package detail projection", () => {
   it("retains stale descriptive details without renewing identity evidence from catalog freshness", () => {
     const result = projectPackageDetails(summary, { ...observation, expiresAt: "2026-09-24T09:59:59Z" }, false, now);
     expect(result).toMatchObject({ longDescription: detailed.longDescription, detailFreshness: { state: "stale" } });
-    expect(result).not.toHaveProperty("identityDetailsCollected");
+    expect(result).toHaveProperty("identityDetailsCollected", true);
     expect(result).not.toHaveProperty("identityRevalidationRequired");
     expect(projectPackageDetails({ ...summary, identityRevalidationRequired: true },
       { ...observation, expiresAt: "2026-09-24T09:59:59Z" }, false, now).identityRevalidationRequired).toBe(true);
@@ -310,7 +310,7 @@ describe("separate package detail projection", () => {
       const result = projectPackageDetails(summary, { ...observation, package: restored,
         catalogRevision: packageDetailRevision(summary) }, false, Date.parse(observation.expiresAt));
       expect(result.detailFreshness).toEqual({ ...empty.detailFreshness, state: "stale" });
-      expect(result).not.toHaveProperty("identityDetailsCollected");
+      expect(result.identityDetailsCollected).toBe(value.identityRevalidationRequired ? undefined : true);
       expect(result.identityRevalidationRequired).toBe(value.identityRevalidationRequired);
     }
   });

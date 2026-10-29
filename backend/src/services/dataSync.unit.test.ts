@@ -164,7 +164,7 @@ describe("temporary sharing diagnostic sync hook", () => {
     vi.spyOn(f.repository, "submit").mockResolvedValue({ run: f.run, created: true });
     vi.spyOn(f.repository, "submitDue").mockResolvedValue({ run: f.run, created: true });
     vi.spyOn(f.repository, "automaticRevisions").mockResolvedValue({ users: "1", graph_packages: "1", power_platform: "1" });
-    vi.spyOn(f.repository, "finishAutomatic").mockResolvedValue(undefined);
+    vi.spyOn(f.repository, "finishRun").mockResolvedValue(undefined);
     vi.spyOn(f.repository, "getSourceAttempt").mockResolvedValue(1);
     vi.spyOn(f.repository, "attachJob").mockResolvedValue(undefined);
     vi.spyOn(f.repository, "updateSource").mockImplementation(async (_scope, _id, _source, update, beforeCommit) => {
@@ -179,7 +179,7 @@ describe("temporary sharing diagnostic sync hook", () => {
       await vi.waitFor(() => {
         expect(f.run.sources[0].status).toBe(mode === "failed" ? "failed" : "succeeded");
         if (mode === "manual" || mode === "diagnostic-failed") expect(sharingDiagnostic).toHaveBeenCalledOnce();
-        if (mode === "automatic") expect(f.repository.finishAutomatic).toHaveBeenCalledOnce();
+        expect(f.repository.finishRun).toHaveBeenCalledOnce();
       });
       await f.service.drain();
       expect(sharingDiagnostic).toHaveBeenCalledTimes(mode === "manual" || mode === "diagnostic-failed" ? 1 : 0);
@@ -192,6 +192,30 @@ describe("temporary sharing diagnostic sync hook", () => {
       }
     } finally { await f.service.drain(); }
   });
+});
+
+it("releases an orphaned manual authorization wait before automatic admission after sign-in", async () => {
+  const f = fixture();
+  Object.assign(f.run, { status: "waiting", completedAt: null, automatic: false });
+  Object.assign(f.run.sources[0], { status: "waiting_authorization" });
+  vi.spyOn(f.repository, "getLatestRun").mockResolvedValue(f.run);
+  vi.mocked(f.repository.finishRun).mockImplementation(async () => {
+    f.run.status = "partial";
+    f.run.completedAt = new Date().toISOString();
+  });
+  vi.spyOn(f.repository, "submitDue").mockImplementation(async () => {
+    expect(f.run.status).toBe("partial");
+    return { run: null, created: false };
+  });
+  vi.spyOn(f.repository, "automaticRevisions").mockResolvedValue({ users: "1", graph_packages: "1", power_platform: "1" });
+  f.packages.refreshDueDetails.mockResolvedValue(undefined);
+  await expect(f.service.automaticRefresh(f.user, Date.now())).resolves.toMatchObject({ run: null });
+  expect(f.repository.finishRun).toHaveBeenCalledWith(
+    { tenantId: f.user.tenantId, principalId: f.user.homeAccountId }, f.run.id,
+  );
+  expect(vi.mocked(f.repository.finishRun).mock.invocationCallOrder[0])
+    .toBeLessThan(vi.mocked(f.repository.submitDue).mock.invocationCallOrder[0]);
+  expect(f.packages.refreshDueDetails).toHaveBeenCalledOnce();
 });
 
 function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>) {
@@ -211,6 +235,7 @@ function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSha
   vi.spyOn(repository, "getRun").mockResolvedValue(run);
   vi.spyOn(repository, "getLatestRun").mockResolvedValue(undefined);
   vi.spyOn(repository, "pausePrincipal").mockResolvedValue(0);
+  vi.spyOn(repository, "finishRun").mockResolvedValue(undefined);
   const forbidden = new Error("This test must not dispatch child or provider work.");
   const packages = {
     startDetailSync: vi.fn<PackageInventoryService["startDetailSync"]>().mockRejectedValue(forbidden),

@@ -2,6 +2,7 @@ import { AppError } from "../errors.js";
 import { packageObservationLimits, type CopilotPackageDetail, type PackageElementDetail } from "../types/copilotPackage.js";
 import { operationalLog } from "./telemetry.js";
 import { dataLimits } from "../db/dataBounds.js";
+import { compareInventoryInstants, isInventoryTimestamp } from "../types/inventoryTimestamp.js";
 
 export type PackageAgentMetadata = {
   environmentId?: string;
@@ -20,6 +21,14 @@ const guidPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const environmentPattern = /^(?:Default-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const schemaNamePattern = /^[a-z_][a-z0-9_]{0,511}$/i;
 const sourceFields = ["EnvironmentId", "CdsBotId", "SchemaName", "ManifestId", "EntraApplicationId"] as const;
+
+export function hasSavedPackageIdentityDetails(value: CopilotPackageDetail) {
+  const details = value.detailFreshness;
+  return !details || (details.state === "fresh" || details.state === "stale")
+    && isInventoryTimestamp(details.observedAt) && isInventoryTimestamp(details.expiresAt)
+    && compareInventoryInstants(details.observedAt, details.expiresAt) < 0
+    && compareInventoryInstants(details.observedAt, new Date().toISOString()) <= 0;
+}
 
 export function normalizedGuid(value: unknown) {
   return normalizedId(value, guidPattern);

@@ -9,6 +9,7 @@ import { assertAccountSessionValidation, beginAccountSessionValidation, commitAc
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { UserSourceKind, UserSourceMetadata } from "../types/userSources.js";
+import { automaticDataSyncIntervalMs, automaticDataSyncRetryIntervalMs } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
 import { UserSourceProvider } from "./userSourceProvider.js";
@@ -68,10 +69,10 @@ export class CopilotUsageService {
         || !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
       if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
-      const retryDelay = source.attemptStatus === "waiting_authorization" || source.attemptStatus === "permission_required" ? 3600000 : 900000;
-      if (source.attemptedAt && source.attemptStatus !== "available" && Date.now() - Date.parse(source.attemptedAt) < retryDelay) return false;
+      if (source.attemptedAt && source.attemptStatus !== "available")
+        return Date.now() - Date.parse(source.attemptedAt) >= automaticDataSyncRetryIntervalMs;
       return source.source === "directory" && reportChanged || !source.generationId || !source.observedAt
-        || Date.now() - Date.parse(source.observedAt) >= (source.source === "directory" ? 900000 : 21600000);
+        || Date.now() - Date.parse(source.observedAt) >= automaticDataSyncIntervalMs;
     };
     const requested = (["directory", "app_activity"] as const).filter(source => due(before.sources[source]));
     if (!requested.length) return { status: before.status, count: before.count, message: "Current saved user sources do not require collection." };

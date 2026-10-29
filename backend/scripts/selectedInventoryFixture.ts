@@ -12,7 +12,7 @@ import { DataExports } from "../src/services/dataExports.js";
 import { inventoryExportColumns, inventoryExportSource, type InventoryExportKind } from "../src/services/inventoryExports.js";
 import type { CopilotPackageDetail } from "../src/types/copilotPackage.js";
 import type { CopilotDirectoryUser } from "../src/types/copilotUsage.js";
-import { powerPlatformResourceTypes, type PowerPlatformResource, type PowerPlatformResourceType } from "../src/types/powerPlatformInventory.js";
+import { isInventoryCount, powerPlatformResourceTypes, type PowerPlatformResource, type PowerPlatformResourceType } from "../src/types/powerPlatformInventory.js";
 
 export type SelectedInventoryFixtureInput = {
   scope?: { tenantId: string; principalId: string };
@@ -21,6 +21,7 @@ export type SelectedInventoryFixtureInput = {
   omitPackages?: boolean;
   omitResources?: boolean;
   directory?: CopilotDirectoryUser[];
+  /** Per-agent response totals, distributed across users (one user by default). */
   usage?: { id: string; responses: number; users?: number }[];
   resourceTypes?: PowerPlatformResourceType[];
   roleScope?: "full" | "ai" | "unknown";
@@ -32,6 +33,8 @@ export type SelectedInventoryFixtureInput = {
 export async function seedSelectedInventory(database: pg.Pool, options: SelectedInventoryFixtureInput = {}) {
   if (process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1") throw new Error("fixture_only");
   if ((options.packages?.length ?? 0) + (options.resources?.length ?? 0) > 1000) throw new Error("selected_fixture_limit");
+  if (options.usage && (options.usage.length > 100 || options.usage.some(value => !isInventoryCount(value.responses)
+    || !isInventoryCount(value.users ?? 1) || (value.users ?? 1) > 10))) throw new Error("selected_usage_fixture_limit");
   const scope = options.scope ?? { tenantId: `selected-${randomUUID()}`, principalId: randomUUID() };
   const store = new InventoryGenerations(database);
   const identity = { ...selectionIdentity, ...scope, sessionEpoch: await store.generations.sessionEpoch(scope.tenantId, scope.principalId) };
@@ -58,19 +61,25 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
   }
   let packages = options.omitPackages ? undefined : await publish("packages", (options.packages ?? []).map(packageInventoryRecord));
   const details = (options.packages ?? []).filter(value => value.detailFreshness && value.detailFreshness.state !== "missing");
-  if (packages && details.length) packages = await publish("packages", details.map(packageInventoryRecord), "detail");
+  if (packages) {
+    for (let offset = 0; offset < details.length; offset += 100) {
+      packages = await publish("packages", details.slice(offset, offset + 100).map(packageInventoryRecord), "detail");
+    }
+  }
   const resources = options.omitResources ? undefined : await publish("power_platform",
     (options.resources ?? []).map(value => powerPlatformInventoryRecord({ ...value, tenantId: scope.tenantId })));
   if (options.directory) await publishFixtureDirectory(database, identity, options.directory);
   if (options.usage) {
-    if (options.usage.length > 100 || options.usage.some(value => (value.users ?? 1) > 10)) throw new Error("selected_usage_fixture_limit");
     const csv = (rows: unknown[][]) => rows.map(row => row.map(cell => `"${String(cell ?? "").replace(/"/g, '""')}"`).join(",")).join("\n");
-    const userRows = options.usage.flatMap(agent => Array.from({ length: agent.users ?? 1 }, (_, index) => ({
-      agent, username: `${agent.id}-user-${index}`, responses: index === 0 ? agent.responses : agent.responses > 0 ? 1 : 0,
-    })));
+    const userRows = options.usage.flatMap(agent => {
+      const users = agent.users ?? 1;
+      return Array.from({ length: users }, (_, index) => ({
+        agent, username: `${agent.id}-user-${index}`, responses: Math.floor(agent.responses / users) + Number(index < agent.responses % users),
+      }));
+    });
     const reports = {
       agents: csv([["Agent ID", "Agent name", "Creator type", "Active users (licensed)", "Active users (unlicensed)", "Responses sent to users", "Last activity date (UTC)"],
-        ...options.usage.map(agent => [agent.id, agent.id, "Your org", agent.responses ? agent.users ?? 1 : 0, 0, agent.responses, "2026-09-16"])]),
+        ...options.usage.map(agent => [agent.id, agent.id, "Your org", Math.min(agent.responses, agent.users ?? 1), 0, agent.responses, "2026-09-16"])]),
       userAgents: csv([["Agent ID", "Agent name", "Creator type", "Username", "Responses sent to users", "Last activity date (UTC)"],
         ...userRows.map(row => [row.agent.id, row.agent.id, "Your org", row.username, row.responses, "2026-09-16"])]),
       users: csv([["Username", "Display name", "Number of agents used", "Agent responses received", "Last activity date (UTC)"],
@@ -78,19 +87,22 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
     };
     await publishUsageReports(database, scope, 10, kind => reports[kind]);
   }
-  const canonical = await reconcileInventoryFixture(database, scope);
+  const canonical = await reconcileInventoryFixture(database, scope, { observedAt: options.observedAt, expiresAt: options.expiresAt });
   if (!canonical) throw new Error("selected_fixture_canonical_required");
   const queries = new InventoryQueries(database, "synthetic-selected-inventory-golden-key");
-  const selections: string[] = [];
+  const selections = new Set<string>();
   return { scope, identity, queries, packages, resources, canonical, input: structuredClone(options),
     async releaseSelections() {
-      for (const id of selections.splice(0)) await queries.selections.invalidate(id, identity);
+      for (const id of selections) {
+        await queries.selections.invalidate(id, identity);
+        selections.delete(id);
+      }
     },
     async select(query: InventoryQuery = {}, limit = 50, domain: "canonical" | "packages" | "power_platform" = "canonical") {
       const root = domain === "canonical" ? canonical : domain === "packages" ? packages : resources;
       if (!root) throw new Error("selected_fixture_source_missing");
       const selection = await queries.capture(identity, root.scopeId, query);
-      selections.push(selection.id);
+      selections.add(selection.id);
       const raw = await queries.page(selection.id, identity, { limit });
       return { selection, raw, page: domain === "canonical" ? inventoryPresentation(raw) : undefined };
     } };
@@ -103,10 +115,12 @@ export async function selectedInventoryCsv(database: pg.Pool,
   const exports = new DataExports(database, fixture.queries.selections, async () => {});
   const id = await exports.create(fixture.identity, { selectionId: selection.id, queryHash: selection.queryHash, kind, filename: "synthetic.csv" });
   await exports.build(id, fixture.identity, inventoryExportColumns[kind], inventoryExportSource(fixture.queries, fixture.identity));
-  let csv = "";
+  const chunks: Buffer[] = [];
+  let bytes = 0;
   for await (const chunk of exports.download(id, fixture.identity, new AbortController().signal)) {
-    csv += chunk.toString();
-    if (Buffer.byteLength(csv) > 2 * 1024 * 1024) throw new Error("selected_csv_fixture_limit");
+    bytes += chunk.length;
+    if (bytes > 2 * 1024 * 1024) throw new Error("selected_csv_fixture_limit");
+    chunks.push(chunk);
   }
-  return { csv, status: await exports.status(id, fixture.identity) };
+  return { csv: Buffer.concat(chunks, bytes).toString("utf8"), status: await exports.status(id, fixture.identity) };
 }

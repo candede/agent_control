@@ -84,7 +84,7 @@ describe("live selected users and reports", () => {
   afterAll(async () => { await fixture?.close(); });
 
   it.each(["running", "failed", "permission_required", "waiting_authorization"] as const)(
-    "keeps valid saved license metrics during a running refresh but preserves %s attempt semantics",
+    "keeps saved license metrics while preserving %s attempt diagnostics",
     async status => {
       const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
       await directory(fixture.runtime, identity, [sourceUser(1), sourceUser(2, "disabled")]);
@@ -105,17 +105,16 @@ describe("live selected users and reports", () => {
         const saved = await reader.page(selection.id, identity);
         expect(saved.sources.directory).toMatchObject({ state: status === "running" ? "available" : "partial", attemptStatus: status, rowCount: 2 });
         expect(saved.summary).toMatchObject({
-          licensedUsers: status === "running" ? 1 : null, usingAgentsUsers: status === "running" ? 1 : null,
-          noAgentActivityUsers: status === "running" ? 0 : null,
+          licensedUsers: 1, usingAgentsUsers: 1, noAgentActivityUsers: 0,
         });
         expect(saved.value).toHaveLength(1);
         const unpaid = await reader.capture(identity, "delegated", "official_users", { licenseCohort: "active_without_paid" });
-        expect((await reader.page(unpaid.id, identity)).value).toHaveLength(status === "running" ? 1 : 0);
+        expect((await reader.page(unpaid.id, identity)).value).toHaveLength(1);
       } finally { await generations.abort(lease); }
     },
   );
 
-  it.each(["missing", "expired"])("distinguishes retained rows from current license metrics with %s directory evidence", async evidence => {
+  it.each(["missing", "expired"])("distinguishes missing from retained saved license evidence (%s directory)", async evidence => {
     const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     if (evidence === "expired") {
       const expiresAt = new Date(Date.now() + 5_000);
@@ -138,7 +137,7 @@ describe("live selected users and reports", () => {
       expect(saved.sources.directory).toMatchObject({ state: evidence === "missing" ? "unavailable" : "stale",
         attemptStatus: "running", generationId: evidence === "missing" ? null : expect.any(String) });
       if (evidence === "expired") expect(saved.value).toHaveLength(1);
-      expect(saved.summary.licensedUsers).toBeNull();
+      expect(saved.summary.licensedUsers).toBe(evidence === "expired" ? 1 : null);
     } finally { await generations.abort(lease); }
   }, 10_000);
 

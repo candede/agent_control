@@ -45,7 +45,7 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   reportPending?: boolean;
 }) {
   const usageContext = inventory?.usageContext;
-  const { data, loading, error, retry, invalidated, restart } = useOfficialUsageOverview({
+  const { data, selectedData, loading, error, retry, invalidated, restart } = useOfficialUsageOverview({
     scope: "selected", setId: usageContext?.reports.setId ?? undefined, limit: 1,
   }, revision, Boolean(usageContext?.reports.setId) && !reportPending);
   const hasCatalog = inventory?.sources.graphPackages.state !== undefined && inventory.sources.graphPackages.state !== "unavailable";
@@ -76,7 +76,8 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
         selected={endUserAccess === "available"} onClick={onAccessChange ? () => onAccessChange(endUserAccess === "available" ? "all" : "available") : undefined} />
       <Metric label="Reported used agents" value={reports?.usedAgents ?? null}
         loading={loadingReports}
-        hint={reports ? "In selected report set" : unavailableReportHint}
+        hint={reports ? error ? "Last saved report evidence" : "In selected report set" : unavailableReportHint}
+        disabled={!selectedData}
         selected={reportedUsage === "used"} onClick={onUsageChange ? () => onUsageChange(reportedUsage === "used" ? "all" : "used") : undefined} />
       <Metric label="Reported active · 30 days" value={reports?.active30Days ?? null}
         loading={loadingReports}
@@ -95,13 +96,13 @@ export function AgentInventoryOverview({ inventory, revision, allSelected, onCle
   </section>;
 }
 
-function Metric({ label, value, hint, selected, onClick, loading = false }: {
-  label: string; value: number | null; hint: string; selected?: boolean; onClick?: () => void; loading?: boolean;
+function Metric({ label, value, hint, selected, onClick, loading = false, disabled = false }: {
+  label: string; value: number | null; hint: string; selected?: boolean; onClick?: () => void; loading?: boolean; disabled?: boolean;
 }) {
   const content = <><span title={label}>{label}</span><strong>{loading
     ? <span className="skeleton-block skeleton-count" aria-hidden="true" /> : usageCount(value)}</strong><small title={hint}>{hint}</small></>;
   return onClick
     ? <button type="button" className="metric agent-overview-filter" aria-label={`Show ${label.toLowerCase()}`}
-      aria-pressed={selected} disabled={value === null} onClick={onClick}>{content}</button>
+      aria-pressed={selected} disabled={disabled || value === null} onClick={onClick}>{content}</button>
     : <div className="metric">{content}</div>;
 }

@@ -12,6 +12,8 @@ import { readAdoptionDepartments, readAdoptionSummary } from "./adoptionDepartme
 import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
 import type { ReportQuery } from "../types/officialReportData.js";
 import { DataSyncRepository } from "../db/dataSync.js";
+import { DataGenerations } from "../db/dataGenerations.js";
+import { revokeAccountSessions } from "../db/sessions.js";
 
 describe("read-only adoption groups", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -234,6 +236,38 @@ describe("read-only adoption groups", () => {
     await new DataSyncRepository(fixture.runtime).submit(identity, { mode: "full", clearSavedData: true });
     await expect(page(cleared.id)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
+  it("loads dashboard summaries, departments and report identities immediately after same-principal sign-in", async () => {
+    const { identity, reader } = await setup([user(1)]);
+    await saveUsageInventory(fixture.runtime, identity, [{ packages: ["Retained"] }]);
+    const today = new Date().toISOString().slice(0, 10);
+    await publish(identity, {
+      users: [`user1@example.invalid,User 1,1,10,${today}`],
+      agents: [`Retained,Retained,Your org,1,0,10,${today}`],
+      userAgents: [`Retained,Retained,Your org,user1@example.invalid,10,${today}`],
+    });
+    const old = await reader.capture(identity, "delegated", "adoption");
+    await revokeAccountSessions(fixture.runtime, identity.tenantId, identity.principalId);
+    const generations = new DataGenerations(fixture.runtime);
+    const renewed = { ...identity, sessionEpoch: await generations.sessionEpoch(identity.tenantId, identity.principalId) };
+    await expect(reader.read(old.id, identity, (client, context) => readAdoptionSummary(client, reader, context)))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    const selected = await reader.capture(renewed, "delegated", "adoption");
+    const summary = await reader.read(selected.id, renewed, (client, context) => readAdoptionSummary(client, reader, context));
+    expect(summary.value[0]).toMatchObject({ organization: { checkedUsers: 1 }, champions: 1 });
+    const departments = await reader.capture(renewed, "delegated", "adoption_departments");
+    expect(await reader.read(departments.id, renewed, (client, context) =>
+      readAdoptionDepartments(client, reader, context, { limit: 10 })))
+      .toMatchObject({ value: [{ company: "Contoso", department: "HR", people: 1, activePeople: 1 }] });
+    const stages = new UserSourceStages(fixture.runtime);
+    const lease = await generations.begin(generationInput({
+      scope: { ...generationInput().scope, ...renewed }, sessionEpoch: renewed.sessionEpoch,
+    }));
+    try {
+      const inputs = await reader.captureReportIdentities(renewed);
+      await reader.feedPositiveIdentities(inputs.id, renewed, stages, lease);
+    } finally { await generations.abort(lease); }
+  });
+
   it("keeps departments separate across companies and pages forward/backward in both sort directions", async () => {
     const { identity, reader } = await setup([user(1, "A"), user(2, "B"), user(3, "C"), user(4, "D")]);
     for (const order of ["asc", "desc"] as const) {

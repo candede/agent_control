@@ -23,8 +23,9 @@ export function FirstSyncNotice({
   const attempts = state.run?.sources.filter(source => automaticSyncSources.some(id => id === source.source)) ?? [];
   const sources = automaticSyncSources.map(id => {
     const saved = state.sources.find(source => source.source === id);
+    const attempt = attempts.find(source => source.source === id);
     return { id, saved: saved?.status === "succeeded",
-      observation: saved?.status === "succeeded" ? saved : attempts.find(source => source.source === id) ?? saved };
+      observation: saved?.status === "succeeded" ? saved : attempt && attempt.status !== "succeeded" ? attempt : saved };
   });
   const savedCount = sources.filter(source => source.saved).length;
   const progressing = state.run?.status === "running" || state.run?.status === "waiting";

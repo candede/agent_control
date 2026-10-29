@@ -1,6 +1,8 @@
 export const dataSyncSourceIds = ["users", "graph_packages", "power_platform", "usage_reports"] as const;
 export type DataSyncSourceId = (typeof dataSyncSourceIds)[number];
 export const automaticDataSyncSourceIds = ["users", "graph_packages", "power_platform"] as const satisfies readonly DataSyncSourceId[];
+export const automaticDataSyncIntervalMs = 6 * 60 * 60_000;
+export const automaticDataSyncRetryIntervalMs = 60 * 60_000;
 export type DataSyncMode = "initial" | "incremental" | "full";
 export type DataSyncSourceState =
   | "not_started"

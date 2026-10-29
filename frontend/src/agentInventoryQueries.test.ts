@@ -85,7 +85,7 @@ describe("AgentInventoryQueries", () => {
     vi.useRealTimers();
   });
 
-  it("reuses saved reads for 30 seconds while separating filters, sorts and pages", async () => {
+  it("reuses saved reads while separating filters, sorts and pages", async () => {
     const query = { view: "organization" as const, sortBy: "responses" as const, sortDirection: "desc" as const };
     await queries.read("tenant:account:viewer:1", query, signal());
     await queries.read("tenant:account:viewer:1", { ...query }, signal());
@@ -101,13 +101,14 @@ describe("AgentInventoryQueries", () => {
 
   it("reuses the first page under its pinned selection without a duplicate read", async () => {
     const query = { inventoryScope: "catalog" as const, limit: 50 };
+    read.mockResolvedValue(page("2026-09-20T12:30:00.000Z"));
     const first = await queries.read("owner", query, signal());
     if ("state" in first) throw new Error("Expected inventory");
     const pinned = { ...query, selectionId: first.selection.id };
     expect(queries.getCached("owner", pinned)).toBe(first);
     expect(await queries.read("owner", pinned, signal())).toBe(first);
     expect(read).toHaveBeenCalledOnce();
-    vi.advanceTimersByTime(30_001);
+    vi.advanceTimersByTime(15 * 60_000 + 1);
     expect(queries.getCached("owner", pinned)).toBeUndefined();
     await queries.read("owner", pinned, signal());
     expect(read).toHaveBeenCalledTimes(2);
@@ -215,14 +216,14 @@ describe("AgentInventoryQueries", () => {
   });
 
   it("does not join an old pinned selection to an unfinished recapture", async () => {
-    const original = page();
-    const revalidated = { ...original, selection: { ...original.selection, validatedAt: new Date(Date.now() + 30_001).toISOString() } };
-    const recaptured = page(undefined, { id: "recaptured-selection", revision: "2" });
+    const original = page("2026-09-20T12:30:00.000Z");
+    const revalidated = { ...original, selection: { ...original.selection, validatedAt: new Date(Date.now() + 15 * 60_000 + 1).toISOString() } };
+    const recaptured = page("2026-09-20T12:30:00.000Z", { id: "recaptured-selection", revision: "2" });
     const response = deferredPage();
     read.mockResolvedValueOnce(original).mockReturnValueOnce(response.promise).mockResolvedValueOnce(revalidated);
     const pinned = { selectionId: original.selection.id };
     await queries.read("owner", pinned, signal());
-    vi.advanceTimersByTime(30_001);
+    vi.advanceTimersByTime(15 * 60_000 + 1);
 
     const superseded = expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "request_aborted" });
     await Promise.resolve();
@@ -322,12 +323,12 @@ describe("AgentInventoryQueries", () => {
   );
 
   it("does not return a recaptured selection under the old pinned request key", async () => {
-    const original = page();
-    const refreshed = page(undefined, { id: "new-selection", revision: "2" });
+    const original = page("2026-09-20T12:30:00.000Z");
+    const refreshed = page("2026-09-20T12:30:00.000Z", { id: "new-selection", revision: "2" });
     read.mockResolvedValueOnce(original).mockResolvedValueOnce(refreshed);
     const pinned = { selectionId: original.selection.id };
     await queries.read("owner", pinned, signal());
-    vi.advanceTimersByTime(30_001);
+    vi.advanceTimersByTime(15 * 60_000 + 1);
     await expect(queries.read("owner", {}, signal())).resolves.toBe(refreshed);
 
     expect(queries.getCached("owner", pinned)).toBeUndefined();
@@ -779,7 +780,7 @@ describe("AgentInventoryQueries", () => {
 
   it("surfaces failed refreshes without retries or stale success-shaped fallback", async () => {
     await queries.read("owner", {}, signal());
-    vi.advanceTimersByTime(30_001);
+    vi.advanceTimersByTime(600_001);
     read.mockRejectedValueOnce(new ApiError(503, "database_unavailable", "Saved inventory is unavailable."));
     await expect(queries.read("owner", {}, signal())).rejects.toMatchObject({ code: "database_unavailable" });
     expect(queries.getCached("owner", {})).toBeUndefined();

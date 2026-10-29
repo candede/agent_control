@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { inventoryBaseline, inventoryDelta, inventoryInput, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryBaseline, inventoryDelta, inventoryInput, nativeInventoryFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
 import { InventoryGenerations, inventoryAsOf, inventorySelector } from "../db/inventoryGenerations.js";
 import { InventoryReconciliation } from "./inventoryReconciliation.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryRecord } from "./inventoryRecordProjection.js";
@@ -22,6 +22,8 @@ import { readAutomaticInventoryRevisions } from "../db/inventoryAutomaticRevisio
 import { checkpointQueries, observePeakMemory, observeQueryWork } from "./peakMemory.js";
 import { inventoryReconciliationAdmissionSql, verifyInventoryReconciliationAdmissionSchema } from "../db/inventoryReconciliationAdmissionSchema.js";
 import { dataLimits } from "../db/dataBounds.js";
+import { inventoryPresentation } from "./inventoryPresentation.js";
+import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
 
 describe("durable bounded reconciliation", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -43,14 +45,19 @@ describe("durable bounded reconciliation", () => {
     } finally { await client.query("ROLLBACK");client.release(); }
     await verifyInventoryReconciliationAdmissionSchema(fixture.runtime);
   });
-  it("seeks scoped pending admission while retaining the exact twenty/plus-one queue bound", async () => {
+  it.each(["fresh", "aged"] as const)("retains the exact twenty/plus-one queue bound with %s source observations", async age => {
     const tenantId = randomUUID();
     await verifyInventoryReconciliationAdmissionSchema(fixture.runtime);
     for (let index=0;index<21;index++) {
       const principalId = randomUUID();
-      const root = await streamedPackageFixture(fixture.runtime,{ tenantId,principalId },[
-        allowlistedPackage({ id: "admission-package",displayName: "Admission package",isBlocked: false }),
-      ]);
+      const root = age === "fresh"
+        ? await streamedPackageFixture(fixture.runtime,{ tenantId,principalId },[
+          allowlistedPackage({ id: "admission-package",displayName: "Admission package",isBlocked: false }),
+        ])
+        : await nativeInventoryFixture(fixture.runtime, { tenantId, principalId },
+          [{ nativeId: "admission-agent", identifiers: [] }], {
+            observedAt: new Date(Date.now() - 2 * 86_400_000), expiresAt: new Date(Date.now() - 86_400_000),
+          });
       const input = inventoryInput(principalId,"canonical");
       input.scope.tenantId = tenantId;
       if (index<20) await expect(reconcile.request(input,[root])).resolves.toBeDefined();
@@ -211,6 +218,58 @@ describe("durable bounded reconciliation", () => {
     const next = await reconcile.runNext(input, async () => {});
     expect(next).not.toBeNull();
   }, 30_000);
+  it.each([{ nativeCount: 60, packageCount: 60 }, { nativeCount: 1613, packageCount: 1320 }])(
+    "batch-publishes $packageCount catalog packages before optional details finish without per-key rebuilding", async ({ nativeCount, packageCount }) => {
+    const principal = randomUUID(), input = inventoryInput(principal, "canonical");
+    const nativeRows = Array.from({ length: nativeCount }, (_, index) =>
+      native(`native-${String(index).padStart(6, "0")}`, [{ kind: "cds_bot_id", value: randomUUID() }]));
+    const pp = await publish(principal, "power_platform", nativeRows);
+    await reconcile.request(input, [pp]);
+    const initial = (await reconcile.runNext(input, async () => {}))!;
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-base-catalog-before-details-secret");
+    const identity = { ...selectionIdentity, principalId: principal };
+    const before = await queries.capture(identity, initial.scopeId);
+    const previousId = (await queries.sourceReferences(before.id, identity, [{
+      domain: "power_platform", nativeId: nativeRows[0].native_id, environmentId: environment,
+    }]))[0].canonical_id;
+    const packages = Array.from({ length: packageCount }, (_, index) => packageInventoryRecord(allowlistedPackage({
+      id: `base-${String(index).padStart(6, "0")}`, displayName: `Base package ${index}`,
+      isBlocked: false, manifestId: randomUUID(), identityDetailsCollected: false,
+    })));
+    const graph = await publish(principal, "packages", packages);
+    const scope = { tenantId: input.scope.tenantId, principalId: principal };
+    const jobs = new PackageRefreshJobs(fixture.runtime);
+    const detailJob = (await jobs.claimDueDetails(scope, principal))!;
+    expect(detailJob.targetCount).toBe(20);
+    expect(await jobs.markRunning(scope, detailJob.id, true)).toBe(true);
+    let expansions = 0;
+    fixture.runtime.on("acquire", checkpointQueries);
+    const stopObserving = observeQueryWork(value => {
+      if (value.sql.includes("INSERT INTO inventory_candidate_edges")) expansions++;
+    });
+    const started = performance.now();
+    try {
+      await reconcile.request(input, [graph, pp]);
+      await reconcile.runNext(input, async () => {});
+    } finally {
+      stopObserving();
+      fixture.runtime.removeListener("acquire", checkpointQueries);
+    }
+    const selected = await queries.capture(identity, initial.scopeId, { inventoryScope: "catalog" });
+    const page = inventoryPresentation(await queries.page(selected.id, identity));
+    expect(page.counts).toMatchObject({ total: nativeCount + packageCount, scoped: packageCount, filtered: packageCount });
+    expect(page.value.length).toBeGreaterThan(0);
+    expect(page.value.every(row => row.packages.length > 0)).toBe(true);
+    expect(page.sources.graphPackages.state).toBe("available");
+    expect(page.identityCollection?.pendingPackages).toBe(packageCount);
+    expect((await jobs.getJob(scope, detailJob.id))?.status).toBe("running");
+    expect((await queries.sourceReferences(selected.id, identity, [{
+      domain: "power_platform", nativeId: nativeRows[0].native_id, environmentId: environment,
+    }]))[0].canonical_id).toBe(previousId);
+    expect(expansions).toBe(0);
+    process.stdout.write(JSON.stringify({ contract: "catalog-listable-before-details", nativeCount, packageCount,
+      perKeyExpansions: expansions, elapsedMs: performance.now() - started }) + "\n");
+  }, 60_000);
   it("resolves native controls only from the current private canonical vector, never a historical selection", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
     const inventory = new NativeInventory(fixture.runtime), scope = { tenantId: "synthetic-tenant", principalId: principal };

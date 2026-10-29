@@ -178,6 +178,49 @@ describe("streamed package refresh service", () => {
     expect(f.repository.claimDueDetails).not.toHaveBeenCalled();
     expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])("does not let an unrelated automatic check resume a cancelled batch while its collector is stopping (signal=%s)", async withSignal => {
+    const f = fixture({ autoDetails: true }), polling = deferred<void>();
+    pendingCollection(f);
+    f.repository.latestAutomaticDetailsJob.mockImplementation(async () => ({ ...f.job }));
+    f.repository.claimDueDetails.mockResolvedValueOnce(f.job).mockResolvedValue(null);
+    f.repository.markRunning.mockImplementationOnce(async () => { f.job.status = "running"; return true; });
+    f.repository.cancel.mockImplementation(async () => { f.job.status = "cancelled"; return { ...f.job }; });
+    f.dependencies.wait.mockImplementation(async (_milliseconds, signal) => {
+      await polling.promise;
+      signal.throwIfAborted();
+    });
+    try {
+      await f.service.startDetailSync(f.owner);
+      await vi.waitFor(() => expect(f.dependencies.wait).toHaveBeenCalledOnce());
+      await f.service.cancel(f.owner, f.job.id, "delegated");
+      const authorizations = f.dependencies.revalidateUser.mock.calls.length;
+      await expect(f.service.refreshDueDetails(f.owner, undefined, withSignal ? new AbortController().signal : undefined))
+        .resolves.toMatchObject({ id: f.job.id, status: "cancelled" });
+      expect(f.repository.claimDueDetails).toHaveBeenCalledOnce();
+      expect(f.dependencies.revalidateUser).toHaveBeenCalledTimes(authorizations);
+    } finally { polling.resolve(); }
+  });
+
+  it("allows explicit detail resume to claim and publish work after persisted cancellation", async () => {
+    const f = fixture({ autoDetails: true });
+    f.repository.latestAutomaticDetailsJob.mockResolvedValue({ ...f.job, status: "cancelled" });
+    f.repository.claimDueDetails.mockResolvedValue(null).mockImplementationOnce(async () => {
+      f.repository.latestAutomaticDetailsJob.mockImplementation(async () => ({ ...f.job }));
+      return f.job;
+    });
+    f.repository.markRunning.mockImplementationOnce(async () => { f.job.status = "running"; return true; });
+    f.repository.complete.mockImplementationOnce(async () => {
+      f.job.status = "succeeded";
+      f.repository.detailCoverage.mockResolvedValue({ catalog_available: true, total: 40, fresh: 40, eligible: 0 });
+    });
+    await f.service.startDetailSync(f.owner);
+    await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
+    await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({ status: "complete", pending: 0 });
+    expect(f.dependencies.delegatedToken).toHaveBeenCalledOnce();
+    expect(f.streams.exactJob).toHaveBeenCalledOnce();
+  });
+
   it("persists cancellation even when its first batch claim finishes after the cancellation request", async () => {
     const f = fixture({ autoDetails: true }), pending = deferred<typeof f.job>();
     f.repository.claimDueDetails.mockReturnValueOnce(pending.promise);

@@ -253,6 +253,8 @@ The scoped response uses `entitlement=paid_inactive` or `entitlement=no_paid` fr
 
 CSV export pins the displayed `selection.id`, including its report/source revisions and `licenseCohort=active_without_paid` query, and applies company, department, search, response cohort and ordering across **all matching people**, not just the page. Every matching user's agent relationships are exported, including those outside an exact-agent filter. Repeated Users totals are not additive across relationship rows. Export is disabled for invalid thresholds, pending filter reads, unavailable licensing, or failed reads. The pinned report and saved licensing dependencies are revalidated before export publication; an invalidated selection requires reload/retry. Snapshot/query changes and leaving the page abort outstanding reads/exports. Failures have local retry actions; 401/403 failures clear retained private data.
 
+Explicit `copilot_users` export IDs use case-insensitive directory object IDs and are stored lowercase; case-variant duplicates are rejected. Official report usernames and agent IDs remain case-sensitive, including UUID-shaped values.
+
 CSV retains a row for matching people without relationships. Absent Users metrics have `userMetricSource=unknown`; absent relationship response totals are `Unknown`, not inferred zero. Saved-user refreshes invalidate verified entitlement labels and opened details even when the revision returns to an earlier value. Switching Users subviews also closes licensed-user details rather than reopening them on browser-history return.
 
 The signed-in workbench retains at most four inactive first-page reads

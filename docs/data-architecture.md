@@ -29,23 +29,65 @@ the current schema.
 - Principal and source epochs fence revoked authority. Generations stage
   bounded records and child facts, then publish a complete head transactionally.
   Failed or partial collection does not replace the previous complete source.
+- Sign-out advances the principal authorization epoch, revokes sessions and
+  cancels unfinished generations without invalidating complete saved sources.
+  A new authenticated session captures new selections over those retained
+  sources; old selections, exports and writers remain fenced. Explicit source
+  invalidation and destructive resets still retire the affected saved data.
+  Reviewed usage associations can use those retained current native publications
+  after a new sign-in without recollection; source validity and authority-expiry
+  checks still apply.
 - Current directory, app activity, Graph package and Power Platform sources
   publish independently. Canonical inventory reconciles exact supported source
-  identities, never display-name guesses.
+  identities, never display-name guesses. Routine collection is due every six
+  hours; ordinary failed attempts wait one hour, subject to provider backoff.
+  Directory and app-activity retries use the latest attempt's cooldown even when
+  the retained successful publication is less than six hours old.
+  Initial collection, newer-sign-in recovery, changed report inputs and explicit
+  refresh remain independently eligible.
+- Automatic admission and setup readiness verify current, owned, validated saved
+  publications. Historical success markers retain their counts and dates but do
+  not postpone rebuilding missing or invalidated sources. Successful-attempt
+  cadence does not delay this recovery; failed-attempt cooldowns still apply.
+- Validated current source generations remain readable when their observation
+  dates age. Original collection/expiry timestamps are preserved; age describes
+  freshness, not disappearance or renewed provider authority. Replacement,
+  explicit invalidation, privacy deletion and real ownership fences still apply.
 - A saved selection binds its principal, authorization, source roots, revisions
   and expiry. Cursors continue that selection, not a newly captured dataset.
   Unrelated publication does not invalidate every selected view.
   The 16 native-source limit is separate from the 20 selection-pin limit, which
   also accommodates the canonical root and report, directory and people-cache
   dependencies.
+- Source-qualified inventory filters and exact-detail reads share a
+  10,000-character encoded record-ID bound; each decoded native identity remains
+  limited to 512 characters. Facet and responsibility searches are endpoint-local,
+  may be empty, and never change the captured inventory filters.
 - Safe replacement keeps valid pinned reads until their own fences close.
   Revocation, privacy deletion, invalidated source scope and selection expiry
   deny affected reads. Readable retained history never grants mutation authority.
-  Selected reads recheck selection and dependency expiry using the database
-  clock after their callback finishes, before committing the result. A live
-  export can extend the page TTL, but never an expired dependency.
+  Selected reads recheck their lease and actual dependency fences using the
+  database clock after their callback finishes, before committing the result.
+  A live export can extend the page TTL, never revoked authority or an expired
+  execution dependency. Source observation age alone does not close saved reads.
 - Collection, reconciliation, retention and exports use bounded batches and
   existing resource limits. No provider wait owns a database transaction.
+  Background inventory sweeps do not inherit the waking request's credentials;
+  each principal's publication uses its own retained initiating authority.
+  Revocation stops that principal's work without interrupting unrelated retention.
+  Pending canonical reconciliation counts toward its tenant queue limit while
+  its deadline and input epochs remain valid, even when source observations age.
+  Initial and renewed writer leases are capped at the persisted deadline, so
+  expired work stops occupying ingestion admission before its first heartbeat.
+- Agent-person cache writes check cancellation before connection acquisition
+  and recheck cancellation and current caller authority immediately before commit,
+  after their database publication fences and transaction bookkeeping finish.
+- Long-running browser inventory and user syncs silently revalidate the
+  initiating Microsoft identity before role evidence becomes stale. Actual
+  interaction requirements, changed roles and revoked sessions stop collection;
+  bearer assertion freshness is never extended. Finished or orphaned sync runs
+  release their active slot so a subsequent signed-in automatic check can
+  recover eligible sources without a manual resume or replaying a data reset.
 
 Implementation owners:
 [generations](../backend/src/db/dataGenerations.ts),
@@ -53,6 +95,30 @@ Implementation owners:
 [inventory queries](../backend/src/db/inventoryQueries.ts),
 [user sources](../backend/src/db/userSources.ts) and
 [sync coordination](../backend/src/services/dataSync.ts).
+
+## Browser saved-read cache
+
+TanStack Query retains authenticated in-memory Users, overview and adoption
+pages, with a fifteen-minute maximum reuse window and one-hour inactive
+retention. Inventory families and inactive report pages remain bounded; at most
+sixteen inactive report pages are retained. The server read lease, at most ten
+minutes, is always the earlier authority boundary. Expired handles are recaptured
+from PostgreSQL without recollecting providers or blanking the previous rows.
+Focus checks and explicit reloads read saved data, not Microsoft.
+Completed adoption history and its dashboard panels stay mounted while a
+replacement history is collected. Expired display data never supplies selection
+handles to facets, exports or other child reads; those follow the renewed handle.
+
+Transient read failures keep the last successful top-level rows and their real
+error. Account/role/session changes, denied access, invalid data and rejected
+selections withdraw affected evidence. The cache is not persisted through
+logout. Exact details, snapshot inspection, management evidence and volatile
+job/permission/progress reads keep their separate current-read contracts;
+retained display data cannot authorize an export or mutation.
+
+Healthy idle collection checks and inventory health reads run every five minutes.
+First-run and active work use faster status checks; unavailable health retries
+after thirty seconds. Status polling is not provider synchronization.
 
 ## Inventory and provider evidence
 
@@ -62,8 +128,13 @@ counts. Source absence, unavailable metadata, explicit null, zero and false
 must remain distinguishable.
 
 Verification checks every visible member's selected source scope, not only the
-preferred Graph and Power Platform observations. Missing, incomplete, expired or
-future source evidence requires attention even while reconciliation is running.
+preferred Graph and Power Platform observations. Missing, incomplete, invalidated
+or future source evidence requires attention even while reconciliation is running.
+Complete older saved observations remain readable, including their successfully
+collected identity links; elapsed observation dates cannot create duplicate agents
+or convert a completed identity check back into missing data.
+API observations and full-source CSV rows apply the same catalog authority checks:
+detail evidence cannot be current when its catalog observation is not current.
 Healthy superseded sources may be shown as updating, without changing their
 strict current or partial flags.
 
@@ -76,8 +147,16 @@ or an inline provenance/byte-count strip.
 
 Package detail reads reconstruct saved hosts, element types and categories from
 child facts, preserving absent versus empty collections and the source reference
-used for complete About text. Inventory and facet searches share Unicode
+used for complete About text. Detail enrichment preserves catalog-owned summary
+text, including chunked text; incompatible detail reads also retain the prior
+description and sharing collections while marking detail evidence invalidated.
+Inventory and facet searches share Unicode
 normalization and case folding; facet cursors bind the normalized search.
+Package projection retains only own observation fields and copies provenance and
+local annotations so caller mutations cannot alter the projected observation.
+Exact inventory/usage IDs and export/control reference lists are captured before
+asynchronous selection acquisition or batched resolution. Later caller changes
+cannot replace submitted IDs or bypass the exact-request limits.
 
 ### Maker-controlled sharing and captured agent configuration
 

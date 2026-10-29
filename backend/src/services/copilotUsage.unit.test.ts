@@ -970,6 +970,20 @@ describe("Users provider HTTP failure boundaries", () => {
 });
 
 describe("automatic Users source cadence", () => {
+  it.each(["not_collected", "invalidated"] as const)("automatically collects both sources when saved data is %s", async state => {
+    const f = fixture("app_activity", "failed", 16);
+    for (const metadata of Object.values(f.sources)) {
+      Object.assign(metadata, {
+        generationId: null, scopeId: null, revision: null, rowCount: null, state: "unavailable",
+        observedAt: state === "not_collected" ? null : now.toISOString(),
+        attemptedAt: state === "not_collected" ? null : now.toISOString(),
+        attemptStatus: state === "not_collected" ? null : "available",
+      });
+    }
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual(["directory", "app_activity"]);
+  });
+
   it.each([true, false])("refreshes a fresh directory for a changed report without recollecting fresh activity or repeating acknowledged work, automatic: %s", async automatic => {
     const f = fixture("app_activity", "failed", 16);
     for (const source of Object.values(f.sources)) {
@@ -1009,10 +1023,41 @@ describe("automatic Users source cadence", () => {
       .toEqual([source === "directory" ? "app_activity" : "directory"]);
   });
 
-  it.each(["directory", "app_activity"] as const)("retries an ordinary %s failure after 15 minutes", async source => {
-    const f = fixture(source, "failed", 16);
+  it.each(["directory", "app_activity"] as const)("retries an ordinary %s failure after one hour", async source => {
+    const f = fixture(source, "failed", 60);
     await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
     expect(f.refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it.each((["directory", "app_activity"] as const).flatMap(source =>
+    (["failed", "waiting_authorization", "permission_required"] as const).flatMap(status =>
+      [3_600_000 - 1, 3_600_000, 3_600_000 + 1].map(elapsed => ({ source, status, elapsed })),
+    ),
+  ))("retries $source $status with a recent saved generation at the one-hour boundary, elapsed: $elapsed ms", async ({ source, status, elapsed }) => {
+    const f = fixture(source, status, 60);
+    for (const metadata of Object.values(f.sources)) {
+      metadata.observedAt = new Date(now.getTime() - 2 * 60 * 60_000).toISOString();
+    }
+    f.sources[source].attemptedAt = new Date(now.getTime() - elapsed).toISOString();
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source))
+      .toEqual(elapsed >= 3_600_000 ? [source] : []);
+  });
+
+  it.each(["directory", "app_activity"] as const)("does not retry an ordinary %s failure after fifteen minutes", async source => {
+    const f = fixture(source, "failed", 16);
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source))
+      .toEqual([source === "directory" ? "app_activity" : "directory"]);
+  });
+
+  it.each([15, 359, 360])("collects healthy user sources after six hours, not after %i minutes alone", async minutes => {
+    const f = fixture("app_activity", "failed", 60);
+    for (const source of Object.values(f.sources)) {
+      Object.assign(source, { attemptStatus: "available", observedAt: new Date(now.getTime() - minutes * 60_000).toISOString() });
+    }
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+    expect(f.refresh).toHaveBeenCalledTimes(minutes >= 360 ? 2 : 0);
   });
 
   it.each(["waiting_authorization", "permission_required"] as const)("retries %s after the hour boundary", async status => {
@@ -1032,6 +1077,16 @@ describe("automatic Users source cadence", () => {
       publication: denied.publication, automatic: true, signedInAt: now.getTime(),
     });
     expect(denied.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual(["directory"]);
+  });
+
+  it.each(["waiting_authorization", "permission_required"] as const)("preserves sign-in recovery rules for %s with recent saved data", async status => {
+    const f = fixture("app_activity", status, 1);
+    for (const metadata of Object.values(f.sources)) metadata.observedAt = now.toISOString();
+    await f.service.refreshUsers(user, undefined, {
+      publication: f.publication, automatic: true, signedInAt: now.getTime(),
+    });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source))
+      .toEqual(status === "waiting_authorization" ? ["app_activity"] : []);
   });
 
   it("lets an explicit incomplete-source retry bypass automatic authorization cooldown", async () => {

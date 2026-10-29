@@ -18,15 +18,15 @@ export const currentNativeInventorySql = `WITH selected AS (
   CROSS JOIN LATERAL unnest(attempt.resource_types) kind
   WHERE root.current AND root.domain='power_platform' AND root.tenant_id=$1 AND scope.principal_id=$2
     AND scope.token_mode='delegated' AND generation.scope_epoch=scope.epoch
-    AND generation.session_epoch=scope.session_epoch AND generation.session_epoch=principal.epoch
-    AND generation.state='published' AND generation.validated AND generation.expires_at>clock_timestamp()
+    AND generation.session_epoch=scope.session_epoch
+    AND generation.state='published' AND generation.validated
     AND kind=ANY($3::text[])
   ORDER BY kind,(coalesce(attempt.environment_id,'')='') DESC,root.catalog_observed_at DESC NULLS LAST,root.scope_id
 ), native AS (
   SELECT row.* FROM selected root JOIN inventory_memberships member ON member.baseline_id=root.baseline_id
     AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
   JOIN power_platform_record_rows row ON row.generation_id=member.generation_id AND row.identity=member.identity
-    AND row.resource_type=root.kind AND row.expires_at>clock_timestamp()
+    AND row.resource_type=root.kind
 )`;
 export class InventoryIdentityQueries {
   constructor(readonly database: pg.Pool) {}

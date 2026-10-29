@@ -84,16 +84,28 @@ function user(username: string): ReportUser {
 }
 
 describe("official export admission", () => {
-  it("canonicalizes selection and retry UUIDs without folding UUID-shaped report identities", async () => {
+  it.each(["official_users", "official_agents"] as const)("canonicalizes request UUIDs without folding UUID-shaped %s identities", async kind => {
     const selection = "abcdefab-1234-4567-89ab-abcdefabcdef", retry = "fedcbafe-1234-4567-89ab-fedcbafedcba";
     const ids = [selection, selection.toUpperCase()];
-    const saved = context("official_users");
+    const saved = context(kind);
     const { client } = clientWith(async () => { throw new Error("Unexpected SQL"); });
     const read = vi.spyOn(reports, "read").mockImplementation((_id, _identity, work) => work(client, saved));
     const create = vi.spyOn(exports.engine, "create").mockResolvedValue(exportId);
-    await exports.create(identity, { selectionId: selection.toUpperCase(), idempotencyKey: retry.toUpperCase(), kind: "official_users", ids });
+    await exports.create(identity, { selectionId: selection.toUpperCase(), idempotencyKey: retry.toUpperCase(), kind, ids });
     expect(read).toHaveBeenCalledWith(selection, identity, expect.any(Function));
     expect(create).toHaveBeenCalledWith(identity, expect.objectContaining({ selectionId: selection, idempotencyKey: retry, ids }), undefined);
+  });
+
+  it("canonicalizes explicit directory IDs to the stored identity before persistence", async () => {
+    const objectId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    const ids = Object.freeze([objectId.toUpperCase()]);
+    const saved = context("copilot_users");
+    const { client } = clientWith(async () => { throw new Error("Unexpected SQL"); });
+    vi.spyOn(reports, "read").mockImplementation((_id, _identity, work) => work(client, saved));
+    const create = vi.spyOn(exports.engine, "create").mockResolvedValue(exportId);
+    await expect(exports.create(identity, { selectionId, kind: "copilot_users", ids })).resolves.toBe(exportId);
+    expect(create).toHaveBeenCalledWith(identity, expect.objectContaining({ kind: "copilot_users", ids: [objectId] }), undefined);
+    expect(ids).toEqual([objectId.toUpperCase()]);
   });
 
   async function rejectInput(input: unknown) {
@@ -107,6 +119,11 @@ describe("official export admission", () => {
     expect(resolve).not.toHaveBeenCalled();
     expect(create).not.toHaveBeenCalled();
   }
+
+  it("rejects case-variant duplicate directory IDs before selected reads or persistence", async () => {
+    const objectId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    await rejectInput({ selectionId, kind: "copilot_users", ids: [objectId, objectId.toUpperCase()] });
+  });
 
   const fields = { selectionId, kind: "official_users", ids: ["person"], idempotencyKey: exportId };
   it.each(["active", "revoked"])("rejects %s proxy input without invoking its traps", async state => {

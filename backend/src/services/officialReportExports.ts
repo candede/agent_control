@@ -167,7 +167,7 @@ function exportInput(value: unknown): OfficialReportExportRequest {
       if (!property || !Object.hasOwn(property, "value")) throw invalid();
       const id = property.value;
       if (typeof id !== "string" || !id || /[\0\p{Cs}]/u.test(id) || id.length > (kind === "unified_agents" ? 8192 : 512)) throw invalid();
-      ids.push(id);
+      ids.push(kind === "copilot_users" ? id.toLowerCase() : id);
     }
     if (new Set(ids).size !== ids.length) throw invalid();
   }
@@ -228,7 +228,7 @@ function lineage(context: ReportReadContext, kind: "agents" | "users" | "userAge
     [`${kind}SourceFreshness`]: source?.sourceFreshness ?? "unknown" };
 }
 function userRow(user: ReportUser, row: ReportRelationship | null, context: ReportReadContext) {
-  const entitlement = context.metadata.directory.state === "available" ? user.entitlement : null;
+  const entitlement = context.metadata.directory.generationId !== null ? user.entitlement : null;
   return { username: user.username, displayName: user.displayName,
     licenseAssignmentStatus: entitlement === "no_paid" || entitlement === "paid_inactive" ? "no_active_paid_license" : "unavailable",
     entitlement: entitlement ?? "unknown",

@@ -400,7 +400,7 @@ export class LargeTenantUsersReports {
       if (q.username !== undefined) clauses.push(`${endpoint === "copilot_users" ? "reported_username" : "username"}=${add(q.username)}`);
       for (const field of ["company", "department"] as const) if (q[field] !== undefined && field !== omit) clauses.push(`${field} IS NOT DISTINCT FROM ${add(q[field])}::text`);
       for (const [key, column] of [["entitlement", "entitlement"], ["serviceState", "service_state"], ["appActivity", "activity_state"]] as const) if (q[key] !== undefined) clauses.push(`${column}=${add(q[key])}`);
-      if (q.licenseCohort) clauses.push(`${add(context.metadata.directory.state === "available")}::boolean AND entitlement IN ('paid_inactive','no_paid') AND has_activity`);
+      if (q.licenseCohort) clauses.push(`${add(context.metadata.directory.generationId !== null)}::boolean AND entitlement IN ('paid_inactive','no_paid') AND has_activity`);
       if (q.cohort === "licensed") clauses.push("entitlement='paid_active'");
       if (q.cohort === "using_agents") clauses.push("entitlement='paid_active' AND agent_activity_state='active'");
       if (q.cohort === "no_agent_activity") clauses.push("entitlement='paid_active' AND agent_activity_state='none'");
@@ -699,7 +699,7 @@ export class LargeTenantUsersReports {
 
   private summaryQuery(context: ReportReadContext): ReportSql {
     const combined = this.dataset(context, "copilot_users"), params = combined.values;
-    const directoryCurrent = context.metadata.directory.state === "available";
+    const directoryCurrent = context.metadata.directory.generationId !== null;
     const where = directoryCurrent && ["copilot_users", "official_users"].includes(context.endpoint) ? this.filter(context, "copilot_users", params) : "true";
     const counts = `SELECT count(*)::text AS checked,
       count(*) FILTER(WHERE entitlement='paid_active')::text AS licensed,
@@ -731,7 +731,7 @@ export class LargeTenantUsersReports {
   }
   private projectSummary(source: pg.QueryResultRow, context: ReportReadContext): ReportSummary {
     const counts = source.directory_counts as pg.QueryResultRow | null;
-    const n = nullableCount, directoryCurrent = context.metadata.directory.state === "available";
+    const n = nullableCount, directoryCurrent = context.metadata.directory.generationId !== null;
     const total = (kind: "agents" | "users" | "userAgents", value: string | null) => context.report.lineages.some(lineage => lineage.kind === kind)
       ? n(value ?? "0") : null;
     const metrics = [total("agents", source.responses), total("userAgents", source.bridge), total("users", source.users)]
@@ -764,7 +764,7 @@ export class LargeTenantUsersReports {
     if (lease.tenantId !== identity.tenantId) throw new SelectionError("selection_invalidated");
     const owned = await this.database.query(`SELECT 1 FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
       WHERE g.id=$1 AND g.owner=$2 AND g.tenant_id=$3 AND s.principal_id=$4 AND g.session_epoch=$5 AND s.source='directory'`,
-    [lease.id, lease.owner, identity.tenantId, identity.principalId, identity.sessionEpoch]);
+    [lease.id, lease.owner, identity.tenantId, identity.principalId, lease.sessionEpoch]);
     fence();
     if (!owned.rowCount) throw new SelectionError("selection_invalidated");
     let after = { key: "", username: "" };

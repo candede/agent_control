@@ -211,7 +211,7 @@ describe("license evidence read ownership", () => {
     render(<QueryClientProvider client={client}><CopilotUsersView route={route} /><CopilotUsersView route={route} /></QueryClientProvider>);
     const pages = screen.getAllByRole("region", { name: "Users and adoption" }).map(element => within(element));
     fireEvent.click(await pages[0].findByRole("button", { name: "User 1" }));
-    await screen.findByText("Contoso", { selector: "dd" });
+    await within(await screen.findByRole("dialog")).findByText("Contoso");
     expect(readReportPage).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("tab", { name: "Licenses" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());

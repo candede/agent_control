@@ -24,7 +24,7 @@ function context(endpoint: ReportEndpoint = "adoption_departments", input: Repor
     selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1", evaluatedAt: at.toISOString(),
       validatedAt: at.toISOString(), expiresAt: "2026-10-01T00:10:00Z",
       publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
-    metadata: { directory: { ...source("directory"), state: "available", rowCount: 5 }, app_activity: source("app_activity") },
+    metadata: { directory: { ...source("directory"), generationId: "directory-generation", state: "available", rowCount: 5 }, app_activity: source("app_activity") },
     report: { setId: "22222222-2222-4222-8222-222222222222", activeSetId: null, activeRevision: "1",
       historyRevision: "1", historyEpoch: "0", availability: "stale", staleAfterDays: 35, periodAgeDays: 60,
       acceptedAgeDays: 0, reportingPeriod: null, acceptedAt: at.toISOString(), expiresAt: null,
@@ -133,10 +133,11 @@ describe("department participation selected reads", () => {
 
   it.each([
     ["available", "users", true], ["available", "userAgents", true], ["available", "agents", false],
-    ["available", null, false], ["stale", "users", false], ["unavailable", "userAgents", false],
+    ["available", null, false], ["stale", "users", true], ["unavailable", "userAgents", false],
   ] as const)("distinguishes zero from missing evidence for %s / %s", async (state, kind, measured) => {
     const { client, query, saved } = fixture();
     saved.metadata.directory.state = state;
+    if (state === "unavailable") saved.metadata.directory.generationId = null;
     saved.report.lineages = saved.report.lineages.filter(lineage => lineage.kind === kind);
     query.mockResolvedValueOnce(result([{ total: "1", filtered: "1" }]))
       .mockResolvedValueOnce(result([{ ...department(1), active_people: "0" }]));
@@ -260,7 +261,10 @@ describe("organization adoption summaries", () => {
 
   it.each(["directory", "report"] as const)("keeps champions unknown without %s evidence", async missing => {
     const { client, query, saved } = fixture(context("adoption"));
-    if (missing === "directory") saved.metadata.directory.state = "unavailable";
+    if (missing === "directory") {
+      saved.metadata.directory.state = "unavailable";
+      saved.metadata.directory.generationId = null;
+    }
     else saved.report.lineages = [];
     query.mockResolvedValueOnce(result([{ ...summaryRow, directory_counts: null }]));
     expect((await readAdoptionSummary(client, reports, saved)).value[0].champions).toBeNull();

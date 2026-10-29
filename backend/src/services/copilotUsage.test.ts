@@ -167,7 +167,7 @@ describe("live Users orchestration and publication boundary", () => {
   });
   it("honors independent automatic TTLs without external calls for fresh sources", async () => {
     const h = await harness();
-    await h.seed("directory", new Date(Date.now() - 16 * 60000));
+    await h.seed("directory", new Date(Date.now() - 361 * 60000));
     await h.seed("app_activity", new Date(Date.now() - 5 * 3600000));
     h.fetcher.mockClear();
     expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true })).toMatchObject({ status: "succeeded" });

@@ -2,12 +2,16 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { DataSyncRepository, type DataSyncScope } from "./dataSync.js";
-import type { DataSyncRun } from "../types/dataSync.js";
+import { automaticDataSyncSourceIds, type DataSyncRun } from "../types/dataSync.js";
 import type { CopilotDirectoryUser } from "../types/copilotUsage.js";
+import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { publishFixtureDirectory, publishFixtureEmptyActivity } from "../../scripts/userSourceFixture.js";
-import { inventoryBaseline, inventoryInput, refreshInventoryFixture } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations } from "./inventoryGenerations.js";
+import { inventoryBaseline, inventoryInput, refreshInventoryFixture, streamedPackageFixture, nativeInventoryFixture,
+  reconcileInventoryFixture, inventorySelectionFixture } from "../../scripts/inventoryFixtures.js";
+import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { DataGenerations } from "./dataGenerations.js";
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { UserSourcesRepository } from "./userSources.js";
 import { UserSourceStages } from "./userSourceStages.js";
@@ -21,6 +25,7 @@ import { packageInventoryRecord, powerPlatformInventoryRecord } from "../service
 import { seedReportSet } from "../../scripts/officialReportFixtures.js";
 import { OfficialReportImports } from "./officialReportImports.js";
 import { OfficialReportHistory } from "./officialReportHistory.js";
+import { inventoryPresentation } from "../services/inventoryPresentation.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-automatic-source-revision-secret"; });
 
@@ -33,6 +38,10 @@ beforeAll(async () => {
 afterAll(async () => { await fixture?.close(); });
 const owner = (): DataSyncScope => ({ tenantId: randomUUID(), principalId: randomUUID() });
 const identity = (scope: DataSyncScope) => ({ ...selectionIdentity, ...scope });
+async function savedSourcesAvailable(scope: DataSyncScope) {
+  const sources = await repository.listSavedSources(scope);
+  return automaticDataSyncSourceIds.every(id => sources.find(source => source.source === id)?.status === "succeeded");
+}
 async function failure(scope: DataSyncScope, source: "directory" | "app_activity", authorization = false) {
   const error = new AppError(authorization ? 401 : 403, authorization ? "authentication_required" : "permission_required", "Fixture authorization unavailable");
   await expect(new UserSourceStages(fixture.runtime).execute(generationInput({
@@ -40,9 +49,24 @@ async function failure(scope: DataSyncScope, source: "directory" | "app_activity
   }), async () => { throw error; }, { beforePublish: async () => {} })).rejects.toBe(error);
 }
 
-async function complete(scope: DataSyncScope, run: DataSyncRun) {
-  for (const source of run.sources) await repository.updateSource(scope, run.id, source.source,
-    { status: "succeeded", count: 0, message: "Saved empty fixture source.", canRetry: false });
+async function publishSource(scope: DataSyncScope, source: "users" | "graph_packages" | "power_platform", packages: CopilotPackageDetail[] = []) {
+  if (source === "users") {
+    const savedIdentity = { ...identity(scope),
+      sessionEpoch: await new DataGenerations(fixture.runtime).sessionEpoch(scope.tenantId, scope.principalId) };
+    await publishFixtureDirectory(fixture.runtime, savedIdentity, []);
+    await publishFixtureEmptyActivity(fixture.runtime, savedIdentity);
+  } else if (source === "graph_packages") await streamedPackageFixture(fixture.runtime, scope, packages);
+  else await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: [...powerPlatformResourceTypes] });
+}
+
+async function complete(scope: DataSyncScope, run: DataSyncRun, packages: CopilotPackageDetail[] = []) {
+  for (const source of run.sources) {
+    if (source.source === "usage_reports") throw new Error("This fixture completes automatic sources only.");
+    await publishSource(scope, source.source, packages);
+    await repository.updateSource(scope, run.id, source.source,
+      { status: "succeeded", count: source.source === "graph_packages" ? packages.length : 0,
+        message: "Saved fixture source.", canRetry: false });
+  }
 }
 
 describe("session-driven automatic sync admission", () => {
@@ -84,7 +108,7 @@ describe("session-driven automatic sync admission", () => {
       sources: expect.arrayContaining([expect.objectContaining({ source: "graph_packages", status: "succeeded" })]),
     });
     expect((await repository.submitDue(scope)).created).toBe(false);
-    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '61 minutes'
       WHERE run_id=$1 AND source_id IN ('users','power_platform')`, [run!.id]);
     const next = await repository.submitDue(scope);
     expect(next.created).toBe(true);
@@ -108,7 +132,7 @@ describe("session-driven automatic sync admission", () => {
       status: "failed", message: "Collection failed.", canRetry: true,
     });
     await fixture.operator.query(`UPDATE data_sync_runs SET status='running',completed_at=NULL WHERE id=$1`, [run!.id]);
-    await repository.finishAutomatic(scope, run!.id);
+    await repository.finishRun(scope, run!.id);
     expect(await repository.getRun(scope, run!.id)).toMatchObject({ status: "partial", completedAt: expect.any(String) });
   });
 
@@ -129,8 +153,10 @@ describe("session-driven automatic sync admission", () => {
     expect(await repository.automaticRevisions(scope)).toEqual(publication);
     expect(await repository.getRun(owner(), left.run!.id)).toBeUndefined();
     await complete(scope, left.run!);
-    expect(await repository.automaticRevisions(scope)).toEqual(publication);
+    const saved = await repository.automaticRevisions(scope);
+    expect(saved.users).not.toBe(publication.users);
     expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: left.run!.id } });
+    expect(await repository.automaticRevisions(scope)).toEqual(saved);
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_sync_runs
       WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(1);
   });
@@ -173,7 +199,7 @@ describe("session-driven automatic sync admission", () => {
       await repository.updateSource(scope, refresh.run!.id, "users", {
         status, count: null, message: "Fixture directory collection did not finish.", canRetry: true,
       });
-      await repository.finishAutomatic(scope, refresh.run!.id);
+      await repository.finishRun(scope, refresh.run!.id);
       await imports.confirm(principal, await imports.confirmPreview(principal, other.id, "select"));
       expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: refresh.run!.id } });
     },
@@ -340,33 +366,165 @@ describe("session-driven automatic sync admission", () => {
     });
   });
 
-  it("refreshes only sources whose saved success and latest attempt are at least 15 minutes old", async () => {
+  it("retains successful sources at fifteen minutes and refreshes only after six hours", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
     await complete(scope, first.run!);
     await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '16 minutes'
       WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+      WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id]);
+    expect((await repository.submitDue(scope)).created).toBe(false);
+    await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
+      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
     // A recent attempt still prevents a duplicate even when its saved timestamp is older.
     expect((await repository.submitDue(scope)).created).toBe(false);
-    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '6 hours 1 minute'
       WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id]);
     const next = await repository.submitDue(scope);
     expect(next).toMatchObject({ created: true, run: { sources: [{ source: "graph_packages" }] } });
     await complete(scope, next.run!);
   });
 
+  it("automatically rebuilds missing inventory despite recent historical success", async () => {
+    const scope = owner(), generations = new DataGenerations(fixture.runtime);
+    const packages = [allowlistedPackage({ id: "recover-me", displayName: "Recovered agent", isBlocked: false })];
+    const first = await repository.submitDue(scope);
+    await complete(scope, first.run!, packages);
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const details = new PackageRefreshJobs(fixture.runtime);
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect(await details.detailCoverage(scope)).toMatchObject({ catalog_available: true, total: 1 });
+    const history = await repository.listMarkers(scope);
+
+    await generations.revokePrincipal(scope.tenantId, scope.principalId);
+    const roots = await fixture.runtime.query<{ scope_id: string }>(`SELECT root.scope_id FROM inventory_roots root
+      JOIN data_scope_epochs scope ON scope.id=root.scope_id WHERE scope.tenant_id=$1 AND scope.principal_id=$2`,
+    [scope.tenantId, scope.principalId]);
+    const inventory = new InventoryGenerations(fixture.runtime);
+    for (const root of roots.rows) await inventory.gcMetadataSlice(root.scope_id, scope.tenantId);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM inventory_roots root
+      JOIN data_scope_epochs scope ON scope.id=root.scope_id
+      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND root.current`, [scope.tenantId, scope.principalId])).rows[0].n).toBe(0);
+    await publishSource(scope, "users");
+    expect(await savedSourcesAvailable(scope)).toBe(false);
+    expect(await repository.listSavedSources(scope)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: "graph_packages", status: "not_started", count: 1,
+        lastSuccessAt: history.find(source => source.source === "graph_packages")!.lastSuccessAt }),
+      expect.objectContaining({ source: "users", status: "succeeded" }),
+    ]));
+    expect(await details.detailCoverage(scope)).toMatchObject({ catalog_available: false, total: 0 });
+    expect(await repository.listMarkers(scope)).toEqual(history);
+
+    const recovery = await repository.submitDue(scope, Date.now());
+    expect(recovery).toMatchObject({ created: true });
+    expect(recovery.run!.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform"]);
+    expect(await repository.submitDue(scope, Date.now())).toMatchObject({
+      created: false, run: { id: recovery.run!.id },
+    });
+
+    await complete(scope, recovery.run!, packages);
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope);
+    expect(inventoryPresentation(selected.raw).value).toHaveLength(1);
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect(await details.detailCoverage(scope)).toMatchObject({ catalog_available: true, total: 1, fresh: 0, eligible: 1 });
+    const detailJob = await details.claimDueDetails(scope, scope.principalId);
+    expect(detailJob).toMatchObject({ targetCount: 1 });
+    expect((await fixture.runtime.query(`SELECT target_id FROM inventory_refresh_targets
+      WHERE job_id=$1 ORDER BY ordinal`, [detailJob!.id])).rows).toEqual([{ target_id: "recover-me" }]);
+    expect((await repository.submitDue(scope, Date.now())).created).toBe(false);
+  });
+
+  it("keeps retained sources usable across a normal sign-out without recollecting them", async () => {
+    const scope = owner();
+    const first = await repository.submitDue(scope);
+    await complete(scope, first.run!);
+    await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId, { preserveSources: true });
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect((await repository.submitDue(scope, Date.now())).created).toBe(false);
+  });
+
+  it("recognizes complete saved publications without requiring sync-history bookkeeping", async () => {
+    const scope = owner();
+    for (const source of automaticDataSyncSourceIds) await publishSource(scope, source);
+    expect((await repository.listMarkers(scope)).every(source => source.status === "not_started")).toBe(true);
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect((await repository.listSavedSources(scope)).filter(source => source.source !== "usage_reports"))
+      .toEqual(automaticDataSyncSourceIds.map(source => expect.objectContaining({
+        source, status: "succeeded", count: null, lastSuccessAt: null,
+      })));
+  });
+
+  it("keeps dated complete sources usable after a failed later attempt", async () => {
+    const scope = { tenantId: selectionIdentity.tenantId, principalId: randomUUID() };
+    const first = await repository.submitDue(scope);
+    const dated = { observedAt: new Date(Date.now() - 2 * 86_400_000), expiresAt: new Date(Date.now() - 86_400_000) };
+    await publishFixtureDirectory(fixture.runtime, identity(scope), [], dated);
+    await publishFixtureEmptyActivity(fixture.runtime, identity(scope), dated);
+    await inventoryBaseline(new InventoryGenerations(fixture.runtime), scope.principalId, 0, dated.observedAt, dated.expiresAt);
+    await nativeInventoryFixture(fixture.runtime, scope, [], { ...dated, resourceTypes: [...powerPlatformResourceTypes] });
+    for (const source of first.run!.sources) await repository.updateSource(scope, first.run!.id, source.source, {
+      status: "succeeded", count: 0, message: "Saved dated fixture source.", canRetry: false,
+    });
+    await failure(scope, "directory");
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect((await repository.submitDue(scope)).created).toBe(false);
+  });
+
+  it("keeps the failed-attempt cooldown when a saved source is missing", async () => {
+    const scope = owner();
+    const first = await repository.submitDue(scope);
+    await complete(scope, first.run!);
+    const graph = (await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
+      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages' AND selector='complete'`,
+    [scope.tenantId, scope.principalId])).rows[0];
+    await new DataGenerations(fixture.runtime).invalidate(graph.id, scope.tenantId);
+    const failed = await repository.submit(scope, { mode: "incremental", sources: ["graph_packages"] });
+    await repository.updateSource(scope, failed.run.id, "graph_packages", {
+      status: "failed", message: "Provider unavailable.", canRetry: true,
+    });
+    expect(await savedSourcesAvailable(scope)).toBe(false);
+    expect((await repository.submitDue(scope)).created).toBe(false);
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '61 minutes'
+      WHERE run_id=$1`, [failed.run.id]);
+    expect(await repository.submitDue(scope)).toMatchObject({
+      created: true, run: { sources: [{ source: "graph_packages", status: "queued" }] },
+    });
+  });
+
+  it("does not substitute a narrower Power Platform publication for the automatic source", async () => {
+    const scope = owner();
+    const first = await repository.submitDue(scope);
+    await complete(scope, first.run!);
+    const native = (await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
+      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_power_platform' AND selector=$3`,
+    [scope.tenantId, scope.principalId, inventorySelector({ domain: "power_platform", resourceTypes: powerPlatformResourceTypes })])).rows[0];
+    await new DataGenerations(fixture.runtime).invalidate(native.id, scope.tenantId);
+    await nativeInventoryFixture(fixture.runtime, scope, [], {
+      resourceTypes: [powerPlatformResourceTypes[0]], environmentId: "environment-only",
+    });
+    expect(await savedSourcesAvailable(scope)).toBe(false);
+    expect(await repository.submitDue(scope)).toMatchObject({
+      created: true, run: { sources: [{ source: "power_platform", status: "queued" }] },
+    });
+  });
+
   it("backs off permission failures independently while allowing healthy source refresh", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
-    for (const source of first.run!.sources) await repository.updateSource(scope, first.run!.id, source.source,
-      source.source === "users"
+    for (const source of first.run!.sources) {
+      if (source.source !== "users" && source.source !== "usage_reports") await publishSource(scope, source.source);
+      await repository.updateSource(scope, first.run!.id, source.source, source.source === "users"
         ? { status: "permission_required", count: null, message: "Directory permission unavailable.", canRetry: true }
         : { status: "succeeded", count: 0, message: "Saved fixture inventory.", canRetry: false });
-    await repository.finishAutomatic(scope, first.run!.id);
+    }
+    await repository.finishRun(scope, first.run!.id);
     expect(await repository.getRun(scope, first.run!.id)).toMatchObject({ status: "partial" });
-    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-
+      CASE WHEN source_id='users' THEN interval '16 minutes' ELSE interval '6 hours 1 minute' END
       WHERE run_id=$1`, [first.run!.id]);
-    await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '16 minutes'
+    await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
       WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId]);
     const next = await repository.submitDue(scope);
     expect(next.run?.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform"]);
@@ -379,12 +537,13 @@ describe("session-driven automatic sync admission", () => {
   it("retries old authorization failures once after sign-in without bypassing other source cooldowns", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
+    await publishSource(scope, "users");
     for (const source of first.run!.sources) await repository.updateSource(scope, first.run!.id, source.source, {
       status: source.source === "graph_packages" ? "waiting_authorization"
         : source.source === "power_platform" ? "permission_required" : "succeeded",
       count: 0, message: "Fixture result.", canRetry: source.source !== "users",
     });
-    await repository.finishAutomatic(scope, first.run!.id);
+    await repository.finishRun(scope, first.run!.id);
     await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '1 minute'
       WHERE run_id=$1`, [first.run!.id]);
     const signedInAt = Date.now();
@@ -394,7 +553,7 @@ describe("session-driven automatic sync admission", () => {
     await repository.updateSource(scope, next.run!.id, "graph_packages", {
       status: "waiting_authorization", message: "MFA is still required.", canRetry: true,
     });
-    await repository.finishAutomatic(scope, next.run!.id);
+    await repository.finishRun(scope, next.run!.id);
     expect((await repository.submitDue(scope, signedInAt)).created).toBe(false);
   });
 
@@ -413,11 +572,13 @@ describe("session-driven automatic sync admission", () => {
   it("does not reuse an old run's start to bypass a newly retried source's authorization cooldown", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
+    await publishSource(scope, "users");
+    await publishSource(scope, "power_platform");
     for (const source of first.run!.sources) await repository.updateSource(scope, first.run!.id, source.source, {
       status: source.source === "graph_packages" ? "waiting_authorization" : "succeeded",
       count: 0, message: "Fixture result.", canRetry: source.source === "graph_packages",
     });
-    await repository.finishAutomatic(scope, first.run!.id);
+    await repository.finishRun(scope, first.run!.id);
     const signedInAt = Date.now();
     await new Promise(resolve => setTimeout(resolve, 5));
     await repository.retry(scope, first.run!.id, ["graph_packages"]);
@@ -427,7 +588,7 @@ describe("session-driven automatic sync admission", () => {
     await repository.updateSource(scope, first.run!.id, "graph_packages", {
       status: "waiting_authorization", message: "The renewed session still needs interaction.", canRetry: true,
     });
-    await repository.finishAutomatic(scope, first.run!.id);
+    await repository.finishRun(scope, first.run!.id);
     expect(await repository.submitDue(scope, signedInAt)).toMatchObject({ created: false, run: { id: first.run!.id } });
     expect((await fixture.runtime.query(`SELECT attempt_started_at FROM data_sync_run_sources
       WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id])).rows[0].attempt_started_at).toEqual(boundary);
@@ -442,6 +603,8 @@ describe("session-driven automatic sync admission", () => {
   it("allows recovery when an old worker reports its authentication failure after sign-in completes", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
+    await publishSource(scope, "users");
+    await publishSource(scope, "power_platform");
     await repository.updateSource(scope, first.run!.id, "users",
       { status: "succeeded", count: 0, message: "Saved.", canRetry: false });
     await repository.updateSource(scope, first.run!.id, "power_platform",
@@ -449,10 +612,39 @@ describe("session-driven automatic sync admission", () => {
     const signedInAt = Date.now();
     await repository.updateSource(scope, first.run!.id, "graph_packages",
       { status: "waiting_authorization", message: "Old token request finished late.", canRetry: true });
-    await repository.finishAutomatic(scope, first.run!.id);
+    await repository.finishRun(scope, first.run!.id);
     expect(await repository.submitDue(scope, signedInAt)).toMatchObject({
       created: true, run: { sources: [{ source: "graph_packages", status: "queued" }] },
     });
+  });
+
+  it.each(["manual", "automatic"] as const)("releases a finished %s authorization wait for one fresh-sign-in retry", async mode => {
+    const scope = owner();
+    const now = new Date().toISOString();
+    await publishSource(scope, "graph_packages");
+    await publishSource(scope, "power_platform");
+    await repository.recordSuccessMarker(scope, "graph_packages", 0, now);
+    await repository.recordSuccessMarker(scope, "power_platform", 0, now);
+    const first = mode === "manual"
+      ? await repository.submit(scope, { mode: "full", sources: ["users"] })
+      : await repository.submitDue(scope);
+    await repository.updateSource(scope, first.run!.id, "users", {
+      status: "waiting_authorization", count: 2100, message: "Previous authorization expired.", canRetry: true,
+    });
+    expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: first.run!.id, status: "waiting" } });
+    await repository.finishRun(scope, first.run!.id);
+    expect(await repository.getRun(scope, first.run!.id)).toMatchObject({
+      status: "partial", completedAt: expect.any(String),
+      sources: [{ source: "users", status: "waiting_authorization", count: 2100 }],
+    });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const signedInAt = Date.now();
+    const [left, right] = await Promise.all([repository.submitDue(scope, signedInAt), repository.submitDue(scope, signedInAt)]);
+    expect([left.created, right.created].sort()).toEqual([false, true]);
+    expect(left.run?.id).toBe(right.run?.id);
+    expect(left.run).toMatchObject({ automatic: true, mode: "incremental", sources: [{ source: "users", status: "queued" }] });
+    expect((await fixture.runtime.query("SELECT clear_saved_data FROM data_sync_runs WHERE id=$1", [left.run!.id])).rows[0])
+      .toEqual({ clear_saved_data: false });
   });
 
   it("defers to manual work and never clears snapshots or rewrites immutable intent", async () => {

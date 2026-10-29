@@ -40,7 +40,7 @@ describe("fresh workspace health independent of frozen browsing", () => {
     await settle();
     expect(view.result.current.inventory).toEqual(receipt);
     expect(read).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
-    await advance(30_000);
+    await advance(5 * 60_000);
     expect(read).toHaveBeenCalledTimes(2);
   });
 
@@ -141,7 +141,7 @@ describe("fresh workspace health independent of frozen browsing", () => {
     const view = renderHook(useHealth, { initialProps: initial });
     await settle();
     expect(view.result.current.unavailable?.state).toBe("not_collected");
-    await advance(30_000);
+    await advance(1_000);
     expect(view.result.current.unavailable?.state).toBe("preparing");
     await advance(1_000);
     expect(view.result.current.unavailable).toBeUndefined();
@@ -195,7 +195,7 @@ describe("fresh workspace health independent of frozen browsing", () => {
     expect(view.result.current.inventory).toEqual(receipt);
     await advance(25_000);
     expect(read).toHaveBeenCalledTimes(2);
-    await advance(5_000);
+    await advance(5 * 60_000 - 25_000);
     expect(read).toHaveBeenCalledTimes(3);
   });
 
@@ -269,7 +269,7 @@ describe("fresh workspace health independent of frozen browsing", () => {
     await act(async () => pending.resolve(receipt));
     expect(view.result.current.inventory).toEqual(receipt);
     expect(view.result.current.loading).toBe(false);
-    await advance(30_000);
+    await advance(5 * 60_000);
     expect(read).toHaveBeenCalledTimes(3);
   });
 

@@ -13,6 +13,7 @@ import { LiveInventory } from "./liveInventory.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import type { InventoryQuery } from "./inventoryQueries.js";
 import { InventoryGenerations } from "./inventoryGenerations.js";
+import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 
 let database: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { database = await testDatabase(); });
@@ -95,17 +96,19 @@ describe("typed package observation identity and provenance", () => {
     expect((await source.read()).page.verification).toMatchObject({ status: "verified", checks: { packageMetadata: true } });
   });
 
-  it("preserves immutable identity expiry through compaction and splits expired detail-only matches off GET", async () => {
+  it("preserves immutable live expiry through compaction while retaining dated saved identity matches", async () => {
     const source = provider(), environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", botId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     await nativeInventoryFixture(database.runtime, source.scope, [{ nativeId: botId, environmentId,
       identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }] }]);
     source.exact.set("package", { ...packageValue("package"), version: "1",
       elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity",
         definition: JSON.stringify({ SourceIds: { EnvironmentId: environmentId, CdsBotId: botId } }) }] }] });
-    await source.exactPage(["package"], false, new Date(Date.now() - 3_600_000 + 2_500));
+    const observedAt = new Date(Date.now() - automaticDataSyncIntervalMs + 2_500);
+    await source.exactPage(["package"], false, observedAt);
     const before = await source.read();
     expect(before.page.value).toHaveLength(1);
     expect(before.page.value[0].presence).toBe("both");
+    const liveBefore = await new LiveInventory(database.runtime).record(source.scope, before.page.value[0].id);
     const root = (await database.runtime.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
       WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.principal_id=$2`,
@@ -113,6 +116,7 @@ describe("typed package observation identity and provenance", () => {
     const expiry = (await database.runtime.query(`SELECT generation_id,identity,identity_expires_at FROM unified_agent_rows
       WHERE generation_id=$1`, [root.baselineId])).rows[0];
     expect(expiry.identity_expires_at).toBeInstanceOf(Date);
+    expect(expiry.identity_expires_at.getTime()).toBe(observedAt.getTime() + automaticDataSyncIntervalMs);
     await expect(database.operator.query(`UPDATE unified_agent_rows SET identity_expires_at=identity_expires_at+interval '1 hour'
       WHERE generation_id=$1 AND identity=$2`, [expiry.generation_id, expiry.identity])).rejects.toThrow("data_record_immutable");
     const input = inventoryInput(source.scope.principalId, "canonical");
@@ -125,28 +129,32 @@ describe("typed package observation identity and provenance", () => {
     await expect(new LiveInventory(database.runtime).record(source.scope, before.page.value[0].id)).rejects.toMatchObject({ code: "agent_not_found" });
     await reconcileInventoryFixture(database.runtime, source.scope);
     const after = await source.read();
-    expect(after.page.counts.total).toBe(2);
-    expect(after.page.summary).toMatchObject({ linked: 0, graphOnly: 1, powerPlatformOnly: 1 });
-    expect(new Set(after.page.value.map(row => row.id)).size).toBe(2);
+    expect(after.page.counts.total).toBe(1);
+    expect(after.page.summary).toMatchObject({ linked: 1, graphOnly: 0, powerPlatformOnly: 0 });
+    expect(new Set(after.page.value.map(row => row.id)).size).toBe(1);
     expect(after.page.value.filter(row => row.id === before.page.value[0].id)).toHaveLength(1);
-    expect(after.page.identityCollection?.pendingDetails.stale).toBe(1);
+    expect(after.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 0, pendingDetails: { stale: 0 } });
+    await expect(new LiveInventory(database.runtime).record(source.scope, after.page.value[0].id))
+      .resolves.toMatchObject({ id: before.page.value[0].id, native: { observation: liveBefore.native!.observation } });
     expect((await before.queries.page(before.selection.id, before.identity)).counts.total).toBe(1);
   });
-  it("reports time-expired detail evidence as stale in a new selection while retaining its provider catalog", async () => {
+  it("retains dated detail checks without rewriting the provider source", async () => {
     const source = provider();
     source.exact.set("package", { ...packageValue("package"), version: "1",
       elementDetails: [{ elementType: "DeclarativeCopilots", elements: [{ id: "agent", definition: "{}" }] }] });
-    await source.exactPage(["package"], false, new Date(Date.now() - 3600_000 + 2500));
+    const observedAt = new Date(Date.now() - automaticDataSyncIntervalMs + 2500);
+    await source.exactPage(["package"], false, observedAt);
     const before = await source.read();
     expect(before.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 0 });
     const revision = (await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
       WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
     [source.scope.tenantId, source.scope.principalId])).rows[0].revision;
     const expiresAt = Date.parse(before.page.value[0].packages[0].detailFreshness!.expiresAt!);
+    expect(expiresAt).toBe(observedAt.getTime() + automaticDataSyncIntervalMs);
     await expect.poll(() => Date.now() >= expiresAt, { interval: 100, timeout: 3500 }).toBe(true);
     const after = await source.read();
     expect(after.page.value).toHaveLength(1);
-    expect(after.page.identityCollection).toMatchObject({ checkedPackages: 0, pendingPackages: 1, pendingDetails: { stale: 1 } });
+    expect(after.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 0, pendingDetails: { stale: 0 } });
     expect(after.page.value[0].packages[0]).toMatchObject({ detailFreshness: { state: "stale" } });
     expect(after.page.value[0].packages[0]).not.toHaveProperty("identityDetailsCollected", true);
     expect(after.page.freshness?.state).toBe("catching_up");
@@ -158,6 +166,9 @@ describe("typed package observation identity and provenance", () => {
     expect(reconciled.page.value[0].id).toBe(before.page.value[0].id);
     expect(reconciled.page.freshness?.state).toBe("idle");
     await expect(live.record(source.scope, reconciled.page.value[0].id)).resolves.toMatchObject({ id: before.page.value[0].id });
+    expect(reconciled.page.value[0].packages[0].detailFreshness).toMatchObject({
+      state: "stale", observedAt: observedAt.toISOString(), expiresAt: new Date(expiresAt).toISOString(),
+    });
     expect((await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
       WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
     [source.scope.tenantId, source.scope.principalId])).rows[0].revision).toBe(revision);

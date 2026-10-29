@@ -1,9 +1,72 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
-import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportPage } from "../src/test/reportDataFixture";
+import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportPage, reportSelection } from "../src/test/reportDataFixture";
 import { mockLayoutApi } from "./layoutFixtures";
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+
+test("Idle dashboard keeps people and champions visible while expired selections renew without a restart", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.install();
+  const selection = { ...reportSelection(2), expiresAt: new Date(Date.now() + 60_000).toISOString() };
+  const history = reportPage([adoptionSnapshot()], { selection });
+  const summary = { ...adoptionSummaryPage(), selection };
+  const departments = { ...adoptionDepartmentPage(), selection };
+  let resumed = false, obsoleteFacets = 0, summaryReads = 0;
+  let releaseHistory: () => void = () => {}, releaseSummary: () => void = () => {};
+  const pendingHistory = new Promise<void>(resolve => { releaseHistory = resolve; });
+  const pendingSummary = new Promise<void>(resolve => { releaseSummary = resolve; });
+  const fresh = reportSelection(3);
+  await page.route(url => url.pathname === "/api/official-usage/history/adoption", async route => {
+    if (resumed) await pendingHistory;
+    await route.fulfill({ json: { ...history, selection: resumed ? fresh : selection } });
+  });
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/summary", async route => {
+    summaryReads++;
+    if (resumed) await pendingSummary;
+    await route.fulfill({ json: { ...summary, selection: resumed ? fresh : selection } });
+  });
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/departments", route =>
+    route.fulfill({ json: { ...departments, selection: resumed ? fresh : selection } }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/facets", route => {
+    const id = new URL(route.request().url()).searchParams.get("selectionId");
+    if (resumed && id === selection.id) {
+      obsoleteFacets++;
+      return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "Expired handle was collected." } });
+    }
+    return route.fulfill({ json: { value: [{ value: "Contoso", count: 2 }],
+      counts: { total: 1, filtered: 1 }, page: summary.page, selection: resumed ? fresh : selection } });
+  });
+  try {
+    await page.goto("/dashboard");
+    const people = page.getByRole("region", { name: "People and engagement" });
+    const champions = page.getByRole("region", { name: "Agents and champions" });
+    await expect(people.getByText("40,000", { exact: true })).toBeVisible();
+    await expect(champions.getByText("6", { exact: true })).toBeVisible();
+    await expect(page.getByRole("combobox", { name: "Company", exact: true })).toHaveAttribute("aria-disabled", "false");
+    await people.evaluate(element => { element.setAttribute("data-continuity", "original"); });
+    resumed = true;
+    await page.clock.fastForward(40 * 60_000);
+    await expect.poll(() => summaryReads).toBe(2);
+    await expect(people).toHaveAttribute("data-continuity", "original");
+    await expect(people.getByText("40,000", { exact: true })).toBeVisible();
+    await expect(champions.getByText("6", { exact: true })).toBeVisible();
+    releaseHistory();
+    releaseSummary();
+    await expect(page.getByRole("combobox", { name: "Company", exact: true })).toHaveAttribute("aria-disabled", "false");
+    await expect(people).toHaveAttribute("data-continuity", "original");
+    await expect(people.getByText("40,000", { exact: true })).toBeVisible();
+    await expect(champions.getByText("6", { exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Restart selection" })).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    expect(obsoleteFacets).toBe(0);
+    expect(summaryReads).toBe(2);
+    expect(unexpected).toEqual([]);
+  } finally {
+    releaseHistory();
+    releaseSummary();
+  }
+});
 
 test("Dashboard shows historical adoption, preserves baseline and company navigation, and fits desktop and mobile", async ({ page }, testInfo) => {
   const unexpected = await mockLayoutApi(page);

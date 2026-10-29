@@ -9,6 +9,8 @@ import {
 } from "./agentUsageTestSupport.js";
 import { retainRecordData } from "./dataRetention.js";
 import { verifySchema } from "./schema.js";
+import { revokeAccountSessions } from "./sessions.js";
+import type { AgentUsageTarget } from "../types/agentUsageTarget.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(); }, 60_000);
@@ -56,6 +58,41 @@ describe("usage association schema and runtime boundary", () => {
     try { await expect(verifySchema(fixture.runtime)).rejects.toThrow("schema is missing or incomplete"); }
     finally { await fixture.operator.query("ALTER TABLE agent_usage_associations ENABLE TRIGGER advance_agent_usage_revision"); }
     await verifySchema(fixture.runtime);
+  });
+
+  it("allows fresh-session associations to retained Graph and Power Platform sources while fencing signed-out selections", async () => {
+    const scope = newUsageScope();
+    const records = await saveUsageInventory(fixture.runtime, scope, [
+      { packages: ["Package-A"] },
+      { packages: [], native: { nativeId: "Native-A", environmentId: "env-a" } },
+    ]);
+    await publishUsageReports(fixture.runtime, scope);
+    const usage = new OfficialAgentUsage(new LargeTenantUsersReports(fixture.runtime, "synthetic-fixture-selected-report-key", 35));
+    const previousIdentity = await usageIdentity(fixture.runtime, scope);
+    const previousInput = await usageIntent(fixture.runtime, scope);
+    const sourceReferencesSql = `SELECT source,source_generation_id FROM inventory_live_sources
+      WHERE tenant_id=$1 AND principal_id=$2 ORDER BY source,source_generation_id`;
+    const sources = (await fixture.runtime.query(sourceReferencesSql, [scope.tenantId, scope.principalId])).rows;
+    expect(sources).toHaveLength(2);
+
+    await revokeAccountSessions(fixture.runtime, scope.tenantId, scope.principalId);
+    const identity = await usageIdentity(fixture.runtime, scope);
+    expect(identity.sessionEpoch).not.toBe(previousIdentity.sessionEpoch);
+    expect((await fixture.runtime.query(sourceReferencesSql, [scope.tenantId, scope.principalId])).rows).toEqual(sources);
+    await expect(usage.mutate(previousIdentity, records[0].id, previousInput, usageAudit(scope).actor))
+      .rejects.toMatchObject({ code: "selection_invalidated" });
+    const targets: AgentUsageTarget[] = [
+      { source: "graph_packages", packageId: "Package-A" },
+      { source: "power_platform", nativeId: "Native-A", environmentId: "env-a" },
+    ];
+    for (const [index, target] of targets.entries()) {
+      const input = await usageIntent(fixture.runtime, scope, index === 0 ? "Report-A" : "Report-B", target);
+      await usage.mutate(identity, records[index].id, input, usageAudit(scope).actor);
+    }
+    expect((await fixture.runtime.query(`SELECT source FROM agent_usage_associations
+      WHERE tenant_id=$1 ORDER BY source`, [scope.tenantId])).rows).toEqual([
+      { source: "graph_packages" }, { source: "power_platform" },
+    ]);
   });
 
   it("requires exact tenant, active Agents identity and the reviewer's current source in persisted rows", async () => {

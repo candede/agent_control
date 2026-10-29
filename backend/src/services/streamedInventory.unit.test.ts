@@ -168,6 +168,133 @@ describe("package stream request and publication fencing without a database", ()
     expect(f.stream.stages.generations.connections.database.connect).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["fresh", 16_384], ["fresh", 16_385], ["fresh", 24_576],
+    ["stale", 16_384], ["stale", 16_385], ["stale", 24_576],
+  ] as const)("retains %s detail descriptions at %i bytes across compatible catalog publication", async (state, bytes) => {
+    const catalog = allowlistedPackage({
+      id: "package", displayName: "Package", isBlocked: false, version: "1",
+      lastModifiedDateTime: "2026-09-24T08:00:00Z", shortDescription: "Current catalog summary",
+      longDescription: "Catalog text must not replace the completed detail observation",
+    });
+    const longDescription = "Saved detail description. ".repeat(1000).slice(0, bytes);
+    const f = savedPackageFixture({
+      ...catalog, longDescription, categories: ["productivity"], identityDetailsCollected: true,
+      detailFreshness: { state, observedAt: "2026-09-24T09:30:00Z",
+        expiresAt: state === "fresh" ? "2026-09-24T10:30:00Z" : "2026-09-24T09:59:59Z" },
+    });
+    expect(f.previous.facts.filter(fact => fact.kind === "about:long"))
+      .toHaveLength(bytes > 16_384 ? Math.ceil(bytes / 8192) : 0);
+    await f.stream.packageObservation(f.lease, catalog, "catalog");
+    const record = f.append.mock.calls[0][1][0];
+    const copied = f.previous.facts.filter(fact => fact.kind === "collection"
+      ? record.factSource?.includeCollections?.includes(fact.value) : record.factSource?.kinds.includes(fact.kind));
+    const restored = restoreInventoryRecord(record.residual, [...record.facts, ...copied], "packages");
+    expect(restored.longDescription).toHaveLength(longDescription.length);
+    expect(restored).toMatchObject({
+      longDescription, shortDescription: catalog.shortDescription, categories: ["productivity"],
+      detailFreshness: { state },
+    });
+    expect(f.stream.stages.generations.connections.database.query).not.toHaveBeenCalled();
+    expect(f.stream.stages.generations.connections.database.connect).not.toHaveBeenCalled();
+  });
+
+  it.each(["detail", "exact"] as const)("lets a new %s read replace or omit a saved detail description", async channel => {
+    const catalog = allowlistedPackage({
+      id: "package", displayName: "Package", isBlocked: false, version: "1",
+      lastModifiedDateTime: "2026-09-24T08:00:00Z",
+    });
+    const f = savedPackageFixture({
+      ...catalog, longDescription: "Previous detail description. ".repeat(800), identityDetailsCollected: true,
+      detailFreshness: { state: "fresh", observedAt: "2026-09-24T09:30:00Z", expiresAt: "2026-09-24T10:30:00Z" },
+    });
+    for (const longDescription of [undefined, "", "Replacement detail description"]) {
+      await f.stream.packageObservation(f.lease, { ...catalog, longDescription }, channel);
+      const record = f.append.mock.calls.at(-1)![1][0];
+      expect(record.factSource?.kinds ?? []).not.toContain("about:long");
+      expect(restoreInventoryRecord(record.residual, record.facts, "packages").longDescription).toBe(longDescription);
+    }
+  });
+
+  it.each([
+    ["compatible", 16_384], ["compatible", 16_385], ["compatible", 24_576],
+    ["invalidated", 16_384], ["invalidated", 16_385], ["invalidated", 24_576],
+  ] as const)("retains catalog-owned descriptions and collections after a %s detail read at %i bytes", async (state, bytes) => {
+    const principals = [{ resourceId: "catalog-user", resourceType: "user" }];
+    const latestPrincipals = [{ resourceId: "detail-group", resourceType: "group" }];
+    const catalog = allowlistedPackage({
+      id: "package", displayName: "Catalog name", isBlocked: false, version: "1",
+      lastModifiedDateTime: "2026-09-24T08:00:00Z",
+      shortDescription: "s".repeat(bytes), longDescription: "l".repeat(bytes),
+      availableTo: "some", deployedTo: "some", categories: ["catalog-category"],
+      allowedUsersAndGroups: principals, acquireUsersAndGroups: principals, sharedWithUsersAndGroups: principals,
+    });
+    const f = savedPackageFixture(catalog);
+    await f.stream.packageObservation(f.lease, {
+      ...catalog, version: state === "compatible" ? "1" : "2",
+      displayName: "Detail name", isBlocked: true, shortDescription: "Detail summary",
+      longDescription: "Detail description", categories: ["detail-category"],
+      allowedUsersAndGroups: latestPrincipals, acquireUsersAndGroups: latestPrincipals,
+      sharedWithUsersAndGroups: latestPrincipals,
+    }, "detail");
+    const record = f.append.mock.calls[0][1][0];
+    const copied = f.previous.facts.filter(fact => record.factSource?.kinds.includes(fact.kind)
+      && (fact.kind !== "collection" || record.factSource.includeCollections?.includes(fact.value)));
+    const restored = restoreInventoryRecord(record.residual, [...record.facts, ...copied], "packages");
+    const expectedLongDescription = state === "compatible" ? "Detail description" : catalog.longDescription;
+    expect(restored.shortDescription).toHaveLength(bytes);
+    expect(restored.shortDescription).toBe(catalog.shortDescription);
+    expect(restored.longDescription).toHaveLength(expectedLongDescription!.length);
+    expect(restored.longDescription).toBe(expectedLongDescription);
+    expect(restored).toMatchObject({
+      displayName: catalog.displayName, isBlocked: catalog.isBlocked,
+      categories: state === "compatible" ? ["detail-category"] : catalog.categories,
+      allowedUsersAndGroups: state === "compatible" ? latestPrincipals : principals,
+      acquireUsersAndGroups: state === "compatible" ? latestPrincipals : principals,
+      sharedWithUsersAndGroups: state === "compatible" ? latestPrincipals : principals,
+      detailFreshness: { state: state === "compatible" ? "fresh" : "invalidated" },
+    });
+    expect(f.stream.stages.generations.connections.database.query).not.toHaveBeenCalled();
+    expect(f.stream.stages.generations.connections.database.connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { sharedWithUsersAndGroups: undefined },
+    { sharedWithUsersAndGroups: [] },
+    { sharedWithUsersAndGroups: [{ resourceId: "catalog-user", resourceType: "user" }] },
+  ])(
+    "preserves absent versus empty catalog sharing after incompatible detail enrichment (%j)", async ({ sharedWithUsersAndGroups }) => {
+      const catalog = allowlistedPackage({
+        id: "package", displayName: "Package", isBlocked: false, version: "1",
+        lastModifiedDateTime: "2026-09-24T08:00:00Z", sharedWithUsersAndGroups,
+      });
+      const f = savedPackageFixture(catalog);
+      await f.stream.packageObservation(f.lease, { ...catalog, version: "2", sharedWithUsersAndGroups: [] }, "detail");
+      const record = f.append.mock.calls[0][1][0];
+      const copied = f.previous.facts.filter(fact => record.factSource?.kinds.includes(fact.kind)
+        && (fact.kind !== "collection" || record.factSource.includeCollections?.includes(fact.value)));
+      const restored = restoreInventoryRecord(record.residual, [...record.facts, ...copied], "packages");
+      expect(restored.sharedWithUsersAndGroups).toEqual(sharedWithUsersAndGroups);
+      expect(record.residual.detailFreshness).toMatchObject({ state: "invalidated" });
+    },
+  );
+
+  it("does not retain an incompatible revision's detail description during catalog publication", async () => {
+    const catalog = allowlistedPackage({
+      id: "package", displayName: "Package", isBlocked: false, version: "1",
+      lastModifiedDateTime: "2026-09-24T08:00:00Z",
+    });
+    const f = savedPackageFixture({
+      ...catalog, longDescription: "Previous revision description. ".repeat(800), identityDetailsCollected: true,
+      detailFreshness: { state: "fresh", observedAt: "2026-09-24T09:30:00Z", expiresAt: "2026-09-24T10:30:00Z" },
+    });
+    await f.stream.packageObservation(f.lease, { ...catalog, version: "2" }, "catalog");
+    const record = f.append.mock.calls[0][1][0];
+    expect(record.factSource?.kinds ?? []).not.toContain("about:long");
+    expect(restoreInventoryRecord(record.residual, record.facts, "packages")).not.toHaveProperty("longDescription");
+    expect(record.residual.detailFreshness).toMatchObject({ state: "invalidated" });
+  });
+
   it.each(["stale", "invalidated", "fresh", "missing"] as const)(
     "preserves valid completed-empty %s detail provenance during catalog publication", async state => {
       const catalog = allowlistedPackage({
@@ -183,7 +310,8 @@ describe("package stream request and publication fencing without a database", ()
       const record = f.append.mock.calls[0][1][0];
       expect(record.residual.detailFreshness).toEqual(f.previous.residual.detailFreshness);
       expect(record.detail_generation).toBe(state === "missing" ? null : "detail");
-      expect(record.residual).not.toHaveProperty("identityDetailsCollected");
+      if (state === "stale") expect(record.residual.identityDetailsCollected).toBe(true);
+      else expect(record.residual).not.toHaveProperty("identityDetailsCollected");
       expect(record.facts.some(fact => fact.kind.startsWith("match:"))).toBe(false);
     },
   );

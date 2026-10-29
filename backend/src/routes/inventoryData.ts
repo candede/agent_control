@@ -25,6 +25,10 @@ function scalar(value: unknown, name: string, maximum = 4096) {
   return value;
 }
 
+function searchScalar(value: unknown) {
+  return value === "" ? value : scalar(value, "search", 256);
+}
+
 export function createInventoryDataRouter(database: pg.Pool) {
   const router = Router();
   const inventory = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, undefined,
@@ -32,7 +36,9 @@ export function createInventoryDataRouter(database: pg.Pool) {
   const filterFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
     "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher", "availableTo", "host", "platform",
     "createdWithinDays", "sortBy", "sortDirection"];
-  const facetFields = ["type", "publisher", "availableTo", "host", "platform"];
+  const queryFieldMaximums: Record<string, number> = {
+    recordId: 10_000, type: 4104, publisher: 4104, availableTo: 4104, host: 4104, platform: 4104,
+  };
   async function capture(identity: SelectionIdentity, query: InventoryQuery) {
     const root = (await database.query(`SELECT s.id,EXISTS(SELECT 1 FROM inventory_roots r
       JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
@@ -48,10 +54,10 @@ export function createInventoryDataRouter(database: pg.Pool) {
       WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_canonical'
         AND s.token_mode='delegated' AND s.selector='complete'`, [identity.tenantId, identity.principalId])).rows[0];
     if (!root || !root.published) {
-      const unavailable: UnifiedAgentInventoryUnavailable = root?.previously_published
-        ? { state: "unavailable", message: "The saved agent inventory is no longer available. Reload saved data or open Sync to collect a new inventory." }
-        : root?.preparing
-          ? { state: "preparing", message: "The first saved agent inventory is being prepared. Results will appear when it is ready. Open Sync to review collection progress." }
+      const unavailable: UnifiedAgentInventoryUnavailable = root?.preparing
+        ? { state: "preparing", message: "Synced agents are being published to the inventory. Results will appear automatically." }
+        : root?.previously_published
+          ? { state: "unavailable", message: "The saved agent inventory is no longer available. Reload saved data or open Sync to collect a new inventory." }
           : { state: "not_collected", message: "No saved agent inventory is available yet. Automatic collection will populate it when authorized, or open Sync to collect it." };
       return unavailable;
     }
@@ -66,7 +72,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     }
     for (const [key, value] of Object.entries(body.query)) {
       if (!filterFields.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported inventory query field: ${key}.`);
-      scalar(value, key, facetFields.includes(key) ? 4104 : 4096);
+      scalar(value, key, queryFieldMaximums[key]);
     }
     const { limit: _limit, ...query } = unifiedAgentInventoryQuery(body.query);
     return query;
@@ -155,10 +161,11 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const allowed = ["selectionId", "limit", "cursor", ...extra, ...dependent ? [] : filterFields];
     for (const [key, value] of Object.entries(request.query)) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported inventory query field: ${key}.`);
-      scalar(value, key, facetFields.includes(key) ? 4104 : 4096);
+      if (key === "search" && (dependent || unfiltered)) searchScalar(value);
+      else scalar(value, key, queryFieldMaximums[key]);
     }
     // Responsibility pages always order/search people; their capture owns that dependency.
-    const query = unifiedAgentInventoryQuery(unfiltered ? { sortBy: "owner" } : request.query);
+    const query = unifiedAgentInventoryQuery(unfiltered ? { sortBy: "owner" } : dependent ? {} : request.query);
     if (request.query.offset !== undefined) throw new AppError(400, "invalid_inventory_query", "Use selectionId and cursor, not offset.");
     const limit = request.query.limit === undefined ? 50 : Number(scalar(request.query.limit, "limit", 3));
     if (request.query.limit !== undefined && !/^[1-9]\d{0,2}$/.test(String(request.query.limit))
@@ -208,7 +215,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     }
     const field = scalar(request.query.field, "field", 32) as Parameters<InventoryQueries["facets"]>[2];
     response.json(await inventory.facets(read.id, read.identity, field, { ...read.options,
-      search: request.query.search === undefined ? undefined : scalar(request.query.search, "search", 256),
+      search: request.query.search === undefined ? undefined : searchScalar(request.query.search),
       selected: request.query.selected === "true" }));
   });
   policyRoute(router, "get", "/agents/:id/detail", {
@@ -236,7 +243,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
   }, async (request, response) => {
     const read = await selected(request, true);
     const page = inventoryPresentation(await inventory.page(read.id, read.identity, {
-      limit: 2, recordId: scalar(request.params.recordId, "recordId", 8192),
+      limit: 2, recordId: scalar(request.params.recordId, "recordId", queryFieldMaximums.recordId),
     }));
     if (!page.value.length) throw new AppError(404, "inventory_record_not_found", "The selected inventory record is unavailable.");
     if (page.value.length > 1 || page.page?.nextCursor) throw new AppError(409, "inventory_identity_ambiguous", "The exact source reference has multiple selected memberships.");
@@ -289,7 +296,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const allowed = ["mode", "selectionId", "cursor", "limit", ...filterFields];
     for (const [key, value] of Object.entries(request.query)) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported package query field: ${key}.`);
-      scalar(value, key, facetFields.includes(key) ? 4104 : 4096);
+      scalar(value, key, queryFieldMaximums[key]);
     }
     const read = await packageReader(request, request.query.mode);
     const { mode, identity, packages } = read;

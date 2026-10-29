@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type pg from "pg";
 import { AppError } from "../errors.js";
 import {
+  automaticDataSyncIntervalMs,
+  automaticDataSyncRetryIntervalMs,
   automaticDataSyncSourceIds,
   dataSyncSourceIds,
   type DataSyncMode,
@@ -14,6 +16,8 @@ import {
 import { pool, transaction } from "./pool.js";
 import { readAutomaticInventoryRevisions } from "./inventoryAutomaticRevisions.js";
 import { directoryNeedsReportRefresh } from "./officialReportStatus.js";
+import { inventorySelector } from "./inventoryGenerations.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
 export type UserSourcePublication = { runId: string; jobId: string };
@@ -61,6 +65,35 @@ const retryableSourceStates = new Set<DataSyncSourceState>([
   "waiting_authorization", "permission_required", "partial", "failed", "cancelled",
 ]);
 
+const automaticPowerPlatformSelector = inventorySelector({ domain: "power_platform", resourceTypes: powerPlatformResourceTypes });
+const savedAutomaticSourcesSql = `
+  SELECT requested.source_id,CASE WHEN requested.source_id='users' THEN NOT EXISTS (
+    SELECT 1 FROM (VALUES('directory'),('app_activity')) required(source)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM data_scope_epochs scope
+      JOIN data_generation_heads head ON head.scope_id=scope.id
+      JOIN data_generations generation ON generation.id=head.generation_id AND generation.scope_id=scope.id
+      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.scope_kind='principal'
+        AND scope.token_mode='delegated' AND scope.source=required.source AND scope.selector='complete'
+        AND generation.state='published' AND generation.validated
+        AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
+        AND EXISTS(SELECT 1 FROM user_source_attempts proof
+          WHERE proof.generation_id=generation.id AND proof.status='available')
+    )
+  ) ELSE EXISTS (
+    SELECT 1 FROM data_scope_epochs scope
+    JOIN inventory_roots root ON root.scope_id=scope.id AND root.current AND root.catalog_complete
+    JOIN inventory_revisions revision ON revision.scope_id=root.scope_id
+      AND revision.baseline_id=root.baseline_id AND revision.revision=root.revision
+    JOIN data_generations generation ON generation.id=revision.generation_id AND generation.scope_id=scope.id
+    WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.scope_kind='principal' AND scope.token_mode='delegated'
+      AND scope.source=CASE requested.source_id WHEN 'graph_packages' THEN 'inventory_packages'
+        WHEN 'power_platform' THEN 'inventory_power_platform' END
+      AND scope.selector=CASE requested.source_id WHEN 'graph_packages' THEN 'complete' ELSE $4::text END
+      AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
+      AND generation.validated AND generation.state IN ('published','retired')
+  ) END AS available FROM unnest($3::text[]) requested(source_id)`;
+
 export class DataSyncRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
@@ -80,7 +113,7 @@ export class DataSyncRepository {
       }
       const reportChanged = await directoryNeedsReportRefresh(client, scope);
       const due = await client.query<{ source_id: DataSyncSourceId }>(`
-        SELECT requested.source_id FROM unnest($3::text[]) requested(source_id)
+        SELECT requested.source_id FROM (${savedAutomaticSourcesSql}) requested
         LEFT JOIN data_sync_success_markers marker
           ON marker.tenant_id=$1 AND marker.principal_id=$2 AND marker.source_id=requested.source_id
         LEFT JOIN LATERAL (
@@ -89,15 +122,18 @@ export class DataSyncRepository {
           WHERE source.tenant_id=$1 AND source.principal_id=$2 AND source.source_id=requested.source_id
           ORDER BY source.updated_at DESC LIMIT 1
         ) attempt ON true
-        WHERE ((marker.last_success_at IS NULL OR marker.last_success_at<=clock_timestamp()-interval '15 minutes'
-            OR requested.source_id='users' AND $5::boolean)
-          AND (attempt.updated_at IS NULL OR requested.source_id='users' AND $5::boolean AND attempt.status='succeeded'
+        WHERE ((NOT requested.available OR marker.last_success_at IS NULL
+            OR marker.last_success_at<=clock_timestamp()-$7::double precision*interval '1 millisecond'
+            OR requested.source_id='users' AND $6::boolean)
+          AND (attempt.updated_at IS NULL OR attempt.status='succeeded'
+              AND (NOT requested.available OR requested.source_id='users' AND $6::boolean)
             OR attempt.updated_at<=clock_timestamp()-
-            CASE WHEN attempt.status IN ('permission_required','waiting_authorization') THEN interval '1 hour'
-              ELSE interval '15 minutes' END))
-          OR (attempt.status='waiting_authorization' AND attempt.attempt_started_at<$4::timestamptz)
+            CASE WHEN attempt.status='succeeded' THEN $7::double precision*interval '1 millisecond'
+              ELSE $8::double precision*interval '1 millisecond' END))
+          OR (attempt.status='waiting_authorization' AND attempt.attempt_started_at<$5::timestamptz)
         ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, automaticDataSyncSourceIds,
-        signedInAt === undefined ? null : new Date(signedInAt), reportChanged]);
+        automaticPowerPlatformSelector, signedInAt === undefined ? null : new Date(signedInAt), reportChanged,
+        automaticDataSyncIntervalMs, automaticDataSyncRetryIntervalMs]);
       if (!due.rows.length) return { run: (await readLatestRun(client, scope)) ?? null, created: false };
       const id = randomUUID();
       const sources = due.rows.map(row => row.source_id);
@@ -111,17 +147,38 @@ export class DataSyncRepository {
     return readAutomaticInventoryRevisions(scope, this.database);
   }
 
-  async finishAutomatic(scope: DataSyncScope, runId: string) {
+  async listSavedSources(scope: DataSyncScope): Promise<DataSyncSourceStatus[]> {
+    validateScope(scope);
+    const [markers, availability] = await Promise.all([
+      this.listMarkers(scope),
+      this.database.query<{ source_id: DataSyncSourceId; available: boolean }>(savedAutomaticSourcesSql,
+        [scope.tenantId, scope.principalId, automaticDataSyncSourceIds, automaticPowerPlatformSelector]),
+    ]);
+    return markers.map(marker => {
+      if (marker.source === "usage_reports") return marker;
+      const saved = availability.rows.find(source => source.source_id === marker.source);
+      if (!saved) throw new Error("data_sync_saved_source_availability_missing");
+      if (saved.available) return marker.status === "succeeded" ? marker : {
+        ...marker, status: "succeeded", message: "A complete saved source is available.",
+      };
+      return { ...marker, status: "not_started",
+        message: marker.lastSuccessAt
+          ? "The previously saved source is no longer available. Automatic sync will collect it again."
+          : marker.message };
+    });
+  }
+
+  async finishRun(scope: DataSyncScope, runId: string) {
     validateScope(scope);
     await transaction(this.database, async client => {
       await lockScope(client, scope);
       const active = await client.query(`SELECT id FROM data_sync_runs
-        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND automatic AND status IN ('running','waiting') FOR UPDATE`,
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting') FOR UPDATE`,
       [runId, scope.tenantId, scope.principalId]);
       if (!active.rowCount) return;
       await finalizeDataSyncRun(client, scope, runId);
       await client.query(`UPDATE data_sync_runs run SET status='partial',completed_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND automatic AND status='waiting'
+        WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='waiting'
           AND NOT EXISTS (SELECT 1 FROM data_sync_run_sources source WHERE source.run_id=run.id AND source.status IN ('queued','running'))`,
       [runId, scope.tenantId, scope.principalId]);
     });
@@ -276,7 +333,8 @@ export class DataSyncRepository {
         FROM data_sync_runs run
         WHERE source.run_id=$1 AND source.tenant_id=$2 AND source.principal_id=$3 AND source.source_id=$4
           AND run.id=source.run_id AND run.tenant_id=source.tenant_id AND run.principal_id=source.principal_id
-          AND run.status IN ('running','waiting')
+          AND (run.status IN ('running','waiting')
+            OR run.status='partial' AND source.source_id='usage_reports' AND source.status='awaiting_upload' AND $5='succeeded')
           AND run.expires_at>clock_timestamp()
           AND source.status<>'succeeded'
           AND ($6::uuid IS NULL OR source.job_id IS NULL OR source.job_id=$6::uuid)
@@ -507,8 +565,10 @@ export async function finalizeDataSyncRun(client: pg.PoolClient, scope: DataSync
           : "partial";
   const terminal = ["completed", "partial", "cancelled"].includes(status);
   await client.query(`UPDATE data_sync_runs SET status=$4,updated_at=clock_timestamp(),
-      completed_at=CASE WHEN $5 THEN COALESCE(completed_at,clock_timestamp()) ELSE NULL END
-    WHERE id=$1 AND tenant_id=$2 AND principal_id=$3`,
+      completed_at=CASE WHEN $5 THEN
+        CASE WHEN status='partial' THEN clock_timestamp() ELSE COALESCE(completed_at,clock_timestamp()) END ELSE NULL END
+    WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
+      AND (status IN ('running','waiting') OR status='partial' AND $4='completed')`,
   [runId, scope.tenantId, scope.principalId, status, terminal]);
 }
 

@@ -217,7 +217,8 @@ describe("exact selected snapshot inspection", () => {
       });
       if (boundary === "expiry") {
         expect(pageSignal?.aborted).toBe(false);
-        expect(facetSignal?.aborted).toBe(false);
+        expect(facetSignal?.aborted).toBe(true);
+        expect(api.readReportFacet).toHaveBeenCalledOnce();
         expect(detailSignal?.aborted).toBe(false);
         expect(exportSignal?.aborted).toBe(false);
         expect(screen.getByRole("region", { name: "Snapshot tenant totals" })).toBeVisible();
