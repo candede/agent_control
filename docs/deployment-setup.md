@@ -374,6 +374,13 @@ must include a source-bound `images.mcp` identity when MCP is configured.
 - Git and a checkout of this repository
 - An Entra administrator who can register applications and grant consent
 
+On Windows, use the same `deploy-local.ps1` script with PowerShell 7 and Docker
+Desktop configured for Linux containers. The script does not require an elevated
+PowerShell session. Protected directories grant the current Windows account
+access to their child folders and files; individual secret files remain private
+to that account. Retry a failed first start with ordinary `start`, without
+`-DbReset` or deleting saved configuration.
+
 ## Configure the Entra application
 
 Complete these steps once for the tenant. The local configuration runs on

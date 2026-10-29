@@ -242,6 +242,52 @@ function Assert-ConfigUnchanged {
     }
 }
 try {
+    $protectedDirectory=Join-Path $testRoot 'protected-paths'
+    $existingDirectory=Join-Path $protectedDirectory 'source'
+    $existingFile=Join-Path $existingDirectory 'existing.txt'
+    [IO.Directory]::CreateDirectory($existingDirectory) | Out-Null
+    [IO.File]::WriteAllText($existingFile,'existing')
+    Protect-LocalPath $protectedDirectory -Directory
+    Assert-True ([IO.File]::ReadAllText($existingFile) -ceq 'existing') 'Protecting a parent made its existing source files unreadable.'
+    [IO.File]::AppendAllText($existingFile,'-updated')
+    Assert-True ([IO.File]::ReadAllText($existingFile) -ceq 'existing-updated') 'Protecting a parent made its existing source files unwritable.'
+    $newDirectory=Join-Path $existingDirectory 'new/nested'
+    [IO.Directory]::CreateDirectory($newDirectory) | Out-Null
+    $newFile=Join-Path $newDirectory 'new.txt'
+    [IO.File]::WriteAllText($newFile,'new')
+    Protect-LocalPath $protectedDirectory -Directory
+    Assert-True ([IO.File]::ReadAllText($newFile) -ceq 'new') 'Reapplying parent protection removed access to newly created descendants.'
+    $protectedFile=Join-Path $newDirectory 'secret.txt'
+    Write-LocalText $protectedFile 'synthetic-protected-value'
+    Write-LocalText $protectedFile 'synthetic-replacement-value'
+    Assert-True ([IO.File]::ReadAllText($protectedFile) -ceq 'synthetic-replacement-value') 'Protected descendant secrets could not be atomically replaced.'
+    if ($IsWindows) {
+        $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+        $inheritance=[Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        foreach ($path in @($protectedDirectory,$protectedFile)) {
+            $acl=Get-Acl -LiteralPath $path
+            $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            Assert-True $acl.AreAccessRulesProtected 'Protected Windows paths retained inherited permissions.'
+            Assert-True ($rules.Count -eq 1 -and $rules[0].IdentityReference.Value -ceq $sid.Value -and
+                $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                $rules[0].FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) 'Protected Windows paths did not restrict full control to the current account.'
+            $expectedInheritance=if ($path -ceq $protectedDirectory) { $inheritance } else { [Security.AccessControl.InheritanceFlags]::None }
+            Assert-True ($rules[0].InheritanceFlags -eq $expectedInheritance) 'Windows directory and file permission inheritance was incorrect.'
+        }
+        foreach ($path in @($existingDirectory,$existingFile,$newDirectory,$newFile)) {
+            $acl=Get-Acl -LiteralPath $path
+            $rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+            Assert-True ($rules.Count -eq 1 -and $rules[0].IsInherited -and
+                $rules[0].IdentityReference.Value -ceq $sid.Value -and
+                $rules[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+                $rules[0].FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) 'Existing or new Windows descendants did not inherit private full control.'
+        }
+    } else {
+        Assert-True ([int][IO.File]::GetUnixFileMode($protectedDirectory) -eq 448) 'Protected directory permissions are not 0700.'
+        Assert-True ([int][IO.File]::GetUnixFileMode($protectedFile) -eq 384) 'Protected secret permissions are not 0600.'
+    }
+    Remove-Item -LiteralPath $protectedDirectory -Recurse -Force
+    Assert-True (-not (Test-Path -LiteralPath $protectedDirectory)) 'Protected source descendants could not be cleaned up.'
     Assert-True (@(Get-FixtureFailureMessages $null).Count -eq 0) 'Successful fixture receipt contains a failure.'
     $primary=[Exception]::new('Fixture workload failed: exit=17, OOMKilled=False.')
     Assert-True (@(Get-FixtureFailureMessages $primary)[0] -ceq $primary.Message) 'Fixture receipt lost its primary failure.'

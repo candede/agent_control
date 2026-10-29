@@ -143,7 +143,8 @@ function Protect-LocalPath {
         [IO.File]::SetUnixFileMode($Path,$mode)
     } else {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        & icacls $Path '/inheritance:r' '/grant:r' "${identity}:(F)" | Out-Null
+        $rights = if ($Directory) { '(OI)(CI)(F)' } else { '(F)' }
+        & icacls $Path '/inheritance:r' '/grant:r' "${identity}:$rights" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Could not restrict local secret permissions.' }
     }
 }
