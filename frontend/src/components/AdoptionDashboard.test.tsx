@@ -22,6 +22,85 @@ const usersCard = () => within(screen.getByRole("region", { name: "Active users"
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("adoption dashboard", () => {
+  it.each([false, true])("shows only complete history when the first response arrives after expiry (complete=%s)", async complete => {
+    vi.useFakeTimers();
+    const selection = reportSelection(2, Date.now());
+    selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    const pending = deferred<Response>();
+    const fetcher = vi.fn().mockReturnValueOnce(pending.promise);
+    vi.stubGlobal("fetch", fetcher);
+    renderDashboard();
+    await act(() => vi.advanceTimersByTimeAsync(1001));
+    await act(async () => {
+      pending.resolve(Response.json(reportPage(complete ? all : [latest], {
+        selection, counts: { total: 3, filtered: 3 },
+        page: { limit: 100, nextCursor: complete ? null : "older", previousCursor: null },
+      })));
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    if (complete) {
+      expect(usersCard().getByText("306")).toBeVisible();
+      expect(screen.getByText(/Showing previously loaded saved data/)).toBeVisible();
+    } else {
+      expect(screen.queryByRole("region", { name: "Active users" })).not.toBeInTheDocument();
+      expect(screen.getByText(/This selection expired/)).toBeVisible();
+      expect(screen.queryByText(/Showing previously loaded saved data/)).not.toBeInTheDocument();
+    }
+    fetcher.mockResolvedValueOnce(Response.json(reportPage(all, { selection: reportSelection(3, Date.now()) })));
+    fireEvent.click(screen.getByRole("button", { name: "Restart selection" }));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(usersCard().getByText("306")).toBeVisible();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(new URL(fetcher.mock.calls[1][0], "http://localhost").searchParams.has("selectionId")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Restart selection" })).not.toBeInTheDocument();
+  });
+
+  it("keeps comparisons when a replacement history's final page arrives after expiry while offline", async () => {
+    vi.useFakeTimers();
+    const initial = reportPage(all, { selection: reportSelection(2, Date.now()) });
+    initial.selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    const pending = deferred<Response>(), older = deferred<Response>();
+    const fetcher = vi.fn().mockResolvedValueOnce(Response.json(initial))
+      .mockReturnValueOnce(pending.promise).mockReturnValueOnce(older.promise);
+    vi.stubGlobal("fetch", fetcher);
+    renderDashboard();
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    const card = screen.getByRole("region", { name: "Active users" });
+    await act(() => vi.advanceTimersByTimeAsync(1000));
+    const selection = reportSelection(3, Date.now());
+    selection.expiresAt = new Date(Date.now() + 1000).toISOString();
+    await act(async () => {
+      pending.resolve(Response.json(reportPage([latest], { selection, counts: { total: 3, filtered: 3 },
+        page: { limit: 100, nextCursor: "older", previousCursor: null } })));
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    fireEvent.offline(window);
+    await act(() => vi.advanceTimersByTimeAsync(1001));
+    await act(async () => {
+      older.resolve(Response.json(reportPage([second, first], { selection, counts: { total: 3, filtered: 3 },
+        page: { limit: 100, nextCursor: null, previousCursor: "newer" } })));
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(screen.getByRole("region", { name: "Active users" })).toBe(card);
+    expect(usersCard().getByText("+6 (+2%)")).toBeVisible();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    fetcher.mockResolvedValueOnce(Response.json(reportPage([{ ...latest, activeUsers: 500 }, second, first], {
+      selection: reportSelection(4, Date.now()),
+    })));
+    online.mockReturnValue(true);
+    fireEvent.online(window);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(screen.getByRole("region", { name: "Active users" })).toBe(card);
+    expect(usersCard().getByText("500")).toBeVisible();
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(new URL(fetcher.mock.calls[3][0], "http://localhost").searchParams.has("selectionId")).toBe(false);
+  });
+
   it.each([false, true])("keeps complete comparisons mounted while an idle history selection renews (multiple pages=%s)", async multiplePages => {
     vi.useFakeTimers();
     const initial = reportPage(all, { selection: reportSelection(2, Date.now()) });

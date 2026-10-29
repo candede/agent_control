@@ -14,7 +14,7 @@ export function useAdoptionHistory(revision: number) {
   const [completed, setCompleted] = useState<{ scope: string; collection: Collection }>();
   let current = collected.owner === owner ? collected : { owner, pages: [] };
   const data = read.data;
-  if (data && !read.loading && !read.error && !read.leaseEnded) {
+  if (data && !read.loading && !read.error) {
     if (current.selectionId !== data.selection.id) current = { owner, selectionId: data.selection.id, pages: [] };
     const index = current.pages.findIndex(page => page.page.previousCursor === data.page.previousCursor);
     if (index < 0 || current.pages[index] !== data) {
@@ -36,15 +36,16 @@ export function useAdoptionHistory(revision: number) {
   useEffect(() => {
     if (data?.page.nextCursor && !read.loading && !read.error && !read.leaseEnded && !inconsistent) advance();
   }, [data, read.loading, read.error, read.leaseEnded, inconsistent]);
-  const complete = Boolean(data && !data.page.nextCursor && !read.loading && !read.error && !read.leaseEnded && !issue
+  const complete = Boolean(data && !data.page.nextCursor && !read.loading && !read.error && !issue
     && snapshots.length === total);
   const rejected = issue || read.invalidated || read.error && !isExpiredSelection(read.error);
   if (complete && completed?.collection !== current) setCompleted({ scope: historyScope, collection: current });
   else if (completed && (rejected || completed.scope !== historyScope)) setCompleted(undefined);
   const retained = !rejected && completed?.scope === historyScope ? completed.collection : undefined;
+  const displayed = complete ? snapshots : retained?.pages.flatMap(page => page.value);
   return {
-    read: issue ? { ...read, error: issue, retry: read.restart } : read,
-    snapshots: complete ? snapshots : retained?.pages.flatMap(page => page.value),
+    read: { ...read, data: displayed ? read.data : undefined, ...(issue ? { error: issue, retry: read.restart } : {}) },
+    snapshots: displayed,
     loaded: snapshots.length,
     total,
   };

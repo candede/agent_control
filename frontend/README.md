@@ -42,6 +42,9 @@ does not establish live browser or provider behavior.
 - **Dashboard**: compare retained report observations and explore colorful
   department, engagement, and agent panels. The company dropdown filters only
   department participation; the six overview cards remain organization-wide.
+  Complete history remains readable if its saved selection expires during a
+  response. Incomplete history never becomes a comparison, and expired
+  selections cannot fetch further pages.
   The department header contains the company selector; its menu matches the
   control width and wraps long company names. Type a prefix to find a company
   or repeat its first letter to cycle matches; closing the menu clears the
