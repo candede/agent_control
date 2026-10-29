@@ -230,7 +230,8 @@ function Build-LocalMcpArtifact {
     $file = Join-Path $Snapshot.Directory "mcp-$Target.iid"
     $labels = if ($Context.SourceHash) { @('--label',"io.agent-control.source-sha256=$($Context.SourceHash)") } else { @() }
     Invoke-DockerCommand (@('build','--provenance=false','-f',(Join-Path $Snapshot.Root 'mcp/Dockerfile'),'--target',$Target,
-        '--iidfile',$file,'-t',"$($Context.McpImage)$(if ($Target -ne 'runtime') {'-test'})") + $labels + @($Snapshot.Root))
+        '--iidfile',$file,'-t',"$($Context.McpImage)$(if ($Target -ne 'runtime') {'-test'})") + $labels + @($Snapshot.Root)) |
+        ForEach-Object { Write-Host $_ }
     $identity = [IO.File]::ReadAllText($file).Trim()
     if ($identity -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'MCP build did not return an immutable image identity.' }
     return $identity

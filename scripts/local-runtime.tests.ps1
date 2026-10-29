@@ -30,6 +30,7 @@ $script:wrongOwner = $false
 $script:candidateInputs = @()
 $script:candidateHash = ''
 $script:replacePostgresOnAppStart = $false
+$script:buildStdout = 'Docker Desktop build summary (Windows)'
 $script:answers = [Collections.Generic.Queue[string]]::new()
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message }; $script:checks++ }
 function Fails([scriptblock]$Action,[string]$Pattern) {
@@ -98,7 +99,7 @@ function docker {
         if ($script:mutateSource -and $target -eq 'operator') { [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'changed-after-snapshot') }
         if ($script:mutateSource) { Assert ([IO.File]::ReadAllText("$source/backend/input.ts") -ceq 'snapshot-v1') 'Build targets consumed different source versions.' }
         [IO.File]::WriteAllText($Arguments[[Array]::IndexOf($Arguments,'--iidfile')+1],$image)
-        return
+        return $script:buildStdout
     }
     if ($Arguments[0] -eq 'ps') { return ($script:containers.Keys -join "`n") }
     if ($Arguments[0] -eq 'inspect') {
@@ -216,10 +217,54 @@ try {
     Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Changed source inventory leaked its snapshot.'
     $script:addDuringCapture=$false
     Remove-Item -LiteralPath (Join-Path $root 'backend/added.ts')
+    & {
+        $nativeExecutable=(Microsoft.PowerShell.Core\Get-Command pwsh -CommandType Application).Source
+        $nativeFixture=Join-Path $root 'native build fixture.ps1'
+        [IO.File]::WriteAllText($nativeFixture,@'
+param([string]$IdentityFile,[string]$Identity,[int]$ExitCode)
+[Console]::Out.WriteLine('Docker Desktop build summary (Windows)')
+[IO.File]::WriteAllText($IdentityFile,$Identity)
+exit $ExitCode
+'@)
+        $nativeIdentity=$script:operator
+        $nativeExitCode=0
+        function docker {
+            param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
+            $identityFile=$Arguments[[Array]::IndexOf($Arguments,'--iidfile')+1]
+            & $nativeExecutable -NoLogo -NoProfile -NonInteractive -File $nativeFixture -IdentityFile $identityFile -Identity $nativeIdentity -ExitCode $nativeExitCode
+        }
+        $directory=Join-Path $root 'native build with spaces'
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+        $snapshot=@{Directory=$directory;Root=$root}
+        $diagnostics=Join-Path $directory 'build-output.txt'
+        foreach ($target in @('operator','runtime','qualification')) {
+            $image=Build-LocalArtifact @{} $snapshot $target "native-${target}:local" @() 6>$diagnostics
+            Assert ($image -is [string] -and $image -ceq $script:operator) "Native $target build stdout contaminated the returned image identity."
+            Assert ([IO.File]::ReadAllText($diagnostics).Contains($script:buildStdout)) 'Native build progress was discarded instead of displayed.'
+        }
+        foreach ($target in @('runtime','test','fixture')) {
+            $image=Build-LocalMcpArtifact @{McpImage='native-mcp:local'} $snapshot -Target $target 6>$diagnostics
+            Assert ($image -is [string] -and $image -ceq $script:operator) "Native MCP $target build stdout contaminated the returned image identity."
+            Assert ([IO.File]::ReadAllText($diagnostics).Contains($script:buildStdout)) 'Native MCP build progress was discarded instead of displayed.'
+        }
+        $nativeExitCode=17
+        Fails { Build-LocalArtifact @{} $snapshot 'operator' 'native-operator:local' @() 6>$diagnostics } 'Docker build failed \(exit code 17\)'
+        Fails { Build-LocalMcpArtifact @{McpImage='native-mcp:local'} $snapshot 6>$diagnostics } 'Docker build failed \(exit code 17\)'
+        $nativeExitCode=0
+        $nativeIdentity='invalid-image-identity'
+        Fails { Build-LocalArtifact @{} $snapshot 'operator' 'native-operator:local' @() 6>$diagnostics } 'did not produce an immutable image identity'
+        Fails { Build-LocalMcpArtifact @{McpImage='native-mcp:local'} $snapshot 6>$diagnostics } 'did not return an immutable image identity'
+        Remove-Item -LiteralPath $directory -Recurse -Force
+        Remove-Item -LiteralPath $nativeFixture
+    }
     foreach ($value in @('11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222','synthetic-runtime-test-client-secret','example.invalid','14399')) { $script:answers.Enqueue($value) }
     $script:mutateSource=$true
     $messages=Run-Deploy
     $script:mutateSource=$false
+    Assert ($context.OperatorImageId -is [string] -and $context.OperatorImageId -ceq $script:operator -and
+        $context.RuntimeImageId -is [string] -and $context.RuntimeImageId -ceq $script:runtime) 'Noisy first-start builds did not retain scalar operator/runtime image identities.'
+    Assert (@($script:calls | Where-Object { $_ -match '^run\|' -and $_.Contains($script:buildStdout) }).Count -eq 0) 'Build progress was passed to Docker as an image or command argument.'
+    Assert (($script:calls -join "`n").Contains("|$($script:operator)|backend/scripts/database.ts|preflight")) 'First-start preflight did not invoke the exact built operator image.'
     Assert ($script:checked -eq 0 -and -not (($script:calls -join "`n") -match 'test-postgres|test-all|qualification')) 'Normal start still ran regression validation.'
     Assert (@($script:calls | Where-Object { $_ -match '^build\|' }).Count -eq 2) 'Normal start did not build exactly the operator and runtime.'
     $preflight = $script:calls.FindIndex([Predicate[string]]{param($line) $line -match 'database\.ts\|preflight$'})

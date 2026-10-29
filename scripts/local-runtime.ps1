@@ -66,7 +66,8 @@ function Build-LocalArtifact {
     $identityFile = Join-Path $Snapshot.Directory "$Target.iid"
     Assert-LocalDependencyImage $Context
     # Timestamped default attestations otherwise change the index ID on an identical local rebuild.
-    Invoke-DockerCommand (@('build','--provenance=false') + $BuildArguments + @('--target',$Target,'--iidfile',$identityFile,'-t',$Tag,$Snapshot.Root))
+    Invoke-DockerCommand (@('build','--provenance=false') + $BuildArguments + @('--target',$Target,'--iidfile',$identityFile,'-t',$Tag,$Snapshot.Root)) |
+        ForEach-Object { Write-Host $_ }
     Assert-LocalDependencyImage $Context
     $identity = [IO.File]::ReadAllText($identityFile).Trim()
     if ($identity -cnotmatch '^sha256:[a-f0-9]{64}$') { throw "The $Target build did not produce an immutable image identity." }

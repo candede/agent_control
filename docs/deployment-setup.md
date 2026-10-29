@@ -381,6 +381,10 @@ access to their child folders and files; individual secret files remain private
 to that account. Retry a failed first start with ordinary `start`, without
 `-DbReset` or deleting saved configuration.
 
+Build progress is displayed separately from the immutable `sha256:...` image
+identity used by subsequent Docker commands. Windows checkout paths do not need
+to be lowercase; Docker's image-repository naming rules do not apply to host paths.
+
 If a Docker command cannot launch during database preflight, inspect the reported
 operating-system error and check `docker version` in the same PowerShell session.
 Captured commands preserve the original launch error rather than PowerShell's
