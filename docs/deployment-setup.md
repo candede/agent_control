@@ -381,6 +381,13 @@ access to their child folders and files; individual secret files remain private
 to that account. Retry a failed first start with ordinary `start`, without
 `-DbReset` or deleting saved configuration.
 
+If a Docker command cannot launch during database preflight, inspect the reported
+operating-system error and check `docker version` in the same PowerShell session.
+Captured commands preserve the original launch error rather than PowerShell's
+misleading `StandardOutputEncoding` shell-fallback error. A healthy PostgreSQL
+container alone does not mean the database operator ran; do not reset data to
+resolve a Docker CLI launch failure.
+
 ## Configure the Entra application
 
 Complete these steps once for the tenant. The local configuration runs on

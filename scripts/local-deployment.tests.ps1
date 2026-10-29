@@ -242,6 +242,45 @@ function Assert-ConfigUnchanged {
     }
 }
 try {
+    & {
+        Set-Alias docker (Microsoft.PowerShell.Core\Get-Command pwsh -CommandType Application).Source
+        $nativeArguments=@('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand')
+        $nativeCases=@(
+            @{program='[Console]::Out.WriteLine(''{"state":"fresh"}'')';expected='{"state":"fresh"}';captureError=$false},
+            @{program='[Console]::Out.WriteLine(''first'');[Console]::Out.WriteLine();[Console]::Out.WriteLine(''last'')';expected="first`n`nlast";captureError=$false},
+            @{program='[Console]::Error.WriteLine(''native diagnostic'')';expected='native diagnostic';captureError=$true}
+        )
+        foreach ($case in $nativeCases) {
+            $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($case.program))
+            $result=Invoke-DockerCommand ($nativeArguments + @($encoded)) -Capture -CaptureError:$case.captureError
+            Assert-True ($result -is [string] -and $result -ceq $case.expected) 'Real native output capture changed stdout, blank lines or merged stderr.'
+        }
+        $nativeStderr=Join-Path $testRoot 'native-stderr.txt'
+        $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+            '[Console]::Out.WriteLine(''{"state":"fresh"}'');[Console]::Error.WriteLine(''separate diagnostic'')'))
+        $result=Invoke-DockerCommand ($nativeArguments + @($encoded)) -Capture 2>$nativeStderr
+        Assert-True ($result -ceq '{"state":"fresh"}' -and [IO.File]::ReadAllText($nativeStderr).Contains('separate diagnostic')) 'Native stderr contaminated captured JSON or was lost.'
+        $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+            '[Console]::Out.WriteLine(''native failure detail'');[Console]::Error.WriteLine(''password=synthetic-native-secret'');exit 17'))
+        $failure=$null
+        try { Invoke-DockerCommand ($nativeArguments + @($encoded)) -Capture -CaptureError }
+        catch { $failure=$_.Exception }
+        Assert-True ($null -ne $failure -and $failure.Message.Contains('exit code 17') -and
+            $failure.Message.Contains('native failure detail') -and $failure.Message.Contains('[redacted]') -and
+            -not $failure.Message.Contains('synthetic-native-secret')) 'Native command failure lost its exit code/diagnostics or exposed a secret.'
+        $invalidProgram=Join-Path $testRoot 'invalid-native-fixture.exe'
+        [IO.File]::WriteAllText($invalidProgram,'Synthetic invalid executable fixture.')
+        if (-not $IsWindows) { [IO.File]::SetUnixFileMode($invalidProgram,[IO.UnixFileMode]448) }
+        Set-Alias docker $invalidProgram
+        foreach ($captureError in @($false,$true)) {
+            $launchFailure=$null
+            try { Invoke-DockerCommand @() -Capture -CaptureError:$captureError }
+            catch { $launchFailure=$_ }
+            Assert-True ($null -ne $launchFailure -and $launchFailure.FullyQualifiedErrorId -eq 'NativeCommandFailed' -and
+                $launchFailure.Exception.Message.Contains($invalidProgram) -and
+                $launchFailure.Exception.Message -notmatch 'Standard(?:Output|Error)Encoding') 'Native launch failure was hidden by a shell fallback or reported as a successful command.'
+        }
+    }
     $protectedDirectory=Join-Path $testRoot 'protected-paths'
     $existingDirectory=Join-Path $protectedDirectory 'source'
     $existingFile=Join-Path $existingDirectory 'existing.txt'

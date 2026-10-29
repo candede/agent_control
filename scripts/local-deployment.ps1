@@ -16,7 +16,9 @@ function Invoke-DockerCommand {
             }
         }
         if ($Capture) {
-            $result = if ($CaptureError) { @(& docker @Arguments 2>&1) } else { @(& docker @Arguments) }
+            # A pipeline avoids PowerShell's Windows shell fallback masking native launch errors.
+            $result = if ($CaptureError) { @(& docker @Arguments 2>&1 | ForEach-Object { $_ }) }
+                else { @(& docker @Arguments | ForEach-Object { $_ }) }
             if ($LASTEXITCODE -ne 0) {
                 $detail = if ($CaptureError) { ConvertTo-RedactedFixtureLog ($result -join "`n") }
                     else { 'See the Docker diagnostics above.' }
