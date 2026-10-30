@@ -18,12 +18,12 @@ const scope = { tenantId: "tenant-data-sync", principalId: "viewer-a" };
 const identity = (owner: typeof scope) => ({ ...selectionIdentity, ...owner });
 const sourceReader = () => new UserSourcesRepository(fixture.runtime, "synthetic-data-sync-source-read-secret");
 async function sourcePage(owner: typeof scope) {
-  const reader = sourceReader(), selected = await reader.capture(identity(owner), "delegated");
+  const reader = sourceReader(), selected = await reader.capture(identity(owner));
   return reader.page(selected.id, identity(owner));
 }
 function failSource(owner: typeof scope, source: "directory" | "app_activity", error: Error) {
   return new UserSourceStages(fixture.runtime).execute(generationInput({
-    scope: { ...generationInput().scope, ...owner, source },
+    scope: { ...generationInput().scope, tenantId: owner.tenantId, source }, actorPrincipalId: owner.principalId,
   }), async () => { throw error; }, { beforePublish: async () => {} });
 }
 
@@ -63,7 +63,7 @@ describe.sequential("Data sync repository", () => {
   });
 
   it.each(["initial", "incremental", "full"] as const)("defaults %s to automatic sources and respects explicit narrower requests", async mode => {
-    const owner = { ...scope, principalId: `default-${mode}` };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: `default-${mode}` };
     const { run } = await repository.submit(owner, { mode });
     expect(run.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform", "users"]);
     expect(run.sources.every(source => source.count === null)).toBe(true);
@@ -79,7 +79,7 @@ describe.sequential("Data sync repository", () => {
   });
 
   it("releases explicit four-source workers and reconciles a later complete zero-row usage bundle", async () => {
-    const owner = { ...scope, principalId: "manual-usage" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "manual-usage" };
     const { run } = await repository.submit(owner, {
       mode: "full", sources: ["users", "graph_packages", "power_platform", "usage_reports"],
     });
@@ -110,7 +110,7 @@ describe.sequential("Data sync repository", () => {
 
   it.each(["failed", "waiting_authorization", "permission_required"] as const)(
     "reconciles a retired upload without reopening a %s provider source", async status => {
-      const owner = { ...scope, principalId: `retained-upload-${status}` };
+      const owner = { ...scope, tenantId: randomUUID(), principalId: `retained-upload-${status}` };
       const { run } = await repository.submit(owner, { mode: "initial", sources: ["users", "usage_reports"] });
       await repository.updateSource(owner, run.id, "users", {
         status, message: "Directory collection did not finish.", canRetry: true,
@@ -138,7 +138,7 @@ describe.sequential("Data sync repository", () => {
   );
 
   it("starts new and retried counts unknown, preserves completed sources and markers, and fences old progress", async () => {
-    const owner = { ...scope, principalId: "observed-counts" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "observed-counts" };
     await repository.recordSuccessMarker(owner, "users", 40, "2026-09-15T10:00:00.000Z");
     await repository.recordSuccessMarker(owner, "graph_packages", 120, "2026-09-15T10:00:00.000Z");
     const { run } = await repository.submit(owner, { mode: "incremental", sources: ["users", "graph_packages"] });
@@ -195,7 +195,7 @@ describe.sequential("Data sync repository", () => {
   });
 
   it("reconciles usage marker changes without changing its saved timestamp on every state read", async () => {
-    const owner = { ...scope, principalId: "usage-marker" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "usage-marker" };
     const acceptedAt = "2026-09-15T10:00:00.000Z";
     await repository.recordSuccessMarker(owner, "usage_reports", 0, acceptedAt);
     const before = (await repository.listMarkers(owner))[3];
@@ -206,13 +206,14 @@ describe.sequential("Data sync repository", () => {
     expect((await repository.listMarkers(owner))[3]).toMatchObject({ status: "succeeded", count: 4, lastSuccessAt: acceptedAt });
   });
 
-  it("keeps run and saved user data private to the tenant and principal", async () => {
+  it("keeps run history actor-private while sharing saved user data within the tenant", async () => {
     expect(await repository.getRun({ ...scope, principalId: "viewer-b" }, (await repository.getLatestRun(scope))!.id)).toBeUndefined();
     await publishFixtureDirectory(fixture.runtime, identity(scope), [directoryUser("saved@example.com")]);
     expect((await sourcePage(scope)).value).toHaveLength(1);
-    for (const owner of [{ ...scope, principalId: "viewer-b" }, { tenantId: "other-tenant", principalId: scope.principalId }]) {
-      const page = await sourcePage(owner);
-      expect(page.value).toEqual([]);
+    expect((await sourcePage({ ...scope, principalId: "viewer-b" })).value).toHaveLength(1);
+      for (const owner of [{ tenantId: "other-tenant", principalId: scope.principalId }]) {
+        const page = await sourcePage(owner);
+        expect(page.value).toEqual([]);
       expect(page.sources.directory).toMatchObject({ generationId: null, rowCount: null });
     }
   });
@@ -228,7 +229,7 @@ describe.sequential("Data sync repository", () => {
   });
 
   it("retains authorized current source rows and counts beyond freshness at the captured read time", async () => {
-    const owner = { ...scope, principalId: "expired-user-sources" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "expired-user-sources" };
     await publishFixtureDirectory(fixture.runtime, identity(owner), []);
     await publishFixtureEmptyActivity(fixture.runtime, identity(owner));
     const reader = sourceReader();
@@ -241,15 +242,20 @@ describe.sequential("Data sync repository", () => {
   });
 
   it.each(["clear", "revoke"] as const)("does not revive old attempt counts after a %s fence", async operation => {
-    const owner = { ...scope, principalId: `fenced-user-attempt-${operation}` };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: `fenced-user-attempt-${operation}` };
     let current = identity(owner);
     await publishFixtureDirectory(fixture.runtime, current, [directoryUser("fenced@example.invalid")]);
     await publishFixtureEmptyActivity(fixture.runtime, current);
     expect((await sourcePage(owner)).sources.directory.rowCount).toBe(1);
     if (operation === "clear") await repository.submit(owner, { mode: "full", clearSavedData: true });
     else current = { ...current, sessionEpoch: await new DataGenerations(fixture.runtime).revokePrincipal(owner.tenantId, owner.principalId) };
-    const reader = sourceReader(), selected = await reader.capture(current, "delegated");
+    const reader = sourceReader(), selected = await reader.capture(current);
     const page = await reader.page(selected.id, current);
+    if (operation === "revoke") {
+      expect(page.value).toHaveLength(1);
+      expect(page.sources.directory).toMatchObject({ rowCount: 1, attemptStatus: "available", state: "available" });
+      return;
+    }
     expect(page.value).toEqual([]);
     for (const source of [page.sources.directory, page.sources.app_activity]) expect(source).toMatchObject({
       generationId: null, attemptStatus: null, attemptedAt: null, attemptObservedCount: null, rowCount: null, state: "unavailable",
@@ -257,7 +263,7 @@ describe.sequential("Data sync repository", () => {
   });
 
   it("persists company and department in native user rows across repository instances", async () => {
-    const owner = { ...scope, principalId: "organization-reader" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "organization-reader" };
     const user = directoryUser("organization@example.invalid");
     user.identity.companyName = "Example Health";
     user.identity.department = "Clinical Services";
@@ -267,11 +273,11 @@ describe.sequential("Data sync repository", () => {
         userPrincipalName: "organization@example.invalid", companyName: "Example Health", department: "Clinical Services",
       } }],
     });
-    expect((await sourcePage({ ...owner, principalId: "other-reader" })).sources.directory.rowCount).toBeNull();
+    expect((await sourcePage({ ...owner, principalId: "other-reader" })).sources.directory.rowCount).toBe(1);
   });
 
   it("losslessly pages distinct immutable service-plan sets without sharing mutable feature evidence between users", async () => {
-    const owner = { ...scope, principalId: "mixed-paid-license-roster" };
+    const owner = { ...scope, tenantId: randomUUID(), principalId: "mixed-paid-license-roster" };
     const enabled = [...copilotServicePlanDefinitions.keys()].map(servicePlanId => resolveCopilotServicePlan(
       servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
     ));
@@ -287,7 +293,7 @@ describe.sequential("Data sync repository", () => {
       copilotServiceState: servicePlans.length ? summarizeCopilotServices(servicePlans) : "disabled" as const,
     }));
     await publishFixtureDirectory(fixture.runtime, identity(owner), users);
-    const reader = sourceReader(), selected = await reader.capture(identity(owner), "delegated");
+    const reader = sourceReader(), selected = await reader.capture(identity(owner));
     const first = await reader.plans(selected.id, identity(owner), users[0].identity.objectId);
     for (const user of users) {
       const plans = await reader.plans(selected.id, identity(owner), user.identity.objectId);
@@ -303,7 +309,7 @@ describe.sequential("Data sync repository", () => {
   it.each(["directory", "app_activity"] as const)(
     "rejects invalid typed %s evidence before replacing its complete saved head",
     async source => {
-      const owner = { ...scope, principalId: `record-bound-${source}` };
+      const owner = { ...scope, tenantId: randomUUID(), principalId: `record-bound-${source}` };
       const user = directoryUser("byte-bound@example.invalid");
       const before = source === "directory"
         ? await publishFixtureDirectory(fixture.runtime, identity(owner), [user])
@@ -313,7 +319,8 @@ describe.sequential("Data sync repository", () => {
         await expect(publishFixtureDirectory(fixture.runtime, identity(owner), [user])).rejects.toMatchObject({ code: "provider_schema" });
       } else {
         const stages = new UserSourceStages(fixture.runtime);
-        await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, ...owner, source } }), async lease => {
+        await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: owner.tenantId, source },
+          actorPrincipalId: owner.principalId }), async lease => {
           const key = await stages.query(lease, "activity", "synthetic:invalid-date");
           await stages.activity(lease, key, [{
             identity: "000000", upn_key: "person@example.invalid", period: "D30", report_refresh_date: "2026-02-30",

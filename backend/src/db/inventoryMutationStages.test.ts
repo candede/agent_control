@@ -8,7 +8,7 @@ import { DataGenerations } from "./dataGenerations.js";
 import { runBulkJob } from "../services/bulkJobs.js";
 import { GraphPackagesClient, type FetchLike } from "../services/graphPackages.js";
 import { capabilities } from "../services/capabilities.js";
-import { inventoryInput } from "../../scripts/inventoryFixtures.js";
+import { inventoryInput, inventorySelectionFixture } from "../../scripts/inventoryFixtures.js";
 import { InventoryReconciliation } from "../services/inventoryReconciliation.js";
 import { StreamedInventory } from "../services/streamedInventory.js";
 import { assertCurrentMutationTargets } from "./inventoryMutationAuthority.js";
@@ -112,6 +112,29 @@ describe("record-store mutation staging", () => {
     expect(mutations).toBe(1);
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "succeeded", succeeded: 1 });
   });
+  it("fences an actor revoked after dispatch without changing the saved tenant publication for another reader", async () => {
+    const { scope, identity, selectionId, intent } = await setup();
+    const preview = await stages.preview(identity, selectionId, intent, ["A"]);
+    const job = await stages.submit(identity, { ...intent, selectionId, ids: ["A"],
+      confirmationHash: preview.confirmationHash, idempotencyKey: randomUUID() });
+    let mutations = 0;
+    const fetcher: FetchLike = async (_url, request) => {
+      if (request?.method === "POST") {
+        mutations++;
+        await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId);
+        return new Response(null, { status: 204 });
+      }
+      return Response.json({ id: "A", displayName: "Inventory A", isBlocked: mutations > 0 });
+    };
+    vi.spyOn(capabilities, "observeOperation").mockImplementation(async (_id, _user, operation) => operation(() => undefined));
+    await runBulkJob(job.id, scope, false, new JobRepository(fixture.runtime),
+      new GraphPackagesClient(fetcher, { minimumReadIntervalMs: 0, maxAttempts: 1 }), async () => "synthetic");
+    expect(mutations).toBe(1);
+    expect((await fixture.runtime.query(`SELECT id FROM package_inventory_snapshots
+      WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId])).rows).toEqual([]);
+    const other = await inventorySelectionFixture(fixture.runtime, { ...scope, principalId: randomUUID() }, {}, "packages");
+    expect(await other.queries.packageDetail(other.selection.id, other.identity, "A")).toMatchObject({ isBlocked: false });
+  });
   it.each(["replacement", "withdrawal", "invalidation", "principal"] as const)(
     "acceptance: rechecks %s at the final real staged provider dispatch", async change => {
       const { scope, identity, selectionId, intent } = await setup();
@@ -125,7 +148,7 @@ describe("record-store mutation staging", () => {
           if (change === "principal") await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId);
           else if (change === "invalidation") {
             const source = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1
-              AND principal_id=$2 AND source='inventory_packages'`, [scope.tenantId, scope.principalId])).rows[0];
+              AND scope_kind='tenant' AND source='inventory_packages'`, [scope.tenantId])).rows[0];
             await new DataGenerations(fixture.runtime).invalidate(source.id, scope.tenantId);
           } else await saveUsageInventory(fixture.runtime, scope, [{ packages: [change === "replacement" ? "A" : "Other"] }]);
         }
@@ -283,8 +306,8 @@ describe("record-store mutation staging", () => {
   });
   it("selects filtered targets entirely in SQL and refuses exact IDs outside that selection", async () => {
     const { identity, intent } = await setup();
-    const root = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-      AND source='inventory_canonical'`, [identity.tenantId, identity.principalId])).rows[0];
+    const root = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+      AND source='inventory_canonical'`, [identity.tenantId])).rows[0];
     const selected = await stages.queries.capture(identity, root.id, { blocked: true });
     const preview = await stages.preview(identity, selected.id, { ...intent, action: "unblock" });
     expect(preview.summary).toMatchObject({ targetCount: 1, targets: [{ id: "Blocked", currentState: { kind: "block", isBlocked: true } }] });
@@ -301,8 +324,8 @@ describe("record-store mutation staging", () => {
       .rejects.toThrow("mutation confirmation is immutable");
     await expect(stages.submit({ ...identity, principalId: "foreign" }, { ...intent,
       confirmationHash: preview.confirmationHash, idempotencyKey: randomUUID() })).rejects.toMatchObject({ code: "confirmation_mismatch" });
-    const source = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-      AND source='inventory_packages'`, [scope.tenantId, scope.principalId])).rows[0];
+    const source = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+      AND source='inventory_packages'`, [scope.tenantId])).rows[0];
     await new DataGenerations(fixture.runtime).invalidate(source.id, scope.tenantId);
     await expect(stages.submit(identity, { ...intent, confirmationHash: preview.confirmationHash,
       ids: ["A"], idempotencyKey: randomUUID() })).rejects.toMatchObject({ code: "selection_invalidated" });

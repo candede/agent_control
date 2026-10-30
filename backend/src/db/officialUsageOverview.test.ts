@@ -50,15 +50,15 @@ async function accept(identity: SelectionIdentity, input: BundleInput) {
 const mutate = async (identity: SelectionIdentity, setId: string, operation: "select" | "delete") =>
   imports.confirm(identity, await imports.confirmPreview(identity, setId, operation));
 async function overview(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50, authority = reports) {
-  const selection = await authority.capture(identity, "delegated", "overview", query);
+  const selection = await authority.capture(identity, "overview", query);
   return authority.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportOverviewAgent>>;
 }
 async function agents(identity: SelectionIdentity, setId: string) {
-  const selection = await reports.capture(identity, "delegated", "official_agents", { setId });
+  const selection = await reports.capture(identity, "official_agents", { setId });
   return reports.page(selection.id, identity) as Promise<ReportPage<ReportAgent>>;
 }
 async function historyCount(identity: SelectionIdentity) {
-  const selection = await reports.capture(identity, "delegated", "history");
+  const selection = await reports.capture(identity, "history");
   return (await reports.page(selection.id, identity)).counts.total;
 }
 

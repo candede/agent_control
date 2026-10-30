@@ -23,7 +23,8 @@ const catalogRevisionHashSql = `encode(sha256(convert_to(jsonb_build_array(
 const detailPendingSql = `(r.detail_generation IS NULL OR coalesce(r.residual->'detailFreshness'->>'state','missing')<>'fresh'
   OR coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz,'-infinity'::timestamptz)<=clock_timestamp())`;
 const detailUnattemptedSql = `NOT EXISTS(SELECT 1 FROM package_refresh_jobs attempted
-  WHERE attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details
+  WHERE attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details
+    AND (attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2)
     AND EXISTS(SELECT 1 FROM inventory_refresh_targets t WHERE t.job_id=attempted.id AND t.target_id=r.native_id
       AND t.catalog_revision_hash=${catalogRevisionHashSql})
     AND attempted.updated_at>clock_timestamp()-interval '1 hour')`;
@@ -52,11 +53,13 @@ type JobRow = {
   attempted_at: Date | null;
   updated_at: Date;
   finished_at: Date | null;
+  deadline_at: Date;
+  checked_at: Date;
   snapshot_id: string | null;
 };
 const jobColumns = `job.id,job.authorization_principal_id,job.token_mode,job.request_hash,job.scope_kind,
   job.auto_details,job.status,job.page_count,job.observed_count,job.total_records,
-  job.error_code,job.message,job.created_at,job.attempted_at,job.updated_at,job.finished_at,
+  job.error_code,job.message,job.created_at,job.attempted_at,job.updated_at,job.finished_at,job.deadline_at,clock.checked_at,
   job.updated_at::text AS result_revision,
   (SELECT count(*)::int FROM inventory_refresh_targets WHERE job_id=job.id) AS target_count`;
 
@@ -181,10 +184,10 @@ export class PackageRefreshJobs {
       await client.query(`UPDATE package_refresh_jobs SET status='failed',error_code='package_refresh_expired',
         message='Automatic detail enrichment expired; the next authorized check may retry after backoff.',
         finished_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE tenant_id=$1 AND principal_id=$2 AND auto_details AND status IN ('waiting_authorization','running')
+        WHERE tenant_id=$1 AND $2::text IS NOT NULL AND auto_details AND status IN ('waiting_authorization','running')
           AND (deadline_at<=clock_timestamp() OR expires_at<=clock_timestamp())`, [scope.tenantId, scope.principalId]);
       const outstanding = await client.query(`SELECT 1 FROM package_refresh_jobs
-        WHERE tenant_id=$1 AND principal_id=$2 AND auto_details AND status IN ('waiting_authorization','running')
+        WHERE tenant_id=$1 AND $2::text IS NOT NULL AND auto_details AND status IN ('waiting_authorization','running')
           AND deadline_at>clock_timestamp() AND expires_at>clock_timestamp() LIMIT 1`, [scope.tenantId, scope.principalId]);
       if (outstanding.rowCount) return null;
       const latest = await client.query<Pick<JobRow, "error_code" | "created_at" | "attempted_at"> & { cooling_down: boolean; requested_ids: string[] }>(`
@@ -202,7 +205,8 @@ export class PackageRefreshJobs {
         WITH recent_detail_attempts AS MATERIALIZED (
           SELECT DISTINCT t.target_id,t.catalog_revision_hash
           FROM package_refresh_jobs attempted JOIN inventory_refresh_targets t ON t.job_id=attempted.id
-          WHERE attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details
+          WHERE attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details
+            AND (attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2)
             AND attempted.updated_at>clock_timestamp()-interval '1 hour'
         )
         SELECT r.native_id,${catalogRevisionHashSql} AS catalog_revision_hash
@@ -214,7 +218,7 @@ export class PackageRefreshJobs {
         JOIN package_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
         LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id
           AND attempted.catalog_revision_hash=${catalogRevisionHashSql}
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='inventory_packages'
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'
           AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()
           AND r.expires_at>clock_timestamp()
           AND ${detailPendingSql}
@@ -237,18 +241,20 @@ export class PackageRefreshJobs {
 
   async getJob(scope: PackageDataScope, id: string) {
     validateScope(scope);
-    const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
+    const { rows } = await this.database.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
       LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
-      WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.expires_at>clock_timestamp()`, [id, scope.tenantId, scope.principalId]);
+      CROSS JOIN clock WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.expires_at>clock.checked_at`, [id, scope.tenantId, scope.principalId]);
     return rows[0] ? projectJob(rows[0]) : undefined;
   }
 
   async latestAutomaticDetailsJob(scope: PackageDataScope, authorizationPrincipalId: string) {
     validateScope(scope);
-    const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
+    const { rows } = await this.database.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
       LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
-      WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3
-        AND job.token_mode='delegated' AND job.auto_details AND job.expires_at>clock_timestamp()
+      CROSS JOIN clock WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3
+        AND job.token_mode='delegated' AND job.auto_details AND job.expires_at>clock.checked_at
       ORDER BY job.created_at DESC,job.id DESC LIMIT 1`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
     return rows[0] ? projectJob(rows[0]) : null;
   }
@@ -260,7 +266,7 @@ export class PackageRefreshJobs {
         SELECT root.* FROM data_scope_epochs s JOIN inventory_roots root ON root.scope_id=s.id AND root.current
         JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
         JOIN data_generations g ON g.id=revision.generation_id
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='inventory_packages'
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'
           AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.validated
           AND g.state IN ('published','retired') AND g.expires_at>clock_timestamp()
           AND root.catalog_complete AND root.catalog_expires_at>clock_timestamp()
@@ -281,15 +287,16 @@ export class PackageRefreshJobs {
     const validation = beginAccountSessionValidation(scope.tenantId, authorizationPrincipalId);
     assertAccountSessionValidation(validation);
     const boundedLimit = Math.min(Math.max(limit, 1), 50);
-    const { rows } = await this.database.query<JobRow>(`SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
+    const { rows } = await this.database.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+      SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
       LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
-      WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3 AND job.expires_at>clock_timestamp()
+      CROSS JOIN clock WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3 AND job.expires_at>clock.checked_at
       ORDER BY job.created_at DESC,job.id DESC LIMIT $4`, [scope.tenantId, scope.principalId, authorizationPrincipalId, boundedLimit]);
     const summary = await this.database.query<{ last_attempt_at: Date | null; last_success_at: Date | null }>(`SELECT
       (SELECT max(attempted_at) FROM package_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2
         AND authorization_principal_id=$3 AND expires_at>clock_timestamp()) AS last_attempt_at,
       (SELECT max(g.observed_at) FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_packages'
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='inventory_packages'
           AND g.state='published' AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
           AND g.validated AND EXISTS(SELECT 1 FROM inventory_roots r JOIN inventory_revisions v
             ON v.scope_id=r.scope_id AND v.revision=r.revision
@@ -306,33 +313,34 @@ export class PackageRefreshJobs {
     const validation = beginAccountSessionValidation(identity.tenantId, identity.principalId);
     assertAccountSessionValidation(validation);
     return dataConnections(this.database).selectedRead(async client => {
-      const job = (await client.query(`SELECT job.updated_at::text AS revision,job.status FROM package_refresh_jobs job
+      const row = (await client.query<JobRow>(`WITH clock AS MATERIALIZED (SELECT clock_timestamp() AS checked_at)
+        SELECT ${jobColumns},NULL::uuid AS snapshot_id FROM package_refresh_jobs job
         JOIN data_principal_epochs p ON p.tenant_id=job.tenant_id AND p.principal_id=job.authorization_principal_id
-        WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.authorization_principal_id=$4
-          AND p.epoch=$5 AND job.expires_at>clock_timestamp() FOR SHARE OF p`,
+        CROSS JOIN clock WHERE job.id=$1 AND job.tenant_id=$2 AND job.principal_id=$3 AND job.authorization_principal_id=$4
+          AND p.epoch=$5 AND job.expires_at>clock.checked_at FOR SHARE OF p`,
       [id, scope.tenantId, scope.principalId, identity.principalId, identity.sessionEpoch])).rows[0];
-      if (!job || scope.tenantId !== identity.tenantId) throw new AppError(404, "not_found", "Refresh job was not found.");
-      if (options.revision && options.revision !== job.revision) throw new SelectionError("selection_invalidated");
+      if (!row || scope.tenantId !== identity.tenantId) throw new AppError(404, "not_found", "Refresh job was not found.");
+      const job = projectJob(row);
+      if (options.revision && options.revision !== job.resultRevision) throw new SelectionError("selection_invalidated");
       const codec = new CursorCodec(config.sessionSecret);
-      const binding = { identity, endpoint: "inventory-refresh-targets", selectionId: id, revision: job.revision, queryHash: hash("ordinal") };
+      const binding = { identity, endpoint: "inventory-refresh-targets", selectionId: id, revision: job.resultRevision, queryHash: hash("ordinal") };
       const cursor = options.cursor ? codec.decode(options.cursor, binding) : undefined;
       const reverse = cursor?.direction === "previous", ordinal = cursor ? Number(cursor.boundary.id) : -1;
       if (!Number.isSafeInteger(ordinal) || ordinal < -1 || ordinal > 4999) throw new SelectionError("invalid_cursor");
       const candidates = (await client.query<{ ordinal: number; id: string; status: string }>(`
-        SELECT t.ordinal,t.target_id AS id,CASE WHEN job.status='succeeded' THEN CASE WHEN k.deleted THEN 'absent' ELSE 'published' END
-          WHEN k.identity IS NOT NULL THEN 'observed_unpublished' ELSE job.status END AS status
+        SELECT t.ordinal,t.target_id AS id,CASE WHEN $4::text='succeeded' THEN CASE WHEN k.deleted THEN 'absent' ELSE 'published' END
+          WHEN k.identity IS NOT NULL THEN 'observed_unpublished' ELSE $4::text END AS status
         FROM inventory_refresh_targets t JOIN package_refresh_jobs job ON job.id=t.job_id
         LEFT JOIN LATERAL(SELECT id FROM data_generations WHERE job_id=job.id ORDER BY created_at DESC,id DESC LIMIT 1) g ON true
         LEFT JOIN inventory_keys k ON k.generation_id=g.id AND k.identity=t.target_id
         WHERE t.job_id=$1 AND t.ordinal ${reverse ? "<" : ">"} $2 ORDER BY t.ordinal ${reverse ? "DESC" : "ASC"} LIMIT $3`,
-      [id, ordinal, limit + 1])).rows;
+      [id, ordinal, limit + 1, job.status])).rows;
       encodeBatch(candidates);
       const more = candidates.length > limit, value = candidates.slice(0, limit);
       if (reverse) value.reverse();
       const token = (row: typeof value[number] | undefined, direction: "next" | "previous") => row
         ? codec.encode({ ...binding, direction, boundary: { id: String(row.ordinal), key: null, nullRank: 1 } }) : null;
-      const total = (await client.query("SELECT count(*)::int AS count FROM inventory_refresh_targets WHERE job_id=$1", [id])).rows[0].count;
-      return { value, revision: job.revision, counts: { total, filtered: total }, page: { limit,
+      return { value, revision: job.resultRevision, counts: { total: job.targetCount, filtered: job.targetCount }, page: { limit,
         nextCursor: !reverse && more || reverse && cursor ? token(value.at(-1), "next") : null,
         previousCursor: reverse && more || !reverse && cursor ? token(value[0], "previous") : null } };
     }).then(result => {
@@ -402,7 +410,7 @@ export class PackageRefreshJobs {
         message='Explicit resume with current authorization is required.',updated_at=clock_timestamp()
       FROM candidates WHERE job.id=candidates.id`);
     const expired = await this.database.query(`WITH candidates AS (
-      SELECT id FROM package_refresh_jobs WHERE status='running' AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())
+      SELECT id FROM package_refresh_jobs WHERE status IN ('running','waiting_authorization') AND (expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp())
         ORDER BY updated_at,id LIMIT 250 FOR UPDATE SKIP LOCKED)
       UPDATE package_refresh_jobs job SET status='failed',error_code='package_refresh_expired',
         message='The package refresh expired before recovery.',finished_at=clock_timestamp(),updated_at=clock_timestamp()
@@ -412,13 +420,19 @@ export class PackageRefreshJobs {
 }
 
 function projectJob(row: JobRow) {
+  const expired = ["waiting_authorization", "running"].includes(row.status) && row.deadline_at <= row.checked_at;
+  const status = expired ? "failed" : row.status;
+  const errorCode = expired ? "package_refresh_expired" : row.error_code;
+  const message = expired ? "The package refresh deadline expired. Start a new refresh; saved data is unchanged." : row.message;
   return { id: row.id, authorizationPrincipalId: row.authorization_principal_id, tokenMode: row.token_mode, scopeKind: row.scope_kind,
-    targetCount: row.target_count, resultRevision: row.result_revision,
-    autoDetails: row.auto_details ?? false, status: row.status, pageCount: row.page_count, observedCount: row.observed_count,
-    totalRecords: row.total_records, snapshotId: row.snapshot_id, ...(row.error_code ? { errorCode: row.error_code } : {}),
-    ...(row.message ? { message: row.message } : {}), createdAt: row.created_at.toISOString(),
-    attemptedAt: row.attempted_at?.toISOString() ?? null, updatedAt: row.updated_at.toISOString(),
-    finishedAt: row.finished_at?.toISOString() ?? null };
+    targetCount: row.target_count, resultRevision: `${row.result_revision}${expired ? ":expired" : ""}`,
+    autoDetails: row.auto_details ?? false, status,
+    pageCount: row.page_count, observedCount: row.observed_count,
+    totalRecords: row.total_records, snapshotId: row.snapshot_id, ...(errorCode ? { errorCode } : {}),
+    ...(message ? { message } : {}), createdAt: row.created_at.toISOString(),
+    attemptedAt: row.attempted_at?.toISOString() ?? null,
+    updatedAt: (expired && row.updated_at < row.deadline_at ? row.deadline_at : row.updated_at).toISOString(),
+    finishedAt: expired ? row.deadline_at.toISOString() : row.finished_at?.toISOString() ?? null };
 }
 
 async function insertRefreshTargets(client: pg.PoolClient, jobId: string, ids: readonly string[], catalogRevisionHashes?: readonly string[]) {

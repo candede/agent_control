@@ -13,7 +13,7 @@ from fastmcp import Context
 from pydantic import ValidationError
 
 import agent_control_mcp.auth as auth
-from agent_control_mcp.api import ApiInvocation
+from agent_control_mcp.api import ApiInvocation, safe_json
 from agent_control_mcp.errors import AdapterError
 from agent_control_mcp.inputs import AboutInput, Empty
 from agent_control_mcp.origin import HEADER, origin_header
@@ -362,6 +362,73 @@ async def test_cookie_jar_never_crosses_principals_and_revocation_fences_after_a
     with pytest.raises(AdapterError) as error:
         await pending
     assert error.value.status == 401
+
+
+@pytest.mark.parametrize("phase", ["dispatch", "response"])
+@pytest.mark.parametrize("invalidation", ["closed", "deadline", "expired"])
+async def test_authority_is_rechecked_after_revocation_lookup(
+    invocation, entra, monkeypatch, phase, invalidation
+):
+    get = invocation.api.store.get
+
+    async def get_revocation(*args, **kwargs):
+        result = await get(*args, **kwargs)
+        if invocation.api_token is not None and (phase == "dispatch" or entra.api_calls):
+            if invalidation == "closed":
+                invocation.closed = True
+            elif invalidation == "deadline":
+                invocation.started -= 61
+            else:
+                invocation.upstream.claims["exp"] = int(time.time()) - 1
+        return result
+
+    monkeypatch.setattr(invocation.api.store, "get", get_revocation)
+    code = "reauthorization_required" if invalidation == "expired" else "invocation_deadline"
+    with pytest.raises(AdapterError, match=code):
+        await invocation.get_capabilities()
+    assert len(entra.api_calls) == (1 if phase == "response" else 0)
+    assert invocation.output_bytes == 0
+
+
+async def test_problem_redacts_credentials_in_nested_detail_keys(invocation, entra):
+    token = await invocation.token()
+    entra.api_responses.append(
+        httpx2.Response(
+            403,
+            json={
+                "status": 403,
+                "code": "forbidden",
+                "detail": "Unavailable.",
+                "details": {
+                    f"upstream {invocation.upstream.token}": "omit upstream",
+                    f"exchanged {token.token}": "omit exchanged",
+                    "nested": [{f"trace {token.token}": "omit nested", "count": 1}],
+                    "cursor": "preserve-me",
+                },
+            },
+            headers={"content-type": "application/problem+json"},
+        )
+    )
+    with pytest.raises(AdapterError) as error:
+        await invocation.get_capabilities()
+    assert error.value.status == 403
+    assert error.value.details == {"nested": [{"count": 1}], "cursor": "preserve-me"}
+
+
+@pytest.mark.parametrize(
+    "key,secrets",
+    [
+        ("trace opaque-value", ("opaque-value",)),
+        ("Bearer opaque-value", ()),
+        ("eyJheader.payload.signature", ()),
+    ],
+)
+def test_safe_json_omits_credential_bearing_keys_without_renaming_them(key, secrets):
+    value = {"nested": [{key: "omit", "count": 1}], "cursor": "preserve-me"}
+    assert safe_json(value, secrets=secrets) == {
+        "nested": [{"count": 1}],
+        "cursor": "preserve-me",
+    }
 
 
 async def test_exact_about_page_preserves_sources_cursor_and_unknowns(invocation, entra):

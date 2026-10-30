@@ -11,11 +11,12 @@ import { createApp } from "../src/app.js";
 import { config } from "../src/config.js";
 import { pool } from "../src/db/pool.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision } from "../src/db/capabilities.js";
+import { seedBrowserCapabilityEvidence } from "./browserFixtureCapabilities.js";
 import { capabilityDefinitions } from "../src/services/capabilityRegistry.js";
 import { capabilities } from "../src/services/capabilities.js";
 import { GraphPackagesClient } from "../src/services/graphPackages.js";
 import { DirectoryPrincipalsClient } from "../src/services/directoryPrincipals.js";
-import { appRoles, type CapabilityStatus } from "../src/types/capability.js";
+import { appRoles } from "../src/types/capability.js";
 import { AppError } from "../src/errors.js";
 import { LargeTenantUsersReports } from "../src/services/largeTenantUsersReports.js";
 import { officialReportFingerprint } from "./officialReportFingerprint.js";
@@ -37,14 +38,19 @@ import { UserSourceProvider } from "../src/services/userSourceProvider.js";
 import { buildCopilotReportUrl, reportHeaders } from "../src/services/userSourceGraphFields.js";
 
 await vi.hoisted(async () => {
-  const { configureBrowserFixtureEnvironment } = await import("./fixtureSupport.js");
+  const { configureBrowserFixtureEnvironment, createBrowserFixtureFetch } = await import("./fixtureSupport.js");
   const tenant = configureBrowserFixtureEnvironment();
   process.env.TENANTS_JSON = JSON.stringify([
     { tenantId: "11111111-1111-1111-1111-111111111111", domains: ["example.invalid"] },
     { tenantId: "33333333-3333-4333-8333-333333333333", domains: ["csv-desktop.example.invalid"] },
     { tenantId: "44444444-4444-4444-8444-444444444444", domains: ["csv-mobile.example.invalid"] },
-    { tenantId: "55555555-5555-4555-8555-555555555555", domains: ["lifecycle.example.invalid"] },
+    { tenantId: "55555555-5555-4555-8555-555555555555", domains: ["desktop-running.lifecycle.example.invalid"] },
+    { tenantId: "66666666-6666-4666-8666-666666666666", domains: ["desktop-failed.lifecycle.example.invalid"] },
+    { tenantId: "77777777-7777-4777-8777-777777777777", domains: ["mobile-running.lifecycle.example.invalid"] },
+    { tenantId: "88888888-8888-4888-8888-888888888888", domains: ["mobile-failed.lifecycle.example.invalid"] },
   ].map(profile => ({ ...tenant, ...profile })));
+  // Provider clients capture fetch during module initialization.
+  vi.stubGlobal("fetch", createBrowserFixtureFetch(globalThis.fetch));
 });
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, { scenario: string; tenantId: string; username: string }>() }));
 vi.mock("../src/auth/msal.js", async original => {
@@ -92,7 +98,6 @@ const selectedBrowserFiles = browserFixtureTestFiles();
 let application: ReturnType<typeof createApp>;
 let server: Server;
 let savedLifecycle: Awaited<ReturnType<typeof savedReadBrowserFixture>> | undefined;
-const statuses: CapabilityStatus[] = ["available", "missing_permission", "missing_internal_role", "missing_role", "missing_license", "not_configured", "unsupported", "preview_disabled", "provider_error", "unknown"];
 const quarantineEnvironmentId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const qualifiedQuarantineBotId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const unqualifiedQuarantineBotId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -119,18 +124,7 @@ beforeAll(async () => {
   const invalidatePrincipal = capabilities.invalidatePrincipal.bind(capabilities);
   vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
     await invalidatePrincipal(user);
-    const scenario = user.homeAccountId.replace(/^fixture-/, "");
-    if (![...statuses, "stale", "role-Viewer", "role-Admin"].includes(scenario) && !scenario.startsWith("lifecycle-")) return;
-    for (const definition of capabilityDefinitions.filter(definition => definition.probe.kind === "provider_read")) {
-      const configuration = await repository.configuration(config.tenants[0].tenantId!, definition.id);
-      await repository.recordEvidence({ tenantId: config.tenants[0].tenantId!, principalId: definition.mode === "application" ? config.tenants[0].clientId! : user.homeAccountId,
-        authorizationPrincipalId: user.homeAccountId, capabilityId: definition.id, resourceAudience: definition.audience, environmentId: definition.cloud,
-        tokenMode: definition.mode as "delegated" | "application", permissionRevision: capabilityPermissionRevision(definition), contractRevision: capabilityContractRevision(definition), configurationRevision: configuration.revision,
-      }, statuses.includes(scenario as CapabilityStatus) ? scenario as CapabilityStatus : "available", {
-        category: scenario === "provider_error" ? "provider_error" : undefined,
-        verification: definition.id === "powerPlatform.quarantine.read" ? "token" : "provider",
-      }, scenario === "stale" ? -1000 : 240000, () => undefined);
-    }
+    await seedBrowserCapabilityEvidence(repository, user);
   });
   vi.spyOn(GraphPackagesClient.prototype, "checkCatalogAccess").mockImplementation(async token => {
     if (token === "fixture-provider_error") throw new AppError(502, "provider_error", "Synthetic provider outage");
@@ -183,16 +177,11 @@ beforeAll(async () => {
     quarantineProviderFixture.updatedAt.set(target.botId, "2026-09-10T10:00:00.456Z");
     return { ...target, isBotQuarantined: requestedState, lastUpdateTimeUtc: "2026-09-10T10:00:00.456Z", observedAt: new Date().toISOString(), correlationId: options.correlationId };
   });
-  const realFetch = globalThis.fetch;
-  vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => {
-    const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-    if (!["localhost", "127.0.0.1"].includes(url.hostname)) throw new Error("Live provider requests are forbidden in browser fixtures.");
-    return realFetch(input, init);
-  });
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
   reportRuntime(fixture.runtime).start();
   if (!selectedBrowserFiles.length || selectedBrowserFiles.includes("savedBackendLifecycle.spec.ts")) {
-    savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator, config.tenants[3].tenantId!);
+    savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator,
+      config.tenants.map(tenant => ({ tenantId: tenant.tenantId!, domains: tenant.domains })));
     process.env.AGENT_CONTROL_LIFECYCLE_CONTROL = savedLifecycle.origin;
     const automaticRefresh = dataSync.automaticRefresh.bind(dataSync);
     vi.spyOn(dataSync, "automaticRefresh").mockImplementation(async (user, signedInAt) => {

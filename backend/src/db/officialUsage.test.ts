@@ -52,7 +52,7 @@ async function bundle(identity: SelectionIdentity, options: Parameters<typeof st
   return { bundleId, preview, accept: () => imports.acceptBundle(identity, bundleId, preview) };
 }
 async function page(identity: SelectionIdentity, endpoint: ReportEndpoint, query: ReportQuery = {}) {
-  return reports.page((await reports.capture(identity, "delegated", endpoint, query)).id, identity, { limit: 50 });
+  return reports.page((await reports.capture(identity, endpoint, query)).id, identity, { limit: 50 });
 }
 async function head(identity: SelectionIdentity) {
   return (await fixture.runtime.query<{ activeSetId: string | null; activeRevision: string }>(
@@ -341,7 +341,7 @@ describe("native immutable official report authority", () => {
       await imports.stage(identity, { bundleId }, chunks(), metadata);
     }
     const accepted = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-    const selected = await reports.capture(identity, "delegated", "history");
+    const selected = await reports.capture(identity, "history");
     await operation(identity, accepted.setId, "delete");
     const rows = async () => (await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_version_rows WHERE tenant_id=$1", [identity.tenantId])).rows[0].n;
     expect(await rows()).toBe(251);

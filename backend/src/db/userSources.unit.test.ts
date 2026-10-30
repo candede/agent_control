@@ -22,7 +22,7 @@ function fixture() {
   vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
   const repository = new UserSourcesRepository(database, "synthetic-source-unit-cursor-secret");
   const context: UserSourceReadContext = {
-    evaluatedAt: at, scope: { ...identity, tokenMode: "delegated" }, query: { sort: "name", order: "asc" }, queryHash: digest("source-query"),
+    evaluatedAt: at, scope: { tenantId: identity.tenantId }, query: { sort: "name", order: "asc" }, queryHash: digest("source-query"),
     selection: {
       id: "selected", revision: "revision", evaluatedAt: at.toISOString(), validatedAt: at.toISOString(),
       expiresAt: new Date(at.getTime() + 600_000).toISOString(),
@@ -86,7 +86,7 @@ describe("wide normalized source cursor boundaries", () => {
     }
     const lookups = query.mock.calls.filter(([statement]) => typeof statement === "string" && statement.includes("SELECT page_key,identity FROM ordered"));
     expect(lookups).toHaveLength(2);
-    const parameters = ["generation", null, false, ...(endpoint === "facets" ? [""] : [])];
+    const parameters = ["generation", null, at, ...(endpoint === "facets" ? [""] : [])];
     expect(lookups[0][1]).toEqual([...parameters, digest(rows[0].identity)]);
     expect(query).toHaveBeenCalledWith(expect.stringContaining('identity COLLATE "C")\n      >'),
       [...parameters, 0, rows[0].page_key, rows[0].identity, 2]);
@@ -106,7 +106,7 @@ describe("source selection search canonicalization", () => {
       const { repository, query, client, context } = fixture();
       const filters = userSourceFilter({ search });
       const hash = canonicalQuery(filters, ["search", "sort", "order"]);
-      query.mockResolvedValue(result([{ token_mode: "delegated", metadata: context.metadata }]));
+      query.mockResolvedValue(result([{ metadata: context.metadata }]));
       const restored = await repository.contextInRead(client, identity, {
         selection: { id: context.selection.id, query_json: filters, query_hash: hash,
           evaluated_at: at, validated_at: at, expires_at: new Date(context.selection.expiresAt),
@@ -122,7 +122,7 @@ describe("source selection search canonicalization", () => {
     "rejects expanded or invalid search before scope admission: %j", async search => {
       const { repository, query } = fixture();
       const ensure = vi.spyOn(repository, "ensureScope").mockRejectedValue(new Error("Unexpected scope admission"));
-      await expect(repository.capture(identity, "delegated", { search })).rejects.toMatchObject({ code: "invalid_cursor", status: 400 });
+      await expect(repository.capture(identity, { search })).rejects.toMatchObject({ code: "invalid_cursor", status: 400 });
       expect(ensure).not.toHaveBeenCalled();
       expect(query).not.toHaveBeenCalled();
     });
@@ -133,7 +133,7 @@ describe("source selection search canonicalization", () => {
     query.mockResolvedValue(result());
     await repository.page("selected", identity);
     expect(query).toHaveBeenCalledWith(expect.stringContaining("strpos(normalize(lower(normalize(upn,NFKC) COLLATE \"default\"),NFKC),$4)"),
-      ["generation", null, false, "\u01f0", 51]);
+      ["generation", null, at, "\u01f0", 51]);
   });
 
   it("reuses facet cursors across equivalent canonical searches", async () => {
@@ -147,7 +147,7 @@ describe("source selection search canonicalization", () => {
     await expect(repository.facets("selected", identity, { field: "company", search: "\u01f0", limit: 1, cursor: first.page.nextCursor! }))
       .resolves.toMatchObject({ selection: first.selection });
     expect(query.mock.calls[0][0]).toContain("strpos(normalize(lower(normalize(coalesce(company,''),NFKC) COLLATE \"default\"),NFKC),$4)");
-    expect(query.mock.calls[0][1]?.slice(0, 4)).toEqual(["generation", null, false, "\u01f0"]);
+    expect(query.mock.calls[0][1]?.slice(0, 4)).toEqual(["generation", null, at, "\u01f0"]);
   });
 });
 
@@ -165,7 +165,7 @@ it("uses a compact facet anchor when a stored identity exceeds the decoder bound
   const first = await repository.facets("selected", identity, { field: "company", limit: 1 });
   await expect(repository.facets("selected", identity, { field: "company", limit: 1, cursor: first.page.nextCursor! })).resolves.toBeDefined();
   expect(query).toHaveBeenCalledWith(expect.stringContaining("SELECT page_key,identity FROM ordered"),
-    ["generation", null, false, "", digest(rows[0].identity)]);
+    ["generation", null, at, "", digest(rows[0].identity)]);
 });
 
 describe("selected people input snapshots", () => {
@@ -179,8 +179,8 @@ describe("selected people input snapshots", () => {
       return work(client, context);
     });
     await repository.people("selected", identity, ids);
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [identity.tenantId, identity.principalId, "generation", [objectId], at, "delegated", true]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($3::text[])"),
+      [identity.tenantId, "generation", [objectId], at, true]);
   });
 
   it("projects the captured inventory and selection identity rather than post-await caller mutations", async () => {

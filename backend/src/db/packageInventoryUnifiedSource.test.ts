@@ -21,7 +21,7 @@ afterAll(async () => { await database?.close(); });
 const packageValue = (id: string, isBlocked = false) => allowlistedPackage({ id, displayName: id, isBlocked });
 
 function provider() {
-  const scope = { tenantId: "typed-package-observations", principalId: randomUUID() };
+  const scope = { tenantId: randomUUID(), principalId: randomUUID() };
   let catalog: CopilotPackageDetail[] = [];
   const exact = new Map<string, CopilotPackageDetail>();
   const graph = new GraphPackagesClient(async url => {
@@ -111,8 +111,8 @@ describe("typed package observation identity and provenance", () => {
     const liveBefore = await new LiveInventory(database.runtime).record(source.scope, before.page.value[0].id);
     const root = (await database.runtime.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-      WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.principal_id=$2`,
-    [source.scope.tenantId, source.scope.principalId])).rows[0];
+      WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.scope_kind='tenant'`,
+    [source.scope.tenantId])).rows[0];
     const expiry = (await database.runtime.query(`SELECT generation_id,identity,identity_expires_at FROM unified_agent_rows
       WHERE generation_id=$1`, [root.baselineId])).rows[0];
     expect(expiry.identity_expires_at).toBeInstanceOf(Date);
@@ -147,8 +147,8 @@ describe("typed package observation identity and provenance", () => {
     const before = await source.read();
     expect(before.page.identityCollection).toMatchObject({ checkedPackages: 1, pendingPackages: 0 });
     const revision = (await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
-      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
-    [source.scope.tenantId, source.scope.principalId])).rows[0].revision;
+      WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant' AND scope.source='inventory_packages' AND root.current`,
+    [source.scope.tenantId])).rows[0].revision;
     const expiresAt = Date.parse(before.page.value[0].packages[0].detailFreshness!.expiresAt!);
     expect(expiresAt).toBe(observedAt.getTime() + automaticDataSyncIntervalMs);
     await expect.poll(() => Date.now() >= expiresAt, { interval: 100, timeout: 3500 }).toBe(true);
@@ -170,8 +170,8 @@ describe("typed package observation identity and provenance", () => {
       state: "stale", observedAt: observedAt.toISOString(), expiresAt: new Date(expiresAt).toISOString(),
     });
     expect((await database.runtime.query(`SELECT revision FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
-      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND scope.source='inventory_packages' AND root.current`,
-    [source.scope.tenantId, source.scope.principalId])).rows[0].revision).toBe(revision);
+      WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant' AND scope.source='inventory_packages' AND root.current`,
+    [source.scope.tenantId])).rows[0].revision).toBe(revision);
     const generationCount = (await database.runtime.query("SELECT count(*)::int AS total FROM data_generations")).rows[0].total;
     await reconcileInventoryFixture(database.runtime, source.scope);
     expect((await database.runtime.query("SELECT count(*)::int AS total FROM data_generations")).rows[0].total).toBe(generationCount);
@@ -221,7 +221,7 @@ describe("typed package observation identity and provenance", () => {
     expect(page.value.some(row => Object.hasOwn(row.observations.packageSnapshots, "removed"))).toBe(false);
   });
 
-  it("retains compatible exact identity children, invalidates changed provider revisions and isolates application observations", async () => {
+  it("retains compatible exact identity children, invalidates changed provider revisions and shares application observations", async () => {
     const source = provider();
     const original = { ...packageValue("new"), lastModifiedDateTime: "2026-09-10T10:00:00.000Z", version: "1",
       appId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -231,13 +231,12 @@ describe("typed package observation identity and provenance", () => {
     await source.exactPage(["delete", "new"]);
     const application = inventoryInput(source.scope.principalId);
     application.scope.tenantId = source.scope.tenantId;
-    application.scope.tokenMode = "application";
     const graph = new GraphPackagesClient(async () => Response.json({ value: [packageValue("application-only")], "@odata.count": 1 }),
       { minimumReadIntervalMs: 0, maxAttempts: 1 });
     await new StreamedInventory(database.runtime, graph).graphCatalog(application, "synthetic", { authorize: async () => {} });
     const readNew = async () => {
       const read = await source.read();
-      expect(read.page.value.map(row => row.packages[0].id)).toEqual(["new", "retain"]);
+      expect(read.page.value.map(row => row.packages[0].id).sort()).toEqual(["application-only", "new", "retain"]);
       const detail = await read.queries.packageDetail(read.selection.id, read.identity, "new");
       const { recordId, sourceScopeId, sourceIdentity } = detail.selectedSource;
       const children = await read.queries.children(read.selection.id, read.identity, recordId,
@@ -249,7 +248,7 @@ describe("typed package observation identity and provenance", () => {
     const compatible = await readNew();
     expect(compatible.detail).toMatchObject({ isBlocked: true, identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
     expect(compatible.children).toMatchObject({ total: 1, value: [{ payload: { elementType: "AgentMetadatas" } }] });
-    expect(compatible.read.page.value[0].observations.packageSnapshots.new.scopeKind).toBe("broad");
+    expect(compatible.read.page.value.find(row => row.packages[0].id === "new")!.observations.packageSnapshots.new.scopeKind).toBe("broad");
 
     await source.catalogPage([packageValue("retain"), { ...catalog, isBlocked: false,
       lastModifiedDateTime: "2026-09-11T10:00:00.000Z", version: "2", appId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }]);
@@ -263,10 +262,10 @@ describe("typed package observation identity and provenance", () => {
     const empty = await readNew();
     expect(empty.detail).toMatchObject({ identityDetailsCollected: true, detailFreshness: { state: "fresh" } });
     expect(empty.children).toMatchObject({ total: 0, value: [] });
-    expect(empty.read.page.value[0].observations.packageSnapshots.new.scopeKind).toBe("exact");
+    expect(empty.read.page.value.find(row => row.packages[0].id === "new")!.observations.packageSnapshots.new.scopeKind).toBe("exact");
     source.exact.delete("new");
     await source.exactPage(["new"]);
-    expect((await source.read()).page.value.map(row => row.packages[0].id)).toEqual(["retain"]);
+    expect((await source.read()).page.value.map(row => row.packages[0].id)).toEqual(["application-only", "retain"]);
   });
 
   it("removes a confirmed absent prototype-named target without inventing a row or an observation", async () => {

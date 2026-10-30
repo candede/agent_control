@@ -2,7 +2,7 @@ import type { LargeTenantUsersReports } from "../src/services/largeTenantUsersRe
 import type { SelectionIdentity } from "../src/services/dataSelections.js";
 
 export async function officialReportFingerprint(reports: LargeTenantUsersReports, identity: SelectionIdentity) {
-  const selected = await reports.capture(identity, "delegated", "official_agents");
+  const selected = await reports.capture(identity, "official_agents");
   return reports.read(selected.id, identity, async (client, context) => {
     const agents = await reports.pageInRead(client, context, { limit: 1 });
     const users = await reports.rowsInRead(client, context, { endpoint: "official_users", limit: 1 });

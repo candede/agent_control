@@ -50,7 +50,7 @@ export class PowerPlatformRefreshJobs {
     const requestHash = queryHash(environmentScope, requestedTypes);
     const id = await transaction(this.database, async client => {
       assertCurrent?.();
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`power-platform:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`power-platform:${scope.tenantId}`]);
       const existing = (await client.query<Pick<JobRow, "id" | "environment_scope" | "requested_types">>(`
         SELECT id,environment_scope,requested_types FROM power_platform_refresh_jobs
         WHERE tenant_id=$1 AND principal_id=$2 AND idempotency_key=$3`, [scope.tenantId, scope.principalId, input.idempotencyKey])).rows[0];
@@ -106,7 +106,7 @@ export class PowerPlatformRefreshJobs {
     const summary = await this.database.query<{ last_attempt_at: Date | null; last_success_at: Date | null }>(`SELECT
       (SELECT max(attempted_at) FROM power_platform_refresh_jobs WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()) AS last_attempt_at,
       (SELECT max(g.observed_at) FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_power_platform'
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='inventory_power_platform'
           AND g.state='published' AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
           AND g.validated AND EXISTS(SELECT 1 FROM inventory_roots r JOIN inventory_revisions v
             ON v.scope_id=r.scope_id AND v.revision=r.revision

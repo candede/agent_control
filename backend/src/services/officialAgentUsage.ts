@@ -31,9 +31,9 @@ export class OfficialAgentUsage {
   private async contextInRead(client: pg.PoolClient, identity: SelectionIdentity, id: string): Promise<UsageReadContext> {
     if (!this.inventory) return this.reports.contextInRead(client, identity, id);
     const { context, selection } = await this.inventory.contextInRead(client, id, identity);
-    if (selection.endpoint !== "inventory" || context.source !== "inventory_canonical" || context.tokenMode !== "delegated") throw new SelectionError("invalid_cursor");
+    if (selection.endpoint !== "inventory" || context.source !== "inventory_canonical") throw new SelectionError("invalid_cursor");
     const query = reportQuery("official_agents", {});
-    return { ...context.data, identity, tokenMode: "delegated", endpoint: "official_agents", query,
+    return { ...context.data, identity, endpoint: "official_agents", query,
       queryHash: canonicalQuery(query, reportQueryFields), inventorySelectionId: id,
       selection: { id, revision: selection.revision, evaluatedAt: new Date(selection.evaluated_at).toISOString(),
         expiresAt: new Date(selection.expires_at).toISOString(), validatedAt: new Date(selection.validated_at).toISOString(),
@@ -52,7 +52,6 @@ export class OfficialAgentUsage {
   }
 
   private async target(client: pg.PoolClient, context: UsageReadContext, recordId: string) {
-    if (context.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires current delegated inventory evidence.");
     const target = parseRecordId(recordId), { tenantId, principalId } = context.identity;
     const native = target.source === "graph_packages" ? target.packageId : target.source === "power_platform" ? normalizeNativeIdentity(target.nativeId) : null;
     const environment = target.source === "power_platform" ? normalizeEnvironmentIdentity(target.environmentId ?? "") : "";
@@ -63,7 +62,7 @@ export class OfficialAgentUsage {
     [tenantId, principalId, target.source === "canonical" ? target.agentId : null, context.inventorySelectionId ?? context.evaluatedAt, target.source, native, environment])).rows;
     if (!matches.length) throw new AppError(404, "agent_not_found", context.inventorySelectionId
       ? "This agent is absent from the saved inventory selection. Reload saved inventory."
-      : "Exact current delegated inventory evidence is unavailable. Refresh inventory and wait for reconciliation.");
+      : "Exact current tenant inventory evidence is unavailable. Refresh inventory and wait for reconciliation.");
     if (matches.length !== 1) throw new AppError(409, "agent_identity_ambiguous", "The exact source belongs to multiple current agents.");
     const row = matches[0];
     const values = [tenantId, principalId, row.agent_id, context.evaluatedAt];
@@ -79,7 +78,7 @@ export class OfficialAgentUsage {
     const values = this.reports.parameters(context);
     values.push(context.identity.principalId, agentId, context.inventorySelectionId ?? context.evaluatedAt);
     const sourceSql = context.inventorySelectionId ? selectedInventorySourcesSql("$4", "$7", "$8", "$9")
-      : `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND principal_id=$7 AND agent_id=$8
+      : `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND $7::text IS NOT NULL AND agent_id=$8
       AND authority_expires_at>GREATEST($9::timestamptz,clock_timestamp())`;
     return { values, sql: `${reportRelationsSql}, sources AS (${sourceSql}),
       linked AS (
@@ -103,7 +102,7 @@ export class OfficialAgentUsage {
     }));
     const values = [...this.reports.parameters(context), context.identity.principalId, ids, context.evaluatedAt];
     encodeBatch(ids, values);
-    const sourceSql = `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND principal_id=$7 AND agent_id=ANY($8::text[])
+    const sourceSql = `SELECT * FROM inventory_live_sources WHERE tenant_id=$4 AND $7::text IS NOT NULL AND agent_id=ANY($8::text[])
       AND authority_expires_at>GREATEST($9::timestamptz,clock_timestamp())`;
     const { rows } = await client.query(`${reportRelationsSql}, sources AS (${sourceSql}),
       requested AS (SELECT id,ordinal FROM unnest($8::text[]) WITH ORDINALITY AS target(id,ordinal)),
@@ -331,7 +330,6 @@ export class OfficialAgentUsage {
   }
 
   packagesInRead(client: pg.PoolClient, context: ReportReadContext, references: readonly { snapshotId: string; nativeId: string }[]) {
-    if (context.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Package evidence requires delegated scope.");
     if (references.length > 100) throw new AppError(400, "data_exact_ids_limit", "At most 100 exact package references.");
     const batch = encodeBatch(references, [context.identity.tenantId, context.identity.principalId, context.evaluatedAt]);
     return client.query(`SELECT r.generation_id AS snapshot_id,r.native_id,r.display_name,(r.residual->>'isBlocked')::boolean AS is_blocked,
@@ -342,7 +340,7 @@ export class OfficialAgentUsage {
       JOIN data_generations g ON g.id=r.generation_id
       JOIN inventory_memberships m ON m.baseline_id=root.baseline_id AND m.generation_id=r.generation_id AND m.identity=r.identity
         AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
-      WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND g.scope_epoch=s.epoch
+      WHERE s.tenant_id=$1 AND $2::text IS NOT NULL AND s.scope_kind='tenant' AND s.token_mode='tenant' AND g.scope_epoch=s.epoch
         AND g.session_epoch=s.session_epoch AND r.expires_at>GREATEST($3,clock_timestamp())`,
     [context.identity.tenantId, context.identity.principalId, context.evaluatedAt, batch.json]).then(result => { encodeBatch(result.rows); return result.rows; });
   }

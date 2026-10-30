@@ -7,8 +7,9 @@ import { GraphPackagesClient } from "../services/graphPackages.js";
 import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRuntime.js";
 import { inventoryPresentation } from "../services/inventoryPresentation.js";
 import { storedInventoryRecord, StreamedInventory } from "../services/streamedInventory.js";
-import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
+import { packageInventoryRecord, type InventoryFact } from "../services/inventoryRecordProjection.js";
 import type { CopilotPackageDetail } from "../types/copilotPackage.js";
+import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 import { PackageRefreshJobs, type PackageDataScope } from "./packageRefreshJobs.js";
 import { verifySchema } from "./schema.js";
 
@@ -19,7 +20,7 @@ afterEach(async () => {
   for (const selected of selections.splice(0)) await selected.queries.selections.invalidate(selected.selection.id, selected.identity);
 });
 afterAll(async () => { await fixture?.close(); });
-const scope = (): PackageDataScope => ({ tenantId: "detail-tenant", principalId: randomUUID() });
+const scope = (): PackageDataScope => ({ tenantId: randomUUID(), principalId: randomUUID() });
 const summary = (id = "one", version = "1") => allowlistedPackage({
   id, displayName: `Catalog ${id}`, isBlocked: false, version, lastModifiedDateTime: "2026-09-24T08:00:00Z",
   manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", availableTo: "some", deployedTo: "none",
@@ -84,6 +85,8 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     await publish(owner, [summary("populated"), summary("empty"), summary("omitted")]);
     expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 3, fresh: 0, eligible: 3 });
     expect(await jobs.detailCoverage({ ...owner, principalId: randomUUID() }))
+      .toEqual({ catalog_available: true, total: 3, fresh: 0, eligible: 3 });
+    expect(await jobs.detailCoverage({ ...owner, tenantId: randomUUID() }))
       .toEqual({ catalog_available: false, total: 0, fresh: 0, eligible: 0 });
     await collect(owner, await claim(owner), [
       { ...detail("populated"), sharedWithUsersAndGroups: recipients },
@@ -113,7 +116,7 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
         storedInventoryRecord(client, result.detail.selectedSource.generationId, id));
       expect(stored.value.sharedWithUsersAndGroups).toEqual(expected);
       expect(stored.residual).not.toHaveProperty("sharedWithUsersAndGroups");
-      expect(stored.facts.filter(fact => fact.kind === "collection" && fact.value === "sharedWithUsersAndGroups"))
+      expect(stored.facts.filter((fact: InventoryFact) => fact.kind === "collection" && fact.value === "sharedWithUsersAndGroups"))
         .toHaveLength(expected === undefined ? 0 : 1);
     }
     await reconcileInventoryFixture(fixture.runtime, owner);
@@ -240,7 +243,7 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     const initial = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated",
       idempotencyKey: randomUUID(), requestedIds: ["changed", "old"] });
     await jobs.markRunning(owner, initial.id);
-    await collect(owner, initial, [detail("changed"), detail("old")], { observedAt: new Date(Date.now() - 3_601_000) });
+    await collect(owner, initial, [detail("changed"), detail("old")], { observedAt: new Date(Date.now() - automaticDataSyncIntervalMs - 1000) });
     await publish(owner, [summary("changed", "2"), summary("old"), summary("new")]);
     const automatic = (await jobs.claimDueDetails(owner, owner.principalId))!;
     expect(await targetIds(owner, automatic)).toEqual(["changed", "new", "old"]);
@@ -275,16 +278,17 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     });
     expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
   });
-  it("fences late details after newer catalog state, including remove/re-add with identical markers", async () => {
+  it("fences late details after a changed catalog revision without inferring deletion from a narrower catalog", async () => {
     const owner = scope();
     await publish(owner, [summary()]);
     const job = await claim(owner);
     await publish(owner, []);
-    await publish(owner, [summary()]);
+    expect((await read(owner)).detail).toMatchObject({ id: "one", version: "1" });
+    await publish(owner, [summary("one", "2")]);
     await collect(owner, job, [detail()]);
     const result = await read(owner);
     expect(result.children.total).toBe(0);
-    expect(result.detail).toMatchObject({ detailFreshness: { state: "missing" } });
+    expect(result.detail).toMatchObject({ version: "2", detailFreshness: { state: "missing" } });
     expect(result.detail).not.toHaveProperty("identityDetailsCollected", true);
   });
   it("retains compatible detail freshness across later catalog names while a changed revision becomes due immediately", async () => {

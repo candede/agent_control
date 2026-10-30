@@ -33,7 +33,7 @@ describe("saved exact-ID agent people projection", () => {
   afterAll(async () => { await fixture?.close(); });
   afterEach(() => vi.restoreAllMocks());
   function harness() {
-    const identity = { ...selectionIdentity, tenantId: "saved-exact-people", principalId: randomUUID() };
+    const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const service = new SavedAgentPeopleService(fixture.runtime), sources = new UserSourcesRepository(fixture.runtime, "synthetic-exact-people-secret-0000000");
     return { identity, service, sources, directory: (users: Parameters<typeof publishFixtureDirectory>[2], options?: Parameters<typeof publishFixtureDirectory>[3]) =>
       publishFixtureDirectory(fixture.runtime, identity, users, options) };
@@ -57,8 +57,8 @@ describe("saved exact-ID agent people projection", () => {
         expect(result.powerPlatformResource).not.toBe(native.powerPlatformResource);
         expect(result.identity).toEqual(native.identity); expect(result.packages).toEqual(native.packages);
         expect(native.people).toBeUndefined();
-        const exact = query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($4::text[])"));
-        expect(exact).toHaveLength(1); expect(exact[0][1]?.[3]).toEqual([firstId]);
+        const exact = query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($3::text[])"));
+        expect(exact).toHaveLength(1); expect(exact[0][1]?.[2]).toEqual([firstId]);
         expect(query.mock.calls.filter(([sql]) => String(sql).includes("current_setting('transaction_isolation')"))).toHaveLength(1);
       } finally { pool.mockRestore(); query.mockRestore(); }
     });
@@ -69,7 +69,7 @@ describe("saved exact-ID agent people projection", () => {
   it.each([null, "Guest#EXT#@example.onmicrosoft.com"])("retains nullable cached UPNs and exact guest directory UPNs: %s", async upn => {
     const h = harness();
     if (upn === null) {
-      await h.sources.capture(h.identity, "delegated");
+      await h.sources.capture(h.identity);
       await h.sources.savePeople(h.identity, [{ objectId: firstId, displayName: "Known name", userPrincipalName: null,
         status: "resolved", checkedAt: new Date().toISOString() }], async () => {});
     } else await h.directory([fixtureDirectoryUser(firstId, "Known name", upn)]);
@@ -102,29 +102,27 @@ describe("saved exact-ID agent people projection", () => {
     expect(value.people?.createdBy).toMatchObject({ displayName: "Unlicensed creator", userPrincipalName: null });
   });
 
-  it("does not guess from names, UPNs, report identities, partial GUIDs or another tenant/principal/token mode", async () => {
+  it("shares another actor's exact directory identities but never guesses from names, UPNs, partial GUIDs or another tenant", async () => {
     const h = harness();
-    for (const identity of [{ ...h.identity, tenantId: "other-tenant" }, { ...h.identity, principalId: "other-principal" }]) {
-      await publishFixtureDirectory(fixture.runtime, identity, [fixtureDirectoryUser(firstId)]);
-    }
-    await h.directory([fixtureDirectoryUser(firstId)], { tokenMode: "application" });
+    await publishFixtureDirectory(fixture.runtime, { ...h.identity, tenantId: randomUUID() }, [fixtureDirectoryUser(firstId)]);
     const native = record(h.identity.tenantId);
     expect((await h.service.project(h.identity, [native]))[0].people).toBeUndefined();
-    await h.directory([fixtureDirectoryUser(firstId)]);
+    await publishFixtureDirectory(fixture.runtime, { ...h.identity, principalId: randomUUID() }, [fixtureDirectoryUser(firstId)]);
+    expect((await h.service.project(h.identity, [native]))[0].people?.owner?.displayName).toBe("Saved person");
     const records = [record(h.identity.tenantId, "Saved person", "person@example.invalid", firstId.slice(1)),
       record(h.identity.tenantId, secondId, null, `{${firstId}}`),
       { ...native, powerPlatformResource: null, presence: "graph_packages" as const }];
     expect((await h.service.project(h.identity, records)).every(value => value.people === undefined)).toBe(true);
   });
 
-  it("removes stale attached people after a complete empty replacement without removing native identifiers", async () => {
+  it("retains saved people after a narrower empty collection without changing native identifiers", async () => {
     const h = harness();
     await h.directory([fixtureDirectoryUser(firstId)]);
     const [enriched] = await h.service.project(h.identity, [record(h.identity.tenantId)]);
     expect(enriched.people?.owner).toBeDefined();
     await h.directory([]);
     const [result] = await h.service.project(h.identity, [enriched]);
-    expect(result.people).toBeUndefined();
+    expect(result.people).toEqual(enriched.people);
     expect(result.powerPlatformResource?.details.ownerId).toBe(firstId);
     expect(result.id).toBe(enriched.id);
   });
@@ -135,11 +133,11 @@ describe("saved exact-ID agent people projection", () => {
       const query = vi.spyOn(client, "query");
       try {
         expect(await h.service.project(h.identity, rows, client)).toHaveLength(100);
-        const exact = query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($4::text[])"));
+        const exact = query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($3::text[])"));
         expect(exact).toHaveLength(3);
         expect(exact.map(([, parameters]: readonly unknown[]) =>
-          Array.isArray(parameters) && Array.isArray(parameters[3]) ? parameters[3].length : null)).toEqual([100, 100, 100]);
-        expect(new Set(exact.map(call => (call[1]?.[4] as Date).toISOString())).size).toBe(1);
+          Array.isArray(parameters) && Array.isArray(parameters[2]) ? parameters[2].length : null)).toEqual([100, 100, 100]);
+        expect(new Set(exact.map(call => (call[1]?.[3] as Date).toISOString())).size).toBe(1);
       } finally { query.mockRestore(); }
     });
     await expect(h.service.project(h.identity, [...rows, rows[0]])).rejects.toMatchObject({ code: "data_page_limit" });
@@ -192,7 +190,7 @@ describe("service-free saved people boundaries", () => {
         return { ...result([]), command: statement.split(" ")[0] };
       }
       if (statement.includes("current_setting('transaction_isolation')")) return result([{ isolation: "repeatable read", now: at }]);
-      if (statement.includes("FROM unnest($4::text[])")) return result((parameters?.[3] as string[]).map(id => ({
+      if (statement.includes("FROM unnest($3::text[])")) return result((parameters?.[2] as string[]).map(id => ({
         id, directory_id: id, display_name: "Known person", upn: null, status: null,
       })));
       throw new Error("Unexpected SQL");
@@ -285,9 +283,9 @@ describe("service-free saved people boundaries", () => {
       finish(result([{ isolation: "repeatable read", now: at }]));
       return pending;
     });
-    expect(h.metadata).toHaveBeenCalledWith(h.client, { ...originalScope, tokenMode: "delegated" }, at);
-    expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [originalScope.tenantId, originalScope.principalId, "directory-generation", [firstId], at, "delegated", true]);
+    expect(h.metadata).toHaveBeenCalledWith(h.client, originalScope, at);
+    expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($3::text[])"),
+      [originalScope.tenantId, "directory-generation", [firstId], at, true]);
     expect(projected).toMatchObject(original);
     expect(projected.people?.owner).toBe(projected.people?.createdBy);
     expect(projected.people?.owner).toBe(projected.people?.lastModifiedBy);
@@ -340,7 +338,7 @@ describe("service-free saved people boundaries", () => {
     expect(Buffer.byteLength(JSON.stringify([native]))).toBeLessThan(1_048_576);
     await expect(h.selected(client => h.service.project(h.scope, [native], client))).rejects.toMatchObject({ code: "data_response_bytes" });
     expect(h.metadata).toHaveBeenCalledOnce();
-    expect(h.query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($4::text[])"))).toHaveLength(1);
+    expect(h.query.mock.calls.filter(([sql]) => String(sql).includes("FROM unnest($3::text[])"))).toHaveLength(1);
   });
 
   it("keeps opaque and padded identities exact, canonicalizes only GUID case and removes stale overlays", async () => {
@@ -352,7 +350,7 @@ describe("service-free saved people boundaries", () => {
     } });
     expect(projected.powerPlatformResource).toEqual(native.powerPlatformResource);
     expect(agentColumnValue(projected, "owner")).toBe(` ${firstId} `);
-    expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-      [h.scope.tenantId, h.scope.principalId, "directory-generation", [firstId], at, "delegated", true]);
+    expect(h.query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($3::text[])"),
+      [h.scope.tenantId, "directory-generation", [firstId], at, true]);
   });
 });

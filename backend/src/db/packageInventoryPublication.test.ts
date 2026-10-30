@@ -63,7 +63,7 @@ describe("streamed package publication transaction", () => {
     await publish(scope, job.id, undefined, async client => {
       const state = (await client.query(`SELECT job.status,source.status AS source_status,source.count,marker.count AS marker_count
         FROM package_refresh_jobs job JOIN data_sync_run_sources source ON source.job_id=job.id
-        JOIN data_sync_success_markers marker ON marker.tenant_id=job.tenant_id AND marker.principal_id=job.principal_id
+        JOIN data_sync_success_markers marker ON marker.tenant_id=job.tenant_id
           AND marker.source_id='graph_packages' WHERE job.id=$1`, [job.id])).rows[0];
       expect(state).toEqual({ status: "succeeded", source_status: "succeeded", count: 2, marker_count: 2 });
       expect((await client.query(`SELECT 1 FROM inventory_roots root JOIN inventory_revisions revision

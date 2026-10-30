@@ -248,7 +248,7 @@ export class StreamedInventory {
   }
 
   async controlReadback(input: BeginGeneration, targetId: string, options: Parameters<InventoryGenerations["execute"]>[3]) {
-    if (input.scope.tokenMode !== "delegated") throw new Error("inventory_control_scope");
+    if (input.scope.tokenMode !== "tenant" || !input.actorPrincipalId) throw new Error("inventory_control_scope");
     await options.authorize(options.signal ?? new AbortController().signal);
     return this.stages.execute(input, { domain: "packages", mode: "delta", channel: "control", targets: [targetId] }, async lease => {
       const controls = await this.stages.generations.connections.run(async client => {
@@ -256,7 +256,7 @@ export class StreamedInventory {
         const attempt = (await client.query("SELECT baseline_id,base_revision FROM inventory_attempts WHERE generation_id=$1", [lease.id])).rows[0];
         const exists = (await client.query(`SELECT 1 FROM inventory_memberships m WHERE ${inventoryAsOf()} AND identity=$3`,
           [attempt.baseline_id, attempt.base_revision, targetId])).rowCount;
-        return exists ? readPackageControls(client, { tenantId: lease.tenantId, principalId: input.scope.principalId! }, [targetId]) : null;
+        return exists ? readPackageControls(client, { tenantId: lease.tenantId, principalId: input.actorPrincipalId! }, [targetId]) : null;
       });
       if (!controls) { await this.exactMissing(lease, targetId); return; }
       if (!controls.length) throw new Error("inventory_control_readback_missing");
@@ -268,7 +268,7 @@ export class StreamedInventory {
     identity: string; nativeId: string; environmentId: string; botId: string; state: boolean; updatedAt: string;
     resourceTypes: string[]; environmentScope: string | null; roleScope: "full" | "ai" | "unknown";
   }, options: Parameters<InventoryGenerations["execute"]>[3]) {
-    if (input.scope.tokenMode !== "delegated") throw new Error("inventory_control_scope");
+    if (input.scope.tokenMode !== "tenant" || !input.actorPrincipalId) throw new Error("inventory_control_scope");
     return this.stages.execute(input, { domain: "power_platform", mode: "delta", channel: "control", targets: [target.nativeId],
       resourceTypes: target.resourceTypes, environmentId: target.environmentScope ?? undefined, roleScope: target.roleScope }, async lease => {
       const record = await this.stages.generations.connections.run(async client => {
@@ -315,10 +315,9 @@ export class StreamedInventory {
       [attempt.baseline_id, attempt.base_revision, values.map(value => value.id)])).rows;
       encodeBatch(oldRows);
       const previousById = new Map(oldRows.map(row => [row.identity, row]));
-      const scope = (await client.query("SELECT principal_id,token_mode FROM data_scope_epochs WHERE id=$1", [lease.scopeId])).rows[0];
       // Deduplicate only control lookups; duplicate source observations must still fail publication.
-      const controls = scope.token_mode === "delegated" ? control ? [control]
-        : await readPackageControls(client, { tenantId: lease.tenantId, principalId: scope.principal_id }, [...new Set(values.map(value => value.id))]) : [];
+      const controls = control ? [control] : generation.actor_principal_id
+        ? await readPackageControls(client, { tenantId: lease.tenantId, principalId: generation.actor_principal_id }, [...new Set(values.map(value => value.id))]) : [];
       encodeBatch(controls);
       const project = async (value: CopilotPackageDetail): Promise<InventoryRecord> => {
       const old = previousById.get(value.id);

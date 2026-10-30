@@ -26,8 +26,13 @@ import { fingerprints } from "./backup.js";
 import { DataGenerations } from "../src/db/dataGenerations.js";
 import { generationInput } from "./largeTenantFixtures.js";
 import { loadOperationalState } from "../src/services/operationalState.js";
+import { closeFixtureResources } from "./fixtureSupport.js";
 
+const mode=process.argv[2];
 const receiptFile=process.argv[3];
+if (!["seed","verify","expire","recover"].includes(mode) || !receiptFile?.trim()) {
+  throw new Error("Usage: restart-fixture.ts <seed|verify|expire|recover> <receipt-file>");
+}
 const scope={tenantId:"11111111-1111-4111-8111-111111111111",principalId:"phase01-fixture-principal"};
 const quarantineAuthority:QuarantineAuthority={contractRevision:"7".repeat(64),permissionRevision:"8".repeat(64),configurationRevision:9};
 const quarantineTargetIds=[
@@ -39,21 +44,21 @@ const input=(ids:string[]):JobInput=>{
   const intent:JobIntentInput={targets:ids.map(id=>({id,displayName:id,prestate:{kind:"block",isBlocked:false}})),action:"block",scope:"bulk",requestPath:"/fixture/restart",actor:{tenantId:scope.tenantId,homeAccountId:scope.principalId,username:"fixture@example.invalid",displayName:"Fixture"}};
   return {...intent,idempotencyKey:randomUUID(),confirmationHash:createJobConfirmation(intent).confirmationHash};
 };
-if (process.argv[2] === "seed") {
+if (mode === "seed") {
   const fixture=await testDatabase();
-  const repository=new JobRepository(fixture.runtime);
-  const qualifications=new PackageMutationQualificationRepository(fixture.runtime);
-  const inventory=new PowerPlatformRefreshJobs(fixture.runtime);
-  const packages=new PackageRefreshJobs(fixture.runtime);
-  const officialUsage=new OfficialReportImports(fixture.runtime);
-  const reportReader=new LargeTenantUsersReports(fixture.runtime,"synthetic-restart-report-cursor-secret",35);
-  const reportUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Admin" as const]};
-  const reportScope=await reportIdentity(fixture.runtime,reportUser);
-  const purviewAudit=new PurviewAuditRepository(fixture.runtime);
-  const defenderHunting=new DefenderHuntingRepository(fixture.runtime);
-  const quarantine=new CopilotStudioQuarantineRepository(fixture.runtime);
   let seeded=false;
-  try {
+  await withFixtureCleanup(async()=>{
+    const repository=new JobRepository(fixture.runtime);
+    const qualifications=new PackageMutationQualificationRepository(fixture.runtime);
+    const inventory=new PowerPlatformRefreshJobs(fixture.runtime);
+    const packages=new PackageRefreshJobs(fixture.runtime);
+    const officialUsage=new OfficialReportImports(fixture.runtime);
+    const reportReader=new LargeTenantUsersReports(fixture.runtime,"synthetic-restart-report-cursor-secret",35);
+    const reportUser={tenantId:scope.tenantId,homeAccountId:scope.principalId,username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Admin" as const]};
+    const reportScope=await reportIdentity(fixture.runtime,reportUser);
+    const purviewAudit=new PurviewAuditRepository(fixture.runtime);
+    const defenderHunting=new DefenderHuntingRepository(fixture.runtime);
+    const quarantine=new CopilotStudioQuarantineRepository(fixture.runtime);
     const job=await repository.submit(scope,input(["a-success","b-uncertain","c-unsent"]));
     const unsent=await repository.submit(scope,input(["only-unsent"]));
     const inventoryCompleted=await inventory.submit(scope,{idempotencyKey:"restart-completed",roleScope:"full",requestedTypes:["microsoft.powerplatform/environments"]});
@@ -110,16 +115,15 @@ if (process.argv[2] === "seed") {
     await purviewAudit.publish(purviewScope,purviewCompleted.id,purviewCompletedExecution,{records:[],pageCount:1,providerRowCount:0,storedRowCount:0,byteCount:2,unknownFieldCount:0,complete:true,nextLink:null,partialReason:null});
     const defenderScope:DefenderHuntingScope={tenantId:scope.tenantId,authorizationPrincipalId:scope.principalId,resultScope:{kind:"principal",scopeId:scope.principalId,configurationRevision:null},tokenMode:"delegated"};
     const defenderFilters={templateId:"agents_inventory" as const,startDateTime:"2026-09-09T09:00:00.000Z",endDateTime:"2026-09-09T09:30:00.000Z",agentIds:["restart-defender-agent"],blueprintIds:[],actorObjectIds:[],operations:[]};
-    const defenderQualification={capabilityId:"defender.hunting.delegated" as const,contractRevision:"d".repeat(64),permissionRevision:"e".repeat(64),configurationRevision:1,approvedBy:scope.principalId};
-    const defenderInterrupted=await defenderHunting.submit(defenderScope,{idempotencyKey:"defender-restart-interrupted",filters:defenderFilters,qualification:defenderQualification});
+    const defenderInterrupted=await defenderHunting.submit(defenderScope,{idempotencyKey:"defender-restart-interrupted",filters:defenderFilters});
     await defenderHunting.begin(defenderScope,defenderInterrupted.id);
-    const defenderCompleted=await defenderHunting.submit(defenderScope,{idempotencyKey:"defender-restart-completed",filters:defenderFilters,qualification:defenderQualification});
+    const defenderCompleted=await defenderHunting.submit(defenderScope,{idempotencyKey:"defender-restart-completed",filters:defenderFilters});
     const defenderCompletedExecution=await defenderHunting.begin(defenderScope,defenderCompleted.id);
     await defenderHunting.authorizeProviderRequest(defenderScope,defenderCompleted.id,defenderCompletedExecution);
     await defenderHunting.recordProviderResponse(defenderScope,defenderCompleted.id,defenderCompletedExecution,"defender-provider-completed");
     await defenderHunting.publish(defenderScope,defenderCompleted.id,defenderCompletedExecution,{rows:[],providerRowCount:0,storedRowCount:0,byteCount:2,complete:true,partialReason:null});
-    const administrator={tenantId:scope.tenantId,homeAccountId:"restart-canary-approver",displayName:"Canary approver",username:"approver@example.invalid",roles:["AgentControl.Admin"] as const};
-    const operator={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin"] as const};
+    const administrator={tenantId:scope.tenantId,homeAccountId:"restart-canary-approver",displayName:"Canary approver",username:"approver@example.invalid",roles:["AgentControl.Admin" as const]};
+    const operator={tenantId:scope.tenantId,homeAccountId:scope.principalId,displayName:"Fixture",username:"fixture@example.invalid",roles:["AgentControl.Admin" as const]};
     const qualificationIdentity={contractRevision:"a".repeat(64),configurationRevision:7,authMode:"delegated" as const};
     const canaryOriginal=await qualifications.createApproved(administrator,{targetId:"restart-canary",action:"block",...qualificationIdentity,prestate:{kind:"block",isBlocked:false},poststate:{kind:"block",isBlocked:true}});
     const canaryRestoration=await qualifications.createApproved(administrator,{targetId:"restart-canary",action:"unblock",...qualificationIdentity,prestate:{kind:"block",isBlocked:true},poststate:{kind:"block",isBlocked:false}});
@@ -142,45 +146,43 @@ if (process.argv[2] === "seed") {
     const usagePreview=await officialUsage.bundle(reportScope,usageBundleId);
     assert.equal(usagePreview.complete,true);
     assert.equal((await officialUsage.acceptBundle(reportScope,usageBundleId,{bundleHash:usagePreview.bundleHash,expectedActiveRevision:usagePreview.expectedActiveRevision})).complete,true);
-    const exportSelection=await reportReader.capture(reportScope,"delegated","official_users");
+    const exportSelection=await reportReader.capture(reportScope,"official_users");
     const exportIdempotencyKey=randomUUID();
     const exportId=await new OfficialReportExports(reportReader,reportUser,"synthetic-restart-report-cursor-secret").create(reportScope,{selectionId:exportSelection.id,kind:"official_users",idempotencyKey:exportIdempotencyKey});
     await assertOfficialUsageRawBytesAbsent(fixture.operator);
-    const lifecycleInput=generationInput({scope:{tenantId:scope.tenantId,principalId:scope.principalId,kind:"principal",tokenMode:"delegated",source:"directory",selector:"restart-heartbeat"}});
+    const lifecycleInput=generationInput({scope:{tenantId:scope.tenantId,principalId:null,kind:"tenant",tokenMode:"tenant",source:"directory",selector:"complete"},actorPrincipalId:scope.principalId});
     const lifecycleLease=await new DataGenerations(fixture.runtime).begin(lifecycleInput);
     writeFileSync(receiptFile,JSON.stringify({database:fixture.name,lifecycleInput,lifecycleLease,exportId,exportSelectionId:exportSelection.id,exportIdempotencyKey,job:job.id,unsent:unsent.id,inventoryInterrupted:inventoryInterrupted.id,inventoryCompleted:inventoryCompleted.id,packageInterrupted:packageInterrupted.id,packageCompleted:packageCompleted.id,purviewInterruptedCreate:purviewInterruptedCreate.id,purviewInterruptedPoll:purviewInterruptedPoll.id,purviewCompleted:purviewCompleted.id,defenderInterrupted:defenderInterrupted.id,defenderCompleted:defenderCompleted.id,quarantineSucceeded:quarantineSucceeded.id,quarantineSent:quarantineSent.id,quarantineUnsent:quarantineUnsent.id,quarantineAuthority,quarantineTargets:quarantineTargetIds,canaryJob:canaryJob.id,canaryOriginal:canaryOriginal.id,canaryRestoration:canaryRestoration.id,canaryIdentity:qualificationIdentity,officialUsage:await officialReportFingerprint(reportReader,reportScope),tables:await fingerprints(fixture.operator)}),{mode:0o600});
     seeded=true;
-    console.log(JSON.stringify({event:"restart_fixture_seeded",outcome:"passed"}));
-  } finally {
-    if (seeded) await fixture.release();
-    else await fixture.close();
-  }
-} else if (process.argv[2] === "verify" || process.argv[2] === "expire") {
+  },()=>seeded ? fixture.release() : fixture.close());
+  console.log(JSON.stringify({event:"restart_fixture_seeded",outcome:"passed"}));
+} else if (mode === "verify" || mode === "expire") {
   const receipt=JSON.parse(readFileSync(receiptFile,"utf8"));
   assert.match(receipt.database,/^agentcontrol_test_[a-z0-9_]+$/);
   const operator=new pg.Pool({...databaseSettings(),database:receipt.database});
-  try {
-    if (process.argv[2] === "verify") {
+  const result=await withFixtureCleanup(async()=>{
+    if (mode === "verify") {
       assert.deepEqual(await fingerprints(operator),receipt.tables);
-      console.log(JSON.stringify({event:"persistent_fixture_fingerprints",outcome:"passed"}));
+      return {event:"persistent_fixture_fingerprints",outcome:"passed"};
     } else {
       const dispatch=(await operator.query("SELECT target_id,status,sent_at IS NOT NULL AS sent FROM job_items WHERE job_id=$1 ORDER BY ordinal",[receipt.job])).rows;
       assert.deepEqual(dispatch.map(row=>[row.target_id,row.status,row.sent]),[["a-success","succeeded",true],["b-uncertain","running",true],["c-unsent","queued",false]]);
       assert.equal((await operator.query("SELECT sent_at IS NOT NULL AS sent FROM job_items WHERE job_id=$1",[receipt.canaryJob])).rows[0].sent,true);
       assert.equal((await operator.query("SELECT sent_at IS NOT NULL AS sent FROM copilot_quarantine_job_items WHERE job_id=$1",[receipt.quarantineSent])).rows[0].sent,true);
-      console.log(JSON.stringify({event:"restart_fixture_dispatch_verified",outcome:"passed",items:dispatch.length}));
       await operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1::uuid[])",[[receipt.job,receipt.canaryJob]]);
       if(receipt.lifecycleLease) await operator.query("UPDATE data_generations SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",[receipt.lifecycleLease.id]);
+      return {event:"restart_fixture_dispatch_verified",outcome:"passed",items:dispatch.length};
     }
-  }
-  finally { await operator.end(); }
+  },()=>operator.end());
+  console.log(JSON.stringify(result));
 } else {
   const receipt=JSON.parse(readFileSync(receiptFile,"utf8"));
   assert.match(receipt.database,/^agentcontrol_test_[a-z0-9_]+$/);
   const operator=new pg.Pool({...databaseSettings(),database:receipt.database});
-  const runtime=new pg.Pool({...databaseSettings(),database:receipt.database,user:"agentcontrol_app",password:secretValue("APP_PGPASSWORD") ?? "isolated-fixture-password-never-production-01"});
-  const repository=new JobRepository(runtime);
-  try {
+  let runtime:pg.Pool|undefined;
+  await withFixtureCleanup(async()=>{
+    runtime=new pg.Pool({...databaseSettings(),database:receipt.database,user:"agentcontrol_app",password:secretValue("APP_PGPASSWORD") ?? "isolated-fixture-password-never-production-01"});
+    const repository=new JobRepository(runtime);
     await loadOperationalState(runtime);
     await operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",[receipt.job]);
     await repository.recover(scope.tenantId,true);
@@ -202,11 +204,29 @@ if (process.argv[2] === "seed") {
     assert.equal((await repository.get(receipt.job,scope))?.inconclusive,1);
     assert.equal((await repository.get(receipt.job,scope))?.succeeded,2);
     assert.equal((await repository.get(receipt.unsent,scope))?.status,"succeeded");
-    console.log(JSON.stringify({event:"restart_fixture_recovered",outcome:"passed",successfulItemsNeverReplayed:true,uncertainItemsNeverReplayed:true}));
+  },()=>closeFixtureResources(
+    ()=>operator.end(),
+    ()=>runtime?.end(),
+    async()=>{
+      const cleanup=new pg.Pool(databaseSettings());
+      await withFixtureCleanup(async()=>{ await cleanup.query(`DROP DATABASE "${receipt.database}" WITH (FORCE)`); },()=>cleanup.end());
+    },
+  ));
+  console.log(JSON.stringify({event:"restart_fixture_recovered",outcome:"passed",successfulItemsNeverReplayed:true,uncertainItemsNeverReplayed:true}));
+}
+
+async function withFixtureCleanup<T>(work:()=>Promise<T>,cleanup:()=>Promise<void>):Promise<T> {
+  let failure:{error:unknown}|undefined;
+  try { return await work(); }
+  catch(error) {
+    failure={error};
+    throw error;
   } finally {
-    await Promise.allSettled([operator.end(),runtime.end()]);
-    const cleanup=new pg.Pool(databaseSettings());
-    try { await cleanup.query(`DROP DATABASE "${receipt.database}" WITH (FORCE)`); } finally { await cleanup.end(); }
+    try { await cleanup(); }
+    catch(cleanupError) {
+      if(failure) throw new AggregateError([failure.error,cleanupError],"Restart fixture execution and cleanup failed.");
+      throw cleanupError;
+    }
   }
 }
 

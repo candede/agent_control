@@ -42,27 +42,34 @@ export class InventoryReconciliation {
         AND g.state IN ('published','retired') AND g.validated`, [scopeId])).rows[0];
   }
 
+  private async assertControlsSettled(client: pg.PoolClient, tenantId: string) {
+    const pending = await client.query(`SELECT 1 WHERE EXISTS(SELECT 1 FROM inventory_control_pending WHERE tenant_id=$1)
+      OR EXISTS(SELECT 1 FROM inventory_native_control_pending WHERE tenant_id=$1)`, [tenantId]);
+    if (pending.rowCount) throw new Error("inventory_input_fenced");
+  }
+
   async request(input: BeginGeneration, inputs: readonly InventoryRoot[], assertCurrent?: () => void, signal?: AbortSignal) {
     signal?.throwIfAborted();
     assertCurrent?.();
-    if (input.scope.source !== "inventory_canonical" || input.scope.tokenMode !== "delegated" || inputs.length > 16 || !inputs.length
+    if (input.scope.source !== "inventory_canonical" || input.scope.tokenMode !== "tenant" || inputs.length > 16 || !inputs.length
       || new Set(inputs.map(root => root.scopeId)).size !== inputs.length) throw new Error("inventory_reconciliation_scope");
     if (input.deadlineAt.getTime() <= Date.now() || input.deadlineAt.getTime() - Date.now() > inventoryLimits.powerPlatformDeadlineMs) throw new Error("inventory_reconciliation_deadline");
     return this.stages.generations.connections.run(async client => {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}:${input.scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}`]);
+      await this.assertControlsSettled(client, input.scope.tenantId);
       const s = input.scope;
       await client.query(`INSERT INTO data_scope_epochs(id,tenant_id,scope_kind,principal_id,token_mode,source,selector,session_epoch)
-        VALUES($1,$2,'principal',$3,'delegated','inventory_canonical',$4,$5)
+        VALUES($1,$2,'tenant',NULL,'tenant','inventory_canonical',$3,0)
         ON CONFLICT(tenant_id,scope_kind,principal_id,token_mode,source,selector) DO NOTHING`,
-      [randomUUID(), s.tenantId, s.principalId, s.selector, input.sessionEpoch]);
-      const output = (await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-        AND token_mode='delegated' AND source='inventory_canonical' AND selector=$3`, [s.tenantId, s.principalId, s.selector])).rows[0].id;
+      [randomUUID(), s.tenantId, s.selector]);
+      const output = (await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+        AND token_mode='tenant' AND source='inventory_canonical' AND selector=$2`, [s.tenantId, s.selector])).rows[0].id;
       for (const scopeId of [output, ...inputs.map(root => root.scopeId)].sort()) await lockDataScope(client, scopeId, input.scope.tenantId);
       const captured: CapturedRoot[] = [];
       for (const root of [...inputs].sort((a, b) => a.scopeId.localeCompare(b.scopeId))) {
         const scope = await lockDataScope(client, root.scopeId, input.scope.tenantId);
-        if (scope.principal_id !== input.scope.principalId || scope.token_mode !== "delegated" || scope.epoch !== root.epoch) throw new Error("inventory_input_fenced");
+        if (scope.scope_kind !== "tenant" || scope.token_mode !== "tenant" || scope.epoch !== root.epoch) throw new Error("inventory_input_fenced");
         const current = (await client.query(`SELECT r.domain,r.baseline_id,r.revision,g.expires_at FROM inventory_roots r
           JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision JOIN data_generations g ON g.id=v.generation_id
           WHERE r.scope_id=$1 AND r.current AND g.scope_epoch=$2 AND g.session_epoch=$3
@@ -107,9 +114,10 @@ export class InventoryReconciliation {
     const claim = await this.stages.generations.connections.run(async client => {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
       const s = input.scope;
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${s.tenantId}:${s.principalId}`]);
-      const scope = (await client.query(`SELECT id,epoch FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-        AND source='inventory_canonical' AND selector=$3`, [s.tenantId, s.principalId, s.selector])).rows[0];
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${s.tenantId}`]);
+      await this.assertControlsSettled(client, s.tenantId);
+      const scope = (await client.query(`SELECT id,epoch FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+        AND source='inventory_canonical' AND selector=$2`, [s.tenantId, s.selector])).rows[0];
       if (!scope) return undefined;
       const state = (await client.query("SELECT * FROM inventory_reconciliation WHERE scope_id=$1", [scope.id])).rows[0];
       if (!state || state.active_id && state.active_until > new Date() && state.active_deadline > new Date()) return undefined;
@@ -120,8 +128,8 @@ export class InventoryReconciliation {
         const current = (await client.query(`SELECT r.baseline_id,r.revision,epoch.epoch,g.expires_at FROM inventory_roots r
           JOIN data_scope_epochs epoch ON epoch.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
           JOIN data_generations g ON g.id=v.generation_id WHERE r.scope_id=$1 AND r.current AND epoch.tenant_id=$2
-            AND epoch.principal_id=$3 AND epoch.token_mode='delegated' AND g.scope_epoch=epoch.epoch AND g.session_epoch=epoch.session_epoch
-            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, s.tenantId, s.principalId])).rows[0];
+            AND epoch.scope_kind='tenant' AND epoch.token_mode='tenant' AND g.scope_epoch=epoch.epoch AND g.session_epoch=epoch.session_epoch
+            AND g.state IN ('published','retired') AND g.validated`, [root.scopeId, s.tenantId])).rows[0];
         if (!current) throw new Error("inventory_input_fenced");
         Object.assign(root, { baselineId: current.baseline_id, revision: current.revision, epoch: current.epoch, expiresAt: current.expires_at.toISOString() });
       }
@@ -149,12 +157,12 @@ export class InventoryReconciliation {
       // Staging replaces an expired/fenced head, so its frontier must include untouched sources too.
       const broad = !reusable || !old || !prior || prior.length !== roots.length
         || roots.some(root => !prior.some(value => value.scopeId === root.scopeId && value.baselineId === root.baselineId));
-      const native = (await client.query(`WITH roots AS (
+      const nativeScopes = new Set((await client.query<{ scope_id: string; kind: string }>(`WITH roots AS (
         SELECT "baselineId" AS baseline_id,revision FROM jsonb_to_recordset($1::jsonb) r("baselineId" uuid,revision bigint)
       ) ${inventoryNativeRootChoicesSql("roots")}`, [JSON.stringify(roots)])).rows
-        .find(row => row.kind === "microsoft.copilotstudio/agents");
+        .filter(row => row.kind === "microsoft.copilotstudio/agents").map(row => row.scope_id));
       return { job, scopeId: scope.id as string, sequence, afterSequence: state.published_sequence as string,
-        inputRoots: roots, roots: roots.filter(root => root.domain === "packages" || root.scopeId === native?.scope_id), old, broad };
+        inputRoots: roots, roots: roots.filter(root => root.domain === "packages" || nativeScopes.has(root.scopeId)), old, broad };
     }, false, signal, undefined, assertCurrent);
     if (!claim) return null;
     try {
@@ -171,7 +179,8 @@ export class InventoryReconciliation {
           }
         }, { signal, authorize, assertCurrent, validateInputs: async client => {
           await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
-          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}:${input.scope.principalId}`]);
+          await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${input.scope.tenantId}`]);
+          await this.assertControlsSettled(client, input.scope.tenantId);
           for (const scopeId of [claim.scopeId, ...claim.inputRoots.map(root => root.scopeId)].sort()) await lockDataScope(client, scopeId, input.scope.tenantId);
           if (!claim.broad && !await this.outputRoot(client, claim.scopeId)) throw new Error("inventory_reconciliation_fenced");
           if ((await client.query(`UPDATE inventory_reconciliation SET active_until=clock_timestamp()+interval '60 seconds'

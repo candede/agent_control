@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
 import { directoryRecord, generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { DataGenerations } from "../db/dataGenerations.js";
@@ -50,8 +50,8 @@ it("distinguishes stalled activity networking from database backpressure using r
     let text = reportHeaders.join(",")+"\n";
     for (let i = 0; i < 251; i++) text += csv(`backpressure-${i}@example.invalid`).split("\n")[1]+"\n";
     const provider = new UserSourceProvider(async () => new Response(text,{ headers: { "content-type": "text/csv" } }));
-    const input = generationInput({ scope: { tenantId: "synthetic-tenant",principalId: randomUUID(),kind: "principal",
-      tokenMode: "delegated",source: "app_activity",selector: "complete" } });
+    const input = generationInput({ scope: { tenantId: "synthetic-tenant",principalId: null,kind: "tenant",
+      tokenMode: "tenant",source: "app_activity",selector: "complete" }, actorPrincipalId: randomUUID() });
     const outcomes = await Promise.allSettled([
       provider.refresh(stages,input,{ authorize: async () => "synthetic" }),
       expect(streamAppActivity(new Response(body),controller.signal).next()).rejects.toMatchObject({ code: "provider_timeout" }),
@@ -77,8 +77,8 @@ function sourceUser(id: string, state: CopilotServiceSummaryState = "enabled", c
 
 describe("dormant user-source foundation", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
-  beforeAll(async () => { fixture = await testDatabase(); }, 30_000);
-  afterAll(async () => { await fixture?.close(); });
+  beforeEach(async () => { fixture = await testDatabase(); }, 30_000);
+  afterEach(async () => { await fixture?.close(); });
 
   it("reads only requested object IDs and preserves licensing-state goldens", async () => {
     const generations = new DataGenerations(fixture.runtime);
@@ -90,11 +90,11 @@ describe("dormant user-source foundation", () => {
     await generations.connections.selectedRead(async client => {
       const spy = vi.spyOn(client, "query");
       const people = await userSourcePeopleInRead(client, {
-        tenantId: input.scope.tenantId, principalId: input.scope.principalId!, tokenMode: "delegated",
+        tenantId: input.scope.tenantId,
       }, { generationId: lease.id, observedAt: input.observedAt }, [firstId], new Date());
       expect(people.map(person => person.objectId)).toEqual([firstId]);
       expect(spy).toHaveBeenCalledOnce();
-      expect(spy.mock.calls[0][0]).toContain("unnest($4::text[])");
+      expect(spy.mock.calls[0][0]).toContain("unnest($3::text[])");
       expect(spy.mock.calls[0][1]).toContainEqual([firstId]);
       spy.mockRestore();
     });
@@ -115,7 +115,7 @@ describe("dormant user-source foundation", () => {
 
   it("publishes independent directory/activity sources and never replaces a good head on denied or inconsistent attempts", async () => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: "pipeline" } });
+    const input = generationInput({ actorPrincipalId: "pipeline" });
     const fetcher = vi.fn(async (url: string | URL) => String(url).includes("subscribedSkus")
       ? Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] })
       : String(url).includes("/users?")
@@ -161,7 +161,7 @@ describe("dormant user-source foundation", () => {
     const identity = { ...selectionIdentity, principalId };
     const stages = new UserSourceStages(fixture.runtime);
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const input = generationInput({ scope: { ...generationInput().scope, principalId } });
+    const input = generationInput({ actorPrincipalId: principalId });
     const states = ["enabled", "warning", "partially_enabled", "suspended", "locked_out", "disabled", "unknown"] as const;
     const ids = states.map((_, index) => `00000000-0000-0000-0000-${String(index + 1).padStart(12, "0")}`);
     const users = states.map((state, index) => sourceUser(ids[index], state, index > 3 ? null : index < 2 ? "Å" : "å"));
@@ -182,8 +182,8 @@ describe("dormant user-source foundation", () => {
       await stages.activity(lease, key, rows);
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
-    const selected = await repository.capture(identity, "delegated", { sort: "company", order: "desc" });
-    const filtered = await repository.capture(identity, "delegated", { company: "Å", entitlement: "paid_active" });
+    const selected = await repository.capture(identity, { sort: "company", order: "desc" });
+    const filtered = await repository.capture(identity, { company: "Å", entitlement: "paid_active" });
     const first = await repository.page(selected.id, identity, { limit: 2 });
     expect(first.counts).toEqual({ total: 7, filtered: 7 });
     expect(first.summary).toEqual({ checkedUsers: 7, licensedUsers: 3, inactivePaidUsers: 2, noPaidUsers: 1, unknownLicenseUsers: 1,
@@ -216,7 +216,9 @@ describe("dormant user-source foundation", () => {
     const nextFacet = await repository.facets(filtered.id, identity, { field: "company", limit: 1, cursor: facet.page.nextCursor! });
     expect(nextFacet.value).toEqual([{ value: "å", count: 1 }]);
     expect((await repository.page(selected.id, identity)).counts.total).toBe(7);
-    expect((await repository.page((await repository.capture(identity, "delegated")).id, identity)).counts.total).toBe(1);
+    const current = await repository.page((await repository.capture(identity)).id, identity);
+    expect(current.counts.total).toBe(7);
+    expect(current.sources.directory.state).toBe("partial");
     await expect(repository.page(selected.id, { ...identity, principalId: "other" })).rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(repository.page(selected.id, identity, { cursor: `${first.page.nextCursor}tampered` })).rejects.toMatchObject({ code: "invalid_cursor" });
     await expect(repository.page(selected.id, identity, { limit: 101 })).rejects.toMatchObject({ code: "invalid_cursor" });
@@ -227,31 +229,44 @@ describe("dormant user-source foundation", () => {
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
     const stages = new UserSourceStages(fixture.runtime);
     const observedAt = new Date(Date.now() - 60_000);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId }, observedAt });
+    const input = generationInput({ actorPrincipalId: identity.principalId, observedAt });
     await stages.execute(input, async lease => {
       const key = await stages.query(lease, "discovery", "people-directory");
       await stages.directory(lease, key, [sourceUser(firstId)]);
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
-    let selected = await repository.capture(identity, "delegated");
+    let selected = await repository.capture(identity);
+    const savedCheckedAt = new Date(observedAt.getTime() - 10_000);
     await repository.savePeople(identity, [{ objectId: firstId, status: "resolved", displayName: "Old cache", userPrincipalName: "old@example.invalid",
-      checkedAt: new Date(observedAt.getTime() - 10_000).toISOString() }], async () => {});
+      checkedAt: savedCheckedAt.toISOString() }], async () => {});
     await expect(repository.people(selected.id, identity, [firstId])).rejects.toMatchObject({ code: "selection_invalidated" });
-    selected = await repository.capture(identity, "delegated");
-    expect((await repository.people(selected.id, identity, [firstId]))[0].displayName).toBe("Émployee");
+    selected = await repository.capture(identity);
+    const saved = (await repository.people(selected.id, identity, [firstId]))[0];
+    expect(saved.displayName).toBe("Émployee");
+    expect(saved).not.toHaveProperty("status");
     await repository.savePeople(identity, [{ objectId: firstId, status: "lookup_failed", displayName: null, userPrincipalName: null,
       checkedAt: new Date().toISOString(), errorCode: "graph_error" }], async () => {});
-    selected = await repository.capture(identity, "delegated");
+    selected = await repository.capture(identity);
     const failure = (await repository.people(selected.id, identity, [firstId]))[0];
     expect(failure).toMatchObject({ displayName: "Émployee", status: "lookup_failed", errorCode: "graph_error" });
-    expect(Date.parse(failure.expiresAt!) - Date.parse(failure.checkedAt!)).toBe(15 * 60_000);
+    expect(Date.parse(failure.expiresAt!)).toBe(savedCheckedAt.getTime() + 7 * 24 * 60 * 60_000);
     await repository.savePeople(identity, [{ objectId: firstId, status: "not_found", displayName: null, userPrincipalName: null,
       checkedAt: new Date(Date.now() + 1000).toISOString() }], async () => {});
+    selected = await repository.capture(identity);
+    const notFound = (await repository.people(selected.id, identity, [firstId]))[0];
+    expect(notFound).toMatchObject({ displayName: null, userPrincipalName: null, status: "not_found" });
+    expect(Date.parse(notFound.expiresAt!) - Date.parse(notFound.checkedAt!)).toBe(24 * 60 * 60_000);
     await repository.savePeople(identity, [{ objectId: firstId, status: "lookup_failed", displayName: null, userPrincipalName: null,
+      checkedAt: new Date(Date.now() + 2000).toISOString(), errorCode: "graph_error" },
+    { objectId: secondId, status: "lookup_failed", displayName: null, userPrincipalName: null,
       checkedAt: new Date(Date.now() + 2000).toISOString(), errorCode: "graph_error" }], async () => {});
-    selected = await repository.capture(identity, "delegated");
-    expect((await repository.people(selected.id, identity, [firstId]))[0]).toMatchObject({ displayName: null, userPrincipalName: null, status: "lookup_failed" });
-    const missing = await repository.capture({ ...identity, tenantId: "other-tenant" }, "delegated");
+    selected = await repository.capture(identity);
+    const [conclusiveFailure, firstFailure] = await repository.people(selected.id, identity, [firstId, secondId]);
+    expect(conclusiveFailure).toMatchObject({ displayName: null, userPrincipalName: null, status: "lookup_failed" });
+    expect(Date.parse(conclusiveFailure.expiresAt!)).toBe(Date.parse(notFound.expiresAt!));
+    expect(firstFailure).toMatchObject({ objectId: secondId, displayName: null, userPrincipalName: null, status: "lookup_failed" });
+    expect(Date.parse(firstFailure.expiresAt!) - Date.parse(firstFailure.checkedAt!)).toBe(15 * 60_000);
+    const missing = await repository.capture({ ...identity, tenantId: "other-tenant" });
     expect(await repository.people(missing.id, { ...identity, tenantId: "other-tenant" }, [firstId])).toEqual([]);
     expect((await repository.page(missing.id, { ...identity, tenantId: "other-tenant" })).summary.licensedUsers).toBeNull();
   });
@@ -259,7 +274,7 @@ describe("dormant user-source foundation", () => {
   it("persists expanded and incompressible directory names with exact prefix-tied source/report pages", async () => {
     const identity = { ...selectionIdentity, principalId: randomUUID() };
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const input = generationInput({ actorPrincipalId: identity.principalId });
     const names = ["\ufdfa".repeat(511) + "b", "\ufdfa".repeat(511) + "a",
       Array.from({ length: 512 }, (_, index) => String.fromCharCode(0x4e00 + index * 7919 % 20992)).join("")];
     const users = names.map((name, index) => {
@@ -280,8 +295,8 @@ describe("dormant user-source foundation", () => {
       Buffer.from(b.identity.displayName!.normalize("NFKC").toLowerCase()),
     )).map(user => user.identity.objectId);
     for (const order of ["asc", "desc"] as const) {
-      const selected = await source.capture(identity, "delegated", { sort: "name", order });
-      const combined = await reports.capture(identity, "delegated", "copilot_users", { sort: "name", order });
+      const selected = await source.capture(identity, { sort: "name", order });
+      const combined = await reports.capture(identity, "copilot_users", { sort: "name", order });
       for (const [reader, id] of [[source, selected.id], [reports, combined.id]] as const) {
         const found: string[] = [];
         let cursor: string | undefined;
@@ -309,10 +324,10 @@ describe("dormant user-source foundation", () => {
   it("invalidates both token modes once per cache statement, including direct clear, and forbids moving identities", async () => {
     const identity = { ...selectionIdentity, principalId: "cache-clear-fences" };
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const selected = await repository.capture(identity, "delegated"), application = await repository.capture(identity, "application");
+    const selected = await repository.capture(identity), application = await repository.capture(identity);
     const epochs = async () => (await fixture.runtime.query(`SELECT token_mode,epoch::text FROM data_scope_epochs
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='user_sources' AND selector='complete' ORDER BY token_mode LIMIT 3`,
-    [identity.tenantId, identity.principalId])).rows.map(row => ({ mode: row.token_mode, epoch: Number(row.epoch) }));
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='user_sources' AND selector='complete' ORDER BY token_mode LIMIT 3`,
+    [identity.tenantId])).rows.map(row => ({ mode: row.token_mode, epoch: Number(row.epoch) }));
     const before = await epochs();
     await repository.savePeople(identity, [firstId, secondId, randomUUID()].map(objectId => ({
       objectId, status: "resolved" as const, displayName: "Cached person", userPrincipalName: `${objectId}@example.invalid`, checkedAt: new Date().toISOString(),
@@ -320,9 +335,9 @@ describe("dormant user-source foundation", () => {
     expect(await epochs()).toEqual(before.map(row => ({ ...row, epoch: row.epoch + 1 })));
     await expect(repository.people(selected.id, identity, [firstId])).rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(repository.people(application.id, identity, [firstId])).rejects.toMatchObject({ code: "selection_invalidated" });
-    await expect(fixture.runtime.query("UPDATE agent_people_cache SET principal_id='another' WHERE tenant_id=$1 AND principal_id=$2",
+    await expect(fixture.runtime.query("UPDATE agent_people_cache SET tenant_id='another' WHERE tenant_id=$1 AND principal_id=$2",
       [identity.tenantId, identity.principalId])).rejects.toThrow("agent_people_identity_immutable");
-    const refreshed = await repository.capture(identity, "delegated");
+    const refreshed = await repository.capture(identity);
     await expect(fixture.runtime.query("DELETE FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2",
       [identity.tenantId, identity.principalId])).rejects.toMatchObject({ code: "42501" });
     await fixture.operator.query("DELETE FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2", [identity.tenantId, identity.principalId]);
@@ -333,7 +348,7 @@ describe("dormant user-source foundation", () => {
   it("rolls back the observation and dependency invalidation when a late people publication fence closes", async () => {
     const identity = { ...selectionIdentity, principalId: "late-cache-publication-fence" };
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const selected = await repository.capture(identity, "delegated");
+    const selected = await repository.capture(identity);
     const clients = new Set<unknown>();
     let checks = 0;
     await expect(repository.savePeople(identity, [{
@@ -355,7 +370,7 @@ describe("dormant user-source foundation", () => {
   it.each([true, false])("keeps a complete people projection in one captured read with caller-owned client %s", async callerOwned => {
     const identity = { ...selectionIdentity, principalId: `composed-people-${callerOwned}` };
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    await repository.capture(identity, "delegated");
+    await repository.capture(identity);
     const records = Array.from({ length: 100 }, (_, index): UnifiedAgentRecord => ({
       id: `agent:${randomUUID()}`, displayName: `Agent ${index}`, presence: "power_platform", environmentId: "environment", packages: [],
       powerPlatformResource: { tenantId: identity.tenantId, nativeId: randomUUID(), type: "microsoft.copilotstudio/agents",
@@ -377,7 +392,7 @@ describe("dormant user-source foundation", () => {
       expect(result.every(row => row.people === undefined)).toBe(true);
       expect(read).toHaveBeenCalledOnce();
       expect(metadata).toHaveBeenCalledOnce();
-      expect(metadata.mock.calls[0][1]).toMatchObject({ tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: "delegated" });
+      expect(metadata.mock.calls[0][1]).toMatchObject({ tenantId: identity.tenantId });
       expect(metadata.mock.calls[0][2]).toBeInstanceOf(Date);
       expect(lookups).toHaveBeenCalledTimes(3);
       expect(lookups.mock.calls.every(call => call[3].length === 100)).toBe(true);
@@ -393,7 +408,7 @@ describe("dormant user-source foundation", () => {
       const identity = { ...selectionIdentity, principalId: `measure-${size}` };
       const stages = new UserSourceStages(fixture.runtime);
       const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-      const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+      const input = generationInput({ actorPrincipalId: identity.principalId });
       const published = await stages.execute(input, async lease => {
         const key = await stages.query(lease, "discovery", "measurement");
         for (let start = 0; start < size; start += 250) {
@@ -403,7 +418,7 @@ describe("dormant user-source foundation", () => {
         }
         await stages.finishQuery(lease, key);
       }, { beforePublish: async () => {} });
-      const selected = await repository.capture(identity, "delegated");
+      const selected = await repository.capture(identity);
       await repository.read(selected.id, identity, async (client, context) => {
         expect((await client.query("SHOW transaction_isolation")).rows[0].transaction_isolation).toBe("repeatable read");
         const query = `SELECT identity FROM (${userSourceFactsSql()}) facts WHERE identity=ANY($4::text[])`;
@@ -423,7 +438,7 @@ describe("dormant user-source foundation", () => {
 
   it("discovers in 20-SKU batches and verifies staged exact inputs in 20-ID batches without repeated known work", async () => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: "exact-provider" } });
+    const input = generationInput({ actorPrincipalId: "exact-provider" });
     const skus = Array.from({ length: 21 }, (_, index) => `10000000-0000-0000-0000-${String(index + 1).padStart(12, "0")}`);
     const calls: string[] = [];
     const observed: number[] = [];
@@ -460,7 +475,7 @@ describe("dormant user-source foundation", () => {
     { kind: "identity", limit: 6000, preceding: 2 },
   ] as const)("checks the $kind page budget before another provider request", async ({ kind, limit, preceding }) => {
     const stages = new UserSourceStages(fixture.runtime), original = stages.query.bind(stages);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID() } });
+    const input = generationInput({ actorPrincipalId: randomUUID() });
     let generationId = "", targetRequests = 0;
     const query = vi.spyOn(stages, "query").mockImplementation(async (lease, queryKind, initialUrl) => {
       const key = await original(lease, queryKind, initialUrl);
@@ -494,7 +509,7 @@ describe("dormant user-source foundation", () => {
   it.each(["conflict", "changed-count", "off-host", "changed-filter", "repeat-token"] as const)(
     "fails %s provider attempts with no partial head and SQL page evidence", async failure => {
       const stages = new UserSourceStages(fixture.runtime);
-      const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID() } });
+      const input = generationInput({ actorPrincipalId: randomUUID() });
       let page = 0;
       const fetcher = vi.fn(async (target: string | URL) => {
         const url = new URL(target);
@@ -515,13 +530,13 @@ describe("dormant user-source foundation", () => {
       const generations = (await fixture.runtime.query("SELECT state FROM data_generations WHERE job_id=$1", [input.jobId])).rows;
       expect(generations).toEqual([{ state: "failed" }]);
       expect((await fixture.runtime.query(`SELECT h.generation_id FROM data_generation_heads h JOIN data_scope_epochs s ON s.id=h.scope_id
-        WHERE s.principal_id=$1`, [input.scope.principalId])).rows[0].generation_id).toBeNull();
+        WHERE s.tenant_id=$1 AND s.source=$2`, [input.scope.tenantId, input.scope.source])).rows[0].generation_id).toBeNull();
     });
 
   it("keeps cold metadata and concurrent foreground access responsive with 4000 directory and 2250 activity rows", async () => {
     const identity = { ...selectionIdentity, principalId: "cold-metadata-matches" };
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const input = generationInput({ actorPrincipalId: identity.principalId });
     const idFor = (index: number) => `00000000-0000-0000-0000-${String(index + 1).padStart(12, "0")}`;
     await stages.execute(input, async lease => {
       const key = await stages.query(lease, "discovery", "cold-metadata-directory");
@@ -542,7 +557,7 @@ describe("dormant user-source foundation", () => {
     const readMetadata = async (repository: UserSourcesRepository) => repository.connections.selectedRead(async client => {
       await client.query("SET LOCAL statement_timeout='2000ms'");
       const start = performance.now();
-      const metadata = await repository.metadataInRead(client, { ...identity, tokenMode: "delegated" }, new Date());
+      const metadata = await repository.metadataInRead(client, identity, new Date());
       expect(metadata.directory.rowCount).toBe(4000);
       expect(metadata.app_activity).toMatchObject({ rowCount: 2250, state: "available" });
       expect(performance.now() - start).toBeLessThan(1000);
@@ -561,7 +576,7 @@ describe("dormant user-source foundation", () => {
   it("retains duplicate CSV identities as ambiguous, including object-ID/UPN alias collisions", async () => {
     const stages = new UserSourceStages(fixture.runtime);
     const identity = { ...selectionIdentity, principalId: "activity-ambiguity" };
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const input = generationInput({ actorPrincipalId: identity.principalId });
     const users = [sourceUser(firstId), sourceUser(secondId),
       sourceUser("00000000-0000-0000-0000-000000000003"), sourceUser("00000000-0000-0000-0000-000000000004"),
       sourceUser("00000000-0000-0000-0000-000000000005")];
@@ -583,7 +598,7 @@ describe("dormant user-source foundation", () => {
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const selected = await repository.capture(identity, "delegated");
+    const selected = await repository.capture(identity);
     const result = await repository.page(selected.id, identity);
     expect(result.value.filter(row => row.appActivity !== null).map(row => row.directory.objectId)).toEqual([secondId, users[4].identity.objectId]);
     expect(result.sources.app_activity.state).toBe("partial");
@@ -597,14 +612,14 @@ describe("dormant user-source foundation", () => {
       expect(complete).toEqual(pointwise);
       expect(complete.filter(row => row.activity_identity !== null).map(row => row.identity)).toEqual([secondId, users[4].identity.objectId]);
     });
-    const application = await repository.capture(identity, "application");
-    expect((await repository.page(application.id, identity)).counts.total).toBe(0);
+    const application = await repository.capture(identity);
+    expect((await repository.page(application.id, identity)).counts.total).toBe(users.length);
   });
 
   it("pages the full 1000-plan child ceiling and rejects 1001 without replacing the good source", async () => {
     const stages = new UserSourceStages(fixture.runtime);
     const identity = { ...selectionIdentity, principalId: "child-ceiling" };
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const input = generationInput({ actorPrincipalId: identity.principalId });
     const user = sourceUser(firstId);
     user.servicePlans = Array.from({ length: 1000 }, (_, index) => ({ ...user.servicePlans[0], servicePlanId: `70000000-0000-4000-8000-${String(index).padStart(12, "0")}` }));
     user.servicePlans[0].assignedDateTime = "2026-01-01T00:00:00.1234567Z";
@@ -615,7 +630,7 @@ describe("dormant user-source foundation", () => {
     }, { beforePublish: async () => {} });
     const good = await publish();
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const selected = await repository.capture(identity, "delegated");
+    const selected = await repository.capture(identity);
     let cursor: string | undefined;
     let count = 0;
     do {
@@ -640,7 +655,7 @@ describe("dormant user-source foundation", () => {
       renewed = originalRenew(lease);
       return renewed;
     });
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: "heartbeat-provider" } });
+    const input = generationInput({ actorPrincipalId: "heartbeat-provider" });
     let calls = 0;
     const advance = async (ms: number) => {
       for (let elapsed = 0; elapsed < ms; elapsed += 20_000) {
@@ -665,7 +680,7 @@ describe("dormant user-source foundation", () => {
 
   it.each(["provider-wait", "validation", "revocation"] as const)("fences cancellation during %s without advancing the head", async moment => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID() } });
+    const input = generationInput({ actorPrincipalId: randomUUID() });
     const controller = new AbortController();
     const original = stages.generations.validationStep.bind(stages.generations);
     if (moment === "validation") vi.spyOn(stages.generations, "validationStep").mockImplementationOnce(async lease => {
@@ -674,7 +689,7 @@ describe("dormant user-source foundation", () => {
     });
     await expect(stages.execute(input, async (lease, signal) => {
       if (moment === "provider-wait") { controller.abort(new Error("wait-cancelled")); signal.throwIfAborted(); }
-      if (moment === "revocation") await stages.generations.revokePrincipal(lease.tenantId, input.scope.principalId!);
+      if (moment === "revocation") await stages.generations.revokePrincipal(lease.tenantId, input.actorPrincipalId!);
       if (moment === "validation") {
         const key = await stages.query(lease, "catalog", "cancel-validation");
         await stages.finishQuery(lease, key);
@@ -690,7 +705,7 @@ describe("dormant user-source foundation", () => {
     const stages = new UserSourceStages(fixture.runtime);
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
     const identity = { ...selectionIdentity, principalId: "partial-source" };
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } });
+    const input = generationInput({ actorPrincipalId: identity.principalId });
     const provider = new UserSourceProvider(async () => Response.json({ value: [] }));
     const result = await provider.refreshSources(stages, repository, identity, [input,
       { ...input, scope: { ...input.scope, source: "app_activity" } }], {
@@ -706,7 +721,7 @@ describe("dormant user-source foundation", () => {
 
   it("never forwards Graph credentials to signed downloads and rejects invalid redirect hosts", async () => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: "signed-download", source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: "signed-download" });
     const calls: RequestInit[] = [];
     const provider = new UserSourceProvider(async (_url, init) => {
       calls.push(init!);
@@ -723,7 +738,7 @@ describe("dormant user-source foundation", () => {
 
   it.each([401, 403, 404, 410, 429, 500, 502, 503, 504])("requests a new signed report after download HTTP %i", async status => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID(), source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: randomUUID() });
     let reports = 0, downloads = 0;
     const wait = vi.fn(async () => {});
     const fetcher = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -745,7 +760,7 @@ describe("dormant user-source foundation", () => {
 
   it.each([400, 403, 503])("bounds repeated report download HTTP %i and keeps the preceding complete source", async status => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID(), source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: randomUUID() });
     const saved = await new UserSourceProvider(async () => new Response(csv())).refresh(stages, input, { authorize: async () => "synthetic-token" });
     let requests = 0;
     const wait = vi.fn(async () => {});
@@ -770,7 +785,7 @@ describe("dormant user-source foundation", () => {
 
   it("cancels report-download backoff without fetching another signed URL", async () => {
     const stages = new UserSourceStages(fixture.runtime), controller = new AbortController();
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: randomUUID(), source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: randomUUID() });
     const reason = new AppError(409, "read_job_cancelled", "Cancelled report refresh.");
     const fetcher = vi.fn(async (url: string | URL | Request) => String(url).startsWith("https://graph.microsoft.com/")
       ? new Response(null, { status: 302, headers: { location: "https://reports.office.com/data/download/synthetic" } })
@@ -827,7 +842,7 @@ describe("dormant user-source foundation", () => {
 
   it("verifies exact forward schema columns/grants and rejects runtime mutation of staged evidence", async () => {
     await verifySchema(fixture.runtime);
-    await expect(fixture.runtime.query("UPDATE user_source_read_contexts SET token_mode='application'")).rejects.toThrow("permission denied");
+    await expect(fixture.runtime.query("UPDATE user_source_read_contexts SET metadata='{}'")).rejects.toThrow("permission denied");
     await expect(fixture.runtime.query("TRUNCATE user_source_identity_inputs")).rejects.toThrow("permission denied");
     const client = await fixture.operator.connect();
     await client.query("BEGIN");
@@ -841,12 +856,12 @@ describe("dormant user-source foundation", () => {
   it("projects caller pages through exact reads, discards stale people and rejects cross-tenant records before queries", async () => {
     const identity = { ...selectionIdentity, principalId: "caller-page" };
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    let selected = await repository.capture(identity, "delegated");
+    let selected = await repository.capture(identity);
     await repository.savePeople(identity, [{ objectId: firstId, displayName: "Owner", userPrincipalName: "owner@example.invalid",
       status: "resolved", checkedAt: new Date().toISOString() }], async () => {});
     await repository.savePeople(identity, [{ objectId: secondId, displayName: "Expired", userPrincipalName: "expired@example.invalid",
       status: "resolved", checkedAt: new Date(Date.now() - 8 * 86_400_000).toISOString() }], async () => {});
-    selected = await repository.capture(identity, "delegated");
+    selected = await repository.capture(identity);
     const row: UnifiedAgentRecord = { id: "agent", displayName: "Saved native", presence: "power_platform", environmentId: "environment", packages: [],
       powerPlatformResource: { tenantId: identity.tenantId, nativeId: "native", type: "microsoft.copilotstudio/agents",
         environmentId: "environment", location: null, displayName: "Saved native", createdAt: null, createdBy: firstId, lastPublishedAt: null,
@@ -869,25 +884,25 @@ describe("dormant user-source foundation", () => {
     const identity = { ...selectionIdentity, principalId: "freshness" };
     const stages = new UserSourceStages(fixture.runtime);
     const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId, source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: identity.principalId });
     await new UserSourceProvider(async () => new Response(reportHeaders.join(",") + "\n")).refresh(stages, input, { authorize: async () => "synthetic-token" });
-    let selected = await repository.capture(identity, "delegated");
+    let selected = await repository.capture(identity);
     expect((await repository.page(selected.id, identity)).sources.app_activity).toMatchObject({
       state: "partial", rowCount: 0, reportRefreshDate: null, period: "D28", reportVersion: "v2",
     });
     const old = csv().replaceAll(date, "2020-01-01");
     await new UserSourceProvider(async () => new Response(old)).refresh(stages, input, { authorize: async () => "synthetic-token" });
-    selected = await repository.capture(identity, "delegated");
+    selected = await repository.capture(identity);
     expect((await repository.page(selected.id, identity)).sources.app_activity.state).toBe("stale");
     await repository.connections.selectedRead(async client => {
-      const source = await repository.metadataInRead(client, { ...identity, tokenMode: "delegated" }, new Date(Date.now() + 2 * 86_400_000));
+      const source = await repository.metadataInRead(client, identity, new Date(Date.now() + 2 * 86_400_000));
       expect(source.app_activity).toMatchObject({ state: "stale", rowCount: expect.any(Number), generationId: expect.any(String) });
     });
   });
 
   it.each(["available", "stale", "partial"] as const)("preserves %s app-activity evidence during a running refresh", async state => {
     const identity = { ...selectionIdentity, principalId: randomUUID() };
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId, source: "app_activity" } });
+    const input = generationInput({ scope: { ...generationInput().scope, source: "app_activity" }, actorPrincipalId: identity.principalId });
     const stages = new UserSourceStages(fixture.runtime);
     await stages.execute({ ...input, scope: { ...input.scope, source: "directory" } }, async lease => {
       const key = await stages.query(lease, "discovery", "synthetic:directory");
@@ -904,7 +919,7 @@ describe("dormant user-source foundation", () => {
         VALUES($1,$2,$3,'app_activity')`, [lease.id, lease.scopeId, identity.tenantId]);
       const repository = new UserSourcesRepository(fixture.runtime, "synthetic-cursor-secret-at-least-32-bytes");
       await repository.connections.selectedRead(async client => {
-        const scope = { ...identity, tokenMode: "delegated" as const };
+        const scope = { tenantId: identity.tenantId };
         const current = await repository.metadataInRead(client, scope, new Date());
         expect(current.app_activity).toMatchObject({ state, attemptStatus: "running" });
         expect(current.app_activity.generationId).not.toBeNull();
@@ -941,7 +956,7 @@ describe("dormant user-source foundation", () => {
     const runId = randomUUID();
     const jobId = randomUUID();
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId }, jobKind: "data_sync", runId, jobId });
+    const input = generationInput({ actorPrincipalId: principalId, jobKind: "data_sync", runId, jobId });
     await fixture.runtime.query(`INSERT INTO data_sync_runs(id,tenant_id,principal_id,mode,source_ids,request_hash,status)
       VALUES($1,$2,$3,'incremental','["users"]',repeat('a',64),'running')`, [runId, input.scope.tenantId, principalId]);
     await fixture.runtime.query(`INSERT INTO data_sync_run_sources(run_id,tenant_id,principal_id,source_id,status,job_id,message,can_retry)
@@ -970,7 +985,7 @@ describe("dormant user-source foundation", () => {
 
   it("rejects missing query evidence, oversized batches and evidence reservations without publishing", async () => {
     const stages = new UserSourceStages(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, principalId: "stage-limits" } });
+    const input = generationInput({ actorPrincipalId: "stage-limits" });
     await expect(stages.execute({ ...input, deadlineAt: new Date(Date.now() + 3_600_000) }, async () => {},
       { beforePublish: async () => {} })).rejects.toMatchObject({ code: "user_source_deadline" });
     await expect(stages.execute(input, async () => {}, { beforePublish: async () => {} })).rejects.toMatchObject({ code: "provider_schema" });
@@ -979,7 +994,7 @@ describe("dormant user-source foundation", () => {
     await expect(stages.execute({ ...input, reserveBytes: 10 }, lease => stages.identities(lease, [firstId]),
       { beforePublish: async () => {} })).rejects.toMatchObject({ code: "data_generation_bytes", details: { limit: 10 } });
     expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
-      WHERE s.principal_id=$1 AND g.state IN ('published','staging','validating')`, [input.scope.principalId])).rows[0].n).toBe(0);
+      WHERE s.tenant_id=$1 AND g.state IN ('published','staging','validating')`, [input.scope.tenantId])).rows[0].n).toBe(0);
   });
 
   it("backpressures streaming CSV while the consumer pauses and cancels its unread body", async () => {

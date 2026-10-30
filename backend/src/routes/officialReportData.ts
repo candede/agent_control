@@ -23,7 +23,7 @@ import { readAdoptionDepartments, readAdoptionSummary } from "../services/adopti
 import { SavedReadContracts } from "../services/savedReadContracts.js";
 import type { AgentRelationship } from "../types/savedReadContracts.js";
 
-type ReportHandlerIdentity = { identity: SelectionIdentity; tokenMode: "delegated" | "application" };
+type ReportHandlerIdentity = { identity: SelectionIdentity };
 export type ReportHandlerOptions = {
   reports: LargeTenantUsersReports;
   inventory?: InventoryQueries;
@@ -74,12 +74,12 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   options = { ...options, identity: async request => {
     const who = await identify(request), authorized = requestScope(request);
     if (who.identity.tenantId !== authorized.tenantId || who.identity.principalId !== authorized.principalId
-      || !["delegated", "application"].includes(who.tokenMode)) throw AppError.unauthorized();
+      ) throw AppError.unauthorized();
     return who;
   } };
   const router = Router(), reports = options.reports, imports = new OfficialReportImports(reports.database), usage = new OfficialAgentUsage(reports);
   const inventoryUsage = new OfficialAgentUsage(reports, options.inventory ?? new InventoryQueries(reports.database,
-    config.sessionSecret, reports.staleAfterDays, undefined, { source: "inventory_canonical", tokenMode: "delegated" }));
+    config.sessionSecret, reports.staleAfterDays, { source: "inventory_canonical" }));
   const savedReads = new SavedReadContracts(reports, inventoryUsage.inventory!);
   router.use((_request, response, next) => { response.setHeader("Cache-Control", "private, no-store"); next(); });
   const route = (method: RouteMethod, path: string, access: "read" | "admin" | "browser-read" | "browser-admin", ...handlers: RequestHandler[]) => {
@@ -127,7 +127,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       try { selection = JSON.parse(Buffer.from(scalar(request.query.cursor).split(".")[0], "base64url").toString()).selectionId; reportUuid(selection); }
       catch { throw new SelectionError("invalid_cursor"); }
     }
-    const id = selection === undefined ? (await reports.capture(who.identity, who.tokenMode, endpoint, query)).id : reportUuid(selection).toLowerCase();
+    const id = selection === undefined ? (await reports.capture(who.identity, endpoint, query)).id : reportUuid(selection).toLowerCase();
     if (selection !== undefined) await reports.read(id, who.identity, async (_client, context) => {
       if (context.endpoint !== endpoint) throw new AppError(400, "invalid_cursor", "Selection endpoint mismatch.");
       const keys = Object.keys(raw).filter(key => reportQueryFields.includes(key as typeof reportQueryFields[number]));
@@ -146,7 +146,6 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     if (Object.keys(request.query).some(key => !allowed.includes(key))) throw new AppError(400, "invalid_usage_query", "Unsupported selected inventory usage query.");
     pageOptions(request.query);
     const who = await options.identity(request), id = reportUuid(request.query.inventorySelectionId).toLowerCase();
-    if (who.tokenMode !== "delegated") throw new AppError(403, "agent_usage_scope_unavailable", "Agent usage requires delegated inventory.");
     if (request.query.selectionId !== undefined && reportUuid(request.query.selectionId).toLowerCase() !== id) throw new SelectionError("invalid_cursor");
     const childQuery = users ? requestQuery("relationships", request.query.search === undefined ? {} : { search: request.query.search }) : undefined;
     return { ...who, id, childQuery, reader: inventoryUsage, setId };
@@ -218,7 +217,7 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     if (Object.keys(query).some(key => !["selectionId", "setId"].includes(key))) throw new AppError(400, "invalid_usage_query", "Use one exact username and saved selection.");
     if (query.selectionId !== undefined && query.setId !== undefined) throw new AppError(400, "invalid_usage_query", "A pinned selection already fixes its report set.");
     const who = await options.identity(request);
-    const id = query.selectionId === undefined ? (await reports.capture(who.identity, who.tokenMode, "copilot_users",
+    const id = query.selectionId === undefined ? (await reports.capture(who.identity, "copilot_users",
       query.setId === undefined ? {} : { setId: reportUuid(query.setId) })).id : reportUuid(query.selectionId);
     response.json(await savedReads.resolve(id, who.identity, username));
   }));

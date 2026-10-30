@@ -16,9 +16,6 @@ export type InventoryIntent = {
   targetJobId?: string;
   roleScope?: "full" | "ai" | "unknown";
 };
-export function inventorySelector(intent: Pick<InventoryIntent, "domain" | "environmentId" | "resourceTypes">) {
-  return intent.domain === "power_platform" ? JSON.stringify([normalizeEnvironmentIdentity(intent.environmentId ?? ""), [...new Set(intent.resourceTypes ?? [])].sort()]) : "complete";
-}
 type Completion = NonNullable<NonNullable<Parameters<DataGenerations["publish"]>[1]>["completeJob"]>;
 export const inventoryAsOf = (alias = "m", root = "$1", revision = "$2") =>
   `${alias}.baseline_id=${root} AND ${alias}.valid_from_revision<=${revision} AND (${alias}.valid_to_revision IS NULL OR ${alias}.valid_to_revision>${revision})`;
@@ -53,7 +50,7 @@ export class InventoryGenerations {
     const scope = (await client.query("SELECT principal_id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2", [scopeId, tenantId])).rows[0];
     if (!scope) throw new Error("inventory_scope_unavailable");
     const acquired = (await client.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired",
-      [`data-sync:${tenantId}:${scope.principal_id}`])).rows[0].acquired;
+      [`data-sync:${tenantId}`])).rows[0].acquired;
     if (!acquired) return false;
     return (await client.query("SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 FOR UPDATE SKIP LOCKED",
       [scopeId,tenantId])).rowCount === 1;
@@ -78,8 +75,9 @@ export class InventoryGenerations {
       validateInputs?: (client: pg.PoolClient) => Promise<void>; afterPublish?: (client: pg.PoolClient, root: InventoryRoot) => Promise<void>;
       onCommitted?: () => void;
       commitPublication?: (operation: () => Promise<void>) => Promise<void> }) {
-    if (input.scope.kind !== "principal" || input.scope.source !== `inventory_${intent.domain}` || input.schemaVersion !== 1) throw new Error("inventory_scope");
-    if (input.scope.selector !== inventorySelector(intent)) throw new Error("inventory_selector");
+    if (input.scope.kind !== "tenant" || input.scope.principalId !== null || input.scope.tokenMode !== "tenant"
+      || input.scope.source !== `inventory_${intent.domain}` || input.schemaVersion !== 1) throw new Error("inventory_scope");
+    if (input.scope.selector !== "complete") throw new Error("inventory_selector");
     if (intent.domain !== "canonical" && intent.mode === "delta" && !intent.targetJobId && (!intent.targets?.length || intent.targets.length > 100
       || new Set(intent.targets).size !== intent.targets.length)) throw new Error("inventory_exact_targets");
     if (intent.targetJobId && (intent.domain !== "packages" || !["exact", "detail"].includes(intent.channel) || intent.targetJobId !== input.jobId || intent.targets)) {
@@ -389,7 +387,7 @@ export class InventoryGenerations {
     const { a,olderCatalog } = prepared,revision = (BigInt(lease.expectedRevision)+1n).toString();
     let changedCount = 0;
     const phases = olderCatalog ? ["prior"] : a.mode==="compact" ? ["compact"]
-      : a.domain==="canonical" ? ["own"] : ["own","newer"];
+      : a.domain==="canonical" ? ["own"] : ["own","newer","unseen"];
     for (const phase of phases) {
       let after = "";
       for (;;) {
@@ -414,9 +412,11 @@ export class InventoryGenerations {
             last = candidates.at(-1)?.identity;
             rows = candidates.filter(row => !row.deleted).map(row => ({ identity: row.identity,generation_id: row.generation_id }));
           } else {
-            rows = phase==="prior"
+            rows = phase==="prior" || phase==="unseen"
               ? (await client.query(`SELECT identity,generation_id FROM inventory_memberships m
-                WHERE ${inventoryAsOf()} AND identity>$3 ORDER BY identity LIMIT 250`,[a.baseline_id,a.base_revision,after])).rows
+                WHERE ${inventoryAsOf()} AND identity>$3
+                ${phase==="unseen" ? `AND NOT EXISTS(SELECT 1 FROM inventory_keys k WHERE k.generation_id=$4 AND k.identity=m.identity)` : ""}
+                ORDER BY identity LIMIT 250`,phase==="unseen" ? [a.baseline_id,a.base_revision,after,lease.id] : [a.baseline_id,a.base_revision,after])).rows
               : (await client.query(`SELECT identity,source_generation_id AS generation_id FROM inventory_compaction_refs
                 WHERE generation_id=$1 AND identity>$2 ORDER BY identity LIMIT 250`,[lease.id,after])).rows;
             last = rows.at(-1)?.identity;
@@ -686,9 +686,9 @@ export class InventoryGenerations {
       const retired = await client.query(`UPDATE inventory_roots r SET current=false FROM data_generations g,data_scope_epochs s,inventory_revisions v
         WHERE r.scope_id=$1 AND r.current AND v.scope_id=r.scope_id AND v.revision=r.revision AND g.id=v.generation_id AND s.id=r.scope_id
           AND (g.state NOT IN ('published','retired') OR g.session_epoch<>s.session_epoch
-            OR g.scope_epoch<>s.epoch AND NOT(s.token_mode='delegated' AND (
+            OR g.scope_epoch<>s.epoch AND NOT(s.token_mode='tenant' AND (
               s.source='inventory_packages' AND EXISTS(SELECT 1 FROM inventory_control_pending p
-                WHERE p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id)
+                WHERE p.tenant_id=s.tenant_id)
               OR s.source='inventory_power_platform' AND EXISTS(SELECT 1 FROM inventory_native_control_pending p WHERE p.scope_id=s.id)))
             OR EXISTS(SELECT 1 FROM jsonb_to_recordset(v.inputs) input("scopeId" uuid,"baselineId" uuid,epoch bigint,"expiresAt" timestamptz)
               LEFT JOIN data_scope_epochs dependency ON dependency.id=input."scopeId"
@@ -698,7 +698,7 @@ export class InventoryGenerations {
                 captured.session_epoch=dependency.session_epoch
                 AND (EXISTS(SELECT 1 FROM inventory_native_control_pending p WHERE p.scope_id=dependency.id)
                   OR dependency.source='inventory_packages' AND EXISTS(SELECT 1 FROM inventory_control_pending p
-                    WHERE p.tenant_id=dependency.tenant_id AND p.principal_id=dependency.principal_id)
+                    WHERE p.tenant_id=dependency.tenant_id)
                   OR EXISTS(SELECT 1 FROM inventory_roots live JOIN inventory_revisions revision
                     ON revision.scope_id=live.scope_id AND revision.revision=live.revision
                     JOIN data_generations published ON published.id=revision.generation_id
@@ -751,6 +751,8 @@ export class InventoryGenerations {
           AND NOT EXISTS(SELECT 1 FROM data_generation_pins p WHERE p.generation_id=g.id)
           AND NOT EXISTS(SELECT 1 FROM inventory_compaction_refs r WHERE r.generation_id=g.id)
           AND NOT EXISTS(SELECT 1 FROM inventory_mutation_targets t WHERE t.source_generation_id=g.id)
+          AND NOT EXISTS(SELECT 1 FROM inventory_records r WHERE r.catalog_generation=g.id
+            OR r.detail_generation=g.id OR r.control_generation=g.id LIMIT 1 OFFSET 0)
           LIMIT 1`, [scopeId])).rows[0];
       await remove("pages", "inventory_pages", "target.generation_id=$3", [generation?.id ?? null]);
       await remove("attempts", "inventory_attempts", `target.generation_id=$3

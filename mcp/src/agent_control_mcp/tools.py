@@ -17,7 +17,7 @@ from . import inputs as i
 from . import inventory_models as inventory
 from . import job_models as jobs
 from . import report_models as reports
-from .api import CanonicalApi
+from .api import MAX_OUTPUT, CanonicalApi
 from .errors import AdapterError
 from .models import (
     AgentAboutPage,
@@ -199,17 +199,17 @@ OPERATIONS = (
         "capture_packages",
         "POST",
         "/api/agents/selections",
-        i.PackageCapture,
+        i.InventoryCapture,
         PublishedSelectedRead,
-        "Capture a provider-free saved delegated package selection.",
+        "Capture a provider-free selection of the shared tenant package inventory.",
     ),
     Operation(
         "list_packages",
         "GET",
         "/api/agents",
-        i.PackageList,
+        i.InventoryList,
         inventory.PackagePage,
-        "Read one saved delegated package page without collection or application fallback.",
+        "Read one shared tenant package page without collecting provider data.",
     ),
     Operation(
         "get_package",
@@ -1196,7 +1196,20 @@ def _register(mcp: FastMCP, api: CanonicalApi, operation: Operation) -> None:
                 )
                 return ToolResult(content=content, structured_content=document)
         except AdapterError as error:
-            raise ToolError(json.dumps(error.as_dict(), ensure_ascii=False)) from None
+            text = json.dumps(error.as_dict(), ensure_ascii=False)
+            envelope = CallToolResult(content=[TextContent(type="text", text=text)], is_error=True)
+            if len(envelope.model_dump_json(by_alias=True).encode()) > MAX_OUTPUT:
+                text = json.dumps(
+                    AdapterError(
+                        413,
+                        "output_limit",
+                        "Invocation output limit exceeded.",
+                        error.request_id,
+                        error.retry_after_seconds,
+                    ).as_dict(),
+                    ensure_ascii=False,
+                )
+            raise ToolError(text) from None
 
     execute.__name__ = operation.name
     execute.__annotations__["request"] = operation.request

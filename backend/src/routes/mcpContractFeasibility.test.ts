@@ -203,7 +203,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         return `${method} ${path.startsWith("/api/") || path === "/{*path}" ? path : `/api${path}`}`;
       });
       expect(new Set(currentRoutes).size).toBe(currentRoutes.length);
-      expect(currentRoutes).toHaveLength(160);
+      expect(currentRoutes).toHaveLength(163);
       expect(currentRoutes).not.toContain("GET /security");
       expect(currentRoutes).not.toContain("POST /api/auth/consent");
       expect(currentRoutes).toEqual(expect.arrayContaining([
@@ -340,7 +340,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     const reports = new LargeTenantUsersReports(fakePool, secret, 7);
     const context = {
       identity, query: reportQuery("adoption"), endpoint: "adoption", queryHash: "synthetic",
-      tokenMode: "delegated", report: { setId: null, lineages: [] },
+      report: { setId: null, lineages: [] },
       metadata: { directory: { generationId: null }, app_activity: { generationId: null } },
       selection: { id: selected.selectionId, revision: selected.revision }, evaluatedAt: new Date("2026-01-31T00:00:00Z"),
     } as ReportReadContext;
@@ -436,7 +436,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document).toContain("first **accepted execution submission**");
     expect(document).toContain("Same idempotency key returns original origin");
     expect(document).toContain("no automatic double dispatch");
-    const tools = routeRows.map(row => row[3].split("|").at(-3)?.trim()).filter(tool => tool !== "—");
+    const tools = routeRows.map(row => row[3].split("|").at(-3)?.trim()).filter(tool => tool !== "—" && tool !== "HTTP only");
     expect(new Set(tools).size).toBe(tools.length);
   });
 });

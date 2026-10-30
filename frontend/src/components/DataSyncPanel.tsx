@@ -461,25 +461,27 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
 
   const refresh = useCallback(async (explicit = true) => {
     if (!mounted.current) return;
-    if (!explicit && (actionController.current || accessDenied.current || loadController.current || timer.current !== undefined
-      || requestedRunController.current || requestedRunTimer.current !== undefined)) return;
+    if (!explicit && (actionController.current || accessDenied.current || loadController.current || timer.current !== undefined)) return;
+    const refreshRequestedRun = explicit || (!requestedRunController.current && requestedRunTimer.current === undefined);
     if (explicit) packageDetailsRef.current?.refresh();
     accessDenied.current = false;
     actionRevision.current += 1;
-    requestedRunGeneration.current += 1;
-    stopRequestedRunPolling();
+    if (refreshRequestedRun) {
+      requestedRunGeneration.current += 1;
+      stopRequestedRunPolling();
+    }
     if (actionController.current) {
       stopPolling();
       return;
     }
     void startPolling(generation.current);
-    if (requestedRunId) setRequestedRunReload(value => value + 1);
+    if (requestedRunId && refreshRequestedRun) setRequestedRunReload(value => value + 1);
   }, [requestedRunId, startPolling, stopPolling, stopRequestedRunPolling]);
 
   useImperativeHandle(ref, () => ({ refresh, start }), [refresh, start]);
 
   function checkStatus() {
-    if (loadController.current || requestedRunController.current) return;
+    if (loadController.current) return;
     void refresh();
   }
 
@@ -697,14 +699,14 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
       <SyncDialog open={confirmClean} title="Reset saved data" fallbackFocusRef={heading} onClose={closeCleanConfirmation}>
         <div className="data-sync-clean-confirm">
           <strong>Clear saved data before syncing?</strong>
-          <p>Your account's saved users, license and app-activity data, Graph packages, and Power Platform inventory will be removed first. These views may be empty until sync succeeds. A failed or cancelled sync does not restore the cleared data.</p>
-          <p>Accepted usage reports, report history, audit records, configuration, and other users' saved data are kept.</p>
+          <p>The tenant's saved users, license and app-activity data, Graph packages, and Power Platform inventory will be removed for all readers first. These views may be empty until sync succeeds. A failed or cancelled sync does not restore the cleared data.</p>
+          <p>Accepted usage reports, report history, audit records, and configuration are kept. Private job ownership is unchanged.</p>
           <label>
             <input type="checkbox" checked={cleanAcknowledged} onChange={event => {
               cleanConsent.current = event.target.checked;
               setCleanAcknowledged(event.target.checked);
             }} />
-            I understand my saved users and inventory will be cleared.
+            I understand the tenant's saved users and inventory will be cleared for all readers.
           </label>
           <div className="data-sync-run-actions">
             <button type="button" className="secondary" onClick={closeCleanConfirmation}>Keep saved data</button>

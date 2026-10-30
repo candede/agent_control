@@ -1,19 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
+import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { inventoryBaseline, inventoryDelta, inventoryInput, inventorySelectionFixture, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { inventoryPresentation, inventorySourceStatuses } from "../services/inventoryPresentation.js";
 import { PowerPlatformResourceQueryClient } from "../services/powerPlatformResourceQuery.js";
 import { StreamedInventory } from "../services/streamedInventory.js";
 import { powerPlatformResourceTypes, type InventoryRoleScope, type PowerPlatformResourceType } from "../types/powerPlatformInventory.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import { LiveInventory } from "./liveInventory.js";
 import { InventoryIdentityQueries, currentNativeInventorySql } from "./inventoryIdentityQueries.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(); });
 afterAll(async () => { await fixture?.close(); });
+beforeEach(() => { selectionIdentity.tenantId = randomUUID(); });
 const agentType = "microsoft.copilotstudio/agents";
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const nativeIds = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"];
@@ -22,7 +24,6 @@ async function publishInventory(roleScope: InventoryRoleScope = "unknown", reque
   const scope = { tenantId: `verification-${randomUUID()}`, principalId: "reader" };
   const input = inventoryInput(scope.principalId, "power_platform");
   input.scope.tenantId = scope.tenantId;
-  input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: requestedTypes });
   const provider = new PowerPlatformResourceQueryClient(async () => Response.json({
     totalRecords: 2, count: 2, resultTruncated: 0,
     data: nativeIds.map(name => ({ name, tenantId: scope.tenantId, type: agentType, properties: { environmentId, displayName: name } })),
@@ -60,7 +61,7 @@ describe("typed immutable inventory verification", () => {
     }
   });
 
-  it("uses the latest executed source scope for current identities and never another principal's source", async () => {
+  it("uses the latest tenant source for every actor while excluding other tenants", async () => {
     const { scope } = await publishInventory();
     const latest = await nativeInventoryFixture(fixture.runtime, scope, nativeIds.map(nativeId => ({
       nativeId, environmentId, identifiers: [{ kind: "entra_agent_id", value: nativeId }],
@@ -72,30 +73,35 @@ describe("typed immutable inventory verification", () => {
       expect(record.native).toMatchObject({ identifiers: [{ kind: "entra_agent_id", value: nativeId }],
         observation: { snapshotId: latest.baselineId } });
       await expect(new LiveInventory(fixture.runtime).record({ ...scope, principalId: "different-reader" }, id))
+        .resolves.toMatchObject({ native: { observation: { snapshotId: latest.baselineId } } });
+      await expect(new LiveInventory(fixture.runtime).record({ ...scope, tenantId: randomUUID() }, id))
         .rejects.toMatchObject({ code: "agent_not_found" });
     }
   });
 
-  it("uses the newest complete tenant-wide agent query without unioning obsolete or environment-scoped membership", async () => {
+  it("lets a different authorized actor update the same source through a narrower query without losing unseen tenant records", async () => {
     const scope = { tenantId: "native-source-precedence", principalId: randomUUID() };
-    await nativeInventoryFixture(fixture.runtime, scope, [
+    const broad = await nativeInventoryFixture(fixture.runtime, scope, [
       { nativeId: "obsolete-global-agent", environmentId, identifiers: [] },
       { nativeId: environmentId, type: "microsoft.powerplatform/environments", displayName: "Finance production", identifiers: [] },
     ], { resourceTypes: [...powerPlatformResourceTypes] });
-    const latest = await nativeInventoryFixture(fixture.runtime, scope,
+    const other = { ...scope, principalId: randomUUID() };
+    const latest = await nativeInventoryFixture(fixture.runtime, other,
       [{ nativeId: "current-global-agent", environmentId, identifiers: [] }], { resourceTypes: [agentType] });
-    await nativeInventoryFixture(fixture.runtime, scope,
+    const scoped = await nativeInventoryFixture(fixture.runtime, other,
       [{ nativeId: "scoped-only-agent", environmentId, identifiers: [] }], { resourceTypes: [agentType], environmentId });
+    expect(new Set([broad.scopeId, latest.scopeId, scoped.scopeId]).size).toBe(1);
     await reconcileInventoryFixture(fixture.runtime, scope);
     const selected = await inventorySelectionFixture(fixture.runtime, scope);
     const page = inventoryPresentation(selected.raw);
-    expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["current-global-agent"]);
-    expect(page.value[0].environment).toMatchObject({ displayName: "Finance production" });
+    expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["current-global-agent", "obsolete-global-agent", "scoped-only-agent"]);
+    expect(page.value.every(row => row.environment?.displayName === "Finance production")).toBe(true);
+    expect(page.value.find(row => row.powerPlatformResource?.nativeId === "obsolete-global-agent")?.observations.powerPlatform?.snapshotId).toBe(broad.baselineId);
     expect(inventorySourceStatuses(selected.raw.freshness.sources, selected.raw.selection.evaluatedAt as Date).powerPlatform)
-      .toMatchObject({ observation: { snapshotId: latest.baselineId, environmentScope: null, observedCount: 1 } });
+      .toMatchObject({ state: "partial", observation: { snapshotId: scoped.baselineId, environmentScope: environmentId, observedCount: 1, totalRecords: 4 } });
     await expect(new LiveInventory(fixture.runtime).record(scope,
       unifiedAgentRecordId({ source: "power_platform", nativeId: "obsolete-global-agent", environmentId })))
-      .rejects.toMatchObject({ code: "agent_not_found" });
+      .resolves.toMatchObject({ native: { resource: { nativeId: "obsolete-global-agent" } } });
   });
 
   it("pins source-scope precedence and retains canonical survivors across changed complete queries and verified emptiness", async () => {
@@ -115,11 +121,18 @@ describe("typed immutable inventory verification", () => {
     await reconcileInventoryFixture(fixture.runtime, scope);
     const second = await inventorySelectionFixture(fixture.runtime, scope);
     const current = inventoryPresentation(second.raw);
-    expect(current.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "retained"]);
+    expect(current.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "deleted", "retained"]);
     expect(current.value.find(row => row.powerPlatformResource?.nativeId === "retained")?.id).toBe(retainedId);
     expect(current.value.every(row => row.environment?.displayName === "Original environment")).toBe(true);
     const historical = await first.queries.page(first.selection.id, first.identity);
-    expect(inventoryPresentation(historical).value).toEqual(original.value);
+    const historicalRows = structuredClone(original.value);
+    for (const row of historicalRows) {
+      if (row.environment) row.environment.observation.current = false;
+      if (row.observations.powerPlatform) Object.assign(row.observations.powerPlatform, {
+        current: false, coverage: "unknown", coveredCount: null, verification: null,
+      });
+    }
+    expect(inventoryPresentation(historical).value).toEqual(historicalRows);
     expect(historical.freshness.state).toBe("stale");
 
     await nativeInventoryFixture(fixture.runtime, scope,
@@ -131,35 +144,32 @@ describe("typed immutable inventory verification", () => {
     await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: [agentType] });
     await reconcileInventoryFixture(fixture.runtime, scope);
     const empty = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
-    expect(empty.value).toEqual([]);
-    expect(empty.counts.total).toBe(0);
-    expect(empty.sources.powerPlatform).toMatchObject({ state: "available",
-      observation: { observedCount: 0, coverage: "covered", verification: { storedCount: 0, uniqueIdentityCount: 0 } } });
+    expect(empty.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "deleted", "retained"]);
+    expect(empty.counts.total).toBe(3);
+    expect(empty.sources.powerPlatform).toMatchObject({ state: "partial",
+      observation: { observedCount: 0, coverage: "unknown", verification: null } });
   });
 
-  it("keeps equal-catalog-time native authority deterministic when the nonwinning scope is compacted later", async () => {
+  it("keeps equal-time tenant observations and canonical identities stable through compaction of their shared source", async () => {
     const scope = { tenantId: "native-compaction-precedence", principalId: randomUUID() }, observedAt = new Date();
     const broad = await nativeInventoryFixture(fixture.runtime, scope,
       [{ nativeId: "broad-agent", environmentId, identifiers: [] }], { resourceTypes: [...powerPlatformResourceTypes], observedAt });
     const agents = await nativeInventoryFixture(fixture.runtime, scope,
       [{ nativeId: "agents-only", environmentId, identifiers: [] }], { resourceTypes: [agentType], observedAt });
-    const winner = broad.scopeId < agents.scopeId ? broad : agents, loser = winner === broad ? agents : broad;
-    const expected = winner === broad ? "broad-agent" : "agents-only";
+    expect(broad.scopeId).toBe(agents.scopeId);
     await reconcileInventoryFixture(fixture.runtime, scope);
     const before = await inventorySelectionFixture(fixture.runtime, scope), original = inventoryPresentation(before.raw);
-    expect(original.value.map(row => row.powerPlatformResource?.nativeId)).toEqual([expected]);
+    expect(original.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["agents-only", "broad-agent"]);
     const input = inventoryInput(scope.principalId, "power_platform");
     input.scope.tenantId = scope.tenantId;
-    input.scope.selector = inventorySelector({ domain: "power_platform",
-      resourceTypes: loser === broad ? powerPlatformResourceTypes : [agentType] });
-    await new InventoryGenerations(fixture.runtime).compact(input, loser, { authorize: async () => {} });
+    await new InventoryGenerations(fixture.runtime).compact(input, agents, { authorize: async () => {} });
     await reconcileInventoryFixture(fixture.runtime, scope);
     const after = await inventorySelectionFixture(fixture.runtime, scope), compacted = inventoryPresentation(after.raw);
     expect(compacted.value.map(row => ({ id: row.id, nativeId: row.powerPlatformResource?.nativeId })))
       .toEqual(original.value.map(row => ({ id: row.id, nativeId: row.powerPlatformResource?.nativeId })));
     const current = await new InventoryIdentityQueries(fixture.runtime).read(client =>
       client.query(`${currentNativeInventorySql} SELECT native_id FROM native`, [scope.tenantId, scope.principalId, [agentType]]));
-    expect(current.rows).toEqual([{ native_id: expected }]);
+    expect(current.rows.map(row => row.native_id).sort()).toEqual(["agents-only", "broad-agent"]);
     await before.queries.selections.invalidate(before.selection.id, before.identity);
     await after.queries.selections.invalidate(after.selection.id, after.identity);
   });
@@ -193,8 +203,7 @@ describe("typed immutable inventory verification", () => {
         totalRecords: change === "provider_total" ? 1 : 2, count: change === "fractional_count" ? 1.5 : 2, resultTruncated: 0, data,
       }));
       const requestedEnvironment = change === "environment" ? "22222222-2222-4222-8222-222222222222" : undefined;
-      const next = { ...input, jobId: randomUUID(), scope: { ...input.scope,
-        selector: inventorySelector({ domain: "power_platform", environmentId: requestedEnvironment, resourceTypes: powerPlatformResourceTypes }) } };
+      const next = { ...input, jobId: randomUUID() };
       await expect(new StreamedInventory(fixture.runtime, undefined, provider).powerPlatformCatalog(next, "synthetic-token",
         powerPlatformResourceTypes, { environmentId: requestedEnvironment, authorize: async () => {} })).rejects.toThrow();
       expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "power_platform")).raw.freshness.sources[0].generation_id).toBe(root.baselineId);
@@ -213,11 +222,11 @@ describe("typed immutable inventory verification", () => {
     const principalId = randomUUID(), store = new InventoryGenerations(fixture.runtime);
     await inventoryBaseline(store, principalId, 2);
     if (kind === "exact") await inventoryDelta(store, principalId, 1);
-    const selected = await inventorySelectionFixture(fixture.runtime, { tenantId: "synthetic-tenant", principalId }, {}, "packages");
+    const selected = await inventorySelectionFixture(fixture.runtime, { tenantId: selectionIdentity.tenantId, principalId }, {}, "packages");
     const row = (await fixture.runtime.query(`SELECT r.generation_id,r.identity FROM package_record_rows r
       JOIN data_scope_epochs s ON s.id=r.scope_id JOIN data_generations g ON g.id=r.generation_id
-      WHERE s.principal_id=$1 AND r.native_id=$2 ORDER BY g.observed_at DESC,g.created_at DESC LIMIT 1`,
-    [principalId, selected.raw.value[0].id])).rows[0];
+      WHERE s.tenant_id=$1 AND r.native_id=$2 ORDER BY g.observed_at DESC,g.created_at DESC LIMIT 1`,
+    [selectionIdentity.tenantId, selected.raw.value[0].id])).rows[0];
     expect(row).toBeDefined();
     await expect(fixture.operator.query("DELETE FROM package_record_rows WHERE generation_id=$1 AND identity=$2", [row.generation_id, row.identity]))
       .rejects.toThrow("inventory_content_pinned");

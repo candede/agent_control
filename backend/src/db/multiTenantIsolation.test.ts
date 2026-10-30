@@ -42,11 +42,11 @@ const environmentType = "microsoft.powerplatform/environments";
 beforeAll(async () => { fixture = await testDatabase(); }, 30_000);
 afterAll(async () => { await fixture?.close(); });
 
-function partitions(label: string): DataSyncScope[] {
+function partitions(label: string, separateTenants = false): DataSyncScope[] {
   return [
     { tenantId: `${label}-tenant-a`, principalId },
     { tenantId: `${label}-tenant-b`, principalId },
-    { tenantId: `${label}-tenant-a`, principalId: "private-account" },
+    { tenantId: `${label}-tenant-${separateTenants ? "c" : "a"}`, principalId: "private-account" },
   ];
 }
 
@@ -56,13 +56,14 @@ function label(scope: DataSyncScope) {
 
 async function directoryPage(scope: DataSyncScope) {
   const source = new UserSourcesRepository(fixture.runtime, "synthetic-multi-tenant-directory-key"), identity = await usageIdentity(fixture.runtime, scope);
-  const selection = await source.capture(identity, "delegated");
+  const selection = await source.capture(identity);
   return source.page(selection.id, identity);
 }
 function collectDirectory(scope: DataSyncScope, user: CopilotDirectoryUser, publication: UserSourcePublication) {
   const stages = new UserSourceStages(fixture.runtime);
   return stages.execute(generationInput({
-    scope: { ...generationInput().scope, ...scope, source: "directory" }, jobKind: "data_sync", ...publication,
+    scope: { ...generationInput().scope, tenantId: scope.tenantId, source: "directory" },
+    actorPrincipalId: scope.principalId, jobKind: "data_sync", ...publication,
   }), async lease => {
     const key = await stages.query(lease, "discovery", "synthetic:isolation");
     await stages.page(lease, key, "synthetic:isolation", 1, 1);
@@ -87,7 +88,7 @@ function nativeResource(scope: DataSyncScope): PowerPlatformResource {
 describe("multi-tenant repositories with overlapping provider and principal identities", () => {
   it("isolates typed package pages, pinned details and composite child foreign keys", async () => {
     const repository = new PackageRefreshJobs(fixture.runtime);
-    const scopes = partitions("packages");
+    const scopes = partitions("packages", true);
     const saved = [];
     for (const scope of scopes) {
       const job = await repository.submit(scope, {
@@ -130,7 +131,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const identities = await fixture.runtime.query(`SELECT r.tenant_id,s.principal_id FROM package_record_rows r
       JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.native_id='shared-package' ORDER BY r.tenant_id,s.principal_id`);
     expect(identities.rows).toHaveLength(3);
-    expect(identities.rows).toEqual(expect.arrayContaining(scopes.map(scope => ({ tenant_id: scope.tenantId, principal_id: scope.principalId }))));
+    expect(identities.rows).toEqual(expect.arrayContaining(scopes.map(scope => ({ tenant_id: scope.tenantId, principal_id: null }))));
     for (const current of saved) {
       await current.selected.queries.selections.invalidate(current.selected.selection.id, current.selected.identity);
     }
@@ -140,7 +141,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const repository = new PowerPlatformRefreshJobs(fixture.runtime);
     const identities = new AgentIdentityRepository(fixture.runtime);
     const saved = [];
-    for (const scope of partitions("native")) {
+    for (const scope of partitions("native", true)) {
       const agent = nativeResource(scope);
       const environment: PowerPlatformResource = {
         ...agent, nativeId: environmentId, environmentId: null, type: environmentType, displayName: `Environment ${label(scope)}`,
@@ -192,11 +193,11 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     for (const current of saved) await current.selected.queries.selections.invalidate(current.selected.selection.id, current.selected.identity);
   });
 
-  it("retains account-private directory users and sync lineage while clearing only the requested scope", async () => {
+  it("isolates tenant directory users and actor-private sync lineage while clearing only the requested tenant", async () => {
     const repository = new DataSyncRepository(fixture.runtime);
     const people = new AgentPeopleRepository(fixture.runtime);
     const saved = [];
-    for (const scope of partitions("directory")) {
+    for (const scope of partitions("directory", true)) {
       const run = (await repository.submit(scope, { mode: "incremental", sources: ["users"] })).run;
       const publication = { runId: run.id, jobId: randomUUID() };
       await repository.attachJob(scope, run.id, "users", publication.jobId);
@@ -265,7 +266,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     for (const current of saved) accepted.push(await repository.acceptBundle(current.identity, bundleId, current.preview));
     expect(accepted[0].setId).not.toBe(accepted[1].setId);
     const read = async (scope: DataSyncScope) => {
-      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
       return reports.page(selection.id, identity);
     };
     const first = await read(owner), second = await read(otherTenant);
@@ -273,7 +274,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     expect(first.reports.lineages.find(lineage => lineage.kind === "agents")?.versionId)
       .not.toBe(second.reports.lineages.find(lineage => lineage.kind === "agents")?.versionId);
     expect((await read(otherAccount)).value).toEqual(first.value);
-    await expect(reports.capture(saved[0].identity, "delegated", "official_agents", { setId: accepted[1].setId }))
+    await expect(reports.capture(saved[0].identity, "official_agents", { setId: accepted[1].setId }))
       .rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(repository.confirmPreview(saved[0].identity, accepted[1].setId, "select")).rejects.toMatchObject({ code: "staging_unavailable" });
     await expect(repository.stage(saved[0].identity, { bundleId: randomUUID(), correctionOfSetId: accepted[1].setId },
@@ -294,7 +295,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const packages = new PackageRefreshJobs(fixture.runtime);
     const powerPlatform = new PowerPlatformRefreshJobs(fixture.runtime);
     const saved = [];
-    for (const scope of partitions(`${source}-lineage`)) {
+    for (const scope of partitions(`${source}-lineage`, true)) {
       const job = source === "graph_packages"
         ? await packages.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "same-child" })
         : await powerPlatform.submit(scope, { roleScope: "full", requestedTypes: [agentType], idempotencyKey: "same-child" });
@@ -402,17 +403,17 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     expect((await repository.evidence(key(scopes[1])))?.details).toEqual({ source: label(scopes[1]) });
   });
 
-  it("keeps canonical internal agent IDs and usage source memberships private for matching native identities", async () => {
+  it("isolates canonical internal agent IDs and usage source memberships across tenants with matching native identities", async () => {
     const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-canonical-isolation-report-key", 35);
     const repository = new OfficialAgentUsage(reports);
     const saved = [];
-    for (const scope of partitions("canonical")) {
+    for (const scope of partitions("canonical", true)) {
       const [record] = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["shared-package"], native: { nativeId, environmentId } }]);
       saved.push({ scope, record });
     }
     expect(new Set(saved.map(value => value.record.id)).size).toBe(3);
     for (const current of saved) {
-      const identity = await usageIdentity(fixture.runtime, current.scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      const identity = await usageIdentity(fixture.runtime, current.scope), selection = await reports.capture(identity, "official_agents");
       expect((await repository.summaries(selection.id, identity, [current.record.id]))[0].recordId).toBe(current.record.id);
       for (const other of saved.filter(value => value !== current)) {
         await expect(repository.summaries(selection.id, identity, [other.record.id])).rejects.toMatchObject({ code: "agent_not_found" });

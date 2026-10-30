@@ -11,6 +11,7 @@ import {
   awaitUsageInventoryExpiry, deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope,
 } from "./agentUsageTestSupport.js";
 import { OfficialReportImports } from "./officialReportImports.js";
+import { DataGenerations } from "./dataGenerations.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let reports: LargeTenantUsersReports, service: OfficialAgentUsage;
@@ -24,7 +25,7 @@ afterEach(() => vi.restoreAllMocks());
 
 async function selected(scope: AgentUsageScope, query: ReportQuery = {}) {
   const identity = await usageIdentity(fixture.runtime, scope);
-  return { identity, selection: await reports.capture(identity, "delegated", "official_agents", query) };
+  return { identity, selection: await reports.capture(identity, "official_agents", query) };
 }
 async function inventory(scope: AgentUsageScope, records: readonly { id: string }[]) {
   return reports.history.connections.selectedRead(async client =>
@@ -92,11 +93,11 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
   });
 
   it("scopes automatic matches to each tenant and viewer's current source evidence", async () => {
-    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }],
-      { expiresAt: new Date(Date.now() + 3000) });
+    const expiresAt = new Date(Date.now() + 3000);
+    const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }], { expiresAt });
     await publishUsageReports(fixture.runtime, scope);
-    const viewer = { ...scope, principalId: "automatic-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Report-A"] }]);
-    expect(other[0].id).not.toBe(records[0].id);
+    const viewer = { ...scope, principalId: "automatic-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Report-A"] }], { expiresAt });
+    expect(other[0].id).toBe(records[0].id);
     expect((await inventory(viewer, other))[0]).toMatchObject({ status: "linked", responses: 10 });
     const foreignScope = newUsageScope(), foreign = await saveUsageInventory(fixture.runtime, foreignScope, [{ packages: ["Report-A"] }]);
     expect((await inventory(foreignScope, foreign))[0]).toMatchObject({ status: "unavailable", responses: null });
@@ -104,7 +105,7 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     expect((await inventory(foreignScope, foreign))[0].responses).toBe(99);
     await awaitUsageInventoryExpiry(fixture.runtime, scope);
     expect((await inventory(scope, records))[0]).toMatchObject({ status: "unlinked", responses: null });
-    expect((await inventory(viewer, other))[0].responses).toBe(10);
+    expect((await inventory(viewer, other))[0]).toMatchObject({ status: "unlinked", responses: null });
     const { identity, selection } = await selected(scope);
     await expect(service.summaries(selection.id, identity, [records[0].id])).rejects.toMatchObject({ code: "agent_not_found" });
     expect(await associationCount(scope.tenantId)).toBe(0);
@@ -119,7 +120,7 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
       && row.context.reports.availability === "never_imported" && row.associationCount === 0)).toBe(true);
     expect(await service.candidates(selection.id, identity, records[0].id, {})).toMatchObject({ value: [], counts: { total: 0, filtered: 0 } });
     const other = await selected({ ...scope, principalId: "other" });
-    await expect(service.candidates(other.selection.id, other.identity, records[0].id, {})).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(service.candidates(other.selection.id, other.identity, records[0].id, {})).resolves.toMatchObject({ value: [] });
   });
 
   it("returns cursor-bounded Agents-only candidates without disclosing user rows or creating associations", async () => {
@@ -198,18 +199,20 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     await expect(associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Bridge-Only"))).rejects.toMatchObject({ code: "usage_report_agent_not_found" });
   });
 
-  it("shares source-qualified associations across private viewer UUIDs but isolates tenants", async () => {
+  it("shares source-qualified associations and canonical UUIDs across tenant actors but isolates tenants", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
     await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
     const viewer = { ...scope, principalId: "another-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }, { packages: ["Package-C"] }]);
-    expect(other[0].id).not.toBe(records[0].id);
+    expect(other[0].id).toBe(records[0].id);
     expect(await inventory(viewer, other)).toMatchObject([{ status: "linked", responses: 10, activeUsers: 2 }, { status: "unlinked", responses: null }]);
     const foreignScope = newUsageScope(), foreign = await saveUsageInventory(fixture.runtime, foreignScope, [{ packages: ["Package-A"] }]);
     await publishUsageReports(fixture.runtime, foreignScope);
     expect((await inventory(foreignScope, foreign))[0]).toMatchObject({ status: "unlinked", responses: null });
     const otherSelection = await selected(viewer);
-    await expect(service.candidates(otherSelection.selection.id, otherSelection.identity, records[0].id, {})).rejects.toMatchObject({ code: "agent_not_found" });
+    const ownerSelection = await selected(scope);
+    expect((await service.candidates(otherSelection.selection.id, otherSelection.identity, records[0].id, {})).value)
+      .toEqual((await service.candidates(ownerSelection.selection.id, ownerSelection.identity, records[0].id, {})).value);
     await expect(associate(foreignScope, records[0].id, await usageIntent(fixture.runtime, foreignScope))).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
@@ -226,13 +229,13 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope, "Report-A", target));
     await associate(scope, records[3].id, await usageIntent(fixture.runtime, scope, "Report-B", { source: "power_platform", nativeId: "Opaque-ID", environmentId: null }));
     expect((await inventory(scope, records)).map(row => row.responses)).toEqual([10, null, null, 20, null]);
+    const packageIntent = await usageIntent(fixture.runtime, scope, "Report-Missing", { source: "graph_packages", packageId: nativeId });
+    await expect(associate(scope, records[2].id, { ...packageIntent, target: { source: "graph_packages", packageId: nativeId.toUpperCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
     const viewer = { ...scope, principalId: "pp-viewer" }, shared = await saveUsageInventory(fixture.runtime, viewer,
       [{ packages: [], native: { nativeId: nativeId.toUpperCase(), environmentId: environmentA.toLowerCase() } }]);
     expect((await inventory(viewer, shared))[0]).toMatchObject({ status: "linked", responses: 10 });
     const valid = await usageIntent(fixture.runtime, scope, "Report-Missing", target);
     await expect(associate(scope, records[0].id, { ...valid, target: { ...target, environmentId: environmentB.toLowerCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
-    const packageIntent = await usageIntent(fixture.runtime, scope, "Report-Missing", { source: "graph_packages", packageId: nativeId });
-    await expect(associate(scope, records[2].id, { ...packageIntent, target: { source: "graph_packages", packageId: nativeId.toUpperCase() } })).rejects.toMatchObject({ code: "usage_target_mismatch" });
   });
 
   it("requires explicit authorized removal before reassignment while preserving same-target retries", async () => {
@@ -254,9 +257,9 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
   it("serializes concurrent reviewed writes with one winner and one failed audit", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
-    const other = { ...scope, principalId: "concurrent-administrator" }, otherRecords = await saveUsageInventory(fixture.runtime, other, [{ packages: ["Package-C"] }]);
+    const other = { ...scope, principalId: "concurrent-administrator" }, otherRecords = records;
     const initial = await usageIntent(fixture.runtime, scope), otherIntent = await usageIntent(fixture.runtime, other, "Report-A", { source: "graph_packages", packageId: "Package-C" });
-    const settled = await Promise.allSettled([associate(scope, records[0].id, initial), associate(other, otherRecords[0].id, otherIntent)]);
+    const settled = await Promise.allSettled([associate(scope, records[0].id, initial), associate(other, otherRecords[1].id, otherIntent)]);
     expect(settled.map(value => value.status).sort()).toEqual(["fulfilled", "rejected"]);
     expect(settled.find((value): value is PromiseRejectedResult => value.status === "rejected")?.reason).toMatchObject({ code: "agent_usage_changed" });
     expect(await associationCount(scope.tenantId)).toBe(1);
@@ -270,7 +273,7 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     const input = await usageIntent(fixture.runtime, scope);
     await expect(associate(scope, records[0].id, { ...input, inventoryRevision: "f".repeat(64) })).rejects.toMatchObject({ code: "inventory_changed" });
     await fixture.operator.query(`UPDATE data_scope_epochs SET epoch=epoch+1
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages'`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_packages'`, [scope.tenantId]);
     await expect(associate(scope, records[0].id, input)).rejects.toMatchObject({ code: "agent_not_found" });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
@@ -336,14 +339,14 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     expect((await inventory(scope, records))[0]).toMatchObject({ status: "unavailable", responses: null });
   });
 
-  it("keeps tenant associations through principal cleanup but stops resolving absent sources", async () => {
+  it("keeps tenant associations and shared source matching through principal cleanup", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     await publishUsageReports(fixture.runtime, scope);
     await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
     const viewer = { ...scope, principalId: "retained-viewer" }, other = await saveUsageInventory(fixture.runtime, viewer, [{ packages: ["Package-A"] }]);
-    await saveUsageInventory(fixture.runtime, scope, []);
+    await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId);
     expect(await associationCount(scope.tenantId)).toBe(1);
-    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unlinked", responses: null });
+    expect((await inventory(scope, records))[0]).toMatchObject({ status: "linked", responses: 10 });
     expect((await inventory(viewer, other))[0]).toMatchObject({ status: "linked", responses: 10 });
   });
 
@@ -357,10 +360,10 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
         try {
           await competitor.query("BEGIN");
           expect((await competitor.query("SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired",
-            [`data-sync:${scope.tenantId}:${scope.principalId}`])).rows[0].acquired).toBe(false);
-          const scopes = (await competitor.query(`SELECT id,source FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
+            [`data-sync:${scope.tenantId}`])).rows[0].acquired).toBe(false);
+          const scopes = (await competitor.query(`SELECT id,source FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
             AND source IN ('inventory_canonical','inventory_packages','inventory_power_platform') ORDER BY source`,
-          [scope.tenantId, scope.principalId])).rows;
+          [scope.tenantId])).rows;
           expect(scopes.map(value => value.source)).toEqual(["inventory_canonical", "inventory_packages", "inventory_power_platform"]);
           expect((await competitor.query("SELECT id FROM data_scope_epochs WHERE id=ANY($1::uuid[]) FOR UPDATE SKIP LOCKED",
             [scopes.map(value => value.id)])).rows).toEqual([]);

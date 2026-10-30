@@ -30,8 +30,9 @@ export function packageValue(i: number, version = 0, opposing = false, profile: 
         EnvironmentId: opposing ? otherEnvironment : fixtureEnvironment, CdsBotId: botId(bot) } }),
     })) }] } : {}) };
 }
-export function nativeValue(i: number, opposing = false, profile: CapacityIdentityProfile = "mixed") {
-  return { tenantId: opposing ? otherTenant : fixtureTenant, type: "microsoft.copilotstudio/agents", name: `native-${key(i)}`,
+export function nativeValue(i: number, opposing = false, profile: CapacityIdentityProfile = "mixed",
+  tenantId = opposing ? otherTenant : fixtureTenant) {
+  return { tenantId, type: "microsoft.copilotstudio/agents", name: `native-${key(i)}`,
     properties: { displayName: `Native ${key(i)}`, environmentId: opposing ? otherEnvironment : fixtureEnvironment,
       ...(profile!=="sparse" && i < 4 ? { botId: botId(i === 3 ? 2 : i) } : {}) } };
 }
@@ -156,7 +157,8 @@ export function capacityProvider() {
       if (!Number.isSafeInteger(offset) || offset < 0 || offset > count) throw new Error("fixture_offset");
       const end = Math.min(offset + 100, count), opposing = url.searchParams.get("opposing") === "true";
       const value = [];
-      for (let i = offset; i < end; i++) value.push(upstream.hostname === "api.powerplatform.com" ? nativeValue(i,opposing,identityProfile) : upstream.pathname.endsWith("/users") ? {
+      for (let i = offset; i < end; i++) value.push(upstream.hostname === "api.powerplatform.com"
+        ? nativeValue(i,opposing,identityProfile,url.searchParams.get("tenantId") ?? undefined) : upstream.pathname.endsWith("/users") ? {
         id: userId(i), userPrincipalName: `user-${key(i)}@example.invalid`, displayName: `User ${key(i)}`,
         companyName: `Company ${key(i)}`, department: opposing ? "Opposing" : "Primary", accountEnabled: !opposing, userType: "Member", employeeType: null,
         assignedLicenses: [{ skuId: sku, disabledPlans: opposing ? [plan] : [] }],

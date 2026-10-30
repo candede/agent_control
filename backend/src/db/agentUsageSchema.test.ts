@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { LargeTenantUsersReports } from "../services/largeTenantUsersReports.js";
 import { OfficialAgentUsage } from "../services/officialAgentUsage.js";
@@ -10,6 +10,7 @@ import {
 import { retainRecordData } from "./dataRetention.js";
 import { verifySchema } from "./schema.js";
 import { revokeAccountSessions } from "./sessions.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import type { AgentUsageTarget } from "../types/agentUsageTarget.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -71,14 +72,14 @@ describe("usage association schema and runtime boundary", () => {
     const previousIdentity = await usageIdentity(fixture.runtime, scope);
     const previousInput = await usageIntent(fixture.runtime, scope);
     const sourceReferencesSql = `SELECT source,source_generation_id FROM inventory_live_sources
-      WHERE tenant_id=$1 AND principal_id=$2 ORDER BY source,source_generation_id`;
-    const sources = (await fixture.runtime.query(sourceReferencesSql, [scope.tenantId, scope.principalId])).rows;
+      WHERE tenant_id=$1 ORDER BY source,source_generation_id`;
+    const sources = (await fixture.runtime.query(sourceReferencesSql, [scope.tenantId])).rows;
     expect(sources).toHaveLength(2);
 
     await revokeAccountSessions(fixture.runtime, scope.tenantId, scope.principalId);
     const identity = await usageIdentity(fixture.runtime, scope);
     expect(identity.sessionEpoch).not.toBe(previousIdentity.sessionEpoch);
-    expect((await fixture.runtime.query(sourceReferencesSql, [scope.tenantId, scope.principalId])).rows).toEqual(sources);
+    expect((await fixture.runtime.query(sourceReferencesSql, [scope.tenantId])).rows).toEqual(sources);
     await expect(usage.mutate(previousIdentity, records[0].id, previousInput, usageAudit(scope).actor))
       .rejects.toMatchObject({ code: "selection_invalidated" });
     const targets: AgentUsageTarget[] = [
@@ -95,7 +96,7 @@ describe("usage association schema and runtime boundary", () => {
     ]);
   });
 
-  it("requires exact tenant, active Agents identity and the reviewer's current source in persisted rows", async () => {
+  it("requires exact tenant, active Agents identity and a current tenant source independently of the reviewer", async () => {
     const scope = newUsageScope();
     await saveUsageInventory(fixture.runtime, scope);
     const report = await publishUsageReports(fixture.runtime, scope);
@@ -106,15 +107,40 @@ describe("usage association schema and runtime boundary", () => {
       values.packageId ?? "Package-A", values.principal ?? scope.principalId,
     ]);
     for (const values of [
-      { tenant: "foreign" }, { principal: "foreign" }, { reportId: "Bridge-Only" },
+      { tenant: "foreign" }, { reportId: "Bridge-Only" },
       { reportId: "report-a" }, { packageId: "package-a" }, { setId: randomUUID() },
     ]) await expect(insert(values)).rejects.toThrow();
-    await insert();
+    await insert({ principal: "other-reviewer" });
+    expect((await fixture.runtime.query("SELECT reviewed_by FROM agent_usage_associations WHERE tenant_id=$1",
+      [scope.tenantId])).rows).toEqual([{ reviewed_by: "other-reviewer" }]);
     await expect(insert({ packageId: "Package-B" })).rejects.toMatchObject({ code: "23505" });
     expect((await fixture.runtime.query("SELECT revision::text FROM agent_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].revision).toBe("1");
     await fixture.runtime.query("DELETE FROM agent_usage_associations WHERE tenant_id=$1 AND report_set_id=$2 AND report_agent_id='Report-A'", [scope.tenantId, report.setId]);
     await insert();
     expect((await fixture.runtime.query("SELECT revision::text FROM agent_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].revision).toBe("3");
+  });
+
+  it("rejects association inserts after canonical identity authority expires while publications remain current", async () => {
+    const scope = newUsageScope(), canonicalId = randomUUID();
+    const append = InventoryGenerations.prototype.append;
+    const publish = vi.spyOn(InventoryGenerations.prototype, "append").mockImplementation(function (this: InventoryGenerations, lease, rows, ordinal) {
+      return append.call(this, lease, rows.map(row => row.identity === canonicalId
+        ? { ...row, identity_expires_at: new Date(Date.now() - 1_000).toISOString() } : row), ordinal);
+    });
+    try {
+      await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Package-A"], canonicalId }]);
+    } finally { publish.mockRestore(); }
+    const report = await publishUsageReports(fixture.runtime, scope);
+    const sources = await fixture.runtime.query(`SELECT authority_expires_at<=clock_timestamp() AS expired
+      FROM inventory_live_sources WHERE tenant_id=$1 AND source='graph_packages'`, [scope.tenantId]);
+    expect(sources.rows).toEqual([{ expired: true }]);
+    await expect(fixture.runtime.query(`INSERT INTO agent_usage_associations
+      (tenant_id,report_set_id,report_agent_id,source,native_id,environment_id,reviewed_by)
+      VALUES($1,$2,'Report-A','graph_packages','Package-A','',$3)`,
+    [scope.tenantId, report.setId, scope.principalId]))
+      .rejects.toThrow("usage association requires an authorized current native source");
+    expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM agent_usage_associations WHERE tenant_id=$1",
+      [scope.tenantId])).rows[0].count).toBe(0);
   });
 
   it("physically cascades association cleanup by the exact tenant/report-set key", async () => {

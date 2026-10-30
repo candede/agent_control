@@ -1,5 +1,6 @@
 import { MiB } from "./capacityTelemetry.js";
 import { fixtureTenant, type CapacityIdentityProfile } from "./capacityProvider.js";
+import { capacityWithCleanup } from "./capacityBackground.js";
 import { generationInput } from "./largeTenantFixtures.js";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,7 +13,8 @@ export const capacityBudgets = Object.freeze({
     parallelGather: 0, statementMs: 15_000 },
   controller: { memory: 1024 * MiB, cpus: 1 }, diskFree: 64 * 1024 ** 3, diskStop: 48 * 1024 ** 3,
 });
-export function fixtureFetch(count: number, version = 0, opposing = false, profile: CapacityIdentityProfile = "mixed", children: 0 | 10_000 = 0) {
+export function fixtureFetch(count: number, version = 0, opposing = false, profile: CapacityIdentityProfile = "mixed",
+  children: 0 | 10_000 = 0, tenantId?: string) {
   return (input: string | URL, init?: RequestInit) => {
     const upstream = new URL(input);
     if (!["graph.microsoft.com", "api.powerplatform.com"].includes(upstream.hostname)) throw new Error("fixture_provider_origin");
@@ -21,6 +23,7 @@ export function fixtureFetch(count: number, version = 0, opposing = false, profi
     url.searchParams.set("version", String(version)); url.searchParams.set("opposing", String(opposing));
     url.searchParams.set("identityProfile",profile);
     url.searchParams.set("children",String(children));
+    if (tenantId !== undefined) url.searchParams.set("tenantId",tenantId);
     const headers = new Headers(init?.headers); headers.delete("authorization");
     return fetch(url, { ...init, headers, redirect: "error" }).then(response => {
       if (response.redirected || new URL(response.url).origin !== "http://controller:8080") throw new Error("fixture_transport_redirect");
@@ -31,7 +34,8 @@ export function fixtureFetch(count: number, version = 0, opposing = false, profi
   };
 }
 export function capacityInput(principal: string, source = "inventory_packages", tenantId = fixtureTenant) {
-  return generationInput({ scope: { tenantId, kind: "principal", principalId: principal, tokenMode: "delegated", source, selector: "complete" },
+  return generationInput({ scope: { tenantId, kind: "tenant", principalId: null, tokenMode: "tenant", source, selector: "complete" },
+    actorPrincipalId: principal,
     reserveBytes: (source.startsWith("inventory_") ? 1 : 8) * 1024 ** 3,
     jobKind: source === "inventory_canonical" ? "derived" : "fixture",
     deadlineAt: new Date(Date.now() + (source === "inventory_packages" ? 4*3600_000 : 30*60_000)) });
@@ -40,6 +44,7 @@ export function capacityInput(principal: string, source = "inventory_packages", 
 export async function capacityInitialSync(database: pg.Pool, user: AuthenticatedUser, count: number) {
   assert.equal(process.env.AGENT_CONTROL_ISOLATED_TESTS,"1");
   assert.equal(process.env.PGHOST,"test-postgres");
+  assert.equal(database.options.host,"test-postgres");
   assert.match(String(database.options.database),/^agentcontrol_test_[a-f0-9]{32}$/);
   assert.equal(user.tenantId,fixtureTenant);
   assert.ok(Number.isInteger(count) && count>0 && count<=100_000);
@@ -67,9 +72,11 @@ export async function capacityInitialSync(database: pg.Pool, user: Authenticated
     revalidateUser: async (tenant,principal) => {
       assert.equal(tenant,user.tenantId); assert.equal(principal,user.homeAccountId); return user;
     },
-    requireAvailable: async () => {},
+    requireAvailable: async capabilityId => ({ capabilityId,status: "available",authorized: true,fresh: true,
+      previewQualification: "not_required",remediation: [] }),
     observeOperation: async (_capability,_user,operation) => operation(() => {}),
     beginOperationValidation: (_capability,actor) => {
+      assert.ok(actor.tenantId);
       assert.equal(actor.tenantId,user.tenantId); assert.equal(actor.homeAccountId,user.homeAccountId);
       const captured = beginAccountSessionValidation(actor.tenantId,actor.homeAccountId);
       return () => assertAccountSessionValidation(captured);
@@ -91,7 +98,7 @@ export async function capacityInitialSync(database: pg.Pool, user: Authenticated
     wait: (milliseconds,signal) => delay(milliseconds,undefined,{ signal }),
   });
   const started = performance.now(), deadline = AbortSignal.timeout(30*60_000);
-  try {
+  return capacityWithCleanup(async () => {
     const run = await sync.start(user,{ mode: "initial" });
     for (;;) {
       deadline.throwIfAborted();
@@ -113,8 +120,10 @@ export async function capacityInitialSync(database: pg.Pool, user: Authenticated
       }
       await delay(500,undefined,{ signal: deadline });
     }
-  } finally {
-    await sync.drain();
-    await Promise.all([packages.drain(),powerPlatform.drain()]);
-  }
+  },async () => {
+    const results = await Promise.allSettled([sync.drain()]);
+    results.push(...await Promise.allSettled([packages.drain(),powerPlatform.drain()]));
+    const failures = results.filter(result => result.status==="rejected").map(result => result.reason);
+    if (failures.length) throw new AggregateError(failures,"capacity_initial_sync_cleanup");
+  });
 }

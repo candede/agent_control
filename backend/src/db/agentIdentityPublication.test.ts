@@ -61,6 +61,17 @@ describe("identity publication privilege and source fences", () => {
     expect(connect).not.toHaveBeenCalled();
   });
 
+  it("requires unexpired effective source authority for cache reads and competing identities", async () => {
+    const { repository, read, connect } = fixture();
+    read.mockResolvedValueOnce(emptyResult);
+    await expect(repository.readState(scope, source)).resolves.toEqual({ status: "missing" });
+    expect(read).toHaveBeenCalledOnce();
+    const statement = read.mock.calls[0][0];
+    expect(statement).toContain("membership.authority_expires_at>clock_timestamp()");
+    expect(statement).toContain("other.authority_expires_at>clock_timestamp()");
+    expect(connect).not.toHaveBeenCalled();
+  });
+
   it.each([
     { application_id: null },
     { application_id: "44444444-4444-4444-8444-444444444444" },
@@ -118,14 +129,15 @@ describe("identity publication privilege and source fences", () => {
     if (outcome === "resolved") await repository.save(scope, source, mapping, fence);
     else await repository.saveFailure(scope, source, { status: outcome, code: "not_found" }, fence);
 
-    expect(query.mock.calls[2][1]).toEqual([`data-sync:${scope.tenantId}:${scope.principalId}`]);
+    expect(query.mock.calls[2][1]).toEqual([`data-sync:${scope.tenantId}`]);
     expect(query.mock.calls[3][1]).toEqual([`agent-identity:${scope.tenantId}`]);
     for (const index of [5, 6]) expect(query.mock.calls[index][0]).toMatch(/FROM data_scope_epochs.*FOR UPDATE$/);
     expect(query.mock.calls[5][1]).toEqual(["44444444-4444-4444-8444-444444444444", scope.tenantId]);
     expect(query.mock.calls[6][1]).toEqual(["55555555-5555-4555-8555-555555555555", scope.tenantId]);
     const insert = outcome === "resolved" ? 9 : 10;
     expect(query.mock.calls[insert][0]).toContain("INSERT INTO agent_identity_cache");
-    for (const predicate of ["FROM inventory_live_sources membership", "membership.tenant_id=$1", "membership.principal_id=$2", "membership.source='power_platform'",
+    for (const predicate of ["FROM inventory_live_sources membership", "membership.tenant_id=$1", "$2::text IS NOT NULL", "membership.source='power_platform'",
+      "membership.authority_expires_at>clock_timestamp()", "other.authority_expires_at>clock_timestamp()",
       "resource.generation_id=$3", "membership.agent_id=substr($7,7)", "resource.native_id=$4", "resource.environment_id=$5",
       "resource.resource_type='microsoft.copilotstudio/agents'", "resource.residual->>'agentKind'='copilot_studio_agent'",
       "resource.residual->'provenance'->'entraAgentId'->>'sourceSystem'='power_platform'",

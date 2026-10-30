@@ -46,7 +46,7 @@ function user(id: string, username: string, name = "Same name"): CopilotDirector
 async function directory(database: pg.Pool, identity: SelectionIdentity, users: CopilotDirectoryUser[]) {
   const stages = new UserSourceStages(database);
   await stages.execute(generationInput({ sessionEpoch: identity.sessionEpoch,
-    scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+    scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }), async lease => {
     const query = await stages.query(lease, "discovery", "phase04");
     await stages.page(lease, query, "phase04", users.length, users.length);
     for (let offset = 0; offset < users.length; offset += 250) await stages.directory(lease, query, users.slice(offset, offset + 250));

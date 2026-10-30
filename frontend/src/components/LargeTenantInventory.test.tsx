@@ -38,7 +38,7 @@ function inventoryPage(offset = 0, prefix = "First account"): UnifiedAgentInvent
     scopeSummary: { ...summary, total: 6021, graphOnly: 6021 }, filteredSummary: summary, partial: false, errors: [],
     verification: createUnifiedVerification({ graphPackageCount: 6021, powerPlatformAgentCount: 10, logicalAgentCount: 6031 }),
     sources: { graphPackages: { state: "available", error: null, observation: {
-      ...observation, tokenMode: "delegated", scopeKind: "broad", observedCount: 6021, totalRecords: 6021,
+      ...observation, scopeKind: "broad", observedCount: 6021, totalRecords: 6021,
     } }, powerPlatform: { state: "available", error: null, observation: {
       ...observation, roleScope: "full", environmentScope: null, coverage: "covered", coveredCount: 1,
       observedCount: 10, totalRecords: 10, pageCount: 1, verification: createInventoryVerification(10),

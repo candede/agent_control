@@ -3,10 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GenerationLease } from "../src/db/dataGenerations.js";
 import { DataGenerations } from "../src/db/dataGenerations.js";
 import { InventoryGenerations } from "../src/db/inventoryGenerations.js";
+import { InventoryReconciliation } from "../src/services/inventoryReconciliation.js";
+import { InventoryRuntime } from "../src/services/inventoryRuntime.js";
+import { powerPlatformInventoryRecord } from "../src/services/inventoryRecordProjection.js";
 import { allowlistedPackage } from "../src/services/packageObservation.js";
 import { StreamedInventory } from "../src/services/streamedInventory.js";
 import type { CopilotPackageDetail } from "../src/types/copilotPackage.js";
-import { inventoryBaseline, inventoryDelta, streamedPackageFixture } from "./inventoryFixtures.js";
+import type { PowerPlatformResource } from "../src/types/powerPlatformInventory.js";
+import { inventoryBaseline, inventoryDelta, nativeInventoryFixture, refreshInventoryFixture, streamedPackageFixture } from "./inventoryFixtures.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -22,14 +26,34 @@ function fixture() {
   const root = { scopeId: lease.scopeId, tenantId: lease.tenantId, baselineId: lease.id,
     revision: "1", epoch: lease.epoch, inserted: 0, closed: 0, changed: 0 };
   const epoch = vi.spyOn(DataGenerations.prototype, "sessionEpoch").mockResolvedValue(lease.sessionEpoch);
-  const execute = vi.spyOn(store, "execute").mockImplementation(async (_input, _intent, work) => {
+  const execute = vi.spyOn(InventoryGenerations.prototype, "execute").mockImplementation(async (_input, _intent, work) => {
     await work(lease, new AbortController().signal);
     return root;
   });
-  const visit = vi.spyOn(store, "visit").mockResolvedValue(undefined);
-  const append = vi.spyOn(store, "appendBounded").mockResolvedValue(undefined);
-  const accept = vi.spyOn(store, "acceptPage").mockResolvedValue(undefined);
+  const visit = vi.spyOn(InventoryGenerations.prototype, "visit").mockResolvedValue(undefined);
+  const append = vi.spyOn(InventoryGenerations.prototype, "appendBounded").mockResolvedValue(undefined);
+  const accept = vi.spyOn(InventoryGenerations.prototype, "acceptPage").mockResolvedValue(undefined);
   return { database, store, lease, root, epoch, execute, visit, append, accept };
+}
+
+function nativeResource(nativeId: string, unknownFieldCount: number): PowerPlatformResource {
+  return {
+    nativeId, unknownFieldCount, type: "microsoft.copilotstudio/agents", environmentId: null, displayName: nativeId,
+    sourceSystem: "power_platform", tenantId: "tenant", location: null, createdAt: null, createdBy: null,
+    creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "unknown", lastPublishedAt: null,
+    authoringTool: null, identityConfidence: "exact_native", provenance: {}, details: {}, identifiers: [],
+  };
+}
+
+function refreshFixture(principalId = "principal", pending = true) {
+  const f = fixture();
+  vi.mocked(f.database.query).mockImplementation(async () => ({
+    rows: [{ actor_principal_id: principalId, attempted_at: new Date(), deadline_at: new Date(Date.now() + 60_000), run_id: null }],
+    rowCount: 1, command: "SELECT", oid: 0, fields: [],
+  }));
+  const enqueue = vi.spyOn(InventoryRuntime.prototype, "enqueue").mockResolvedValue(pending);
+  const reconcile = vi.spyOn(InventoryReconciliation.prototype, "runNext").mockResolvedValue(null);
+  return { ...f, enqueue, reconcile };
 }
 
 describe("inventory generation fixtures without a database", () => {
@@ -101,15 +125,84 @@ describe("streamed package fixture provider contracts", () => {
       for (const target of ids) exact.push(await this.graph.getPackageDetails(token, target));
       return { ...f.root, revision: "2" };
     });
-    expect(await streamedPackageFixture(f.database, scope, [value], { exact: true, tokenMode: "application" }))
+    expect(await streamedPackageFixture(f.database, scope, [value], { exact: true }))
       .toMatchObject({ revision: "2" });
     expect(catalog).toEqual([value]);
     expect(exact).toEqual([value]);
     expect(f.epoch).toHaveBeenCalledTimes(2);
     const input = expect.objectContaining({
-      sessionEpoch: "7", scope: expect.objectContaining({ ...scope, tokenMode: "application" }),
+      sessionEpoch: "7", actorPrincipalId: scope.principalId,
+      scope: expect.objectContaining({ tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant" }),
     });
     expect(catalogRead).toHaveBeenCalledWith(input, "synthetic", expect.any(Object));
     expect(exactRead).toHaveBeenCalledWith(input, "synthetic", [id], expect.any(Object));
+  });
+});
+
+describe("native inventory fixture metadata", () => {
+  it.each([0, 3])("retains %i omitted fields per resource in page metadata", async omitted => {
+    const f = fixture(), scope = { tenantId: "tenant", principalId: "principal" };
+    const resources = [nativeResource("one", omitted), nativeResource("two", omitted)];
+    expect(await nativeInventoryFixture(f.database, scope, resources)).toBe(f.root);
+    expect(f.accept).toHaveBeenCalledExactlyOnceWith(f.lease,
+      expect.objectContaining({ rawCount: 2, expectedCount: 2, omittedFieldCount: omitted * 2 }), 2);
+    expect(f.append.mock.calls[0][1].map(record => record.residual.unknownFieldCount)).toEqual([omitted, omitted]);
+  });
+});
+
+describe("refresh inventory fixture contracts", () => {
+  it.each(["principal", "application-client"])("reconciles a job owned by %s using its authorizing actor", async principalId => {
+    const f = refreshFixture(), scope = { tenantId: "tenant", principalId };
+    f.epoch.mockImplementation(async (_tenant, principal) => principal === "principal" ? "7" : "0");
+    expect(await refreshInventoryFixture(f.database, scope, "job", "packages", [])).toBe(f.root);
+    const actor = { tenantId: scope.tenantId, principalId: "principal" };
+    expect(f.enqueue).toHaveBeenCalledExactlyOnceWith(actor);
+    expect(f.reconcile).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      actorPrincipalId: actor.principalId, sessionEpoch: "7",
+      scope: expect.objectContaining({ tenantId: actor.tenantId, principalId: null, tokenMode: "tenant", source: "inventory_canonical" }),
+    }), expect.any(Function));
+  });
+
+  it.each([[0, 0], [3, 4]])("retains omitted native field counts %j when completing a refresh", async (first, second) => {
+    const f = refreshFixture(), scope = { tenantId: "tenant", principalId: "principal" };
+    const records = [nativeResource("one", first), nativeResource("two", second)].map(powerPlatformInventoryRecord);
+    expect(await refreshInventoryFixture(f.database, scope, "job", "power_platform", records,
+      ["microsoft.copilotstudio/agents"])).toBe(f.root);
+    expect(f.accept).toHaveBeenCalledExactlyOnceWith(f.lease,
+      expect.objectContaining({ omittedFieldCount: first + second }), 2);
+  });
+
+  it.each([-1, 0.5, NaN, Infinity, "3", undefined])("rejects invalid omitted field counts %s before starting a refresh", async count => {
+    const f = refreshFixture();
+    const record = powerPlatformInventoryRecord(nativeResource("one", 0));
+    record.residual.unknownFieldCount = count;
+    await expect(refreshInventoryFixture(f.database, { tenantId: "tenant", principalId: "principal" },
+      "job", "power_platform", [record], ["microsoft.copilotstudio/agents"])).rejects.toThrow("tiny_native_fixture_omitted_count");
+    expect(f.database.query).not.toHaveBeenCalled();
+    expect(f.execute).not.toHaveBeenCalled();
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("rejects a refresh without an authorizing actor before publication", async () => {
+    const f = refreshFixture("");
+    await expect(refreshInventoryFixture(f.database, { tenantId: "tenant", principalId: "application-client" }, "job", "packages", []))
+      .rejects.toThrow("synthetic_refresh_requires_actor");
+    expect(f.execute).not.toHaveBeenCalled();
+    expect(f.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("returns the source root when there is no reconciliation work", async () => {
+    const f = refreshFixture("principal", false), scope = { tenantId: "tenant", principalId: "principal" };
+    expect(await refreshInventoryFixture(f.database, scope, "job", "packages", [])).toBe(f.root);
+    expect(f.reconcile).not.toHaveBeenCalled();
+  });
+
+  it("does not enqueue reconciliation after a source publication failure", async () => {
+    const f = refreshFixture(), error = new Error("synthetic publication failure");
+    f.execute.mockRejectedValue(error);
+    await expect(refreshInventoryFixture(f.database, { tenantId: "tenant", principalId: "principal" }, "job", "packages", []))
+      .rejects.toBe(error);
+    expect(f.enqueue).not.toHaveBeenCalled();
+    expect(f.reconcile).not.toHaveBeenCalled();
   });
 });

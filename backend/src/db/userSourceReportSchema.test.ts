@@ -41,7 +41,7 @@ describe("Copilot report v2 schema", () => {
     for (const [days, expected] of [[28, "inactive"], [27, "active"]] as const) {
       const csv = `${reportHeaders.join(",")},Prompts submitted for all apps\n${csvRow(daysAgo(days)).join(",")},10\n`;
       await new UserSourceProvider(async () => new Response(csv)).refresh(stages, input, { authorize: async () => "synthetic-token" });
-      const current = await repository.capture(selectionIdentity, "delegated");
+      const current = await repository.capture(selectionIdentity);
       const page = await repository.page(current.id, selectionIdentity);
       expect(page.sources.app_activity).toMatchObject({ period: "D28", reportVersion: "v2", rowCount: 1 });
       expect(page.value[0].activityState).toBe(expected);
@@ -54,7 +54,7 @@ describe("Copilot report v2 schema", () => {
       const key = await stages.query(lease, "activity", "empty-v2");
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
-    expect((await repository.refreshStatus(selectionIdentity, "delegated")).sources.app_activity)
-      .toMatchObject({ period: "D28", reportVersion: "v2", rowCount: 0 });
+    expect((await repository.refreshStatus(selectionIdentity)).sources.app_activity)
+      .toMatchObject({ period: "D28", reportVersion: "v2", rowCount: 1, state: "partial" });
   });
 });

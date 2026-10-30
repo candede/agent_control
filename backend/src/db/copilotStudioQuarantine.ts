@@ -282,7 +282,7 @@ export class CopilotStudioQuarantineRepository {
       const item = selected.rows[0];
       await this.requireCurrentJobAuthority(client, job, item);
       const correlationId = randomUUID();
-      await client.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()+interval '120 seconds',updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
+      await client.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()+interval '120 seconds',status='running',updated_at=clock_timestamp() WHERE id=$1", [lease.jobId]);
       await client.query("UPDATE copilot_quarantine_job_items SET status='running',correlation_id=$2,updated_at=clock_timestamp() WHERE id=$1", [item.id, correlationId]);
       await client.query(`INSERT INTO copilot_quarantine_attempts(id,job_id,item_id,lease_owner,lease_version,correlation_id)
         VALUES(gen_random_uuid(),$1,$2,$3,$4,$5)`, [lease.jobId, item.id, lease.owner, lease.version, correlationId]);
@@ -324,7 +324,7 @@ export class CopilotStudioQuarantineRepository {
 
   async markSent(lease: QuarantineLease, item: QuarantineItemRow, authority: QuarantineAuthority, signal?: AbortSignal, beforeCommit?: () => void) {
     await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${lease.scope.tenantId}:${lease.scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${lease.scope.tenantId}`]);
       const job = await this.fence(client, lease);
       await this.requireCurrentInventoryTarget(client, lease.scope, item);
       await this.requireCurrentDispatchAuthority(client, job, item, authority);
@@ -342,7 +342,7 @@ export class CopilotStudioQuarantineRepository {
     observed?: CopilotStudioQuarantineStatus; readbackCount?: number; errorCode?: string; message?: string;
   } = {}, signal?: AbortSignal, beforeCommit?: () => void) {
     await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${lease.scope.tenantId}:${lease.scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${lease.scope.tenantId}`]);
       const job = await this.fence(client, lease);
       if (outcome === "succeeded" || outcome === "skipped" || evidence.observed) await this.requireCurrentJobAuthority(client, job, item);
       if (evidence.observed) await this.requireCurrentInventoryTarget(client, lease.scope, item);
@@ -456,7 +456,7 @@ export class CopilotStudioQuarantineRepository {
   async recordReconciliation(scope: QuarantineScope, job: QuarantineJobRow, item: QuarantineItemRow, status: Exclude<QuarantineReconciliationStatus, "not_required" | "required">, observed: CopilotStudioQuarantineStatus, message: string, signal?: AbortSignal, beforeCommit?: () => void) {
     validateScope(scope);
     await transaction(this.database, async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
       const current = await client.query<QuarantineJobRow>(`SELECT * FROM copilot_quarantine_jobs
         WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp() FOR UPDATE`, [job.id, scope.tenantId, scope.principalId]);
       if (!current.rows[0]) throw new AppError(409, "reconciliation_state", "The quarantine item no longer requires reconciliation.");
@@ -544,8 +544,9 @@ export class CopilotStudioQuarantineRepository {
     if (cancelQueued) await client.query(`UPDATE copilot_quarantine_job_items SET status='cancelled',error_code='cancelled',message='Cancelled before provider dispatch.',updated_at=clock_timestamp()
       WHERE job_id=$1 AND status='queued' AND EXISTS(SELECT 1 FROM copilot_quarantine_jobs WHERE id=$1 AND cancel_requested)`, [id]);
     await client.query(`UPDATE copilot_quarantine_jobs SET status=CASE
+      WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='running') THEN 'running'
       WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='inconclusive' AND reconciliation_status='required') THEN 'inconclusive'
-      WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status IN ('queued','running')) THEN 'waiting_authorization'
+      WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='queued') THEN 'waiting_authorization'
       WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='cancelled') THEN 'cancelled'
       WHEN NOT EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status<>'failed') THEN 'failed'
       WHEN EXISTS(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=$1 AND status='failed') THEN 'partial'

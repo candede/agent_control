@@ -399,7 +399,7 @@ describe("SQL pinned reads", () => {
   it("returns retryable admission rather than an internal error at the principal selection ceiling", async () => {
     const source = new DataGenerations(fixture.runtime);
     const identity = { ...selectionIdentity, principalId: "selection-quota" };
-    const lease = await source.begin(generationInput({ scope: { ...generationInput().scope, principalId: identity.principalId } }));
+    const lease = await source.begin(generationInput({ actorPrincipalId: identity.principalId }));
     await source.validate(lease, { rows: 0, children: 0, batches: 0, pages: 0, wireRows: 0 });
     await source.publish(lease);
     const roots = [{ kind: "generation" as const, scopeId: lease.scopeId, generationId: lease.id, revision: "1", expiresAt: new Date(Date.now() + 600_000) }];

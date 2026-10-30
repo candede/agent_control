@@ -17,13 +17,13 @@ type TargetRow = { id: string; generation_id: string; source_identity: string; d
 export class InventoryMutationStages {
   readonly queries: InventoryQueries;
   constructor(readonly database: pg.Pool) {
-    this.queries = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, undefined,
-      { source: "inventory_canonical", tokenMode: "delegated" });
+    this.queries = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays,
+      { source: "inventory_canonical" });
   }
   async currentSelection(identity: SelectionIdentity) {
-    const root = (await this.database.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-      AND source='inventory_canonical' AND token_mode='delegated' AND selector='complete'`,
-    [identity.tenantId, identity.principalId])).rows[0];
+    const root = (await this.database.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+      AND source='inventory_canonical' AND token_mode='tenant' AND selector='complete'`,
+    [identity.tenantId])).rows[0];
     if (!root) throw new AppError(409, "inventory_unavailable", "Refresh inventory before preparing a mutation.");
     return (await this.queries.capture(identity, root.id)).id;
   }
@@ -31,7 +31,7 @@ export class InventoryMutationStages {
     validateTargets(ids, recordIds);
     if (!ids && !recordIds) throw new AppError(400, "invalid_targets", "Select exact packages or canonical groups.");
     return this.queries.withCurrentSelection(selectionId, identity, async (client, context) => ({
-      count: await this.queries.mutationTargetCount(client, { ...context, query: {} }, ids, recordIds),
+      count: await this.queries.mutationTargetCount(client, context, ids, recordIds),
     }));
   }
   async preview(identity: SelectionIdentity, selectionId: string, input: StagedMutationIntent, ids?: readonly string[], recordIds?: readonly string[]) {
@@ -121,13 +121,13 @@ export class InventoryMutationStages {
   async submit(identity: SelectionIdentity, input: Omit<StagedMutationIntent, "actor" | "reassignUserId"> & {
     confirmationHash: string; idempotencyKey: string; selectionId?: string; ids?: readonly string[]; recordIds?: readonly string[];
   }) {
-    const stage = (await this.database.query<{ id: string; selection_id: string; intent: StagedMutationIntent; target_filter_hash: string }>(`
-      SELECT id,selection_id,intent,target_filter_hash FROM inventory_mutation_stages
+    const stage = (await this.database.query<{ id: string; selection_id: string; intent: StagedMutationIntent }>(`
+      SELECT id,selection_id,intent FROM inventory_mutation_stages
       WHERE tenant_id=$1 AND principal_id=$2 AND authorization_hash=$3 AND confirmation_hash=$4 AND expires_at>clock_timestamp()
-        AND ($5::uuid IS NULL OR selection_id=$5) ORDER BY created_at DESC,id DESC LIMIT 1`,
-    [identity.tenantId, identity.principalId, identity.authorizationHash, input.confirmationHash, input.selectionId ?? null])).rows[0];
-    if (!stage || stage.target_filter_hash !== targetFilterHash(input.ids, input.recordIds)
-      || mutationRetryIntentHash({ ...stage.intent, requestPath: input.requestPath })
+        AND ($5::uuid IS NULL OR selection_id=$5) AND target_filter_hash=$6 ORDER BY created_at DESC,id DESC LIMIT 1`,
+    [identity.tenantId, identity.principalId, identity.authorizationHash, input.confirmationHash, input.selectionId ?? null,
+      targetFilterHash(input.ids, input.recordIds)])).rows[0];
+    if (!stage || mutationRetryIntentHash({ ...stage.intent, requestPath: input.requestPath })
       !== mutationRetryIntentHash(input)) throw new AppError(409, "confirmation_mismatch", "Review the selected current mutation intent.");
     const jobs = new JobRepository(this.database);
     const id = await this.queries.withCurrentSelection(stage.selection_id, identity, async client => {

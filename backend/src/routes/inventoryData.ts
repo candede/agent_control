@@ -1,7 +1,7 @@
 import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router, type Request } from "express";
 import type pg from "pg";
-import { config, getTenantConfiguration } from "../config.js";
+import { config } from "../config.js";
 import { InventoryQueries, type InventoryQuery } from "../db/inventoryQueries.js";
 import type { SelectionIdentity } from "../services/dataSelections.js";
 import { AppError } from "../errors.js";
@@ -31,8 +31,8 @@ function searchScalar(value: unknown) {
 
 export function createInventoryDataRouter(database: pg.Pool) {
   const router = Router();
-  const inventory = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, undefined,
-    { source: "inventory_canonical", tokenMode: "delegated" });
+  const inventory = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays,
+    { source: "inventory_canonical" });
   const filterFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
     "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher", "availableTo", "host", "platform",
     "createdWithinDays", "sortBy", "sortDirection"];
@@ -51,8 +51,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
         AND (work.status='running' AND work.active_until>clock_timestamp()
           OR work.status IN ('idle','catching_up') AND work.pending_inputs IS NOT NULL AND work.pending_deadline>clock_timestamp())) AS preparing
       FROM data_scope_epochs s
-      WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_canonical'
-        AND s.token_mode='delegated' AND s.selector='complete'`, [identity.tenantId, identity.principalId])).rows[0];
+      WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='inventory_canonical'
+        AND s.token_mode='tenant' AND s.selector='complete'`, [identity.tenantId])).rows[0];
     if (!root || !root.published) {
       const unavailable: UnifiedAgentInventoryUnavailable = root?.preparing
         ? { state: "preparing", message: "Synced agents are being published to the inventory. Results will appear automatically." }
@@ -77,26 +77,19 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const { limit: _limit, ...query } = unifiedAgentInventoryQuery(body.query);
     return query;
   }
-  async function packageReader(request: Request, requestedMode: unknown) {
-    const mode = requestedMode ?? "delegated";
-    if (mode !== "delegated" && mode !== "application") throw new AppError(400, "invalid_token_mode", "Use delegated or application mode.");
+  async function packageReader(request: Request) {
     const identity = await reportIdentity(database, requestUser(request));
-    let applicationScope;
-    if (mode === "application") {
-      await capabilities.requireApplicationDataScope("graph.package.read.application", requestUser(request));
-      applicationScope = { tenantId: identity.tenantId, principalId: getTenantConfiguration(identity.tenantId).clientId };
-    }
-    const packages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, applicationScope,
-      { source: "inventory_packages", tokenMode: mode });
-    return { mode, identity, applicationScope, packages } as const;
+    const packages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays,
+      { source: "inventory_packages" });
+    return { identity, packages };
   }
   async function capturePackages(read: Awaited<ReturnType<typeof packageReader>>, query: InventoryQuery) {
-    const { identity, applicationScope, mode, packages } = read;
-    const root = (await database.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-      AND source='inventory_packages' AND token_mode=$3 AND selector='complete'`,
-    [identity.tenantId, applicationScope?.principalId ?? identity.principalId, mode])).rows[0];
+    const { identity, packages } = read;
+    const root = (await database.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+      AND source='inventory_packages' AND token_mode='tenant' AND selector='complete'`,
+    [identity.tenantId])).rows[0];
     if (!root) throw new AppError(409, "inventory_unavailable", "Refresh the package source before reading it.");
-    return packages.capture(identity, root.id, Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined)), mode);
+    return packages.capture(identity, root.id, Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined)));
   }
   policyRoute(router, "post", "/agent-inventory/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
@@ -126,8 +119,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "post", "/agents/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
   }, async (request, response) => {
-    const query = capturedQuery(request, ["mode"]);
-    response.status(201).json(await capturePackages(await packageReader(request, request.body.mode), query));
+    const query = capturedQuery(request);
+    response.status(201).json(await capturePackages(await packageReader(request), query));
   });
   policyRoute(router, "post", "/agents/refresh-selection", {
     access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true,
@@ -222,20 +215,14 @@ export function createInventoryDataRouter(database: pg.Pool) {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
     for (const key of Object.keys(request.query)) {
-      if (!["selectionId", "mode"].includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported detail field: ${key}.`);
+      if (key !== "selectionId") throw new AppError(400, "invalid_inventory_query", `Unsupported detail field: ${key}.`);
     }
     const selectionId = scalar(request.query.selectionId, "selectionId", 36);
-    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(selectionId)
-      || request.query.mode !== undefined && !["delegated", "application"].includes(String(request.query.mode))) {
-      throw new AppError(400, "invalid_inventory_query", "Use the exact saved inventory selection and token mode.");
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(selectionId)) {
+      throw new AppError(400, "invalid_inventory_query", "Use the exact saved inventory selection.");
     }
     const identity = await reportIdentity(database, requestUser(request));
-    let applicationScope;
-    if (request.query.mode === "application") {
-      await capabilities.requireApplicationDataScope("graph.package.read.application", requestUser(request));
-      applicationScope = { tenantId: identity.tenantId, principalId: getTenantConfiguration(identity.tenantId).clientId };
-    }
-    const selectedPackages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays, applicationScope);
+    const selectedPackages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays);
     response.json(await selectedPackages.packageDetail(selectionId, identity, scalar(request.params.id, "package ID", 512)));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/detail", {
@@ -293,13 +280,13 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "get", "/agents", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
-    const allowed = ["mode", "selectionId", "cursor", "limit", ...filterFields];
+    const allowed = ["selectionId", "cursor", "limit", ...filterFields];
     for (const [key, value] of Object.entries(request.query)) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported package query field: ${key}.`);
       scalar(value, key, queryFieldMaximums[key]);
     }
-    const read = await packageReader(request, request.query.mode);
-    const { mode, identity, packages } = read;
+    const read = await packageReader(request);
+    const { identity, packages } = read;
     const parsed = unifiedAgentInventoryQuery(request.query);
     const { limit: _limit, ...filters } = parsed;
     let id = request.query.selectionId === undefined ? undefined : scalar(request.query.selectionId, "selectionId", 36);
@@ -315,7 +302,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const page = await packages.page(id, identity, { limit, cursor,
       expectedQuery: Object.fromEntries(Object.entries(filters).filter(([key]) => Object.hasOwn(request.query, key))) });
     response.json({ value: page.value.map(row => ({ ...row.residual, columns: row.columns, sourceIdentity: row.id })),
-      selection: page.selection, counts: page.counts, page: page.page, freshness: page.freshness, mode });
+      selection: page.selection, counts: page.counts, page: page.page, freshness: page.freshness });
   });
   return router;
 }

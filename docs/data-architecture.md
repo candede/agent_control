@@ -29,17 +29,26 @@ the current schema.
 - Principal and source epochs fence revoked authority. Generations stage
   bounded records and child facts, then publish a complete head transactionally.
   Failed or partial collection does not replace the previous complete source.
+  Inventory controls initialize first-use actor epochs before taking the shared
+  principal fence and source locks; an absent row never stands in for a locked
+  epoch-zero actor.
 - Sign-out advances the principal authorization epoch, revokes sessions and
   cancels unfinished generations without invalidating complete saved sources.
+  Revocation locks principal-owned scopes and heads before their generations,
+  matching writer lock order to avoid deadlocks with in-flight refresh work.
   A new authenticated session captures new selections over those retained
   sources; old selections, exports and writers remain fenced. Explicit source
   invalidation and destructive resets still retire the affected saved data.
   Reviewed usage associations can use those retained current native publications
   after a new sign-in without recollection; source validity and authority-expiry
-  checks still apply.
+  checks still apply. Their database write guard uses the same live-source view
+  as service reads and rejects expired effective identity authority or pending
+  tenant control publication.
 - Current directory, app activity, Graph package and Power Platform sources
   publish independently. Canonical inventory reconciles exact supported source
-  identities, never display-name guesses. Routine collection is due every six
+  identities, never display-name guesses. Reconciliation includes every captured
+  agent-capable native scope; environment-only scopes remain enrichment inputs.
+  Routine collection is due every six
   hours; ordinary failed attempts wait one hour, subject to provider backoff.
   Directory and app-activity retries use the latest attempt's cooldown even when
   the retained successful publication is less than six hours old.
@@ -49,12 +58,17 @@ the current schema.
   publications. Historical success markers retain their counts and dates but do
   not postpone rebuilding missing or invalidated sources. Successful-attempt
   cadence does not delay this recovery; failed-attempt cooldowns still apply.
+- Tenant source collection conflicts apply only to newly admitted work.
+  Equivalent starts join the account's existing active run without recollection;
+  retries check only the incomplete sources selected for that attempt.
 - Validated current source generations remain readable when their observation
   dates age. Original collection/expiry timestamps are preserved; age describes
   freshness, not disappearance or renewed provider authority. Replacement,
   explicit invalidation, privacy deletion and real ownership fences still apply.
 - A saved selection binds its principal, authorization, source roots, revisions
   and expiry. Cursors continue that selection, not a newly captured dataset.
+  Name-page candidates apply the inventory scope before the page limit;
+  enrichment-only environment rows cannot consume Power Platform-only agent pages.
   Unrelated publication does not invalidate every selected view.
   The 16 native-source limit is separate from the 20 selection-pin limit, which
   also accommodates the canonical root and report, directory and people-cache
@@ -79,6 +93,11 @@ the current schema.
   its deadline and input epochs remain valid, even when source observations age.
   Initial and renewed writer leases are capped at the persisted deadline, so
   expired work stops occupying ingestion admission before its first heartbeat.
+  Worker generation admission holds at most 32 pending requests per database
+  pool. Waiting requests expire at their original deadlines independently of
+  retry backoff or another request's SQL admission. An in-flight admission stays
+  owned until it settles; any late lease is released before cancellation or
+  deadline rejection, and release failures retain both causes.
 - Agent-person cache writes check cancellation before connection acquisition
   and recheck cancellation and current caller authority immediately before commit,
   after their database publication fences and transaction bookkeeping finish.
@@ -133,6 +152,9 @@ or future source evidence requires attention even while reconciliation is runnin
 Complete older saved observations remain readable, including their successfully
 collected identity links; elapsed observation dates cannot create duplicate agents
 or convert a completed identity check back into missing data.
+Native identity matching and agent-person reference discovery include every
+requested resource type still present in current membership, even when the latest
+collection queried only a subset of types or returned no new records.
 API observations and full-source CSV rows apply the same catalog authority checks:
 detail evidence cannot be current when its catalog observation is not current.
 Healthy superseded sources may be shown as updating, without changing their
@@ -239,6 +261,17 @@ permission, current prestate, confirmation and readback. Generic controls reuse
 those same provider effects. Receipts bind the exact intent and source evidence;
 they are not a separate business approval.
 
+Package control readbacks compare identity with validated current saved membership
+even after its observation expires; this comparison does not renew live provider
+authority. Actor-private receipt conflicts survive consecutive controls before
+asynchronous projection, until a newer identity-detail read supersedes them.
+Recovery discovers both package and Studio pending receipts independently of the
+last source publisher. Orphan cleanup retains the receipt's actor scope even when
+another actor supplies current tenant authorization. A replacement Studio receipt
+updates its queued actor as well as its observation. Canonical discovery, claims
+and publication wait for all tenant control receipts to settle, with transactional
+checks under the same tenant lock used by receipt writers.
+
 Administrative audit separates the verified actor, `webapp|mcp|unknown` origin,
 reported client/agent labels and provider source. Unknown historical Microsoft
 events and unknown attribution remain explicit; neither is inferred into a
@@ -254,8 +287,22 @@ Explicit hunts/searches run under current permissions and configured sharing,
 without an earlier qualification query.
 
 Retention invalidates affected references before bounded physical cleanup.
+Inventory catalog, detail and control generation metadata remains retained while
+stored records reference it, even after the original content is collected.
+Indexed provenance checks preserve freshness and identity evidence until those
+references are released.
 Backup/restore checksums and table fingerprints establish the saved snapshot;
 restore revokes recovered authority and compares current ownership before
 reopening. Reset deliberately deletes saved reports, audit and jobs: provider
 resync cannot recreate imported CSV history.
 See [operations](operations.md) and [security](security-model.md).
+
+### Local lifecycle fixture checks
+
+Run `npm test --workspace backend -- scripts/savedReadBrowserFixture.unit.test.ts`
+from the repository root for infrastructure-free fixture checks. Mocked server
+and database boundaries cover overlapping setup, pending-work cleanup, startup
+errors, required initial canonical publication, and propagation of unexpected
+provider failures. Only the deliberately injected replacement failure is
+accepted as the failed scenario. These checks do not replace the isolated
+PostgreSQL-backed `savedBackendLifecycle.spec.ts` browser journey.

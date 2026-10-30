@@ -86,7 +86,6 @@ type UnifiedAgentSourceObservation = {
 };
 
 export type UnifiedAgentPackageObservation = UnifiedAgentSourceObservation & {
-  tokenMode: "delegated" | "application";
   scopeKind: "broad" | "exact";
   observedCount: number;
   totalRecords: number;

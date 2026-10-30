@@ -53,8 +53,8 @@ async function membership(scope: Scope) {
     JOIN unified_agent_rows r ON r.generation_id=members.generation_id AND r.identity=members.identity
     JOIN unified_agent_memberships m ON m.generation_id=r.generation_id AND m.identity=r.identity
     JOIN inventory_records source ON source.generation_id=m.source_generation_id AND source.identity=m.source_identity
-    WHERE root.current AND root.domain='canonical' AND scope.tenant_id=$1 AND scope.principal_id=$2
-    ORDER BY source.domain,source.native_id,source.environment_id`, [scope.tenantId, scope.principalId])).rows;
+    WHERE root.current AND root.domain='canonical' AND scope.tenant_id=$1 AND scope.scope_kind='tenant'
+    ORDER BY source.domain,source.native_id,source.environment_id`, [scope.tenantId])).rows;
 }
 
 describe("typed canonical identity registry", () => {
@@ -105,9 +105,9 @@ describe("typed canonical identity registry", () => {
     const ids = [...new Set((await membership(scope)).map(row => row.identity))].sort();
     const expected = preference === "uuid" ? ids[0] : ids[1];
     await fixture.operator.query(`UPDATE inventory_canonical_ids ids SET created_at=
-      CASE WHEN ids.id=$3 THEN '2000-01-01'::timestamptz ELSE $4::timestamptz END
-      FROM data_scope_epochs scope WHERE scope.id=ids.scope_id AND scope.tenant_id=$1 AND scope.principal_id=$2`,
-    [scope.tenantId, scope.principalId, expected,
+      CASE WHEN ids.id=$2 THEN '2000-01-01'::timestamptz ELSE $3::timestamptz END
+      FROM data_scope_epochs scope WHERE scope.id=ids.scope_id AND scope.tenant_id=$1 AND scope.scope_kind='tenant'`,
+    [scope.tenantId, expected,
       preference === "uuid" ? "2000-01-01" : "2001-01-01"]);
     const next = await publish(scope, [packageValue("b", nativeGuid), packageValue("a", nativeGuid)]);
     expect(next.page.value.map(row => row.id)).toEqual([`agent:${expected}`]);
@@ -136,7 +136,7 @@ describe("typed canonical identity registry", () => {
     for (const id of new Set(rows.map(row => row.identity))) expect(rows.filter(row => row.identity === id && row.domain === "power_platform")).toHaveLength(1);
   });
 
-  it("removes complete-view membership, preserves read pins, and closes current authority before reconciliation", async () => {
+  it("retains unseen membership and read pins without extending current mutation authority", async () => {
     const scope = newScope(), first = await publish(scope, [packageValue("a", nativeGuid)]);
     const id = first.page.value[0].id;
     await streamedPackageFixture(fixture.runtime, scope, []);
@@ -144,32 +144,35 @@ describe("typed canonical identity registry", () => {
     await expect(new LiveInventory(fixture.runtime).record(scope, id)).rejects.toMatchObject({ code: "agent_not_found" });
     expect((await first.queries.page(first.selection.id, first.identity)).counts.total).toBe(1);
     await reconcileInventoryFixture(fixture.runtime, scope);
-    expect((await selected(scope)).page.counts.total).toBe(0);
-    expect(await membership(scope)).toEqual([]);
+    expect((await selected(scope)).page.counts.total).toBe(1);
+    expect(await membership(scope)).toHaveLength(2);
   });
 
-  it.each(["Graph", "native"] as const)("does not reuse an opaque %s source identity after a case-only replacement", async domain => {
+  it.each(["Graph", "native"] as const)("retains distinct opaque %s identities after a case-only narrower collection", async domain => {
     const scope = newScope();
     const first = await publish(scope, domain === "Graph" ? [packageValue("Opaque")] : [],
       domain === "native" ? [{ ...nativeValue("Opaque"), identifiers: [] }] : []);
     const next = await publish(scope, domain === "Graph" ? [packageValue("opaque")] : [],
       domain === "native" ? [{ ...nativeValue("opaque"), identifiers: [] }] : []);
-    expect(next.page.counts.total).toBe(1);
-    expect(next.page.value[0].id).not.toBe(first.page.value[0].id);
+    expect(next.page.counts.total).toBe(2);
+    expect(next.page.value.map(row => row.id)).toContain(first.page.value[0].id);
+    expect(new Set(next.page.value.map(row => row.id)).size).toBe(2);
   });
 
-  it("isolates canonical UUIDs, source selections and live references across principal and tenant", async () => {
+  it("shares tenant canonical UUIDs while isolating selections by actor and references by tenant", async () => {
     const scopes = [newScope(), newScope()];
     scopes.push({ ...scopes[0], principalId: "other-principal" });
     const saved = [];
     for (const scope of scopes) saved.push(await publish(scope, [packageValue("shared", nativeGuid)]));
-    expect(new Set(saved.map(value => value.page.value[0].id)).size).toBe(3);
+    expect(new Set(saved.map(value => value.page.value[0].id)).size).toBe(2);
+    expect(saved[0].page.value[0].id).toBe(saved[2].page.value[0].id);
     for (let index = 0; index < scopes.length; index++) {
       for (let other = 0; other < scopes.length; other++) if (index !== other) {
         await expect(saved[index].queries.page(saved[other].selection.id, saved[index].identity))
           .rejects.toMatchObject({ code: "selection_invalidated" });
-        await expect(new LiveInventory(fixture.runtime).record(scopes[index], saved[other].page.value[0].id))
-          .rejects.toMatchObject({ code: "agent_not_found" });
+        const record = new LiveInventory(fixture.runtime).record(scopes[index], saved[other].page.value[0].id);
+        if (scopes[index].tenantId !== scopes[other].tenantId) await expect(record).rejects.toMatchObject({ code: "agent_not_found" });
+        else await expect(record).resolves.toMatchObject({ id: saved[other].page.value[0].id });
       }
     }
   });
@@ -179,8 +182,8 @@ describe("typed canonical identity registry", () => {
     const before = await membership(scope);
     const root = (await fixture.runtime.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-      WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.principal_id=$2`,
-    [scope.tenantId, scope.principalId])).rows[0];
+      WHERE r.current AND r.domain='canonical' AND s.tenant_id=$1 AND s.scope_kind='tenant'`,
+    [scope.tenantId])).rows[0];
     const input = inventoryInput(scope.principalId, "canonical"); input.scope.tenantId = scope.tenantId;
     await new InventoryGenerations(fixture.runtime).compact(input, root, { authorize: async () => {} });
     expect(await membership(scope)).toEqual(before);

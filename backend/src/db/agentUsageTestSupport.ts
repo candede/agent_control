@@ -14,7 +14,7 @@ import { OfficialReportImports } from "./officialReportImports.js";
 import { DataGenerations } from "./dataGenerations.js";
 import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { inventoryInput } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import { InventoryReconciliation } from "../services/inventoryReconciliation.js";
 import { canonicalRecord, nativeInventoryKey, packageInventoryRecord, powerPlatformInventoryRecord,
   type InventoryRecord } from "../services/inventoryRecordProjection.js";
@@ -61,7 +61,6 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
     input.scope.tenantId = scope.tenantId;
     const intent = { domain, mode: "baseline" as const, channel: "catalog" as const,
       ...domain === "power_platform" ? { resourceTypes: [...powerPlatformResourceTypes], roleScope: "full" as const } : {} };
-    input.scope.selector = inventorySelector(intent);
     return stages.execute(input, intent, async lease => {
       await stages.visit(lease, "fixture");
       await stages.appendBounded(lease, rows);
@@ -122,25 +121,39 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
   await database.query(`UPDATE inventory_reconciliation SET active_id=$2,active_inputs=pending_inputs,active_sequence=pending_sequence,
     active_epoch=(SELECT epoch FROM data_scope_epochs WHERE id=$1),active_deadline=$3,active_until=clock_timestamp()+interval '60 seconds',
     pending_inputs=NULL,status='running' WHERE scope_id=$1`, [queue.scopeId, input.jobId, input.deadlineAt]);
-  await stages.execute(input, { domain: "canonical", mode: "baseline", channel: "canonical" }, async lease => {
-    for (const candidate of candidates) {
-      const id = survivors.get(candidate.index) ?? groups[candidate.index].canonicalId ?? randomUUID();
-      candidate.record.id = `agent:${id}`;
-      await database.query("INSERT INTO inventory_canonical_ids(id,scope_id,tenant_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-        [id, queue.scopeId, scope.tenantId]);
-      await stages.append(lease, [canonicalRecord(id, candidate.record)]);
-      for (const member of candidate.sources) {
-        const root = member.source === "graph_packages" ? packageRoot : nativeRoot;
-        const sourceIdentity = member.source === "graph_packages" ? member.native_id : nativeInventoryKey(candidate.record.powerPlatformResource!);
-        await database.query(`INSERT INTO unified_agent_memberships(generation_id,scope_id,tenant_id,identity,schema_version,
-          source_scope_id,source_identity,source_generation_id,evidence) VALUES($1,$2,$3,$4,1,$5,$6,$7,'[]')`,
-        [lease.id, queue.scopeId, scope.tenantId, id, root.scopeId, sourceIdentity, root.baselineId]);
+  try {
+    await stages.execute(input, { domain: "canonical", mode: "baseline", channel: "canonical" }, async lease => {
+      for (const candidate of candidates) {
+        const id = survivors.get(candidate.index) ?? groups[candidate.index].canonicalId ?? randomUUID();
+        candidate.record.id = `agent:${id}`;
+        await database.query("INSERT INTO inventory_canonical_ids(id,scope_id,tenant_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+          [id, queue.scopeId, scope.tenantId]);
+        await stages.append(lease, [canonicalRecord(id, candidate.record)]);
+        for (const member of candidate.sources) {
+          const root = member.source === "graph_packages" ? packageRoot : nativeRoot;
+          const sourceIdentity = member.source === "graph_packages" ? member.native_id : nativeInventoryKey(candidate.record.powerPlatformResource!);
+          await database.query(`INSERT INTO unified_agent_memberships(generation_id,scope_id,tenant_id,identity,schema_version,
+            source_scope_id,source_identity,source_generation_id,evidence) VALUES($1,$2,$3,$4,1,$5,$6,$7,'[]')`,
+          [lease.id, queue.scopeId, scope.tenantId, id, root.scopeId, sourceIdentity, root.baselineId]);
+        }
       }
+    }, { authorize: async () => {}, completeJob: async client => {
+      const completed = await client.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_until=NULL,active_deadline=NULL,
+        published_sequence=active_sequence,published_inputs=active_inputs,
+        status=CASE WHEN pending_inputs IS NULL THEN 'idle' ELSE 'catching_up' END WHERE scope_id=$1 AND active_id=$2`,
+      [queue.scopeId, input.jobId]);
+      if (completed.rowCount !== 1) throw new Error("inventory_reconciliation_fenced");
+    } });
+  } catch (error) {
+    try {
+      await database.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_until=NULL,active_deadline=NULL,
+        pending_inputs=coalesce(pending_inputs,active_inputs),status='failed' WHERE scope_id=$1 AND active_id=$2`,
+      [queue.scopeId, input.jobId]);
+    } catch (cleanup) {
+      throw new AggregateError([error, cleanup], "inventory_reconciliation_and_cleanup_failed");
     }
-  }, { authorize: async () => {}, completeJob: async client => {
-    await client.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_until=NULL,active_deadline=NULL,
-      published_sequence=active_sequence,published_inputs=active_inputs,status='idle' WHERE scope_id=$1 AND active_id=$2`, [queue.scopeId, input.jobId]);
-  } });
+    throw error;
+  }
   return records;
 }
 
@@ -148,8 +161,8 @@ export async function awaitUsageInventoryExpiry(database: pg.Pool, scope: AgentU
   const seconds = Number((await database.query(`SELECT GREATEST(extract(epoch FROM g.expires_at-clock_timestamp()),0)+0.05 AS seconds
     FROM data_scope_epochs s JOIN inventory_roots r ON r.scope_id=s.id AND r.current
     JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
-    JOIN data_generations g ON g.id=v.generation_id WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_canonical'`,
-  [scope.tenantId, scope.principalId])).rows[0]?.seconds);
+    JOIN data_generations g ON g.id=v.generation_id WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='inventory_canonical'`,
+  [scope.tenantId])).rows[0]?.seconds);
   if (!Number.isFinite(seconds) || seconds > 3.1) throw new Error("Expiry fixture requires a deliberately short-lived source.");
   await database.query("SELECT pg_sleep($1)", [seconds]);
 }
@@ -188,7 +201,7 @@ BridgeUser,Bridge,1,77,2026-09-18`,
 export async function usageIntent(database: pg.Pool, scope: AgentUsageScope,
   reportAgentId = "Report-A", target: AgentUsageTarget = { source: "graph_packages", packageId: "Package-A" }): Promise<CandidateAgentUsageMutation> {
   const reports = new LargeTenantUsersReports(database, "synthetic-fixture-selected-report-key", 35), identity = await usageIdentity(database, scope);
-  const selection = await reports.capture(identity, "delegated", "official_agents");
+  const selection = await reports.capture(identity, "official_agents");
   const [summary] = await new OfficialAgentUsage(reports).summaries(selection.id, identity, [unifiedAgentRecordId(target)]);
   const { selectionId, reportSetId, usageRevision, inventoryRevision } = summary.context;
   if (!reportSetId) throw new Error("Usage mutation fixtures require an available report set.");

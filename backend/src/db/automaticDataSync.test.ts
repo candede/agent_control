@@ -10,7 +10,7 @@ import { generationInput, selectionIdentity } from "../../scripts/largeTenantFix
 import { publishFixtureDirectory, publishFixtureEmptyActivity } from "../../scripts/userSourceFixture.js";
 import { inventoryBaseline, inventoryInput, refreshInventoryFixture, streamedPackageFixture, nativeInventoryFixture,
   reconcileInventoryFixture, inventorySelectionFixture } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import { DataGenerations } from "./dataGenerations.js";
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { UserSourcesRepository } from "./userSources.js";
@@ -45,7 +45,7 @@ async function savedSourcesAvailable(scope: DataSyncScope) {
 async function failure(scope: DataSyncScope, source: "directory" | "app_activity", authorization = false) {
   const error = new AppError(authorization ? 401 : 403, authorization ? "authentication_required" : "permission_required", "Fixture authorization unavailable");
   await expect(new UserSourceStages(fixture.runtime).execute(generationInput({
-    scope: { ...generationInput().scope, ...scope, source },
+    scope: { ...generationInput().scope, tenantId: scope.tenantId, source }, actorPrincipalId: scope.principalId,
   }), async () => { throw error; }, { beforePublish: async () => {} })).rejects.toBe(error);
 }
 
@@ -172,7 +172,7 @@ describe("session-driven automatic sync admission", () => {
   function savedUsers(scope: DataSyncScope) {
     const reader = new UserSourcesRepository(fixture.runtime, "synthetic-automatic-source-read-secret");
     return async () => {
-      const selected = await reader.capture(identity(scope), "delegated");
+      const selected = await reader.capture(identity(scope));
       const { selection: _selection, ...page } = await reader.page(selected.id, identity(scope));
       return page;
     };
@@ -193,7 +193,6 @@ describe("session-driven automatic sync admission", () => {
       await complete(scope, first.run!);
       expect((await repository.submitDue(scope)).created).toBe(false);
       await imports.confirm(principal, await imports.confirmPreview(principal, saved.id, "select"));
-      await publishFixtureDirectory(fixture.runtime, { ...principal, principalId: randomUUID() }, []);
       const refresh = await repository.submitDue(scope);
       expect(refresh).toMatchObject({ created: true, run: { automatic: true, sources: [{ source: "users" }] } });
       await repository.updateSource(scope, refresh.run!.id, "users", {
@@ -338,10 +337,11 @@ describe("session-driven automatic sync admission", () => {
       expect(await repository.automaticRevisions(scope)).toEqual(expired);
     });
 
-    it("ignores other scopes, failed attempts and unlinked snapshots but detects actual retirement", async () => {
+    it("ignores other tenants, failed attempts and unlinked snapshots but detects actual retirement", async () => {
       const scope = owner();
+      await publishFixtureDirectory(fixture.runtime, identity(scope), []);
       const before = await repository.automaticRevisions(scope);
-      const other = await publishFixtureDirectory(fixture.runtime, identity({ ...scope, principalId: "another-reader" }), []);
+      const other = await publishFixtureDirectory(fixture.runtime, identity({ tenantId: randomUUID(), principalId: "another-reader" }), []);
       await publishFixtureEmptyActivity(fixture.runtime, identity({ ...scope, tenantId: "another-tenant" }));
       expect(await repository.automaticRevisions(scope)).toEqual(before);
 
@@ -350,9 +350,9 @@ describe("session-driven automatic sync admission", () => {
       expect(failed.users).toBe(before.users);
       expect(failed.graph_packages).toBe(before.graph_packages);
       expect(failed.power_platform).toBe(before.power_platform);
-      await expect(fixture.operator.query(`UPDATE data_generation_heads head SET generation_id=$3
-        FROM data_scope_epochs scope WHERE head.scope_id=scope.id AND scope.tenant_id=$1 AND scope.principal_id=$2
-          AND scope.source='directory'`, [scope.tenantId, scope.principalId, other.generationId])).rejects.toMatchObject({ message: "data_head_fenced" });
+      await expect(fixture.operator.query(`UPDATE data_generation_heads head SET generation_id=$2
+        FROM data_scope_epochs scope WHERE head.scope_id=scope.id AND scope.tenant_id=$1 AND scope.scope_kind='tenant'
+          AND scope.source='directory'`, [scope.tenantId, other.generationId])).rejects.toMatchObject({ message: "data_head_fenced" });
       expect(await repository.automaticRevisions(scope)).toEqual(failed);
 
       const own = await publishFixtureDirectory(fixture.runtime, identity(scope), []);
@@ -371,12 +371,12 @@ describe("session-driven automatic sync admission", () => {
     const first = await repository.submitDue(scope);
     await complete(scope, first.run!);
     await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '16 minutes'
-      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1 AND source_id='graph_packages'`, [scope.tenantId]);
     await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '16 minutes'
       WHERE run_id=$1 AND source_id='graph_packages'`, [first.run!.id]);
     expect((await repository.submitDue(scope)).created).toBe(false);
     await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
-      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1 AND source_id='graph_packages'`, [scope.tenantId]);
     // A recent attempt still prevents a duplicate even when its saved timestamp is older.
     expect((await repository.submitDue(scope)).created).toBe(false);
     await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '6 hours 1 minute'
@@ -398,14 +398,18 @@ describe("session-driven automatic sync admission", () => {
     const history = await repository.listMarkers(scope);
 
     await generations.revokePrincipal(scope.tenantId, scope.principalId);
+    expect(await savedSourcesAvailable(scope)).toBe(true);
     const roots = await fixture.runtime.query<{ scope_id: string }>(`SELECT root.scope_id FROM inventory_roots root
-      JOIN data_scope_epochs scope ON scope.id=root.scope_id WHERE scope.tenant_id=$1 AND scope.principal_id=$2`,
-    [scope.tenantId, scope.principalId]);
+      JOIN data_scope_epochs scope ON scope.id=root.scope_id WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant'`,
+    [scope.tenantId]);
     const inventory = new InventoryGenerations(fixture.runtime);
-    for (const root of roots.rows) await inventory.gcMetadataSlice(root.scope_id, scope.tenantId);
+    for (const root of roots.rows) {
+      await generations.invalidate(root.scope_id, scope.tenantId);
+      await inventory.gcMetadataSlice(root.scope_id, scope.tenantId);
+    }
     expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM inventory_roots root
       JOIN data_scope_epochs scope ON scope.id=root.scope_id
-      WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND root.current`, [scope.tenantId, scope.principalId])).rows[0].n).toBe(0);
+      WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant' AND root.current`, [scope.tenantId])).rows[0].n).toBe(0);
     await publishSource(scope, "users");
     expect(await savedSourcesAvailable(scope)).toBe(false);
     expect(await repository.listSavedSources(scope)).toEqual(expect.arrayContaining([
@@ -477,8 +481,8 @@ describe("session-driven automatic sync admission", () => {
     const first = await repository.submitDue(scope);
     await complete(scope, first.run!);
     const graph = (await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages' AND selector='complete'`,
-    [scope.tenantId, scope.principalId])).rows[0];
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_packages' AND selector='complete'`,
+    [scope.tenantId])).rows[0];
     await new DataGenerations(fixture.runtime).invalidate(graph.id, scope.tenantId);
     const failed = await repository.submit(scope, { mode: "incremental", sources: ["graph_packages"] });
     await repository.updateSource(scope, failed.run.id, "graph_packages", {
@@ -493,21 +497,19 @@ describe("session-driven automatic sync admission", () => {
     });
   });
 
-  it("does not substitute a narrower Power Platform publication for the automatic source", async () => {
+  it("uses the same saved source and freshness after a successful narrower Power Platform collection", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
     await complete(scope, first.run!);
     const native = (await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_power_platform' AND selector=$3`,
-    [scope.tenantId, scope.principalId, inventorySelector({ domain: "power_platform", resourceTypes: powerPlatformResourceTypes })])).rows[0];
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_power_platform' AND selector='complete'`,
+    [scope.tenantId])).rows[0];
     await new DataGenerations(fixture.runtime).invalidate(native.id, scope.tenantId);
     await nativeInventoryFixture(fixture.runtime, scope, [], {
       resourceTypes: [powerPlatformResourceTypes[0]], environmentId: "environment-only",
     });
-    expect(await savedSourcesAvailable(scope)).toBe(false);
-    expect(await repository.submitDue(scope)).toMatchObject({
-      created: true, run: { sources: [{ source: "power_platform", status: "queued" }] },
-    });
+    expect(await savedSourcesAvailable(scope)).toBe(true);
+    expect(await repository.submitDue(scope)).toMatchObject({ created: false });
   });
 
   it("backs off permission failures independently while allowing healthy source refresh", async () => {
@@ -525,7 +527,7 @@ describe("session-driven automatic sync admission", () => {
       CASE WHEN source_id='users' THEN interval '16 minutes' ELSE interval '6 hours 1 minute' END
       WHERE run_id=$1`, [first.run!.id]);
     await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
-      WHERE tenant_id=$1 AND principal_id=$2`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1`, [scope.tenantId]);
     const next = await repository.submitDue(scope);
     expect(next.run?.sources.map(source => source.source)).toEqual(["graph_packages", "power_platform"]);
     await complete(scope, next.run!);

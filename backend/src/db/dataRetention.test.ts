@@ -23,7 +23,7 @@ const reader = () => new UserSourcesRepository(fixture.runtime, "synthetic-recor
 async function publish(owner: ReturnType<typeof identity>, count: number, fail = false) {
   const stages = new UserSourceStages(fixture.runtime);
   return stages.execute(generationInput({ scope: { ...generationInput().scope,
-    tenantId: owner.tenantId, principalId: owner.principalId } }), async lease => {
+    tenantId: owner.tenantId }, actorPrincipalId: owner.principalId }), async lease => {
     const key = await stages.query(lease, "discovery", "synthetic:retention");
     await stages.page(lease, key, "synthetic:retention", count, count);
     for (let offset = 0; offset < count; offset += 250) {
@@ -40,7 +40,7 @@ describe("live bounded record retention", () => {
   it("skips a writer-held scope before locking its abandoned generation and budgets the derived charge update", async () => {
     const owner = identity(), generations = new DataGenerations(fixture.runtime);
     const lease = await generations.begin(generationInput({ scope: { ...generationInput().scope,
-      tenantId: owner.tenantId, principalId: owner.principalId } }));
+      tenantId: owner.tenantId }, actorPrincipalId: owner.principalId }));
     await fixture.operator.query("UPDATE data_generations SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [lease.id]);
     const held = await fixture.runtime.connect();
     try {
@@ -86,7 +86,7 @@ describe("live bounded record retention", () => {
     await publish(owner, 1);
     await expect(publish(owner, 1, true)).rejects.toMatchObject({ code: "provider_schema" });
     await collect();
-    const sources = reader(), selected = await sources.capture(owner, "delegated");
+    const sources = reader(), selected = await sources.capture(owner);
     const page = await sources.page(selected.id, owner);
     expect(page.value).toHaveLength(1);
     expect(page.sources.directory).toMatchObject({ attemptStatus: "failed", state: "partial", rowCount: 1 });
@@ -97,7 +97,7 @@ describe("live bounded record retention", () => {
 
   it("protects pinned generations and removes obsolete control rows only after selection invalidation", async () => {
     const owner = identity(), first = await publish(owner, 1), sources = reader();
-    const selected = await sources.capture(owner, "delegated");
+    const selected = await sources.capture(owner);
     await publish(owner, 1);
     await collect();
     expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM directory_user_rows WHERE generation_id=$1", [first.generationId])).rows[0].n).toBe(1);
@@ -109,7 +109,7 @@ describe("live bounded record retention", () => {
 
   it("expires queued exports with their real audit classification and purges explicit IDs in bounded batches", async () => {
     const owner = identity(), reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-retention-export-secret", 30);
-    const selected = await reports.capture(owner, "delegated", "copilot_users");
+    const selected = await reports.capture(owner, "copilot_users");
     const producer = new OfficialReportExports(reports, usageAudit(owner).actor);
     const id = await producer.create(owner, { selectionId: selected.id, kind: "copilot_users",
       ids: Array.from({ length: 501 }, (_, index) => `synthetic-${index}`) });

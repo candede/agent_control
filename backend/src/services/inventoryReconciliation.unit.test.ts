@@ -28,8 +28,9 @@ function fixture(records: InventoryRecord[], factsError?: Error,
     scopeId: randomUUID(), tenantId: "synthetic-tenant", baselineId: randomUUID(), revision: "1", epoch: "0",
   };
   const input: BeginGeneration = {
-    scope: { kind: "principal", tenantId: root.tenantId, principalId: "synthetic-principal",
-      tokenMode: "delegated", source: "inventory_canonical", selector: "complete" },
+    scope: { kind: "tenant", tenantId: root.tenantId, principalId: null,
+      tokenMode: "tenant", source: "inventory_canonical", selector: "complete" },
+    actorPrincipalId: "synthetic-principal",
     schemaVersion: 1, sessionEpoch: "0", jobId: randomUUID(), jobKind: "fixture",
     observedAt: at, expiresAt: new Date(at.getTime() + 60_000), deadlineAt: new Date(at.getTime() + 60_000), reserveBytes: 1024 ** 3,
   };
@@ -51,6 +52,7 @@ function fixture(records: InventoryRecord[], factsError?: Error,
     statements.push(statement);
     const values = parameters as unknown[] | undefined;
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(statement)) return { ...result(), command: statement };
+    if (statement.startsWith("SELECT 1 WHERE EXISTS")) return result();
     if (statement.startsWith("INSERT INTO inventory_reconciliation_keys")) cancelRequest?.();
     if (statement.startsWith("SELECT id,epoch FROM data_scope_epochs")) return result([{ id: lease.scopeId, epoch: "0" }]);
     if (statement.startsWith("SELECT * FROM inventory_reconciliation")) return result([{
@@ -61,7 +63,7 @@ function fixture(records: InventoryRecord[], factsError?: Error,
     }]);
     if (statement.startsWith("SELECT id FROM data_scope_epochs")) return result([{ id: lease.scopeId }]);
     if (statement.startsWith("SELECT * FROM data_scope_epochs")) return result([{
-      epoch: "0", session_epoch: "0", principal_id: input.scope.principalId, token_mode: "delegated",
+      epoch: "0", session_epoch: "0", scope_kind: "tenant", principal_id: null, token_mode: "tenant",
     }]);
     if (statement.startsWith("SELECT r.domain,r.baseline_id,r.revision,g.expires_at")) {
       return result([{ domain: "packages", baseline_id: root.baselineId, revision: "1", expires_at: input.expiresAt }]);
@@ -139,6 +141,94 @@ function fixture(records: InventoryRecord[], factsError?: Error,
 }
 
 describe("bounded isolated reconciliation without a database", () => {
+  it.each((["request", "claim", "staging", "publication"] as const).flatMap(stage =>
+    (["inventory_control_pending", "inventory_native_control_pending"] as const).map(table => ({ stage, table }))))(
+    "fences canonical $stage while another actor has pending $table", async ({ stage, table }) => {
+      const f = fixture([]);
+      const query = vi.mocked(f.client.query).getMockImplementation()!;
+      let checks = 0;
+      vi.mocked(f.client.query).mockImplementation(async (...args) => {
+        const statement = String(args[0]);
+        if (statement.startsWith("SELECT 1 WHERE EXISTS")) {
+          expect(args[1]).toEqual([f.root.tenantId]);
+          expect(statement).not.toContain("principal_id");
+          expect(vi.mocked(f.client.query).mock.calls.at(-2)).toEqual([
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${f.root.tenantId}`],
+          ]);
+          checks++;
+          const blocked = statement.includes(table)
+            && checks >= (stage === "staging" ? 2 : stage === "publication" ? 3 : 1);
+          return { command: "SELECT", rows: blocked ? [{}] : [], rowCount: blocked ? 1 : 0, fields: [], oid: 0 };
+        }
+        return query(...args);
+      });
+      if (stage === "request" || stage === "claim") {
+        vi.mocked(f.database.connect).mockImplementation(async () => f.client);
+        vi.mocked(f.reconciliation.stages.generations.connections.run).mockRestore();
+      } else if (stage === "publication") {
+        const execute = f.execute.getMockImplementation()!;
+        f.execute.mockImplementation(async (...args) => {
+          const result = await execute(...args);
+          await args[3].validateInputs?.(f.client);
+          return result;
+        });
+      }
+
+      const operation = stage === "request" ? f.reconciliation.request(f.input, [f.root])
+        : f.reconciliation.runNext(f.input, async () => {});
+      await expect(operation).rejects.toThrow("inventory_input_fenced");
+      if (stage === "request" || stage === "claim") {
+        expect(f.statements).toContain("ROLLBACK");
+        expect(f.statements).not.toContain("COMMIT");
+        expect(f.execute).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([false, true])("reconciles every agent scope regardless of native-choice row order (reversed: %s)", async reversed => {
+    const f = fixture([]);
+    const agents = "microsoft.copilotstudio/agents";
+    const environments = "microsoft.powerplatform/environments";
+    const nativeRoots = Array.from({ length: 3 }, () => ({
+      ...f.root, scopeId: randomUUID(), baselineId: randomUUID(), domain: "power_platform",
+      expiresAt: f.input.expiresAt.toISOString(),
+    }));
+    const roots = [{ ...f.root, domain: "packages", expiresAt: f.input.expiresAt.toISOString() }, ...nativeRoots];
+    const choices = nativeRoots.flatMap((root, index) =>
+      (index === 0 ? [agents, environments] : index === 1 ? [agents] : [environments]).map(kind => ({
+        scope_id: root.scopeId, baseline_id: root.baselineId, revision: root.revision, kind,
+      })));
+    if (reversed) choices.reverse();
+    const query = vi.mocked(f.client.query).getMockImplementation()!;
+    vi.mocked(f.client.query).mockImplementation((...args) => {
+      const statement = String(args[0]);
+      const result = (rows: pg.QueryResultRow[]): pg.QueryResult =>
+        ({ command: "SELECT", rows, rowCount: rows.length, fields: [], oid: 0 });
+      if (statement.startsWith("SELECT * FROM inventory_reconciliation")) {
+        return Promise.resolve(result([{ pending_inputs: roots, pending_sequence: "1", published_sequence: "0", active_id: null }]));
+      }
+      if (statement.startsWith("SELECT r.baseline_id,r.revision,epoch.epoch,g.expires_at")) {
+        const values = args[1] as unknown[];
+        const root = roots.find(root => root.scopeId === values[0]);
+        if (!root) throw new Error("Unexpected native reconciliation scope.");
+        return Promise.resolve(result([{
+          baseline_id: root.baselineId, revision: root.revision, epoch: root.epoch, expires_at: f.input.expiresAt,
+        }]));
+      }
+      if (statement.startsWith("WITH roots AS")) return Promise.resolve(result(choices));
+      return query(...args);
+    });
+
+    await expect(f.reconciliation.runNext(f.input, async () => {})).resolves.toMatchObject({ inserted: 0 });
+    const seededBaselines = vi.mocked(f.client.query).mock.calls
+      .filter(([sql]) => String(sql).includes("SELECT $3,scope_id,identity FROM inventory_memberships"))
+      .map(([, values]) => (values as unknown[])[0]);
+    expect(seededBaselines).toEqual([f.root.baselineId, nativeRoots[0].baselineId, nativeRoots[1].baselineId]);
+    const candidates = vi.mocked(f.client.query).mock.calls.find(([sql]) => String(sql).includes("WHERE ordinal=included"));
+    expect(candidates).toBeDefined();
+    expect(JSON.parse(String((candidates![1] as unknown[])[1]))).toEqual(roots.slice(0, 3));
+  });
+
   it.each([19, 20])("preserves admission at %i queued jobs when retained source observations have aged", async queued => {
     const f = fixture([], undefined, { reusable: false, unchanged: true });
     f.input.observedAt = new Date(Date.now() - 2 * 86_400_000);

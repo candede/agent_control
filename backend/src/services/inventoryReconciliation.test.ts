@@ -1,8 +1,8 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { inventoryBaseline, inventoryDelta, inventoryInput, nativeInventoryFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations, inventoryAsOf, inventorySelector } from "../db/inventoryGenerations.js";
+import { InventoryGenerations, inventoryAsOf } from "../db/inventoryGenerations.js";
 import { InventoryReconciliation } from "./inventoryReconciliation.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord, restoreInventoryRecord, type InventoryRecord } from "./inventoryRecordProjection.js";
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
@@ -33,6 +33,7 @@ describe("durable bounded reconciliation", () => {
     fixture = await testDatabase(); sources = new InventoryGenerations(fixture.runtime); reconcile = new InventoryReconciliation(fixture.runtime);
   }, 30_000);
   afterAll(async () => { await fixture?.close(); });
+  beforeEach(() => { selectionIdentity.tenantId = randomUUID(); });
   it("fails readiness when the admission index is missing or excludes pending work", async () => {
     const client = await fixture.operator.connect();
     try {
@@ -45,9 +46,10 @@ describe("durable bounded reconciliation", () => {
     } finally { await client.query("ROLLBACK");client.release(); }
     await verifyInventoryReconciliationAdmissionSchema(fixture.runtime);
   });
-  it.each(["fresh", "aged"] as const)("retains the exact twenty/plus-one queue bound with %s source observations", async age => {
+  it.each(["fresh", "aged"] as const)("coalesces twenty-one actors into one tenant reconciliation with %s source observations", async age => {
     const tenantId = randomUUID();
     await verifyInventoryReconciliationAdmissionSchema(fixture.runtime);
+    const queuedScopes = new Set<string>();
     for (let index=0;index<21;index++) {
       const principalId = randomUUID();
       const root = age === "fresh"
@@ -60,23 +62,23 @@ describe("durable bounded reconciliation", () => {
           });
       const input = inventoryInput(principalId,"canonical");
       input.scope.tenantId = tenantId;
-      if (index<20) await expect(reconcile.request(input,[root])).resolves.toBeDefined();
-      else await expect(reconcile.request(input,[root])).rejects.toMatchObject({ code: "inventory_queue_admission" });
+      queuedScopes.add((await reconcile.request(input,[root])).scopeId);
     }
+    expect(queuedScopes.size).toBe(1);
     await sources.generations.connections.run(async client => {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
-      expect((await client.query(inventoryReconciliationAdmissionSql,[tenantId,randomUUID()])).rows[0].count).toBe(20);
+      expect((await client.query(inventoryReconciliationAdmissionSql,[tenantId,randomUUID()])).rows[0].count).toBe(1);
       const plan = (await client.query(`EXPLAIN(ANALYZE,BUFFERS,WAL,SETTINGS,FORMAT JSON) ${inventoryReconciliationAdmissionSql}`,
         [tenantId,randomUUID()])).rows;
       expect(JSON.stringify(plan)).toContain("inventory_reconciliation_tenant_admission");
-      process.stdout.write(JSON.stringify({ contract: "inventory-scoped-admission-plan",admitted: 20,rejected: 21,plan })+"\n");
+      process.stdout.write(JSON.stringify({ contract: "inventory-tenant-admission-plan", actors: 21, collections: 1, plan })+"\n");
     });
   }, 30_000);
   const environment = "11111111-1111-4111-8111-111111111111";
   const bot = "22222222-2222-4222-8222-222222222222";
   const native = (id: string, identifiers: PowerPlatformResource["identifiers"] = [{ kind: "cds_bot_id", value: bot }],
     details: PowerPlatformResource["details"] = {}) => powerPlatformInventoryRecord({
-    tenantId: "synthetic-tenant", nativeId: id, type: "microsoft.copilotstudio/agents", location: null, displayName: id,
+    tenantId: selectionIdentity.tenantId, nativeId: id, type: "microsoft.copilotstudio/agents", location: null, displayName: id,
     environmentId: environment, createdAt: null, createdBy: null, lastPublishedAt: null, sourceSystem: "power_platform",
     authoringTool: "Copilot Studio", creatorType: "unknown", agentKind: "copilot_studio_agent", lifecycle: "published",
     identityConfidence: "exact_native", identifiers, provenance: {}, details, unknownFieldCount: 0,
@@ -85,7 +87,7 @@ describe("durable bounded reconciliation", () => {
     ...(linked ? { elementDetails: [{ elementType: "AgentMetadatas", elements: [{ id: "identity",
       definition: JSON.stringify({ SourceIds: { EnvironmentId: environment, CdsBotId: bot } }) }] }] } : {}) }));
   it("bounds orphan control cleanup without attempting publication from an expired or missing baseline", async () => {
-    const principalId = randomUUID(), scope = { tenantId: "synthetic-tenant", principalId };
+    const principalId = randomUUID(), scope = { tenantId: selectionIdentity.tenantId, principalId };
     const client = await fixture.runtime.connect();
     try {
       await client.query("BEGIN");
@@ -105,15 +107,15 @@ describe("durable bounded reconciliation", () => {
     await expect(runtime.publishControls(scope)).resolves.toBe(0);
     expect(await pending()).toBe(0);
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM data_generations g
-      JOIN data_scope_epochs s ON s.id=g.scope_id WHERE s.principal_id=$1`,
-      [principalId])).rows[0].count).toBe(0);
+      JOIN data_scope_epochs s ON s.id=g.scope_id WHERE s.tenant_id=$1`,
+      [scope.tenantId])).rows[0].count).toBe(0);
   });
-  async function publish(principal: string, domain: "packages" | "power_platform", records: InventoryRecord[], delta = false) {
+  async function publish(principal: string, domain: "packages" | "power_platform", records: InventoryRecord[], delta = false, tenantId = selectionIdentity.tenantId) {
     const input = inventoryInput(principal, domain);
+    input.scope.tenantId = tenantId;
     const intent = { domain, mode: delta ? "delta" as const : "baseline" as const, channel: delta ? "exact" as const : "catalog" as const,
       ...(domain === "power_platform" ? { resourceTypes: ["microsoft.copilotstudio/agents"], environmentId: environment } : {}),
       ...(delta ? { targets: records.map(row => row.native_id) } : {}) };
-    input.scope.selector = inventorySelector(intent);
     return sources.execute(input, intent, async lease => {
       if (!delta) await sources.visit(lease, "all");
       await sources.appendBounded(lease, records);
@@ -142,11 +144,11 @@ describe("durable bounded reconciliation", () => {
     const replacement = (await reconcile.runNext(input,async () => {}))!;
     expect(replacement.baselineId).not.toBe(canonical.baselineId);
     expect((await fixture.runtime.query(`SELECT row_count FROM inventory_roots WHERE baseline_id=$1`,
-      [replacement.baselineId])).rows[0].row_count).toBe(1);
+      [replacement.baselineId])).rows[0].row_count).toBe(3);
     expect((await fixture.runtime.query(`SELECT source_identity FROM unified_agent_memberships member
       JOIN inventory_memberships current ON current.generation_id=member.generation_id AND current.identity=member.identity
-      WHERE current.baseline_id=$1 AND current.valid_to_revision IS NULL`,[replacement.baselineId])).rows)
-      .toEqual([{ source_identity: "baseline-c" }]);
+      WHERE current.baseline_id=$1 AND current.valid_to_revision IS NULL ORDER BY source_identity`,[replacement.baselineId])).rows)
+      .toEqual([{ source_identity: "baseline-a" }, { source_identity: "baseline-b" }, { source_identity: "baseline-c" }]);
   });
   it("keeps cold-statistics pair probes keyed by source record and exact scoped match", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
@@ -270,9 +272,9 @@ describe("durable bounded reconciliation", () => {
     process.stdout.write(JSON.stringify({ contract: "catalog-listable-before-details", nativeCount, packageCount,
       perKeyExpansions: expansions, elapsedMs: performance.now() - started }) + "\n");
   }, 60_000);
-  it("resolves native controls only from the current private canonical vector, never a historical selection", async () => {
+  it("resolves native control evidence from the current tenant canonical vector, never a historical selection or another tenant", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
-    const inventory = new NativeInventory(fixture.runtime), scope = { tenantId: "synthetic-tenant", principalId: principal };
+    const inventory = new NativeInventory(fixture.runtime), scope = { tenantId: selectionIdentity.tenantId, principalId: principal };
     const identifiers: PowerPlatformResource["identifiers"] = [{ kind: "environment_id", value: environment }, { kind: "cds_bot_id", value: bot }];
     const first = await publish(principal, "power_platform", [native("exact-native", identifiers, { isQuarantined: false })]);
     await expect(inventory.resolveQuarantineTargets(scope, first.baselineId, ["exact-native"])).rejects.toMatchObject({ code: "quarantine_target_unavailable" });
@@ -284,6 +286,8 @@ describe("durable bounded reconciliation", () => {
     const target = (await inventory.resolveQuarantineTargets(scope, first.baselineId, ["exact-native"]))[0];
     expect(target).toMatchObject({ resourceNativeId: "exact-native", environmentId: environment, botId: bot, inventoryQuarantineState: false });
     await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: randomUUID() }, first.baselineId, ["exact-native"]))
+      .resolves.toMatchObject([{ resourceNativeId: "exact-native", inventoryQuarantineState: false }]);
+    await expect(inventory.resolveQuarantineTargets({ ...scope, tenantId: randomUUID() }, first.baselineId, ["exact-native"]))
       .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
     const next = await publish(principal, "power_platform", [native("exact-native", identifiers, { isQuarantined: true })]);
     await expect(inventory.resolveQuarantineTargets(scope, first.baselineId, ["exact-native"])).rejects.toMatchObject({ code: "quarantine_target_unavailable" });
@@ -298,12 +302,12 @@ describe("durable bounded reconciliation", () => {
     const root = await publish(principal, "power_platform", [native(bot, [{ kind: "environment_id", value: environment }])]);
     await reconcile.request(input, [root]); await reconcile.runNext(input, async () => {});
     await expect(new NativeInventory(fixture.runtime).resolveQuarantineTargets(
-      { tenantId: "synthetic-tenant", principalId: principal }, root.baselineId, [bot]))
+      { tenantId: selectionIdentity.tenantId, principalId: principal }, root.baselineId, [bot]))
       .rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
   });
   it("fences and recovers verified native readback off GET, without treating status-cache observations as publications", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical");
-    const scope = { tenantId: "synthetic-tenant", principalId: principal };
+    const scope = { tenantId: selectionIdentity.tenantId, principalId: principal };
     const identifiers: PowerPlatformResource["identifiers"] = [{ kind: "environment_id", value: environment }, { kind: "cds_bot_id", value: bot }];
     const source = await publish(principal, "power_platform", [native("native-readback", identifiers, { isQuarantined: false })]);
     await reconcile.request(input, [source]);
@@ -501,11 +505,11 @@ describe("durable bounded reconciliation", () => {
   }, 30_000);
   it("clears scoped inventory heads and pending readbacks atomically without reusing historical revision numbers", async () => {
     const principal = randomUUID(), other = randomUUID(), input = inventoryInput(principal, "canonical");
-    const scope = { tenantId: "synthetic-tenant", principalId: principal };
+    const scope = { tenantId: selectionIdentity.tenantId, principalId: principal };
     const identifiers: PowerPlatformResource["identifiers"] = [{ kind: "environment_id", value: environment }, { kind: "cds_bot_id", value: bot }];
     const graph = await publish(principal, "packages", [packaged("cleared-graph", false)]);
     const source = await publish(principal, "power_platform", [native("cleared-native", identifiers, { isQuarantined: false })]);
-    const foreign = await publish(other, "packages", [packaged("other-principal", false)]);
+    const foreign = await publish(other, "packages", [packaged("other-tenant", false)], false, randomUUID());
     await reconcile.request(input, [graph, source]); await reconcile.runNext(input, async () => {});
     const queries = new InventoryQueries(fixture.runtime, "synthetic-clear-selection-cursor-key-32-bytes");
     const identity = { ...selectionIdentity, principalId: principal };
@@ -519,7 +523,7 @@ describe("durable bounded reconciliation", () => {
     expect(clear.created).toBe(true);
     await expect(queries.page(pin.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_roots root
-      JOIN data_scope_epochs s ON s.id=root.scope_id WHERE s.principal_id=$1 AND root.current`, [principal])).rows[0].count).toBe(0);
+      JOIN data_scope_epochs s ON s.id=root.scope_id WHERE s.tenant_id=$1 AND root.current`, [scope.tenantId])).rows[0].count).toBe(0);
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_native_control_pending WHERE principal_id=$1", [principal])).rows[0].count).toBe(0);
     const runtime = new InventoryRuntime(fixture.runtime, async () => {});
     expect(await runtime.publishNativeControls(scope)).toBe(0);
@@ -616,13 +620,13 @@ describe("durable bounded reconciliation", () => {
         (SELECT count(*)::int FROM data_generations generation WHERE generation.scope_id=state.scope_id
           AND generation.state IN ('staging','validating')) AS active_jobs
         FROM inventory_reconciliation state JOIN data_scope_epochs scope ON scope.id=state.scope_id
-        WHERE scope.tenant_id=$1 AND scope.principal_id=$2`, [input.scope.tenantId, principal])).rows[0])
+        WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant'`, [input.scope.tenantId])).rows[0])
         .toEqual({ active: true, pending: true, active_jobs: authorization === 2 ? 1 : 0 });
       expect(await reconcile.runNext(input, async () => {})).toBeNull();
       if (authorization === 2) {
         const active = (await fixture.runtime.query(`SELECT scope_id,active_id FROM inventory_reconciliation
-          WHERE active_id IS NOT NULL AND scope_id IN (SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2)`,
-        [input.scope.tenantId, principal])).rows[0];
+          WHERE active_id IS NOT NULL AND scope_id IN (SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant')`,
+        [input.scope.tenantId])).rows[0];
         const count = async () => (await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_frontier WHERE worker_id=$1",
           [active.active_id])).rows[0].count;
         const before = await count();
@@ -674,7 +678,7 @@ describe("durable bounded reconciliation", () => {
     });
     expect(first).not.toBeNull();
     const live = () => fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_live_sources
-      WHERE tenant_id=$1 AND principal_id=$2 AND authority_expires_at>clock_timestamp()`, [input.scope.tenantId, principal]);
+      WHERE tenant_id=$1 AND authority_expires_at>clock_timestamp()`, [input.scope.tenantId]);
     expect((await live()).rows[0].count).toBe(0);
     const nextInput = inventoryInput(principal, "canonical");
     await reconcile.request(nextInput, [root]);
@@ -736,10 +740,11 @@ describe("durable bounded reconciliation", () => {
     expect((await queries.page(selected.id, identity)).counts.total).toBe(20);
 
     const emptyPrincipal = randomUUID(), emptyInput = inventoryInput(emptyPrincipal, "canonical");
-    const empty = await inventoryBaseline(sources, emptyPrincipal, 0);
+    emptyInput.scope.tenantId = randomUUID();
+    const empty = await publish(emptyPrincipal, "packages", [], false, emptyInput.scope.tenantId);
     await reconcile.request(emptyInput, [empty]);
     await reconcile.runNext(emptyInput, async () => {});
-    await inventoryBaseline(sources, emptyPrincipal, 1);
+    await publish(emptyPrincipal, "packages", [packaged("new-saved-record")], false, emptyInput.scope.tenantId);
     expect((await sources.gcMetadata(empty.scopeId, empty.tenantId)).revisions).toBe(0);
     await reconcile.runNext(emptyInput, async () => {});
     for (let pass = 0; pass < 5; pass++) {
@@ -788,8 +793,10 @@ describe("durable bounded reconciliation", () => {
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_memberships m
       JOIN unified_agent_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
       WHERE ${inventoryAsOf()} AND r.link_state='ambiguous'`, [root.baselineId, root.revision])).rows[0].count).toBe(1);
-    const densePrincipal = randomUUID(), dense = await publish(densePrincipal, "packages", Array.from({ length: 251 }, (_, index) => packaged(`dense-${index}`)));
+    const densePrincipal = randomUUID(), denseTenant = randomUUID();
+    const dense = await publish(densePrincipal, "packages", Array.from({ length: 251 }, (_, index) => packaged(`dense-${index}`)), false, denseTenant);
     const denseInput = inventoryInput(densePrincipal, "canonical");
+    denseInput.scope.tenantId = denseTenant;
     const request = await reconcile.request(denseInput, [dense]);
     await expect(reconcile.runNext(denseInput, async () => {})).rejects.toMatchObject({ code: "inventory_dense_component" });
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM inventory_roots WHERE scope_id=$1", [request.scopeId])).rows[0].count).toBe(0);
@@ -836,7 +843,7 @@ describe("durable bounded reconciliation", () => {
   });
   it("joins native reports, resolved people and responsibility in one selected revision and invalidates changed people", async () => {
     const principal = randomUUID(), input = inventoryInput(principal, "canonical"), objectId = randomUUID();
-    const observerScope = { tenantId: "synthetic-tenant", principalId: principal };
+    const observerScope = { tenantId: selectionIdentity.tenantId, principalId: principal };
     const absent = await readAutomaticInventoryRevisions(observerScope, fixture.runtime);
     const ppRecord = native("owned");
     ppRecord.residual = { ...ppRecord.residual, createdBy: objectId, details: { ownerId: objectId } };
@@ -868,8 +875,8 @@ describe("durable bounded reconciliation", () => {
     expect(withPeople.power_platform).not.toBe(withCanonical.power_platform);
     expect(withPeople.graph_packages).not.toBe(withCanonical.graph_packages);
     expect(await readAutomaticInventoryRevisions(observerScope, fixture.runtime)).toEqual(withPeople);
-    await expect(fixture.runtime.query("UPDATE inventory_people_revisions SET revision=revision+1 WHERE tenant_id=$1 AND principal_id=$2",
-      [observerScope.tenantId, principal])).rejects.toMatchObject({ code: "42501" });
+    await expect(fixture.runtime.query("UPDATE inventory_people_revisions SET revision=revision+1 WHERE tenant_id=$1",
+      [observerScope.tenantId])).rejects.toMatchObject({ code: "42501" });
     const selected = await queries.capture(identity, root.scopeId, { search: "Resolved Owner", sortBy: "owner" });
     const page = await queries.page(selected.id, identity);
     expect(page.counts.filtered).toBe(1);

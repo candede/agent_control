@@ -18,7 +18,8 @@ const scope = { tenantId: "sync-persistence-tenant", principalId: "sync-reader" 
 const identity = (owner = scope, sessionEpoch = "0") => ({ ...selectionIdentity, ...owner, sessionEpoch });
 async function sourcePage(database: pg.Pool, owner = scope, sessionEpoch = "0") {
   const reader = new UserSourcesRepository(database, "synthetic-persistence-source-read-secret");
-  const actor = identity(owner, sessionEpoch), selected = await reader.capture(actor, "delegated");
+  const actor = identity(owner, sessionEpoch);
+  const selected = await reader.capture(actor);
   return reader.page(selected.id, actor);
 }
 
@@ -116,7 +117,9 @@ describe("data sync persistence integration", () => {
       const restoredRepository = new DataSyncRepository(restored);
       for (const owner of [scope, revoked]) {
         const epoch = await new DataGenerations(restored).sessionEpoch(owner.tenantId, owner.principalId);
-        expect((await sourcePage(restored, owner, epoch)).sources.directory).toMatchObject({ generationId: null, state: "unavailable", rowCount: null });
+        expect((await sourcePage(restored, owner, epoch)).sources.directory).toMatchObject({
+          generationId: removed.generationId, state: "partial", rowCount: 2,
+        });
       }
       expect((await restoredRepository.getRun(scope, run.id))?.sources.find(source => source.source === "users")).toMatchObject({
         status: "waiting_authorization", canRetry: true,
@@ -124,8 +127,8 @@ describe("data sync persistence integration", () => {
       expect((await restored.query("SELECT mode FROM operational_state")).rows[0]).toEqual({
         mode: "maintenance",
       });
-      expect((await current.runtime.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(1);
-      expect((await restored.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(0);
+      expect((await current.runtime.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(0);
+      expect((await restored.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(2);
     } finally {
       await restored?.end();
       await current.operator.query(`DROP DATABASE IF EXISTS "${target}"`);

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import { parse } from "csv-parse/sync";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput, selectionIdentity } from "../../scripts/largeTenantFixtures.js";
@@ -86,23 +87,25 @@ describe("selected persisted directory people", () => {
     expect((await selected(scope, { sortBy: "createdBy" })).page.value[0].people?.createdBy).toMatchObject({ status: "not_found", displayName: null });
   });
 
-  it("excludes other scopes and unmatched IDs while retaining current directory evidence past freshness until revocation", async () => {
-    const scope = { tenantId: "saved-people", principalId: "private-reader" };
+  it("shares tenant people, excludes other tenants and retains unseen evidence while fencing revoked actor selections", async () => {
+    const scope = { tenantId: randomUUID(), principalId: "private-reader" };
     await inventory(scope);
     const before = await selected(scope);
     expect(before.page.value[0].people?.createdBy).toBeUndefined();
     await publish({ ...scope, tenantId: "other-tenant" }, [directoryUser("Other tenant")]);
-    await publish({ ...scope, principalId: "other-reader" }, [directoryUser("Other principal")]);
+    expect((await selected(scope)).page.value[0].people?.createdBy).toBeUndefined();
+    await publish({ ...scope, principalId: "other-reader" }, [directoryUser("Shared tenant person")]);
     const stages = new UserSourceStages(fixture.runtime);
-    await stages.execute(generationInput({ scope: { ...generationInput().scope, ...scope, source: "app_activity" } }), async lease => {
+    await stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: scope.tenantId, source: "app_activity" },
+      actorPrincipalId: scope.principalId }), async lease => {
       const key = await stages.query(lease, "activity", "synthetic:empty-activity");
       await stages.finishQuery(lease, key);
     }, { beforePublish: async () => {} });
     const isolated = await selected(scope);
-    expect(isolated.page.value[0].people?.createdBy).toBeUndefined();
+    expect(isolated.page.value[0].people?.createdBy?.displayName).toBe("Shared tenant person");
     expect(isolated.page.value[0].id).toBe(before.page.value[0].id);
     await publish(scope, [directoryUser("Unmatched", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")]);
-    expect((await selected(scope)).page.value[0].people?.createdBy).toBeUndefined();
+    expect((await selected(scope)).page.value[0].people?.createdBy?.displayName).toBe("Shared tenant person");
     const expiresAt = new Date(Date.now() + 1500);
     await publish(scope, [directoryUser()], expiresAt);
     const saved = await selected(scope);
@@ -122,10 +125,11 @@ describe("selected persisted directory people", () => {
     await new DataGenerations(fixture.runtime).revokePrincipal(scope.tenantId, scope.principalId);
     await expect(saved.queries.page(saved.selection.id, saved.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(exportRows(saved)).rejects.toMatchObject({ code: "selection_invalidated" });
+    expect((await selected({ ...scope, principalId: "other-reader" })).page.value[0].people?.createdBy?.displayName).toBe("Saved Person");
   });
 
   it("keeps an existing read pinned across same-timestamp directory replacement while new selections see the new people", async () => {
-    const scope = { tenantId: "saved-people", principalId: "replacement-reader" };
+    const scope = { tenantId: randomUUID(), principalId: "replacement-reader" };
     await inventory(scope);
     await publish(scope, [directoryUser()]);
     const before = await selected(scope);
@@ -142,11 +146,11 @@ describe("selected persisted directory people", () => {
   });
 
   it("retains a valid prior observation when denied or malformed directory replacements fail", async () => {
-    const scope = { tenantId: "saved-people", principalId: "failure-reader" };
+    const scope = { tenantId: randomUUID(), principalId: "failure-reader" };
     await inventory(scope);
     await publish(scope, [directoryUser()]);
     const stages = new UserSourceStages(fixture.runtime);
-    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, ...scope } }),
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: scope.tenantId }, actorPrincipalId: scope.principalId }),
       async () => { throw new AppError(403, "permission_required", "Synthetic denial."); }, { beforePublish: async () => {} }))
       .rejects.toMatchObject({ code: "permission_required" });
     const retained = await selected(scope);

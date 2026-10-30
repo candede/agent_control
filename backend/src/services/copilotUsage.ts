@@ -60,7 +60,7 @@ export class CopilotUsageService {
     };
     const identity = await reportIdentity(this.database, user);
     fence();
-    const before = await this.sources.refreshStatus(identity, "delegated");
+    const before = await this.sources.refreshStatus(identity);
     fence();
     const reportChanged = (options.automatic || options.incompleteOnly) && await directoryNeedsReportRefresh(this.database, scope);
     fence();
@@ -97,7 +97,8 @@ export class CopilotUsageService {
       };
       const now = new Date();
       await this.dependencies.observeOperation(capability, user, () => this.dependencies.provider.refresh(this.stages, {
-        scope: { kind: "principal", ...scope, tokenMode: "delegated", source, selector: "complete" },
+        scope: { kind: "tenant", tenantId: scope.tenantId, principalId: null, tokenMode: "tenant", source, selector: "complete" },
+        actorPrincipalId: scope.principalId,
         sessionEpoch: identity.sessionEpoch, schemaVersion: 1, jobKind: "data_sync",
         jobId: options.publication.jobId, runId: options.publication.runId,
         observedAt: now, expiresAt: new Date(now.getTime() + 7 * 86400000),
@@ -135,7 +136,7 @@ export class CopilotUsageService {
         source: requested[index], ...graphErrorTelemetry(outcome.reason),
       });
     }
-    const after = await this.sources.refreshStatus(identity, "delegated");
+    const after = await this.sources.refreshStatus(identity);
     fence();
     const failed = outcomes.flatMap((outcome, index) => outcome.status === "rejected" ? [requested[index]] : []);
     return { status: after.status === "succeeded" && failed.length ? "partial" : after.status,

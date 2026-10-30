@@ -808,7 +808,7 @@ describe("access API client", () => {
     fetchMock.mockResolvedValueOnce(Response.json({ id: "package-selection" }));
     await getAgents();
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/selections", expect.objectContaining({
-      credentials: "include", method: "POST", body: JSON.stringify({ query: {}, mode: "delegated" }),
+      credentials: "include", method: "POST", body: JSON.stringify({ query: {} }),
     }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents?selectionId=package-selection&limit=50",
       expect.objectContaining({ credentials: "include" }));
@@ -968,6 +968,23 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  describe.each([
+    { name: "package", read: () => getAgents(), path: "/api/agents/selections" },
+    { name: "unified", read: () => getUnifiedAgents(), path: "/api/agent-inventory/selections" },
+  ])("$name selection capture validation", ({ read, path }) => {
+    it.each([null, false, 42, "selection", [], {}, { id: null }, { id: 42 }, { id: "" }, { id: "   " }]
+      .map(response => ({ response })))(
+      "rejects malformed selection $response without issuing a selected read",
+      async ({ response }) => {
+        const fetchMock = mockJsonResponse(response);
+        const result = read();
+        await expect(result).rejects.toBeInstanceOf(ApiError);
+        await expect(result).rejects.toMatchObject({ code: "invalid_response", kind: "problem" });
+        expect(fetchMock).toHaveBeenCalledExactlyOnceWith(path, expect.objectContaining({ method: "POST" }));
+      },
+    );
+  });
+
   it("captures maximum-width Unicode criteria in a body and continues with bounded selection URLs", async () => {
     const publisher = "界".repeat(4096), controller = new AbortController();
     const fetchMock = mockJsonResponse({ value: [] });
@@ -987,19 +1004,19 @@ describe("access API client", () => {
     expect(fetchMock.mock.calls.every(([, request]) => request?.signal === controller.signal)).toBe(true);
   });
 
-  it.each(["delegated", "application"] as const)("captures wide %s package criteria without including them in read URLs", async mode => {
+  it("captures tenant package criteria without provider modes or wide filters in read URLs", async () => {
     const publisher = "界".repeat(4096), controller = new AbortController();
     const fetchMock = mockJsonResponse({ value: [] });
     fetchMock.mockResolvedValueOnce(Response.json({ id: "package-selection" }));
-    await getAgents({ publisher, mode, limit: 25 }, { signal: controller.signal });
+    await getAgents({ publisher, limit: 25 }, { signal: controller.signal });
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/selections", expect.objectContaining({
-      method: "POST", body: JSON.stringify({ query: { publisher: `~string:${publisher}` }, mode }), signal: controller.signal,
+      method: "POST", body: JSON.stringify({ query: { publisher: `~string:${publisher}` } }), signal: controller.signal,
     }));
-    await getAgents({ publisher, mode, selectionId: "package-selection", cursor: "next", limit: 25 }, { signal: controller.signal });
+    await getAgents({ publisher, selectionId: "package-selection", cursor: "next", limit: 25 }, { signal: controller.signal });
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.slice(1).map(([url]) => url)).toEqual([
-      `/api/agents?selectionId=package-selection&limit=25&mode=${mode}`,
-      `/api/agents?selectionId=package-selection&limit=25&mode=${mode}&cursor=next`,
+      "/api/agents?selectionId=package-selection&limit=25",
+      "/api/agents?selectionId=package-selection&limit=25&cursor=next",
     ]);
     expect(fetchMock.mock.calls.every(([, request]) => request?.signal === controller.signal)).toBe(true);
   });
@@ -1650,6 +1667,21 @@ describe("API response failures", () => {
     }
   });
 
+  it.each([401, 403].flatMap(status => ["", " \t "].map(code => ({ status, code }))))(
+    "revalidates an unclassified $status denial with blank code $code",
+    async ({ status, code }) => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code }, { status })));
+      const listener = vi.fn();
+      const unsubscribe = subscribeSessionRevalidationRequired(listener);
+      try {
+        await expect(getAgents()).rejects.toMatchObject({ status, code: "request_failed", kind: "problem" });
+        expect(listener).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ status, code: "request_failed" }));
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
+
   it("preserves the denial when a session owner cancels protected reads during notification", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ code: "unauthorized" }, { status: 401 })));
     const controller = new AbortController();
@@ -1801,7 +1833,8 @@ describe("API response failures", () => {
     await expect(getAgents()).rejects.toMatchObject({ status: 429, requestId: undefined, retryAfterSeconds: undefined });
   });
 
-  it.each(["not JSON", "null", "[]", '{"code":23,"detail":{},"requestId":false,"type":[]}'])(
+  it.each(["not JSON", "null", "[]", '{"code":23,"detail":{},"requestId":false,"type":[]}',
+    '{"code":"","detail":""}', '{"code":" \\t ","detail":" \\n "}'])(
     "retains HTTP status and request diagnostics for malformed problem body %s",
     async body => {
       vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(body, {

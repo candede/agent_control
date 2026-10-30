@@ -34,14 +34,11 @@ export const errorHandler: ErrorRequestHandler = (
   error,
   request,
   response,
-  _next,
+  next,
 ) => {
   const appError = normalizeError(error);
-  const retryAfter: unknown = Object.getOwnPropertyDescriptor(appError, "retryAfterSeconds")?.value;
+  let retryAfter: unknown = Object.getOwnPropertyDescriptor(appError, "retryAfterSeconds")?.value;
   const details: unknown = Object.getOwnPropertyDescriptor(appError, "details")?.value;
-  if (typeof retryAfter === "number" && Number.isSafeInteger(retryAfter) && retryAfter > 0) {
-    response.setHeader("Retry-After", String(retryAfter));
-  }
   const telemetry = errorTelemetry(error, appError.code);
   const responseLocals: unknown = types.isProxy(response) ? undefined : Object.getOwnPropertyDescriptor(response, "locals")?.value;
   if (responseLocals && typeof responseLocals === "object" && !types.isProxy(responseLocals)) {
@@ -60,6 +57,19 @@ export const errorHandler: ErrorRequestHandler = (
     requestId: locals.requestId, jobId: locals.jobId,
     route: requestRouteTemplate(request), ...telemetry, status: appError.status,
   });
+  if (response.headersSent) {
+    next(error);
+    return;
+  }
+  if (retryAfter === undefined && details !== null && typeof details === "object" && !types.isProxy(details)) {
+    const retryAfterMs: unknown = Object.getOwnPropertyDescriptor(details, "retryAfterMs")?.value;
+    if (typeof retryAfterMs === "number" && Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0) {
+      retryAfter = Math.ceil(retryAfterMs / 1000);
+    }
+  }
+  if (typeof retryAfter === "number" && Number.isSafeInteger(retryAfter) && retryAfter > 0) {
+    response.setHeader("Retry-After", String(retryAfter));
+  }
 
   const requestId = typeof locals.requestId === "string"
     ? locals.requestId
@@ -156,12 +166,13 @@ export function normalizeError(error: unknown) {
   const message = errorProperty(error, "message");
   if (isApplicationError(error)) {
     const code: unknown = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    // Problem type URIs cannot encode lone UTF-16 surrogates.
     if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599
-      && typeof code === "string" && typeof message === "string") return error;
+      && typeof code === "string" && !/[\uD800-\uDFFF]/u.test(code) && typeof message === "string") return error;
     return new AppError(500, "internal_error", "An unexpected error occurred");
   }
 
-  if (typeof status === "number" && [400,403,404,413].includes(status)) return new AppError(status, "request_rejected", "The request could not be served.");
+  if (typeof status === "number" && [400,403,404,413,415].includes(status)) return new AppError(status, "request_rejected", "The request could not be served.");
 
   if (types.isNativeError(error)) {
     return new AppError(
@@ -183,6 +194,7 @@ function problemTitle(status: number) {
   if (status === 404) return "Not found";
   if (status === 409) return "Conflict";
   if (status === 413) return "Request too large";
+  if (status === 415) return "Unsupported media type";
   if (status === 429) return "Request limit reached";
   if (status === 503) return "Service unavailable";
   return "Request failed";

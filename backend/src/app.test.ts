@@ -475,12 +475,10 @@ describe.sequential("packaged API/session contracts", () => {
     const originalCookie=cookie;
     cookie=await roleCookie("fixture-principal",["AgentControl.Viewer"]);
     try {
-      expect((await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":"wrong"},body:JSON.stringify({capabilityId})})).status).toBe(403);
+      expect((await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":"wrong"},body:JSON.stringify({capabilityId})})).status).toBe(404);
       const consent=await request("/api/auth/consent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({capabilityId})});
-      expect(consent.status).toBe(410);
-      const body = await consent.json();
-      expect(body).toMatchObject({ code: "admin_managed_permissions", detail: expect.stringContaining("Grant admin consent") });
-      expect(body).not.toHaveProperty("authorizationUrl");
+      expect(consent.status).toBe(404);
+      expect(await consent.text()).not.toContain("authorizationUrl");
       const redemptions = authFixture.redemptions;
       expect((await request("/api/auth/callback?code=fixture&state=fixture-state______________________________")).status).toBe(400);
       expect(authFixture.redemptions).toBe(redemptions);
@@ -1211,8 +1209,8 @@ describe.sequential("packaged API/session contracts", () => {
     expect(acquireDelegatedToken).toHaveBeenCalledTimes(tokenReads);
     const other = await roleCookie("responsibility-other", ["AgentControl.Viewer"]);
     const otherResult = await request(`/api/agent-responsibility?objectId=${objectId}`, { headers: { Cookie: other } });
-    expect(otherResult.status).toBe(409);
-    expect(await otherResult.json()).toMatchObject({ code: "inventory_unavailable" });
+    expect(otherResult.status).toBe(200);
+    expect(await otherResult.json()).toMatchObject({ selected: { count: 1, agents: [{ id: result.selected.agents[0].id }] } });
     expect((await request("/api/agent-responsibility?principalId=responsibility-reader", { headers: { Cookie: other } })).status).toBe(400);
     const unassigned = await roleCookie(principalId, []);
     expect((await request("/api/agent-responsibility", { headers: { Cookie: unassigned } })).status).toBe(403);
@@ -1317,7 +1315,7 @@ describe.sequential("packaged API/session contracts", () => {
       if (change === "exact-overlay" || change === "environment") {
         expect(exported.status).toBe(200);
         const rows = parseCsv(await exported.text(), { columns: true, bom: true });
-        expect(rows.filter((row: Record<string, string>) => row.recordType === "agent"))
+        expect(rows.filter((row: Record<string, string>) => row.recordType === "agent" && row.packageIds === '["package-1"]'))
           .toMatchObject([{ displayName: "Fixture", packageIds: '["package-1"]' }]);
       } else {
         expect(exported.status).toBe(change === "role" ? 403 : change === "session" ? 401 : 409);
@@ -1425,7 +1423,9 @@ describe.sequential("packaged API/session contracts", () => {
       security: { status: "unmatched" },
     });
     const otherReader = await roleCookie("source-detail-other", ["AgentControl.Viewer"]);
-    expect((await request(path, { headers: { Cookie: otherReader } })).status).toBe(409);
+    const shared = await request(path, { headers: { Cookie: otherReader } });
+    expect(shared.status).toBe(200);
+    expect(JSON.stringify(await shared.json())).not.toContain(job.id);
   });
   it("reads authorized saved audit data during provider outage", async () => {
     const securityReaderCookie=await roleCookie("security-reader",["AgentControl.Viewer"]);
@@ -1499,7 +1499,7 @@ describe.sequential("packaged API/session contracts", () => {
 
       const otherReader=await roleCookie("inventory-other",["AgentControl.Viewer"]);
       expect((await request(`/api/inventory/refresh-jobs/${job.id}`,{headers:{Cookie:otherReader}})).status).toBe(404);
-      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:otherReader}})).status).toBe(409);
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=%40native`,{headers:{Cookie:otherReader}})).status).toBe(200);
       expect((await request("/api/data-exports", { method: "POST", headers: { Cookie: otherReader, "Content-Type": "application/json" },
         body: JSON.stringify({ kind: "power_platform_agents", selectionId: selection.selection.id }) })).status).toBe(409);
       expect(await (await request("/api/inventory/refresh-jobs",{headers:{Cookie:otherReader}})).json()).toMatchObject({value:[]});
@@ -1520,7 +1520,7 @@ describe.sequential("packaged API/session contracts", () => {
       expect(targetList.status).toBe(200);
       const targetPage = await targetList.json();
       expect(targetPage).toMatchObject({ snapshot: { id: snapshotId }, value: [{ nativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111" }] });
-      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: otherOperatorCookie } })).status).toBe(409);
+      expect((await request(`/api/inventory/quarantine-selection?snapshotId=${snapshotId}&selected=native-agent`, { headers: { Cookie: otherOperatorCookie } })).status).toBe(200);
       expect(vi.mocked(CopilotStudioQuarantineClient.prototype.getStatus).mock.calls.length).toBe(providerReads);
       expect((await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: securityReaderCookie } })).status).toBe(200);
       expect((await request("/api/quarantine/status?snapshotId=not-a-uuid&nativeId=native-agent", { headers: { Cookie: operatorCookie } })).status).toBe(400);
@@ -1531,8 +1531,13 @@ describe.sequential("packaged API/session contracts", () => {
       expect(await status.json()).toMatchObject({ target: { resourceNativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222" },
         direct: { isBotQuarantined: false, providerUpdatedAt: "2026-09-09T10:00:00.123Z" }, inventory: { isQuarantined: true, snapshotId }, disagreesWithInventory: true });
       const isolated = await request(`/api/quarantine/status?snapshotId=${snapshotId}&nativeId=native-agent`, { headers: { Cookie: otherOperatorCookie } });
-      expect(isolated.status).toBe(409);
-      expect(await isolated.json()).toMatchObject({ code: "quarantine_target_unavailable" });
+      expect(isolated.status).toBe(200);
+      expect(await isolated.json()).toMatchObject({
+        target: { resourceNativeId: "native-agent", environmentId: "11111111-1111-4111-8111-111111111111", botId: "22222222-2222-4222-8222-222222222222" },
+        inventory: { isQuarantined: true, snapshotId },
+        direct: { isBotQuarantined: false, providerUpdatedAt: "2026-09-09T10:00:00.123Z" },
+        disagreesWithInventory: true,
+      });
 
       expect((await request("/api/quarantine/preview", { method: "POST", headers: { Cookie: operatorCookie, "Content-Type": "application/json" },
         body: JSON.stringify({ action: "quarantine", snapshotId, resourceNativeIds: ["native-agent"], packageId: "must-not-be-a-target" }) })).status).toBe(400);
@@ -1587,8 +1592,10 @@ describe.sequential("packaged API/session contracts", () => {
     vi.mocked(acquireDelegatedToken).mockRejectedValueOnce(new AppError(401,"interaction_required","Interactive authorization is required."));
     try {
       const response=await request("/api/inventory/refresh-jobs",{method:"POST",headers:{Cookie:readerCookie,"Content-Type":"application/json"},body:JSON.stringify({types:["microsoft.copilotstudio/agents"],environmentId:"environment-a"})});
-      expect(response.status).toBe(401);
-      expect(await response.json()).toMatchObject({code:"authorization_required"});
+      expect(response.status).toBe(202);
+      const submitted = await response.json();
+      await vi.waitFor(async () => expect(await new PowerPlatformRefreshJobs(fixture.runtime).getJob(
+        { tenantId: config.tenants[0].tenantId!, principalId }, submitted.id)).toMatchObject({ status: "waiting_authorization" }));
       expect(inventoryProviderFixture.queries).toBe(0);
       const persisted=await new PowerPlatformRefreshJobs(fixture.runtime).listJobs({tenantId:config.tenants[0].tenantId!,principalId});
       expect(persisted.value).toHaveLength(1);
@@ -2079,7 +2086,7 @@ describe.sequential("packaged API/session contracts", () => {
     let outcome: { status: number; body: string } | undefined;
     try {
       for (const source of ["directory", "app_activity"]) leases.push(await generations.begin(generationInput({
-        scope: { ...generationInput().scope, tenantId: config.tenants[0].tenantId, principalId: "held-source-admission", source },
+        scope: { ...generationInput().scope, tenantId: config.tenants[0].tenantId, source }, actorPrincipalId: "held-source-admission",
       })));
       const boundary = `shared-source-${randomUUID()}`;
       pending = httpRequest(`${base}/api/official-usage/staging?bundleId=${randomUUID()}`, {

@@ -677,7 +677,7 @@ function inventoryLifecycle() {
     }]);
     if (statement.startsWith("SELECT g.id FROM data_generations")) return result([{ id: "inventory-baseline" }]);
     if (statement.startsWith("SELECT 1 FROM inventory_revisions")) {
-      expect(values).toEqual(["inventory-root", "1", "inventory-baseline", fixture.identity.tenantId, [fixture.identity.principalId], ""]);
+      expect(values).toEqual(["inventory-root", "1", "inventory-baseline", fixture.identity.tenantId]);
       return result([{}]);
     }
     if (statement.startsWith("SELECT 1 FROM inventory_read_contexts c")) {

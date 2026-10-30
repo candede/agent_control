@@ -2,6 +2,7 @@ import type pg from "pg";
 import { encodeBatch } from "../src/db/dataBounds.js";
 import { UserSourceStages } from "../src/db/userSourceStages.js";
 import type { SelectionIdentity } from "../src/services/dataSelections.js";
+import { snapshotUserSourceBatch } from "../src/services/userSourceRecords.js";
 import type { CopilotDirectoryUser } from "../src/types/copilotUsage.js";
 import { generationInput } from "./largeTenantFixtures.js";
 
@@ -14,12 +15,14 @@ export function fixtureDirectoryUser(objectId: string, displayName: string | nul
 }
 
 export async function publishFixtureDirectory(database: pg.Pool, identity: SelectionIdentity, users: readonly CopilotDirectoryUser[],
-  options: { observedAt?: Date; expiresAt?: Date; tokenMode?: "delegated" | "application" } = {}) {
+  options: { observedAt?: Date; expiresAt?: Date } = {}) {
+  users = snapshotUserSourceBatch(users);
   encodeBatch(users);
   const stages = new UserSourceStages(database);
   return stages.execute(generationInput({
-    scope: { kind: "principal", tenantId: identity.tenantId, principalId: identity.principalId,
-      source: "directory", selector: "complete", tokenMode: options.tokenMode ?? "delegated" },
+    scope: { kind: "tenant", tenantId: identity.tenantId, principalId: null,
+      source: "directory", selector: "complete", tokenMode: "tenant" },
+    actorPrincipalId: identity.principalId,
     sessionEpoch: identity.sessionEpoch, observedAt: options.observedAt ?? new Date(),
     ...(options.expiresAt ? { expiresAt: options.expiresAt } : {}),
   }), async lease => {
@@ -34,8 +37,9 @@ export async function publishFixtureEmptyActivity(database: pg.Pool, identity: S
   options: { observedAt?: Date; expiresAt?: Date } = {}) {
   const stages = new UserSourceStages(database);
   return stages.execute(generationInput({
-    scope: { kind: "principal", tenantId: identity.tenantId, principalId: identity.principalId,
-      source: "app_activity", selector: "complete", tokenMode: "delegated" },
+    scope: { kind: "tenant", tenantId: identity.tenantId, principalId: null,
+      source: "app_activity", selector: "complete", tokenMode: "tenant" },
+    actorPrincipalId: identity.principalId,
     sessionEpoch: identity.sessionEpoch,
     ...(options.observedAt ? { observedAt: options.observedAt } : {}),
     ...(options.expiresAt ? { expiresAt: options.expiresAt } : {}),

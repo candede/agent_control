@@ -320,7 +320,7 @@ describe("selection scope-before-domain lock order", () => {
       allowed: ["inventoryQuery", "operationIdPrefix"],
     }, expect.any(Function));
     expect(query).toHaveBeenCalledWith(expect.stringContaining("SELECT r.scope_id,r.baseline_id,r.revision::text,v.inputs"),
-      ["a", identity.tenantId, "delegated"]);
+      ["a", identity.tenantId]);
     expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO inventory_read_contexts"),
       [selection.id, identity.tenantId, expect.any(String), "7", "a", JSON.stringify(criteria)]);
   });

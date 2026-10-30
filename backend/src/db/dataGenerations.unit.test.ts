@@ -16,6 +16,12 @@ function result(rows: pg.QueryResultRow[] = [], command = "SELECT"): pg.QueryRes
   return { command, rowCount: rows.length, oid: 0, fields: [], rows };
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 function fixture({ existingScope = true } = {}) {
   const database = new pg.Pool({ max: 4 });
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
@@ -100,6 +106,87 @@ describe("generation admission and retained source contracts", () => {
     expect(query.mock.calls.some(([statement]) =>
       typeof statement === "string" && statement.includes("INSERT INTO data_generations"))).toBe(false);
     expect(query).toHaveBeenCalledWith("ROLLBACK");
+  });
+});
+
+describe("principal revocation lock ordering", () => {
+  it("still cancels tenant-owned work when the actor has no principal-owned scopes", async () => {
+    const { store, query, input } = fixture();
+    const execute = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      if (typeof statement !== "string") throw new Error("Unexpected query shape");
+      if (statement.startsWith("UPDATE data_principal_epochs")) return result([{ epoch: "8" }]);
+      if (statement.startsWith("SELECT id FROM data_scope_epochs")) return result();
+      return execute(statement, values);
+    });
+
+    await expect(store.revokePrincipal(lease.tenantId, input.scope.principalId!, { preserveSources: true })).resolves.toBe("8");
+
+    const cancellation = query.mock.calls.find(([statement]) =>
+      typeof statement === "string" && statement.startsWith("UPDATE data_generations"));
+    expect(cancellation?.[0]).toContain("WHERE tenant_id=$1 AND actor_principal_id=$2 AND state IN ('staging','validating')");
+    expect(cancellation?.[1]).toEqual([lease.tenantId, input.scope.principalId]);
+    expect(query.mock.calls.some(([statement]) =>
+      typeof statement === "string" && /UPDATE data_(scope_epochs|generation_heads)/.test(statement))).toBe(false);
+    expect(query).toHaveBeenCalledWith("COMMIT");
+  });
+
+  it.each([false, true])("does not deadlock an in-flight writer with preserveSources=%s", async preserveSources => {
+    const { store, query, input } = fixture();
+    const writerHasScope = deferred();
+    const continueWriter = deferred();
+    const writerReleased = deferred();
+    const revokerNeedsScope = deferred();
+    let revokerHasGeneration = false;
+    const execute = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      if (typeof statement !== "string") throw new Error("Unexpected query shape");
+      if (statement.startsWith("UPDATE data_principal_epochs")) return result([{ epoch: "8" }]);
+      if (statement.startsWith("SELECT id FROM data_scope_epochs")) {
+        if (values?.[2] !== null) return result();
+        revokerNeedsScope.resolve();
+        await writerReleased.promise;
+        return result([{ id: lease.scopeId }]);
+      }
+      if (statement.startsWith("UPDATE data_scope_epochs")) return result([], "UPDATE");
+      if (statement.startsWith("UPDATE data_generations")) revokerHasGeneration = true;
+      return execute(statement, values);
+    });
+    const writerClient = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(writerClient, "query").mockImplementation(async (statement: unknown) => {
+      if (typeof statement !== "string") throw new Error("Unexpected query shape");
+      if (statement.startsWith("SET LOCAL") || statement.includes("pg_advisory_xact_lock")) return result();
+      if (statement.includes("SELECT * FROM data_scope_epochs")) {
+        writerHasScope.resolve();
+        await continueWriter.promise;
+        return result([{ id: lease.scopeId }]);
+      }
+      if (statement.includes("SELECT scope_id FROM data_generation_heads")) return result([{ scope_id: lease.scopeId }]);
+      if (statement.includes("SELECT g.* FROM selected_generation")) {
+        if (revokerHasGeneration) throw new Error("generation_scope_lock_cycle");
+        return result([{ id: lease.id, job_kind: "derived", run_id: null }]);
+      }
+      throw new Error(`Unexpected writer query: ${statement}`);
+    });
+
+    const writer = store.fence(writerClient, lease).finally(() => writerReleased.resolve());
+    await writerHasScope.promise;
+    const revoked = store.revokePrincipal(lease.tenantId, input.scope.principalId!, { preserveSources });
+    const outcomes = Promise.allSettled([writer, revoked]);
+    await revokerNeedsScope.promise;
+    continueWriter.resolve();
+
+    expect(await outcomes).toEqual([
+      { status: "fulfilled", value: { id: lease.id, job_kind: "derived", run_id: null } },
+      { status: "fulfilled", value: "8" },
+    ]);
+    expect(query).toHaveBeenCalledWith("COMMIT");
+    const scopeChanges = query.mock.calls.filter(([statement]) =>
+      typeof statement === "string" && statement.startsWith("UPDATE data_scope_epochs"));
+    expect(scopeChanges).toHaveLength(preserveSources ? 0 : 1);
+    expect(query.mock.calls.some(([statement, values]) =>
+      typeof statement === "string" && statement.includes("WHERE tenant_id=$1 AND actor_principal_id=$2")
+      && values?.[0] === lease.tenantId && values[1] === input.scope.principalId)).toBe(true);
   });
 });
 

@@ -190,9 +190,9 @@ describe("Durable bulk execution", () => {
         JOIN data_scope_epochs owner ON owner.id=root.scope_id
         JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
         JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
-        WHERE owner.tenant_id=$1 AND owner.principal_id=$2 AND root.domain='canonical'
+        WHERE owner.tenant_id=$1 AND owner.scope_kind='tenant' AND root.domain='canonical'
           AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
-          AND r.domain='packages' AND r.native_id='readback-package'`, [owner.tenantId, owner.principalId]);
+          AND r.domain='packages' AND r.native_id='readback-package'`, [owner.tenantId]);
       expect(page.counts.filtered).toBe(1);
       expect(page.value[0]).toMatchObject({
         id: original.id, presence: "both", identity: original.identity,
@@ -250,7 +250,7 @@ describe("Durable bulk execution", () => {
       if (request?.method === "POST") { blocked = true; return new Response(null, { status: 204 }); }
       const response = Response.json({ id: "readback-package", displayName: "Reviewed package", isBlocked: blocked });
       if (blocked && !cleared) {
-        await new DataSyncRepository(fixture.runtime).submit(owner, { mode: "full", clearSavedData: true });
+        await new DataSyncRepository(fixture.runtime).submit({ ...owner, principalId: randomUUID() }, { mode: "full", clearSavedData: true });
         cleared = true;
       }
       return response;
@@ -271,8 +271,8 @@ describe("Durable bulk execution", () => {
     expect(reconciled).toMatchObject({ status: "succeeded", reconciliation: { attempted: 1, failed: 0 } });
     expect(await readPackageControls(fixture.runtime, owner, ["readback-package"])).toMatchObject([{ detail: { isBlocked: true } }]);
     expect((await fixture.runtime.query(`SELECT count(*)::integer AS count FROM inventory_roots r
-      JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.current AND s.tenant_id=$1 AND s.principal_id=$2`,
-    [owner.tenantId, owner.principalId])).rows[0].count).toBe(0);
+      JOIN data_scope_epochs s ON s.id=r.scope_id WHERE r.current AND s.tenant_id=$1 AND s.scope_kind='tenant'`,
+    [owner.tenantId])).rows[0].count).toBe(0);
     expect(fetcher.mock.calls.filter(([, request]) => request?.method === "POST")).toHaveLength(1);
   });
 

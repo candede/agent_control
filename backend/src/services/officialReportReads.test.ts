@@ -24,7 +24,7 @@ describe.each(["history", "overview"] as const)("%s query admission", endpoint =
   it.each(rejected)("rejects unsupported intent before acquiring a database connection: %j", async input => {
     const database = { options: { max: 4 }, connect: vi.fn().mockRejectedValue(new Error("No database work for invalid intent")) };
     const reports = new LargeTenantUsersReports(database as unknown as pg.Pool, secret, 35);
-    await expect(reports.capture(selectionIdentity, "delegated", endpoint, input as ReportQuery)).rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
+    await expect(reports.capture(selectionIdentity, endpoint, input as ReportQuery)).rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
     expect(database.connect).not.toHaveBeenCalled();
   });
   it("normalizes literal search and uses the frozen cursor-order defaults", () => {
@@ -37,7 +37,7 @@ describe.each(["history", "overview"] as const)("%s query admission", endpoint =
   it.each(["tenantId", "principalId", "authorizationHash"] as const)("rejects an empty %s before persistence", async field => {
     const database = { options: { max: 4 }, connect: vi.fn().mockRejectedValue(new Error("No unscoped persistence")) };
     const reports = new LargeTenantUsersReports(database as unknown as pg.Pool, secret, 35);
-    await expect(reports.capture({ ...selectionIdentity, [field]: "" }, "delegated", endpoint)).rejects.toMatchObject({ status: 403, code: "scope_mismatch" });
+    await expect(reports.capture({ ...selectionIdentity, [field]: "" }, endpoint)).rejects.toMatchObject({ status: 403, code: "scope_mismatch" });
     expect(database.connect).not.toHaveBeenCalled();
   });
 });
@@ -57,7 +57,7 @@ describe("native history/overview snapshot execution", () => {
       await imports.stage(identity, { bundleId }, (async function* () { yield Buffer.from(schemaRegistry[kind].headers.join(",") + "\n" + row + "\n"); })());
     }
     const accepted = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-    return { identity, set: { id: accepted.setId }, selection: await reports.capture(identity, "delegated", endpoint) };
+    return { identity, set: { id: accepted.setId }, selection: await reports.capture(identity, endpoint) };
   }
   async function instrument(failure?: (sql: string) => Error | undefined) {
     const client = await fixture.runtime.connect(), execute = client.query.bind(client), statements: string[] = [];
@@ -85,7 +85,7 @@ describe("native history/overview snapshot execution", () => {
       expect(tape.statements.at(-1)).toBe("COMMIT");
     } finally { tape.restore(); }
     await expect(reports.historyOptions(selection.id, { ...identity, principalId: "other" })).rejects.toMatchObject({ code: "selection_invalidated" });
-    const overview = await reports.capture(identity, "delegated", "overview");
+    const overview = await reports.capture(identity, "overview");
     await expect(reports.historyOptions(overview.id, identity)).rejects.toMatchObject({ code: "invalid_cursor" });
     await fixture.operator.query("UPDATE data_read_selections SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [selection.id]);
     await expect(reports.historyOptions(selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });

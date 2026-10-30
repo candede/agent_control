@@ -1,8 +1,8 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { inventoryBaseline, inventoryDelta, inventoryInput, packageRecord,streamedPackageFixture,reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations, inventoryAsOf, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations, inventoryAsOf } from "./inventoryGenerations.js";
 import type { GenerationLease } from "./dataGenerations.js";
 import { InventoryQueries } from "./inventoryQueries.js";
 import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
@@ -31,6 +31,7 @@ describe("immutable inventory record storage", () => {
   let store: InventoryGenerations;
   beforeAll(async () => { fixture = await testDatabase(); store = new InventoryGenerations(fixture.runtime); }, 30_000);
   afterAll(async () => { await fixture?.close(); });
+  beforeEach(() => { selectionIdentity.tenantId = randomUUID(); });
   it("enters account serialization before opening publication locks and retains it through completion", async () => {
     const isolated = await testDatabase();
     const store = new InventoryGenerations(isolated.runtime);
@@ -180,8 +181,10 @@ describe("immutable inventory record storage", () => {
     const roots: Awaited<ReturnType<typeof inventoryBaseline>>[] = [];
     beforeAll(async () => {
       const currentPrincipal = randomUUID(),retiredPrincipal = randomUUID();
+      selectionIdentity.tenantId = randomUUID();
       await inventoryBaseline(store,currentPrincipal,1000);
       roots.push(await inventoryDelta(store,currentPrincipal));
+      selectionIdentity.tenantId = randomUUID();
       roots.push(await inventoryBaseline(store,retiredPrincipal,1000));
       await inventoryBaseline(store,retiredPrincipal,1000);
     },30_000);
@@ -381,6 +384,54 @@ describe("immutable inventory record storage", () => {
     await store.gc(changed);
     expect((await queries.exact(old.id, identity, ["package-000001"]))[0].residual.displayName).toBe("Changed 1");
   });
+  it.each(["catalog", "detail"] as const)("retains referenced %s metadata after content GC and releases it after clear", async evidence => {
+    const principal = randomUUID(), stream = new StreamedInventory(fixture.runtime), now = Date.now();
+    const value = allowlistedPackage({ id: "one", displayName: "One", isBlocked: false, version: "1",
+      manifestId: randomUUID(), lastModifiedDateTime: new Date(now - 60_000).toISOString() });
+    const input = { ...inventoryInput(principal), observedAt: new Date(now - 30_000) };
+    const catalog = (catalogInput: typeof input) => store.execute(catalogInput,
+      { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
+        await store.visit(lease, "one");
+        await stream.packageObservation(lease, value, "catalog");
+        await store.acceptPage(lease, { token: "one", nextToken: null, records: [value], rawCount: 1, expectedCount: 1, page: 1 }, 1);
+      }, { authorize: async () => {} });
+    const original = evidence === "catalog" ? await catalog(input) : await store.execute(input,
+      { domain: "packages", mode: "delta", channel: "exact", targets: ["one"] },
+      lease => stream.packageObservation(lease, value, "exact"), { authorize: async () => {} });
+    const retained = evidence === "catalog" ? await store.execute(
+      { ...inventoryInput(principal), observedAt: new Date(now - 20_000) },
+      { domain: "packages", mode: "delta", channel: "detail", targets: ["one"] },
+      lease => stream.packageObservation(lease, value, "detail"), { authorize: async () => {} }) : original;
+    const current = evidence === "catalog"
+      ? await store.compact(inventoryInput(principal), retained, { authorize: async () => {} })
+      : await catalog({ ...inventoryInput(principal), observedAt: new Date(now - 10_000) });
+    const collect = async () => {
+      for (let pass = 0; pass < 12; pass++) {
+        await store.gcContent(current.scopeId, current.tenantId);
+        await store.gcMetadata(current.scopeId, current.tenantId);
+      }
+    };
+
+    await store.gc(retained);
+    await collect();
+    expect((await fixture.runtime.query("SELECT 1 FROM inventory_keys WHERE generation_id=$1", [original.baselineId])).rows).toEqual([]);
+    expect((await fixture.runtime.query("SELECT 1 FROM inventory_attempts WHERE generation_id=$1", [original.baselineId])).rowCount).toBe(1);
+    const client = await fixture.runtime.connect();
+    try {
+      const member = (await client.query(`SELECT generation_id FROM inventory_memberships m WHERE ${inventoryAsOf()} AND identity='one'`,
+        [current.baselineId, current.revision])).rows[0];
+      const record = await storedInventoryRecord(client, member.generation_id, "one");
+      expect(record?.[`${evidence}_generation`]).toBe(original.baselineId);
+      expect(record?.[`${evidence}_observed_at`]).toEqual(input.observedAt);
+      expect(record?.[`${evidence}_expires_at`]).toEqual(input.expiresAt);
+      await expect(client.query("UPDATE data_generations SET state='deleting' WHERE id=$1", [original.baselineId]))
+        .rejects.toThrow("inventory_generation_reachable");
+    } finally { client.release(); }
+    await store.clear(current.scopeId, current.tenantId);
+    await store.gc(current);
+    await collect();
+    expect((await fixture.runtime.query("SELECT 1 FROM inventory_attempts WHERE generation_id=$1", [original.baselineId])).rows).toEqual([]);
+  });
   it("advances bounded content scans past live keys, wraps, and revisits newly unpinned keys", async () => {
     const principal = randomUUID(), root = await inventoryBaseline(store,principal,600);
     const reader = new InventoryQueries(fixture.runtime,"synthetic-collection-cursor-secret-32");
@@ -468,7 +519,7 @@ describe("immutable inventory record storage", () => {
     try {
       await held.query("BEGIN");
       if (fence==="scope") await held.query("SELECT id FROM data_scope_epochs WHERE id=$1 FOR UPDATE",[root.scopeId]);
-      else await held.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`data-sync:${root.tenantId}:${principal}`]);
+      else await held.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",[`data-sync:${root.tenantId}`]);
       const started = performance.now();
       expect(await store.gcSlice(root)).toEqual({ rows: 0,removed: 0,bytes: 0 });
       expect(await store.gcContent(root.scopeId,root.tenantId)).toEqual({ rows: 0,bytes: 0 });
@@ -633,7 +684,8 @@ describe("immutable inventory record storage", () => {
     const rows = (await fixture.runtime.query(`SELECT r.identity,r.display_name FROM inventory_memberships m
       JOIN inventory_records r ON r.generation_id=m.generation_id AND r.identity=m.identity WHERE ${inventoryAsOf()} ORDER BY r.identity`,
     [broad.baselineId, broad.revision])).rows;
-    expect(rows).toEqual([{ identity: "package-000001", display_name: "Agent 1" }, { identity: "package-000003", display_name: "Newest exact" }]);
+    expect(rows).toEqual([{ identity: "package-000001", display_name: "Agent 1" },
+      { identity: "package-000002", display_name: "Agent 2" }, { identity: "package-000003", display_name: "Newest exact" }]);
   });
   it("retains exact tombstones and presence through repeated broad swaps, compaction and GC until newer evidence", async () => {
     const principal = randomUUID(), now = Date.now(), stream = new StreamedInventory(fixture.runtime);
@@ -670,7 +722,8 @@ describe("immutable inventory record storage", () => {
     const third = await broad(now - 15_000);
     expect(await read(third)).toEqual(expected);
     const latest = await broad(now);
-    expect(await read(latest)).toEqual([{ identity: "package-000000", display_name: "Agent 0" }, { identity: "package-000001", display_name: "Agent 1" }]);
+    expect(await read(latest)).toEqual([{ identity: "package-000000", display_name: "Agent 0" },
+      { identity: "package-000001", display_name: "Agent 1" }, { identity: "package-000003", display_name: "Newest exact" }]);
     await store.gcMetadata(initial.scopeId, initial.tenantId);
     expect((await fixture.runtime.query("SELECT identity FROM inventory_exact_heads WHERE scope_id=$1", [initial.scopeId])).rows).toEqual([]);
     expect(await read(await broad(now - 25_000))).toEqual(await read(latest));
@@ -721,7 +774,7 @@ describe("immutable inventory record storage", () => {
     record.facts.push(...facts);
     const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: [record.identity] },
       lease => store.append(lease, [record]).then(() => {}), { authorize: async () => {} });
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, principalId: input.actorPrincipalId! };
     const queries = new InventoryQueries(fixture.runtime, "synthetic-legal-multibyte-children-secret");
     const selection = await queries.capture(identity, root.scopeId);
     const seen: string[] = [];
@@ -760,7 +813,7 @@ describe("immutable inventory record storage", () => {
   });
   it("round-trips large definitions, copies them without truncation and collects them within the dedicated budget", async () => {
     const input = inventoryInput(), queries = new InventoryQueries(fixture.runtime, "synthetic-large-definition-cursor-secret");
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, principalId: input.actorPrincipalId! };
     const empty = { elementType: "AgentMetadatas", id: "0", definition: JSON.stringify({ padding: "" }) };
     const overhead = (await fixture.operator.query("SELECT octet_length($1::jsonb::text)::int AS bytes",
       [JSON.stringify(empty)])).rows[0].bytes;
@@ -837,7 +890,7 @@ describe("immutable inventory record storage", () => {
     ].map(value => ({ ...value, platform: value.publisher, version: value.publisher, isBlocked: false }));
     const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: values.map(value => value.id) },
       lease => store.appendBounded(lease, values.map(packageInventoryRecord)).then(() => {}), { authorize: async () => {} });
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, principalId: input.actorPrincipalId! };
     const queries = new InventoryQueries(fixture.runtime, "synthetic-wide-sort-boundary-secret");
     const selected = await queries.capture(identity, root.scopeId, { sortBy, sortDirection });
     const expected = sortDirection === "asc" ? ["a", "b", "c", "d"] : ["c", "b", "a", "d"];
@@ -991,7 +1044,6 @@ describe("immutable inventory record storage", () => {
     const environmentId = randomUUID();
     const botId = (index: number) => `11111111-1111-4111-8111-${index.toString(16).padStart(12, "0")}`;
     const types = ["microsoft.copilotstudio/agents"] as const;
-    input.scope.selector = inventorySelector({ domain: "power_platform", environmentId, resourceTypes: types });
     const provider = new PowerPlatformResourceQueryClient(async (_url, init) => {
       const offset = Number(JSON.parse(String(init!.body)).Options.SkipToken ?? 0), count = Math.min(100, 5001 - offset);
       return Response.json({ totalRecords: 5001, count, resultTruncated: offset + count < 5001,
@@ -1030,9 +1082,8 @@ describe("immutable inventory record storage", () => {
     process.stdout.write("INVENTORY_SCOPED_STREAM_PROOF " + JSON.stringify({ rows: root.inserted, ...counts, maximumBindBytes: maximum,
       candidateRows: matches.length, candidateResponseBytes: Buffer.byteLength(JSON.stringify(matches)), freshPlan, analyzedPlan }) + "\n");
   }, 60_000);
-  it("keeps application exact-only visibility separate, rejects oversized exact responses, and never resurrects cleared rows", async () => {
+  it("shares exact-only tenant inventory, rejects oversized exact responses, and never resurrects cleared rows", async () => {
     const principal = randomUUID(), input = inventoryInput(principal);
-    input.scope.tokenMode = "application";
     await fixture.operator.query(`INSERT INTO capability_configuration(tenant_id,capability_id,enabled,shared_data_scope,updated_by)
       VALUES($1,'graph.package.read.application',true,true,$2) ON CONFLICT(tenant_id,capability_id)
       DO UPDATE SET enabled=true,shared_data_scope=true`, [input.scope.tenantId, principal]);
@@ -1041,10 +1092,8 @@ describe("immutable inventory record storage", () => {
     const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: records.map(row => row.native_id) },
       lease => store.appendBounded(lease, records), { authorize: async () => {} });
     const identity = { ...selectionIdentity, principalId: principal };
-    const queries = new InventoryQueries(fixture.runtime, "synthetic-inventory-cursor-secret-32-bytes", 7,
-      { tenantId: input.scope.tenantId, principalId: principal });
-    await expect(queries.capture(identity, root.scopeId)).rejects.toMatchObject({ code: "selection_invalidated" });
-    const selected = await queries.capture(identity, root.scopeId, {}, "application");
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-inventory-cursor-secret-32-bytes");
+    const selected = await queries.capture(identity, root.scopeId);
     expect((await queries.page(selected.id, identity)).partial).toBe(true);
     await expect(queries.exact(selected.id, identity, records.map(row => row.native_id))).rejects.toMatchObject({ code: "inventory_exact_bytes" });
     expect(await queries.exact(selected.id, identity, ["wide-0"])).toHaveLength(1);
@@ -1053,7 +1102,7 @@ describe("immutable inventory record storage", () => {
     const replacement = await store.execute({ ...input, jobId: randomUUID() }, { domain: "packages", mode: "delta", channel: "exact", targets: ["wide-0"] },
       lease => store.appendBounded(lease, [records[0]]), { authorize: async () => {} });
     expect(replacement.baselineId).not.toBe(root.baselineId);
-    const fresh = await queries.capture(identity, root.scopeId, {}, "application");
+    const fresh = await queries.capture(identity, root.scopeId);
     expect((await queries.page(fresh.id, identity)).counts.total).toBe(1);
   });
   it("enforces stored presentation byte bounds and maximum-size facet cursors", async () => {
@@ -1069,7 +1118,7 @@ describe("immutable inventory record storage", () => {
     );
     const root = await store.execute(input, { domain: "packages", mode: "delta", channel: "exact", targets: records.map(row => row.native_id) },
       lease => store.appendBounded(lease, records).then(() => {}), { authorize: async () => {} });
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, principalId: input.actorPrincipalId! };
     const queries = new InventoryQueries(fixture.runtime, "synthetic-inventory-cursor-secret-32-bytes");
     const selected = await queries.capture(identity, root.scopeId);
     await expect(queries.page(selected.id, identity)).rejects.toMatchObject({ code: "inventory_page_record_bytes" });
@@ -1111,7 +1160,6 @@ describe("immutable inventory record storage", () => {
   it.each(["exact", "guid_case"])("rejects %s native identities across streamed pages and preserves the prior complete head", async mode => {
     const input = inventoryInput(randomUUID(), "power_platform");
     const environmentId = randomUUID(), types = ["microsoft.copilotstudio/agents"] as const;
-    input.scope.selector = inventorySelector({ domain: "power_platform", environmentId, resourceTypes: types });
     let duplicate = false;
     const nativeId = mode === "guid_case" ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" : "Opaque-A";
     const provider = new PowerPlatformResourceQueryClient(async (_url, init) => {

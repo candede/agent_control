@@ -10,7 +10,6 @@ import { packageInventoryRecord, restoreInventoryRecord } from "./inventoryRecor
 import { projectPackageControl } from "./packageControlProjection.js";
 import { publishPackageReadback } from "../db/packageControls.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
-import { inventorySelector } from "../db/inventoryGenerations.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
@@ -21,8 +20,9 @@ function fixture() {
   const fetcher = vi.fn(async () => Response.json({ value: [] }));
   const stream = new StreamedInventory(database, new GraphPackagesClient(fetcher, { baseDelayMs: 0, delay: async () => undefined }));
   const input: BeginGeneration = {
-    scope: { kind: "principal", tenantId: "tenant", principalId: "principal", tokenMode: "delegated",
+    scope: { kind: "tenant", tenantId: "tenant", principalId: null, tokenMode: "tenant",
       source: "inventory_packages", selector: "complete" },
+    actorPrincipalId: "principal",
     schemaVersion: 1, sessionEpoch: "0", jobId: "job", jobKind: "fixture",
     observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
     deadlineAt: new Date(Date.now() + 60_000), reserveBytes: 1024,
@@ -440,7 +440,6 @@ describe("package stream request and publication fencing without a database", ()
     const f = fixture(), reason = new AppError(409, "generation_lost", "Synthetic generation cancellation.");
     const types = ["microsoft.copilotstudio/agents"] as const;
     f.input.scope.source = "inventory_power_platform";
-    f.input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: types });
     const fetcher = vi.fn(async () => new Response(null, { status: 503 }));
     const provider = new PowerPlatformResourceQueryClient(fetcher, { delay: async () => {} });
     vi.spyOn(f.stream.powerPlatform, "pages").mockImplementation((...args) => provider.pages(...args));
@@ -653,7 +652,6 @@ describe("package stream request and publication fencing without a database", ()
       run = f.stream.graphCatalog(f.input, "token", { signal: f.signal, authorize: async () => {}, onProgress: progress });
     } else {
       f.input.scope.source = "inventory_power_platform";
-      f.input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: types });
       fetcher = vi.fn()
         .mockResolvedValueOnce(Response.json({
           totalRecords: 2, count: 1, resultTruncated: true, skipToken: "next",
@@ -728,7 +726,6 @@ describe("package stream request and publication fencing without a database", ()
     const f = fixture();
     const types = ["microsoft.copilotstudio/agents"] as const;
     f.input.scope.source = "inventory_power_platform";
-    f.input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: types });
     const fetcher = vi.fn(async () => new Response(body));
     const provider = new PowerPlatformResourceQueryClient(fetcher);
     vi.spyOn(f.stream.powerPlatform, "pages").mockImplementation((...args) => provider.pages(...args));
@@ -762,7 +759,6 @@ describe("package stream request and publication fencing without a database", ()
     const f = fixture();
     const types = ["microsoft.copilotstudio/agents"] as const;
     f.input.scope.source = "inventory_power_platform";
-    f.input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: types });
     f.input.deadlineAt = new Date(Date.now() - 1);
     const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, data: [], resultTruncated: false }));
     const provider = new PowerPlatformResourceQueryClient(fetcher);

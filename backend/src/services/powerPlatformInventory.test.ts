@@ -565,8 +565,9 @@ describe("Power Platform inventory refresh service", () => {
     const pending = deferred<AuthenticatedUser>();
     dependencies.revalidateUser.mockResolvedValueOnce(user).mockReturnValueOnce(pending.promise);
     vi.mocked(inventoryJobInput).mockResolvedValueOnce({
-      scope: { tenantId: user.tenantId!, principalId: user.homeAccountId, kind: "principal", tokenMode: "delegated",
+      scope: { tenantId: user.tenantId!, principalId: null, kind: "tenant", tokenMode: "tenant",
         source: "inventory_power_platform", selector: "complete" },
+      actorPrincipalId: user.homeAccountId,
       schemaVersion: 1, sessionEpoch: "0", jobId: job.id, jobKind: "power_platform_refresh",
       observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
       deadlineAt: new Date(Date.now() + 1000), reserveBytes: 1024,

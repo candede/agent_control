@@ -53,7 +53,7 @@ describe("exact agent report history", () => {
       .toEqual([[second.setId, 210], [first.setId, 200], [backfill.setId, 55]]);
     expect(history.latestReported?.setId).toBe(second.setId);
     expect(history.latestReportSetId).toBe(second.setId);
-    const optionsSelection = await reports.capture(selected.identity, "delegated", "history");
+    const optionsSelection = await reports.capture(selected.identity, "history");
     const options = await reports.historyOptions(optionsSelection.id, selected.identity, { limit: 1 });
     expect(options.value).toMatchObject([{ id: second.setId }]);
     expect((await reports.historyOptions(optionsSelection.id, selected.identity, { limit: 1, cursor: options.page.nextCursor! })).value)

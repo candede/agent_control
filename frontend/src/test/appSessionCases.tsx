@@ -87,7 +87,6 @@ const createPackagePage = (): PackagePage => ({
     validatedAt: new Date().toISOString(), publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
   page: { limit: 50, nextCursor: null, previousCursor: null },
   freshness: { state: "current", capturedRevision: "1", sources: [] },
-  mode: "delegated",
 });
 
 const unifiedRevision = "a".repeat(64);
@@ -117,7 +116,6 @@ const createUnifiedPage = (): UnifiedAgentInventoryPage => ({
         observedAt: packagePage.selection.evaluatedAt,
         expiresAt: packagePage.selection.expiresAt,
         current: true,
-        tokenMode: "delegated",
         scopeKind: "broad",
         observedCount: 1,
         totalRecords: 1,
@@ -138,7 +136,6 @@ const createUnifiedPage = (): UnifiedAgentInventoryPage => ({
         observedAt: packagePage.selection.evaluatedAt,
         expiresAt: packagePage.selection.expiresAt,
         current: true,
-        tokenMode: "delegated",
         scopeKind: "broad",
         observedCount: 1,
         totalRecords: 1,
@@ -1153,7 +1150,7 @@ export function sessionAndNavigationCases() {
     { route: "/users", view: "users", path: "/api/copilot-usage/users" },
     { route: "/users?view=activity", view: "users", path: "/api/official-usage/users" },
     { route: "/audit", view: "audit", path: "/api/audit/events" },
-  ])("keeps the $view skeleton from unknown setup through the first data read at $route", async ({ route, view, path }) => {
+  ])("reads saved $view data without waiting for sync status at $route", async ({ route, view, path }) => {
     window.history.replaceState({}, "", route);
     const roles: SessionUser["roles"] = ["AgentControl.Admin"];
     const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
@@ -1174,7 +1171,7 @@ export function sessionAndNavigationCases() {
     expect(screen.getByRole("button", { name: "Sign out" })).toBeEnabled();
     expect(screen.queryByText("Setup needed")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(pageReads()).toHaveLength(0);
+    expect(pageReads().length).toBeGreaterThan(0);
 
     await act(async () => status.resolve(await base("/api/data-sync/state")));
     await waitFor(() => expect(pageReads().length).toBeGreaterThan(0));
@@ -1390,7 +1387,7 @@ export function sessionAndNavigationCases() {
     }
   });
 
-  it("replaces unknown setup with an inline status error and retries without opening onboarding", async () => {
+  it("keeps saved inventory readable during a sync status error and retries status without opening onboarding", async () => {
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
     let failing = true;
@@ -1403,7 +1400,8 @@ export function sessionAndNavigationCases() {
     expect(await screen.findByRole("heading", { name: "Workspace status is unavailable" })).toBeVisible();
     await waitFor(() => expect(screen.queryByRole("region", { name: "Loading agents" })).not.toBeInTheDocument());
     expect(screen.getByRole("alert")).toHaveTextContent("Workspace status could not be read.");
-    expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    expect(await screen.findByText("Sensitive cached agent")).toBeVisible();
     expect(screen.queryByText("Setup needed")).not.toBeInTheDocument();
     failing = false;
     await userEvent.click(screen.getByRole("button", { name: "Retry status check" }));
@@ -4862,7 +4860,7 @@ export function sessionAndNavigationCases() {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByText(agent.displayName)).toBeVisible();
-    expect(screen.getByText("Updating saved agent inventory. Results will appear automatically.")).toBeVisible();
+    expect(screen.getByText("Publishing synced agents to the inventory. Results will appear automatically.")).toBeVisible();
     expect(screen.queryByRole("button", { name: /Inventory needs attention/ })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Export agent inventory CSV" })).toBeEnabled();
     await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
@@ -5698,11 +5696,14 @@ export function savedInventoryCases() {
     if (state === "saved") await userEvent.click(screen.getByRole("button", { name: "Agents" }));
     const before = transport.fetchMock.mock.calls.length;
     await revalidateTransportSession(transport);
+    const revalidated = transport.fetchMock.mock.calls.length;
     if (state === "saved") await userEvent.click(await screen.findByRole("button", { name: "Users" }));
     await screen.findByRole("button", { name: "Ada" });
     expect(window.location.search).not.toContain(responsibilityOwnerId);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(transport.fetchMock.mock.calls.slice(before).some(([input]) => input.includes(responsibilityOwnerId))).toBe(false);
+    const interrupted = transport.fetchMock.mock.calls.slice(before, revalidated).filter(([input]) => input.includes(responsibilityOwnerId));
+    expect(interrupted.every(([, init]) => init?.signal?.aborted)).toBe(true);
+    expect(transport.fetchMock.mock.calls.slice(revalidated).filter(([input]) => input.includes(responsibilityOwnerId))).toEqual([]);
   });
 
   it.each(["same", "replacement"] as const)("does not restore an earlier history selection after %s session revalidation", async account => {
@@ -8975,8 +8976,12 @@ export function savedInventoryCases() {
     render(<App />);
     const notice = await screen.findByRole("dialog", { name: "Your first sync is in progress" });
     expect(notice).toBeVisible();
-    expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
-    expect(screen.queryByText(/No saved package catalog observation. Open Sync to collect it/)).not.toBeInTheDocument();
+    expect(agentListRequests(transport.fetchMock)).toHaveLength(1);
+    expect(screen.getByRole("region", { name: "Agent inventory" })).toBeVisible();
+    expect(notice).toHaveAttribute("open");
+    expect(within(notice).getByRole("heading", { name: "Your first sync is in progress" })).toHaveFocus();
+    expect(document.body.style.overflow).toBe("hidden");
+    expect(screen.getByText(/No saved package catalog observation. Open Sync to collect it/)).toBeVisible();
     expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);

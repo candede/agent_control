@@ -44,7 +44,7 @@ for (const outcome of ["running", "failed"] as const) {
       maximumBytes = Math.max(maximumBytes, bytes.length);
       pages.push(JSON.parse(bytes.toString()));
     });
-    await page.goto(fixtureLoginUrl(setup.scenario, "fixture@lifecycle.example.invalid"));
+    await page.goto(fixtureLoginUrl(setup.scenario, setup.username));
     await page.goto("/agents");
     await expect(page.getByText("Before 0000", { exact: true })).toBeVisible();
     await expect.poll(() => pages.length).toBe(1);

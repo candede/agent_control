@@ -3,7 +3,7 @@ import type { SelectedRead } from "./dataSelection.js";
 
 // Candidate contracts only. Official report metrics are composed by 02A.
 export type UserSourceKind = "directory" | "app_activity";
-export type UserSourceScope = { tenantId: string; principalId: string; tokenMode: "delegated" | "application" };
+export type UserSourceScope = { tenantId: string };
 export type UserSourceFilter = {
   search?: string;
   company?: string | null;

@@ -13,25 +13,26 @@ import { currentNativeInventorySql } from "./inventoryIdentityQueries.js";
 export type AgentPersonObservation = { objectId: string; status: "resolved" | "not_found" | "lookup_failed";
   displayName: string | null; userPrincipalName: string | null; checkedAt: string; errorCode?: string };
 export type CachedAgentPerson = SavedAgentPerson & { lastConclusiveAt: string | null };
-export type AgentPeopleGeneration = Readonly<{ sessionEpoch: string; scopeId: string; scopeEpoch: string }>;
+export type AgentPeopleGeneration = Readonly<{ actorPrincipalId: string; sessionEpoch: string; scopeId: string; scopeEpoch: string }>;
 
 export class AgentPeopleRepository {
   constructor(private readonly database: pg.Pool = pool) {}
   generation(scope: DataSyncScope): Promise<AgentPeopleGeneration> {
     return dataConnections(this.database).run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-        [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+        [`data-sync:${scope.tenantId}`]);
       await client.query("INSERT INTO data_principal_epochs(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
         [scope.tenantId, scope.principalId]);
       const principal = (await client.query("SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2 FOR UPDATE",
         [scope.tenantId, scope.principalId])).rows[0];
       const state = (await client.query(`INSERT INTO data_scope_epochs
         (id,tenant_id,scope_kind,principal_id,token_mode,source,selector,session_epoch)
-        VALUES($1,$2,'principal',$3,'delegated','agent_people','cache',$4)
+        VALUES($1,$2,'tenant',NULL,'tenant','agent_people','cache',0)
         ON CONFLICT(tenant_id,scope_kind,principal_id,token_mode,source,selector)
-        DO UPDATE SET session_epoch=EXCLUDED.session_epoch RETURNING id,epoch`,
-      [randomUUID(), scope.tenantId, scope.principalId, principal.epoch])).rows[0];
-      return Object.freeze({ sessionEpoch: principal.epoch, scopeId: state.id, scopeEpoch: state.epoch });
+        DO NOTHING RETURNING id,epoch`,
+      [randomUUID(), scope.tenantId])).rows[0] ?? (await client.query(`SELECT id,epoch FROM data_scope_epochs
+        WHERE tenant_id=$1 AND scope_kind='tenant' AND source='agent_people' AND selector='cache'`, [scope.tenantId])).rows[0];
+      return Object.freeze({ actorPrincipalId: scope.principalId, sessionEpoch: principal.epoch, scopeId: state.id, scopeEpoch: state.epoch });
     });
   }
   async referencedIds(scope: DataSyncScope, after = ""): Promise<string[]> {
@@ -51,7 +52,7 @@ export class AgentPeopleRepository {
       JOIN data_generation_heads h ON h.scope_id=s.id AND h.generation_id=d.generation_id
       JOIN data_generations g ON g.id=d.generation_id AND g.state='published' AND g.validated
         AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-      WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND s.source='directory'
+      WHERE s.tenant_id=$1 AND $2::text IS NOT NULL AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='directory'
         AND d.identity=ANY($3::text[]) LIMIT 100`, [scope.tenantId, scope.principalId, requested]);
     return rows.rows.map(row => row.identity);
   }
@@ -59,7 +60,7 @@ export class AgentPeopleRepository {
     const requested = userSourceObjectIds(ids);
     if (!requested.length) return [];
     const result = await database.query(`SELECT object_id,status,display_name,user_principal_name,checked_at,resolved_at,expires_at,error_code
-      FROM agent_people_cache WHERE tenant_id=$1 AND principal_id=$2 AND object_id=ANY($3::uuid[]) AND expires_at>clock_timestamp() LIMIT 100`,
+      FROM agent_people_cache WHERE tenant_id=$1 AND $2::text IS NOT NULL AND object_id=ANY($3::uuid[]) AND expires_at>clock_timestamp() LIMIT 100`,
     [scope.tenantId, scope.principalId, requested]);
     return result.rows.map(row => ({ objectId: row.object_id, status: row.status, displayName: row.display_name,
       userPrincipalName: row.user_principal_name, observedAt: (row.resolved_at ?? row.checked_at).toISOString(),
@@ -67,18 +68,18 @@ export class AgentPeopleRepository {
       lastConclusiveAt: (row.status === "not_found" ? row.checked_at : row.resolved_at)?.toISOString() ?? null,
       ...(row.error_code ? { errorCode: row.error_code } : {}) }));
   }
-  save(scope: DataSyncScope, observations: readonly AgentPersonObservation[],
+  async save(scope: DataSyncScope, observations: readonly AgentPersonObservation[],
     context: { generation: AgentPeopleGeneration; publication?: UserSourcePublication; signal?: AbortSignal; fence?: () => void }) {
+    if (context.generation.actorPrincipalId !== scope.principalId) throw new SelectionError("selection_invalidated");
     if (!observations.length) throw new AppError(400, "invalid_agent_people", "Save at least one exact observation.");
     return new UserSourcesRepository(this.database, config.sessionSecret).savePeople({
       ...scope, sessionEpoch: context.generation.sessionEpoch, authorizationHash: "internal-people-observation",
     }, observations, async client => {
       context.signal?.throwIfAborted(); context.fence?.();
-      const current = (await client.query(`SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
-        AND scope_kind='principal' AND token_mode='delegated' AND source='agent_people' AND selector='cache'
-        AND epoch=$4 AND session_epoch=$5 FOR UPDATE`,
-      [context.generation.scopeId, scope.tenantId, scope.principalId,
-        context.generation.scopeEpoch, context.generation.sessionEpoch])).rows[0];
+      const current = (await client.query(`SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2
+        AND scope_kind='tenant' AND token_mode='tenant' AND source='agent_people' AND selector='cache'
+        AND epoch=$3 FOR UPDATE`,
+      [context.generation.scopeId, scope.tenantId, context.generation.scopeEpoch])).rows[0];
       if (!current) throw new SelectionError("selection_invalidated");
       if (context.publication) await requireUserPublication(client, scope, context.publication);
     }, { signal: context.signal, beforeCommit: context.fence });

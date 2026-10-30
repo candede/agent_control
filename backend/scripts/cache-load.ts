@@ -13,13 +13,15 @@ import { packageInventoryRecord } from "../src/services/inventoryRecordProjectio
 import { completeInventoryJob, inventoryJobInput } from "../src/services/inventoryRuntime.js";
 
 const fixture=await testDatabase();
-const packageRepository=new PackageRefreshJobs(fixture.runtime);
-const usageRepository=new OfficialReportImports(fixture.runtime);
-const scope={tenantId:"load-tenant",principalId:"load-principal"};
-const durations:number[]=[];
-const initialRss=process.memoryUsage().rss;
-const initialSize=Number((await fixture.operator.query("SELECT pg_database_size(current_database()) AS bytes")).rows[0].bytes);
+let receipt:string;
+let failure:{error:unknown}|undefined;
 try {
+  const packageRepository=new PackageRefreshJobs(fixture.runtime);
+  const usageRepository=new OfficialReportImports(fixture.runtime);
+  const scope={tenantId:"load-tenant",principalId:"load-principal"};
+  const durations:number[]=[];
+  const initialRss=process.memoryUsage().rss;
+  const initialSize=Number((await fixture.operator.query("SELECT pg_database_size(current_database()) AS bytes")).rows[0].bytes);
   const actor={tenantId:scope.tenantId,homeAccountId:scope.principalId,username:"fixture@example.invalid",displayName:"Load fixture"};
   const identity=await reportIdentity(fixture.runtime,{...actor,roles:["AgentControl.Admin"]});
   const reader=new LargeTenantUsersReports(fixture.runtime,"synthetic-cache-load-cursor-secret",35);
@@ -44,7 +46,7 @@ try {
     }
   },{authorize:async()=>{},completeJob:completeInventoryJob(input,"packages")});
   const inventorySelection=await exports.inventory.capture(identity,root.scopeId,{sortBy:"displayName"});
-  await Promise.all(Array.from({length:8},async()=>{
+  const reads=await Promise.allSettled(Array.from({length:8},async()=>{
     let cursor:string|undefined;
     for(let request=0;request<15;request++) {
       const started=performance.now();
@@ -56,6 +58,9 @@ try {
       cursor=page.page.nextCursor??undefined;
     }
   }));
+  const readFailures:unknown[]=reads.flatMap(result=>result.status==="rejected"?[result.reason]:[]);
+  if(readFailures.length===1) throw readFailures[0];
+  if(readFailures.length) throw new AggregateError(readFailures,"Cache-only concurrent reads failed.");
   const inventoryExport=await exports.create(identity,{selectionId:inventorySelection.id,kind:"graph_packages"});
   await exports.build(inventoryExport,identity,"graph_packages");
   const inventoryCsv=await exports.status(inventoryExport,identity);
@@ -85,7 +90,7 @@ try {
     await usageRepository.stage(identity,{bundleId},(async function*(){yield Buffer.from(content);})(),metadata);
   }
   await usageRepository.acceptBundle(identity,bundleId,await usageRepository.bundle(identity,bundleId));
-  const selection=await reader.capture(identity,"delegated","official_users");
+  const selection=await reader.capture(identity,"official_users");
   const page=await reader.page(selection.id,identity,{limit:50});
   assert.equal(page.counts.total,250); assert.equal(page.value.length,50); assert.ok(page.page.nextCursor);
   const exportId=await exports.create(identity,{selectionId:selection.id,kind:"official_users"});
@@ -118,7 +123,15 @@ try {
   assert.ok(finalRss-initialRss<256*1024*1024,"Load memory growth exceeded 256 MiB.");
   assert.ok(finalSize-initialSize<128*1024*1024,"Load database growth exceeded 128 MiB.");
   assert.ok(fixture.runtime.totalCount<=4 && fixture.runtime.waitingCount===0,"Database pool exceeded its four-connection bound.");
-  console.log(JSON.stringify(result));
+  receipt=JSON.stringify(result);
+} catch(error) {
+  failure={error};
+  throw error;
 } finally {
-  await fixture.close();
+  try { await fixture.close(); }
+  catch(cleanupError) {
+    if(failure) throw new AggregateError([failure.error,cleanupError],"Cache load and fixture cleanup failed.");
+    throw cleanupError;
+  }
 }
+console.log(receipt);

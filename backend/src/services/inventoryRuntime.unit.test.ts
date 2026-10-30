@@ -30,8 +30,9 @@ describe("inventory child completion", () => {
   ] satisfies { domain: "packages" | "power_platform"; sibling: DataSyncSourceState; status: string; terminal: boolean }[]))(
     "finalizes $domain publication with a $sibling sibling as $status", async ({ domain, sibling, status, terminal }) => {
       const input: BeginGeneration = {
-        scope: { kind: "principal", tenantId: "synthetic-completion-tenant", principalId: "synthetic-reader",
-          tokenMode: "delegated", source: `inventory_${domain}`, selector: "complete" },
+        scope: { kind: "tenant", tenantId: "synthetic-completion-tenant", principalId: null,
+          tokenMode: "tenant", source: `inventory_${domain}`, selector: "complete" },
+        actorPrincipalId: "synthetic-reader",
         schemaVersion: 1, sessionEpoch: "0", runId: randomUUID(), jobId: randomUUID(),
         jobKind: domain === "packages" ? "package_refresh" : "power_platform_refresh",
         observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
@@ -47,15 +48,16 @@ describe("inventory child completion", () => {
         .mockImplementationOnce(async () => updated);
       await completeInventoryJob(input, domain)(client, { jobId: input.jobId!, rows: 0 });
       expect(query.mock.calls.at(-1)?.[1]).toEqual([
-        input.runId, input.scope.tenantId, input.scope.principalId, status, terminal,
+        input.runId, input.scope.tenantId, input.actorPrincipalId, status, terminal,
       ]);
     },
   );
 
   it.each(["packages", "power_platform"] as const)("fences %s publication when its parent sync run has expired", async domain => {
     const input: BeginGeneration = {
-      scope: { kind: "principal", tenantId: "synthetic-expired-sync", principalId: "synthetic-reader",
-        tokenMode: "delegated", source: `inventory_${domain}`, selector: "complete" },
+      scope: { kind: "tenant", tenantId: "synthetic-expired-sync", principalId: null,
+        tokenMode: "tenant", source: `inventory_${domain}`, selector: "complete" },
+      actorPrincipalId: "synthetic-reader",
       schemaVersion: 1, sessionEpoch: "0", runId: randomUUID(), jobId: randomUUID(),
       jobKind: domain === "packages" ? "package_refresh" : "power_platform_refresh",
       observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
@@ -112,9 +114,9 @@ describe("inventory durable commit notification", () => {
       const removePublication = stage === "publication_observer" ? observePublicationWork(() => { throw failure; }) : () => {};
       try {
         const execution = generations.execute({
-          scope: { tenantId: lease.tenantId, principalId: "principal", kind: "principal", tokenMode: "delegated",
+          scope: { tenantId: lease.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant",
             source: "inventory_power_platform", selector: "complete" },
-          schemaVersion: 1, sessionEpoch: "0", jobKind: "power_platform_refresh", jobId: "job",
+          actorPrincipalId: "principal", schemaVersion: 1, sessionEpoch: "0", jobKind: "power_platform_refresh", jobId: "job",
           observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000), deadlineAt: new Date(Date.now() + 60_000), reserveBytes: 1024,
         }, (ownedLease, signal) => {
           heartbeatSignal = signal;
@@ -166,9 +168,9 @@ describe("inventory durable commit notification", () => {
       const parent = new AbortController();
       const onCommitted = vi.fn();
       await expect(generations.execute({
-        scope: { tenantId: lease.tenantId, principalId: "principal", kind: "principal", tokenMode: "delegated",
+        scope: { tenantId: lease.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant",
           source: "inventory_power_platform", selector: "complete" },
-        schemaVersion: 1, sessionEpoch: "0", jobKind: "fixture", jobId: "job",
+        actorPrincipalId: "principal", schemaVersion: 1, sessionEpoch: "0", jobKind: "fixture", jobId: "job",
         observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000), deadlineAt: new Date(Date.now() + 60_000), reserveBytes: 1024,
       }, ownedLease => generations.publish(ownedLease, { onCommitted }), parent.signal)).rejects.toBeInstanceOf(Error);
       expect(onCommitted).not.toHaveBeenCalled();
@@ -190,8 +192,9 @@ describe("native quarantine receipt settlement", () => {
       const botId = nativeId;
       const at = new Date();
       const input: BeginGeneration = {
-        scope: { kind: "principal", tenantId: "tenant", principalId: "principal", tokenMode: "delegated",
+        scope: { kind: "tenant", tenantId: "tenant", principalId: null, tokenMode: "tenant",
           source: "inventory_power_platform", selector: "complete" },
+        actorPrincipalId: "principal",
         schemaVersion: 1, sessionEpoch: "0", jobId: randomUUID(), jobKind: "fixture",
         observedAt: at, expiresAt: new Date(at.getTime() + 60_000), deadlineAt: new Date(at.getTime() + 60_000), reserveBytes: 1024,
       };
@@ -288,7 +291,7 @@ describe("package job control settlement commit fencing", () => {
         ? [{ target_id: "package", observation_id: randomUUID(), updated_at: at }] : []);
       if (statement.startsWith("SELECT p.scope_id")) return rows(stage === "native-publication" ? [{
         scope_id: sourceId, identity: "native-agent", observation_id: randomUUID(), updated_at: at, receipt_observed_at: at,
-        selector: '["",["microsoft.copilotstudio/agents"]]', resource_native_id: randomUUID(), environment_id: randomUUID(), bot_id: randomUUID(),
+        selector: "complete", resource_native_id: randomUUID(), environment_id: randomUUID(), bot_id: randomUUID(),
         is_bot_quarantined: true, provider_updated_at: at.toISOString(), environment_scope: null,
         resource_types: ["microsoft.copilotstudio/agents"], role_scope: "full",
       }] : []);
@@ -299,6 +302,7 @@ describe("package job control settlement commit fencing", () => {
     const query = vi.spyOn(client, "query").mockImplementation(async sql => {
       const statement = String(sql);
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(statement)) return rows([], statement);
+      if (statement.startsWith("SELECT 1 WHERE EXISTS")) return rows();
       if (statement.startsWith("DELETE FROM inventory_control_pending")) {
         if (stage === "package-cleanup") invalidate();
         return rows([{}]);
@@ -312,7 +316,7 @@ describe("package job control settlement commit fencing", () => {
         return rows([{ pending_inputs: [root], published_inputs: [root], pending_sequence: "1", published_sequence: "0", active_id: null }]);
       }
       if (statement.startsWith("SELECT * FROM data_scope_epochs")) return rows([{
-        principal_id: scope.principalId, token_mode: "delegated", epoch: "0", session_epoch: "0",
+        principal_id: null, scope_kind: "tenant", token_mode: "tenant", epoch: "0", session_epoch: "0",
       }]);
       if (statement.startsWith("SELECT id FROM data_scope_epochs") || statement.startsWith("SELECT id,epoch FROM data_scope_epochs")) {
         return rows([{ id: sourceId, epoch: "0" }]);

@@ -58,11 +58,11 @@ export class UserSourceProvider {
     const fence = () => { options.signal?.throwIfAborted(); options.assertCurrent?.(); };
     fence();
     if (!inputs.length || inputs.length > 2 || new Set(inputs.map(input => input.scope.source)).size !== inputs.length
-      || inputs.some(input => input.scope.tenantId !== identity.tenantId || input.scope.principalId !== identity.principalId
-        || input.sessionEpoch !== identity.sessionEpoch || input.scope.tokenMode !== inputs[0].scope.tokenMode)) throw new Error("user_source_refresh_scope");
+      || inputs.some(input => input.scope.tenantId !== identity.tenantId || input.actorPrincipalId !== identity.principalId
+        || input.sessionEpoch !== identity.sessionEpoch || input.scope.kind !== "tenant" || input.scope.tokenMode !== "tenant")) throw new Error("user_source_refresh_scope");
     const outcomes = await Promise.allSettled(inputs.map(input => this.refresh(stages, input, options)));
     fence();
-    const summary = await repository.refreshStatus(identity, inputs[0].scope.tokenMode as "delegated" | "application");
+    const summary = await repository.refreshStatus(identity);
     fence();
     return { ...summary, status: summary.status === "succeeded" && outcomes.some(outcome => outcome.status === "rejected") ? "partial" as const : summary.status,
       outcomes: outcomes.map((outcome, index) => ({ source: inputs[index].scope.source,

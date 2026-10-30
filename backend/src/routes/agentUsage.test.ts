@@ -6,7 +6,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { config } from "../config.js";
 import { AppError, errorHandler } from "../errors.js";
 import { OfficialAgentUsage } from "../services/officialAgentUsage.js";
-import { LargeTenantUsersReports, reportQuery } from "../services/largeTenantUsersReports.js";
+import { LargeTenantUsersReports, reportQuery, reportQueryFields } from "../services/largeTenantUsersReports.js";
+import { canonicalQuery } from "../services/dataSelections.js";
 import type { CandidateAgentUsageMutation, CandidateAgentUsageCandidates, CandidateAgentUsageContext } from "../types/officialReportApi.js";
 import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { createOfficialReportDataRouter } from "./officialReportData.js";
@@ -29,7 +30,9 @@ const identity = { ...selectionIdentity, tenantId: config.tenants[0].tenantId!, 
 const context: CandidateAgentUsageContext = { selectionId, reportSetId: null, inventoryRevision: "a".repeat(64), usageRevision: "b".repeat(64),
   reports: { setId: null, activeSetId: null, activeRevision: "1", historyRevision: "0", historyEpoch: "0", availability: "never_imported",
     lineages: [], staleAfterDays: 35, periodAgeDays: null, acceptedAgeDays: null, acceptedAt: null, expiresAt: null, reportingPeriod: null } };
-const selection = { id: selectionId, revision: "a".repeat(64), evaluatedAt: "2026-09-18T00:00:00Z", expiresAt: "2026-09-18T00:30:00Z" };
+const selection = { id: selectionId, revision: "a".repeat(64), evaluatedAt: "2026-09-18T00:00:00Z",
+  validatedAt: "2026-09-18T00:00:00Z", expiresAt: "2026-09-18T00:30:00Z",
+  publicationRevisions: { graph_packages: "a".repeat(64), power_platform: "b".repeat(64), users: "c".repeat(64) } };
 const page: CandidateAgentUsageCandidates = { context, selection, value: [], counts: { total: 0, filtered: 0 },
   page: { limit: 50, nextCursor: null, previousCursor: null } };
 const database = { options: { max: 4 }, query: vi.fn(), connect: vi.fn() };
@@ -60,7 +63,7 @@ beforeAll(async () => {
     next();
   });
   app.use("/api", createOfficialReportDataRouter({ reports,
-    identity: async () => ({ identity, tokenMode: "delegated" }),
+    identity: async () => ({ identity }),
     enqueueExport: async () => { throw new Error("Unexpected export"); },
   }));
   app.use(errorHandler);
@@ -78,7 +81,9 @@ beforeEach(() => {
   summaries.mockReset().mockResolvedValue([{ recordId, status: "unavailable", responses: null, activeUsers: null,
     lastActivityDateUtc: null, associationCount: 0, context }]);
   associations.mockReset().mockResolvedValue({ value: [], context, page: page.page, counts: page.counts });
-  capture.mockReset().mockResolvedValue(selection);
+  capture.mockReset().mockImplementation(async (_identity, endpoint, input = {}) => ({ ...selection, endpoint,
+    evaluatedAt: new Date(selection.evaluatedAt), validatedAt: new Date(selection.validatedAt), expiresAt: new Date(selection.expiresAt),
+    queryHash: canonicalQuery(reportQuery(endpoint, input), reportQueryFields) }));
   provider.mockReset().mockRejectedValue(new Error("No provider calls are allowed"));
   vi.spyOn(OfficialAgentUsage.prototype, "candidates").mockImplementation(candidates);
   vi.spyOn(OfficialAgentUsage.prototype, "mutate").mockImplementation(mutate);
@@ -140,10 +145,10 @@ describe("native Admin reviewed usage routes", () => {
       .toHaveBeenCalledWith(selectionId, identity, recordId, expect.objectContaining({ setId }));
     expect(capture).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
   });
-  it("keeps the requested report on an initial legacy capture for its subsequent child reads", async () => {
+  it("keeps the requested report on an initial capture for its subsequent child reads", async () => {
     const setId = "66666666-6666-4666-8666-666666666666";
     expect(await request("GET", `/usage?setId=${setId}`, undefined, { role: "viewer" })).toMatchObject({ status: 200 });
-    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", { setId }));
+    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "official_agents", reportQuery("official_agents", { setId }));
     expect(summaries).toHaveBeenCalledWith(selectionId, identity, [recordId], setId);
   });
   it("rejects unauthorized and unsupported history requests before reading evidence", async () => {
@@ -186,7 +191,7 @@ describe("native Admin reviewed usage routes", () => {
   });
   it("browses candidates with one immutable selected query and exact current record", async () => {
     expect(await request("GET", "/usage-candidates?search=Report%20A&limit=20")).toEqual({ status: 200, body: page });
-    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", { search: "Report A" }));
+    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "official_agents", reportQuery("official_agents", { search: "Report A" }));
     expect(candidates).toHaveBeenCalledExactlyOnceWith(selectionId, identity, recordId, { limit: 20 });
     expect(mutate).not.toHaveBeenCalled();
   });
@@ -194,7 +199,7 @@ describe("native Admin reviewed usage routes", () => {
     expect(await request("GET", "/usage-users?search=Exact%20User&limit=25", undefined, { role: "viewer" }))
       .toEqual({ status: 200, body: { ...page, value: [], reports: context.reports } });
     expect(users).toHaveBeenCalledExactlyOnceWith(selectionId, identity, recordId, { search: "exact user", limit: 25 });
-    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "official_agents", reportQuery("official_agents", {}));
+    expect(capture).toHaveBeenCalledExactlyOnceWith(identity, "official_agents", reportQuery("official_agents", {}));
     expect(candidates).not.toHaveBeenCalled(); expect(mutate).not.toHaveBeenCalled();
   });
   it.each(["agentId=other", "search=a&search=b", "limit=101", "limit=1.5", "offset=0", "inventoryRevision=anything", "sort=name"])(

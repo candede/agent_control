@@ -23,7 +23,7 @@ function page(expiresAt = "2026-09-20T12:10:00.000Z",
         state: "available", error: null,
         observation: {
           id: "snapshot", snapshotId: "snapshot", observedAt: "2026-09-20T12:00:00.000Z", expiresAt,
-          current: true, tokenMode: "delegated", scopeKind: "broad", observedCount: 0, totalRecords: 0,
+          current: true, scopeKind: "broad", observedCount: 0, totalRecords: 0,
         },
       },
       powerPlatform: {

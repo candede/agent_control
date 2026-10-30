@@ -29,7 +29,7 @@ function source(source: UserSourceMetadata["source"]): UserSourceMetadata {
 
 function context(endpoint: ReportEndpoint): ReportReadContext {
   const query = reportQuery(endpoint);
-  return { identity, tokenMode: "delegated", endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
+  return { identity, endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
     evaluatedAt: new Date("2026-01-01T00:00:00Z"),
     selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1",
       evaluatedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-01T00:10:00Z", validatedAt: "2026-01-01T00:00:00Z",
@@ -157,7 +157,7 @@ describe("history selection status", () => {
 });
 
 describe.each(["history", "directory_report_inputs"] as const)("%s selection expiry maintenance", endpoint => {
-  const captureSelection = () => endpoint === "history" ? reports.capture(identity, "delegated", endpoint) : reports.captureReportIdentities(identity);
+  const captureSelection = () => endpoint === "history" ? reports.capture(identity, endpoint) : reports.captureReportIdentities(identity);
 
   it.each([0, 1, 4, 5, 9])("drains %i expired sets before capturing a selection", async expired => {
     vi.spyOn(reports.sources, "ensureScope").mockResolvedValue("source-scope");
@@ -458,7 +458,7 @@ describe("exact report text filters", () => {
   it.each(["company", "department", "creatorType"] as const)(
     "rejects unpaired surrogates in %s before database work", async field => {
       for (const value of ["Invalid\ud800", "Invalid\udfff"]) {
-        await expect(reports.capture(identity, "delegated", "official_users", { [field]: value }))
+        await expect(reports.capture(identity, "official_users", { [field]: value }))
           .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
       }
       expect(database.connect).not.toHaveBeenCalled();
@@ -475,7 +475,7 @@ describe("exact report text filters", () => {
   it.each(["Custom\0Agent", "Custom\u000bAgent", "Custom\u0085Agent"])(
     "rejects creator-type characters that imports reject: %j", async creatorType => {
       expect(() => acceptedCreatorType(creatorType)).toThrow();
-      await expect(reports.capture(identity, "delegated", "official_agents", { creatorType }))
+      await expect(reports.capture(identity, "official_agents", { creatorType }))
         .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
       expect(database.connect).not.toHaveBeenCalled();
     },

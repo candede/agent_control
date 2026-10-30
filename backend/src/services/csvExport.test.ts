@@ -11,7 +11,8 @@ import { createExportPublicationValidator, publishBoundedCsv } from "./csvExport
 
 const storedSession = vi.hoisted(() => ({ query: vi.fn() }));
 vi.mock("../db/pool.js", () => ({ pool: storedSession, secretValue: () => undefined }));
-vi.mock("../config.js", () => ({
+vi.mock("../config.js", async original => ({
+  ...await original<typeof import("../config.js")>(),
   findTenantConfiguration: (tenantId: string) => tenantId === "csv-tenant" ? { tenantId, clientId: "csv-client" } : undefined,
 }));
 

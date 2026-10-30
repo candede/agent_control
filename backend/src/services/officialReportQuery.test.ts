@@ -30,7 +30,7 @@ function sourceMetadata(source: UserSourceMetadata["source"]): UserSourceMetadat
 }
 function readContext(endpoint: ReportEndpoint, search: string): ReportReadContext {
   const query = reportQuery(endpoint, { search });
-  return { identity, tokenMode: "delegated", endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
+  return { identity, endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
     evaluatedAt: new Date("2026-01-01T00:00:00Z"),
     selection: { id: "11111111-1111-4111-8111-111111111111", revision: "1",
       evaluatedAt: "2026-01-01T00:00:00Z", expiresAt: "2026-01-01T00:10:00Z", validatedAt: "2026-01-01T00:00:00Z",
@@ -74,7 +74,7 @@ describe("report search admission boundaries", () => {
     { name: "unpaired surrogate", search: "\ud800" },
   ])("rejects $name before acquiring a database connection", async ({ search }) => {
     const connect = vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
-    await expect(reports.capture(identity, "delegated", "official_users", { search }))
+    await expect(reports.capture(identity, "official_users", { search }))
       .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
     expect(connect).not.toHaveBeenCalled();
   });
@@ -84,7 +84,7 @@ describe("report query admission shapes", () => {
   it.each([{ input: [] }, { input: null }, { input: 0 }, { input: "" }, { input: { sort: null } }])(
     "rejects malformed query shapes before acquiring a database connection: $input", async ({ input }) => {
       const connect = vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
-      await expect(reports.capture(identity, "delegated", "official_users", input as ReportQuery))
+      await expect(reports.capture(identity, "official_users", input as ReportQuery))
         .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
       expect(connect).not.toHaveBeenCalled();
     },
@@ -99,7 +99,7 @@ describe("report query admission shapes", () => {
     { agentId: "Agent-\u0085" }, { username: "User-\t" },
   ])("rejects malformed exact identities before acquiring a connection: %j", async input => {
     const connect = vi.spyOn(database, "connect").mockRejectedValue(new Error("Unexpected database acquisition"));
-    await expect(reports.capture(identity, "delegated", "relationships", input as ReportQuery))
+    await expect(reports.capture(identity, "relationships", input as ReportQuery))
       .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
     expect(connect).not.toHaveBeenCalled();
   });
@@ -135,7 +135,7 @@ it.each([" \u00a8 ", "J\u030c", "\ud835\udc09\u030c", "\u337f".repeat(64), "\u01
       rows: [{
         endpoint: saved.endpoint, query_json: saved.query, query_hash: saved.queryHash, revision: saved.selection.revision,
         evaluated_at: saved.evaluatedAt, expires_at: new Date(saved.selection.expiresAt), validated_at: saved.evaluatedAt,
-        token_mode: saved.tokenMode, metadata: { ...saved.metadata, publicationRevisions: saved.selection.publicationRevisions }, report_metadata: saved.report,
+        metadata: { ...saved.metadata, publicationRevisions: saved.selection.publicationRevisions }, report_metadata: saved.report,
       }],
     }));
     const context = await reports.contextInRead(client, identity, saved.selection.id);

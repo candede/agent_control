@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { acquireAuthorizedToken } from "../auth/msal.js";
 import { requireUserPublication } from "../db/dataSync.js";
 import { DataGenerations } from "../db/dataGenerations.js";
@@ -20,6 +20,8 @@ import { activitySourceRecord, directorySourceRecord } from "./userSourceRecords
 import { reportIdentity } from "./reportIdentity.js";
 import type { FetchLike } from "./graphPackages.js";
 import { observePeakMemory, observeTransactionResult } from "./peakMemory.js";
+
+beforeEach(() => { vi.spyOn(UserSourceStages.prototype, "preserveUnseen").mockResolvedValue(0); });
 
 vi.mock("../db/pool.js", () => ({
   pool: { options: { max: 4 },
@@ -265,8 +267,9 @@ describe("Users source failure diagnostics", () => {
       vi.spyOn(stages.generations, "fence").mockResolvedValue({ state: "staging" });
       vi.spyOn(stages.generations, "execute").mockImplementation(async (_input, work) => work(lease, new AbortController().signal));
       const result = await stages.execute({
-        scope: { kind: "principal", tenantId: lease.tenantId, principalId: "synthetic-principal",
-          tokenMode: "delegated", source: "app_activity", selector: "complete" },
+        scope: { kind: "tenant", tenantId: lease.tenantId, principalId: null,
+          tokenMode: "tenant", source: "app_activity", selector: "complete" },
+        actorPrincipalId: "synthetic-principal",
         sessionEpoch: "0", schemaVersion: 1, jobKind: "fixture", jobId: randomUUID(),
         observedAt: new Date(), expiresAt: new Date(), deadlineAt: new Date(Date.now() + 60_000), reserveBytes: 1,
       }, async () => { throw failure; }, { beforePublish: async () => undefined })
@@ -313,8 +316,9 @@ describe("Users source deadline and durable publication boundaries", () => {
     const counts = { rows: 1, children: 0, batches: 1, pages: 1, wireRows: 1, bytes: 10 };
     const readCounts = vi.spyOn(stages, "counts").mockResolvedValue(counts);
     const input = {
-      scope: { kind: "principal" as const, tenantId: lease.tenantId, principalId: "synthetic-principal",
-        tokenMode: "delegated" as const, source: "app_activity", selector: "complete" },
+      scope: { kind: "tenant" as const, tenantId: lease.tenantId, principalId: null,
+        tokenMode: "tenant" as const, source: "app_activity", selector: "complete" },
+      actorPrincipalId: "synthetic-principal",
       sessionEpoch: "0", schemaVersion: 1, jobKind: "fixture" as const, jobId: randomUUID(),
       observedAt: now, expiresAt: new Date(now.getTime() + 60_000),
       deadlineAt: new Date(now.getTime() + 1000), reserveBytes: 100,
@@ -618,8 +622,9 @@ describe("Users provider HTTP failure boundaries", () => {
           rows: 0, children: 0, batches: 0, pages: 1, wireRows: 0, bytes: 0 };
       });
       await expect(f.provider.refresh(f.stages, {
-        scope: { kind: "principal", tenantId: f.lease.tenantId, principalId: user.homeAccountId,
-          tokenMode: "delegated", source: boundary === "signed-download" ? "app_activity" : "directory", selector: "complete" },
+        scope: { kind: "tenant", tenantId: f.lease.tenantId, principalId: null,
+          tokenMode: "tenant", source: boundary === "signed-download" ? "app_activity" : "directory", selector: "complete" },
+        actorPrincipalId: user.homeAccountId,
         sessionEpoch: "0", schemaVersion: 1, jobKind: "data_sync", jobId: randomUUID(), runId: randomUUID(),
         observedAt: now, expiresAt: now, deadlineAt: now, reserveBytes: 1,
       }, { authorize: async () => "synthetic-token", assertCurrent })).rejects.toBe(reason);
@@ -900,8 +905,9 @@ describe("Users provider HTTP failure boundaries", () => {
     });
     const identity = { tenantId: f.lease.tenantId, principalId: "synthetic-principal", sessionEpoch: "0", authorizationHash: "synthetic" };
     const input = {
-      scope: { kind: "principal" as const, tenantId: identity.tenantId, principalId: identity.principalId,
-        tokenMode: "delegated" as const, source: "directory", selector: "complete" },
+      scope: { kind: "tenant" as const, tenantId: identity.tenantId, principalId: null,
+        tokenMode: "tenant" as const, source: "directory", selector: "complete" },
+      actorPrincipalId: identity.principalId,
       sessionEpoch: "0", schemaVersion: 1, jobKind: "fixture" as const, jobId: randomUUID(),
       observedAt: now, expiresAt: now, deadlineAt: now, reserveBytes: 1,
     };
@@ -941,8 +947,9 @@ describe("Users provider HTTP failure boundaries", () => {
         rows: 0, children: 0, batches: 0, pages: 1, wireRows: 0, bytes: 0 };
     });
     await expect(f.provider.refresh(f.stages, {
-      scope: { kind: "principal", tenantId: f.lease.tenantId, principalId: "synthetic-principal",
-        tokenMode: "delegated", source: "directory", selector: "complete" },
+      scope: { kind: "tenant", tenantId: f.lease.tenantId, principalId: null,
+        tokenMode: "tenant", source: "directory", selector: "complete" },
+      actorPrincipalId: "synthetic-principal",
       sessionEpoch: "0", schemaVersion: 1, jobKind: "fixture", jobId: randomUUID(),
       observedAt: now, expiresAt: now, deadlineAt: now, reserveBytes: 1,
     }, { authorize, assertCurrent: () => { if (!current) throw reason; } })).rejects.toBe(reason);
@@ -961,8 +968,9 @@ describe("Users provider HTTP failure boundaries", () => {
     });
     const identity = { tenantId: f.lease.tenantId, principalId: "synthetic-principal", sessionEpoch: "0", authorizationHash: "synthetic" };
     await expect(f.provider.refreshSources(f.stages, repository, identity, [{
-      scope: { kind: "principal", tenantId: identity.tenantId, principalId: identity.principalId,
-        tokenMode: "delegated", source: "directory", selector: "complete" },
+      scope: { kind: "tenant", tenantId: identity.tenantId, principalId: null,
+        tokenMode: "tenant", source: "directory", selector: "complete" },
+      actorPrincipalId: identity.principalId,
       sessionEpoch: "0", schemaVersion: 1, jobKind: "fixture", jobId: randomUUID(),
       observedAt: now, expiresAt: now, deadlineAt: now, reserveBytes: 1,
     }], { authorize: async () => "synthetic-token", signal: controller.signal })).rejects.toBe(reason);

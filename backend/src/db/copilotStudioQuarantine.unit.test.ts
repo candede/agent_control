@@ -418,12 +418,14 @@ describe("quarantine submission receipt identity without a database", () => {
   describe("quarantine lease and cancellation persistence without a database", () => {
     it("renews the fenced lease for each newly begun item rather than timing out a whole 25-item job", async () => {
       const f = leaseFixture();
+      f.job.status = "waiting_authorization";
       await f.repository.beginItem(f.lease);
       await f.repository.beginItem(f.lease);
       const statements = f.query.mock.calls.map(([text]) => String(text));
       const renewals = statements.filter(text => text.startsWith("UPDATE copilot_quarantine_jobs SET lease_until="));
       expect(renewals).toHaveLength(2);
       expect(renewals[0]).toContain("clock_timestamp()+interval '120 seconds'");
+      expect(renewals[0]).toContain("status='running'");
       expect(statements.findIndex(text => text.includes("lease_until>clock_timestamp() FOR UPDATE")))
         .toBeLessThan(statements.indexOf(renewals[0]));
       expect(statements.indexOf(renewals[0])).toBeLessThan(statements.findIndex(text => text.includes("SET status='running'")));
@@ -437,6 +439,31 @@ describe("quarantine submission receipt identity without a database", () => {
       expect(f.query.mock.calls.some(([text]) => String(text).includes("SET lease_until="))).toBe(false);
       expect(f.query).toHaveBeenCalledWith("ROLLBACK");
     });
+
+    it.each(["cancellation", "reconciliation"] as const)(
+      "preserves running-job recovery eligibility when %s aggregates a job with active work", async mode => {
+        const f = leaseFixture();
+        f.job.status = "running";
+        const normalQuery = f.query.getMockImplementation()!;
+        f.query.mockImplementation(async (...args) => {
+          const statement = String(args[0]);
+          if (statement.startsWith("UPDATE copilot_quarantine_jobs SET cancel_requested=")) return f.result([f.job]);
+          if (statement.startsWith("UPDATE copilot_quarantine_job_items SET")) return f.result([f.item]);
+          return normalQuery(...args);
+        });
+
+        if (mode === "cancellation") await f.repository.cancel(scope, f.job.id);
+        else await f.repository.recordReconciliation(scope, f.job, f.item, "verified_applied", target.directStatus, "Observed.");
+
+        const aggregate = f.query.mock.calls.find(([text]) => String(text).startsWith("UPDATE copilot_quarantine_jobs SET status=CASE"));
+        expect(aggregate).toBeDefined();
+        expect(String(aggregate?.[0])).toMatch(
+          /SET status=CASE\s+WHEN EXISTS\(SELECT 1 FROM copilot_quarantine_job_items WHERE job_id=\$1 AND status='running'\) THEN 'running'/,
+        );
+        expect(String(aggregate?.[0])).toContain("WHERE job_id=$1 AND status='queued') THEN 'waiting_authorization'");
+        expect(f.query).toHaveBeenCalledWith("COMMIT");
+      },
+    );
 
     it("cancels recovered queued work before computing job status", async () => {
       const f = leaseFixture();

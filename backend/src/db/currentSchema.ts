@@ -2015,21 +2015,18 @@ CREATE TABLE data_sync_source_jobs (
 
 CREATE TABLE data_sync_success_markers (
     tenant_id text NOT NULL
-  , principal_id text NOT NULL
   , source_id text NOT NULL
   , count integer
   , last_success_at timestamp with time zone NOT NULL
   , updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
   , CONSTRAINT data_sync_success_markers_count_check CHECK (count IS NULL OR count >= 0)
-  , CONSTRAINT data_sync_success_markers_principal_id_check CHECK (length(principal_id) >= 1
-                                                               AND length(principal_id) <= 256)
   , CONSTRAINT data_sync_success_markers_source_id_check CHECK (source_id = ANY(ARRAY[CAST('users' AS text)
                                                                                     , CAST('graph_packages' AS text)
                                                                                     , CAST('power_platform' AS text)
                                                                                     , CAST('usage_reports' AS text)]))
   , CONSTRAINT data_sync_success_markers_tenant_id_check CHECK (length(tenant_id) >= 1
                                                             AND length(tenant_id) <= 128)
-  , CONSTRAINT data_sync_success_markers_pkey PRIMARY KEY (tenant_id, principal_id, source_id)
+  , CONSTRAINT data_sync_success_markers_pkey PRIMARY KEY (tenant_id, source_id)
 );
 
 CREATE TABLE agent_usage_state (
@@ -2110,7 +2107,7 @@ CREATE TABLE agent_people_cache (
                                                      AND length(tenant_id) <= 128)
   , CONSTRAINT agent_people_cache_user_principal_name_check CHECK (length(user_principal_name) >= 1
                                                                AND length(user_principal_name) <= 320)
-  , CONSTRAINT agent_people_cache_pkey PRIMARY KEY (tenant_id, principal_id, object_id)
+  , CONSTRAINT agent_people_cache_pkey PRIMARY KEY (tenant_id, object_id)
 );
 
 CREATE TABLE agent_identity_cache (
@@ -2198,6 +2195,10 @@ CREATE TABLE data_scope_epochs (
                                            AND principal_id IS NOT NULL
                                            AND token_mode <> CAST('tenant' AS text)))
   , CONSTRAINT data_scope_epochs_epoch_check CHECK (epoch >= 0)
+  , CONSTRAINT tenant_inventory_owner CHECK (source NOT IN ('directory','app_activity','user_sources','agent_people',
+      'inventory_packages','inventory_power_platform','inventory_canonical') OR scope_kind='tenant')
+  , CONSTRAINT tenant_inventory_selector CHECK (source NOT IN ('inventory_packages','inventory_power_platform','inventory_canonical')
+      OR selector='complete')
   , CONSTRAINT data_scope_epochs_principal_id_check CHECK (length(principal_id) >= 1
                                                        AND length(principal_id) <= 256)
   , CONSTRAINT data_scope_epochs_scope_kind_check CHECK (scope_kind = ANY(ARRAY[CAST('tenant' AS text)
@@ -2223,6 +2224,9 @@ CREATE TABLE data_generations (
   , schema_version integer NOT NULL
   , scope_epoch bigint NOT NULL
   , session_epoch bigint NOT NULL
+  , actor_principal_id text
+  , actor_session_epoch bigint
+  , CONSTRAINT data_generation_actor CHECK ((actor_principal_id IS NULL) = (actor_session_epoch IS NULL))
   , expected_revision bigint NOT NULL
   , job_id uuid NOT NULL
   , run_id uuid
@@ -2603,6 +2607,7 @@ CREATE TABLE user_source_attempts (
   , error_code text
   , message text
   , observed_count integer
+  , retained_count integer DEFAULT 0 NOT NULL CHECK (retained_count>=0)
   , report_refresh_date date
   , report_period text DEFAULT CAST('D30' AS text) NOT NULL
   , CONSTRAINT user_source_attempts_error_code_check CHECK (error_code ~ CAST('^[a-z][a-z0-9_]{0,127}$' AS text))
@@ -2678,12 +2683,9 @@ CREATE TABLE user_source_identity_inputs (
 CREATE TABLE user_source_read_contexts (
     selection_id uuid NOT NULL
   , tenant_id text NOT NULL
-  , token_mode text NOT NULL
   , metadata jsonb NOT NULL
   , CONSTRAINT user_source_read_contexts_metadata_check CHECK (jsonb_typeof(metadata) = CAST('object' AS text)
                                                            AND octet_length(CAST(metadata AS text)) <= 8192)
-  , CONSTRAINT user_source_read_contexts_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                      , CAST('application' AS text)]))
   , CONSTRAINT user_source_read_contexts_pkey PRIMARY KEY (selection_id)
 );
 
@@ -2774,7 +2776,6 @@ CREATE TABLE official_usage_ingestion_rows (
 CREATE TABLE official_usage_read_contexts (
     selection_id uuid NOT NULL
   , tenant_id text NOT NULL
-  , token_mode text NOT NULL
   , metadata jsonb NOT NULL
   , report_metadata jsonb NOT NULL
   , set_id uuid
@@ -2782,8 +2783,6 @@ CREATE TABLE official_usage_read_contexts (
   , history_epoch bigint NOT NULL
   , CONSTRAINT official_usage_read_contexts_metadata_check CHECK (octet_length(CAST(metadata AS text)) <= 32768)
   , CONSTRAINT official_usage_read_contexts_report_metadata_check CHECK (octet_length(CAST(report_metadata AS text)) <= 32768)
-  , CONSTRAINT official_usage_read_contexts_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                         , CAST('application' AS text)]))
   , CONSTRAINT official_usage_read_contexts_pkey PRIMARY KEY (selection_id)
 );
 
@@ -2982,7 +2981,8 @@ CREATE TABLE power_platform_record_rows (
                                                              AND management = ANY(ARRAY[CAST('user_managed' AS text)
                                                                                       , CAST('organization_managed' AS text)
                                                                                       , CAST('unknown' AS text)]))
-                                                             OR (resource_type = CAST('microsoft.powerplatform/environments' AS text)
+                                                             OR (resource_type IS NOT NULL
+                                                             AND resource_type = CAST('microsoft.powerplatform/environments' AS text)
                                                              AND num_nonnulls(presence, link_state, availability, management) = 0))
   , CONSTRAINT power_platform_record_rows_content_hash_check CHECK (content_hash ~ CAST('^[a-f0-9]{64}$' AS text))
   , CONSTRAINT power_platform_record_rows_display_name_check CHECK (length(display_name) <= 512)
@@ -3339,14 +3339,11 @@ CREATE TABLE inventory_native_control_pending (
 
 CREATE TABLE inventory_people_revisions (
     tenant_id text NOT NULL
-  , principal_id text NOT NULL
   , revision bigint DEFAULT 1 NOT NULL
-  , CONSTRAINT inventory_people_revisions_principal_id_check CHECK (length(principal_id) >= 1
-                                                                AND length(principal_id) <= 256)
   , CONSTRAINT inventory_people_revisions_revision_check CHECK (revision > 0)
   , CONSTRAINT inventory_people_revisions_tenant_id_check CHECK (length(tenant_id) >= 1
                                                              AND length(tenant_id) <= 256)
-  , CONSTRAINT inventory_people_revisions_pkey PRIMARY KEY (tenant_id, principal_id)
+  , CONSTRAINT inventory_people_revisions_pkey PRIMARY KEY (tenant_id)
 );
 
 CREATE TABLE data_lifecycle_progress (
@@ -3524,8 +3521,7 @@ CREATE VIEW inventory_records
 CREATE VIEW inventory_live_sources
   AS SELECT canonical.identity AS agent_id
           , canonical.generation_id AS control_revision
-          , r.tenant_id
-          , scope.principal_id
+          , scope.tenant_id
           , scope.id AS canonical_scope_id
           , CASE
               WHEN r.domain = CAST('packages' AS text) THEN CAST('graph_packages' AS text)
@@ -3567,8 +3563,6 @@ CREATE VIEW inventory_live_sources
           INNER JOIN public.inventory_revisions AS revision ON revision.scope_id = root.scope_id
                                                            AND revision.revision = root.revision
           INNER JOIN public.data_generations AS generation ON generation.id = revision.generation_id
-          INNER JOIN public.data_principal_epochs AS principal ON principal.tenant_id = scope.tenant_id
-                                                              AND principal.principal_id = scope.principal_id
           INNER JOIN public.inventory_memberships AS membership ON membership.baseline_id = root.baseline_id
                                                                AND membership.valid_from_revision <= root.revision
                                                                AND (membership.valid_to_revision IS NULL
@@ -3579,10 +3573,11 @@ CREATE VIEW inventory_live_sources
                                                                AND member.identity = canonical.identity
           INNER JOIN public.inventory_records AS r ON r.generation_id = member.source_generation_id
                                                   AND r.identity = member.source_identity
+                                                  AND r.tenant_id = scope.tenant_id
           INNER JOIN public.data_scope_epochs AS source_scope ON source_scope.id = r.scope_id
           INNER JOIN public.data_generations AS source_generation ON source_generation.id = r.generation_id
      WHERE scope.source = CAST('inventory_canonical' AS text)
-       AND scope.token_mode = CAST('delegated' AS text)
+       AND scope.token_mode = CAST('tenant' AS text)
        AND scope.selector = CAST('complete' AS text)
        AND generation.scope_epoch = scope.epoch
        AND generation.session_epoch = scope.session_epoch
@@ -3592,16 +3587,15 @@ CREATE VIEW inventory_live_sources
        AND canonical.expires_at > clock_timestamp()
        AND r.expires_at > clock_timestamp()
        AND source_scope.tenant_id = scope.tenant_id
-       AND source_scope.principal_id = scope.principal_id
-       AND source_scope.token_mode = CAST('delegated' AS text)
+       AND source_scope.scope_kind = CAST('tenant' AS text)
+       AND source_scope.token_mode = CAST('tenant' AS text)
        AND source_generation.session_epoch = source_scope.session_epoch
        AND source_generation.state = ANY(ARRAY[CAST('published' AS text), CAST('retired' AS text)])
        AND source_generation.validated
        AND source_generation.expires_at > clock_timestamp()
        AND NOT EXISTS (SELECT 1
                        FROM public.inventory_control_pending AS pending
-                       WHERE pending.tenant_id = scope.tenant_id
-                         AND pending.principal_id = scope.principal_id)
+                       WHERE pending.tenant_id = scope.tenant_id)
        AND NOT EXISTS (SELECT 1
                        FROM public.inventory_reconciliation AS work
                        WHERE work.scope_id = scope.id
@@ -3628,8 +3622,8 @@ CREATE VIEW inventory_live_sources
                             INNER JOIN public.data_generations AS cg ON cg.id = cv.generation_id
                        WHERE candidate.current
                          AND candidate.tenant_id = scope.tenant_id
-                         AND cs.principal_id = scope.principal_id
-                         AND cs.token_mode = CAST('delegated' AS text)
+                         AND cs.scope_kind = CAST('tenant' AS text)
+                         AND cs.token_mode = CAST('tenant' AS text)
                          AND candidate.domain = ANY(ARRAY[CAST('packages' AS text)
                                                         , CAST('power_platform' AS text)])
                          AND cg.scope_epoch = cs.epoch
@@ -3893,16 +3887,16 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public', 'pg
 AS $$
 DECLARE source_scope record; removed integer;
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
-  PERFORM pg_advisory_xact_lock(hashtextextended('package-refresh:'||NEW.tenant_id||':'||NEW.principal_id,0));
-  PERFORM pg_advisory_xact_lock(hashtextextended('power-platform:'||NEW.tenant_id||':'||NEW.principal_id,0));
-  IF EXISTS(SELECT 1 FROM public.package_refresh_jobs WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('package-refresh:'||NEW.tenant_id,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('power-platform:'||NEW.tenant_id,0));
+  IF EXISTS(SELECT 1 FROM public.package_refresh_jobs WHERE tenant_id=NEW.tenant_id
     AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp())
-    OR EXISTS(SELECT 1 FROM public.power_platform_refresh_jobs WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id
+    OR EXISTS(SELECT 1 FROM public.power_platform_refresh_jobs WHERE tenant_id=NEW.tenant_id
     AND status IN ('waiting_authorization','running') AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp())
   THEN RAISE EXCEPTION USING ERRCODE='PDS01',
     MESSAGE='Finish or cancel active Graph package and Power Platform refresh jobs before clearing saved data.'; END IF;
-  FOR source_scope IN SELECT id,source FROM public.data_scope_epochs WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id
+  FOR source_scope IN SELECT id,source FROM public.data_scope_epochs WHERE tenant_id=NEW.tenant_id AND scope_kind='tenant'
     AND source IN ('directory','app_activity','user_sources','agent_people','inventory_packages','inventory_power_platform','inventory_canonical')
     ORDER BY id FOR UPDATE
   LOOP
@@ -3929,7 +3923,7 @@ BEGIN
     EXIT WHEN removed=0;
   END LOOP;
   DELETE FROM public.package_inventory_snapshots WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id;
-  DELETE FROM public.data_sync_success_markers WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id
+  DELETE FROM public.data_sync_success_markers WHERE tenant_id=NEW.tenant_id
     AND source_id IN ('users','graph_packages','power_platform');
   RETURN NEW;
 END$$;
@@ -3939,7 +3933,7 @@ RETURNS trigger
 LANGUAGE plpgsql SET search_path TO 'pg_catalog', 'public', 'pg_temp'
 AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.reviewed_by,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
   IF TG_OP='UPDATE' THEN RAISE EXCEPTION 'reviewed usage associations are immutable; remove before reassignment'; END IF;
   IF NOT EXISTS (
     SELECT 1 FROM public.official_usage_state state
@@ -3963,45 +3957,15 @@ BEGIN
   ) THEN RAISE EXCEPTION 'usage association requires an agent in the active accepted Agents export'; END IF;
 
   IF NOT EXISTS (
-    SELECT 1 FROM public.data_scope_epochs scope
-    JOIN public.inventory_roots root ON root.scope_id=scope.id AND root.current
-    JOIN public.inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
-    JOIN public.data_generations generation ON generation.id=revision.generation_id
-    JOIN public.data_principal_epochs principal ON principal.tenant_id=scope.tenant_id AND principal.principal_id=scope.principal_id
-    JOIN public.inventory_memberships membership ON membership.baseline_id=root.baseline_id
-      AND membership.valid_from_revision<=root.revision AND (membership.valid_to_revision IS NULL OR membership.valid_to_revision>root.revision)
-    JOIN public.unified_agent_rows canonical ON canonical.generation_id=membership.generation_id AND canonical.identity=membership.identity
-    JOIN public.unified_agent_memberships member ON member.generation_id=canonical.generation_id AND member.identity=canonical.identity
-    JOIN public.inventory_records r ON r.generation_id=member.source_generation_id AND r.identity=member.source_identity
-    JOIN public.data_scope_epochs source_scope ON source_scope.id=r.scope_id
-    JOIN public.data_generations source_generation ON source_generation.id=r.generation_id
-    WHERE scope.tenant_id=NEW.tenant_id AND scope.principal_id=NEW.reviewed_by
-      AND scope.source='inventory_canonical' AND scope.token_mode='delegated' AND scope.selector='complete'
-      AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
-      AND generation.state='published' AND generation.validated AND generation.expires_at>clock_timestamp()
-      AND canonical.expires_at>clock_timestamp() AND r.expires_at>clock_timestamp()
-      AND source_scope.tenant_id=scope.tenant_id AND source_scope.principal_id=scope.principal_id AND source_scope.token_mode='delegated'
-      AND source_generation.session_epoch=source_scope.session_epoch
-      AND source_generation.state IN ('published','retired') AND source_generation.validated
-      AND (NEW.source='graph_packages' AND r.domain='packages' AND r.native_id=NEW.native_id
-        OR NEW.source='power_platform' AND r.domain='power_platform' AND r.resource_type='microsoft.copilotstudio/agents'
-          AND coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'')=${normalizeEnvironmentIdentitySql("NEW.environment_id")}
-          AND (${normalizeNativeIdentitySql("r.native_id")})=(${normalizeNativeIdentitySql("NEW.native_id")}))
-      AND NOT EXISTS(SELECT 1 FROM public.inventory_reconciliation work WHERE work.scope_id=scope.id
-        AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL))
-      AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(revision.inputs)
-        input("scopeId" uuid,"baselineId" uuid,revision bigint,epoch bigint,"expiresAt" timestamptz)
-        LEFT JOIN public.inventory_roots current ON current.scope_id=input."scopeId" AND current.current
-        LEFT JOIN public.data_scope_epochs epoch ON epoch.id=input."scopeId"
-        WHERE current.baseline_id IS DISTINCT FROM input."baselineId" OR current.revision IS DISTINCT FROM input.revision
-          OR epoch.epoch IS DISTINCT FROM input.epoch OR input."expiresAt"<=clock_timestamp())
-      AND NOT EXISTS(SELECT 1 FROM public.inventory_roots candidate JOIN public.data_scope_epochs cs ON cs.id=candidate.scope_id
-        JOIN public.inventory_revisions cv ON cv.scope_id=candidate.scope_id AND cv.revision=candidate.revision
-        JOIN public.data_generations cg ON cg.id=cv.generation_id
-        WHERE candidate.current AND candidate.tenant_id=scope.tenant_id AND cs.principal_id=scope.principal_id
-          AND cs.token_mode='delegated' AND candidate.domain IN ('packages','power_platform')
-          AND cg.scope_epoch=cs.epoch AND cg.session_epoch=cs.session_epoch AND cg.expires_at>clock_timestamp()
-          AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(revision.inputs) input("scopeId" uuid) WHERE input."scopeId"=candidate.scope_id))
+    SELECT 1 FROM public.inventory_live_sources source
+    WHERE source.tenant_id=NEW.tenant_id AND source.authority_expires_at>clock_timestamp()
+      AND (NEW.source='graph_packages' AND source.source='graph_packages' AND source.native_id=NEW.native_id
+        OR NEW.source='power_platform' AND source.source='power_platform'
+          AND source.normalized_environment_id=${normalizeEnvironmentIdentitySql("NEW.environment_id")}
+          AND source.normalized_native_id=${normalizeNativeIdentitySql("NEW.native_id")}
+          AND EXISTS(SELECT 1 FROM public.power_platform_record_rows r
+            WHERE r.generation_id=source.source_generation_id AND r.identity=source.source_identity
+              AND r.resource_type='microsoft.copilotstudio/agents'))
   ) THEN RAISE EXCEPTION 'usage association requires an authorized current native source'; END IF;
   RETURN NEW;
 END$$;
@@ -4031,8 +3995,8 @@ RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public', 'pg_temp'
 AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
-  DELETE FROM public.agent_people_cache WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id;
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
+  DELETE FROM public.agent_people_cache WHERE tenant_id=NEW.tenant_id;
   RETURN NEW;
 END$$;
 
@@ -4041,7 +4005,7 @@ RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public', 'pg_temp'
 AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
   DELETE FROM public.agent_identity_cache WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id;
   RETURN NEW;
 END$$;
@@ -4066,10 +4030,10 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF (NEW.id,NEW.scope_id,NEW.tenant_id,NEW.schema_version,NEW.scope_epoch,NEW.session_epoch,
+  IF (NEW.id,NEW.scope_id,NEW.tenant_id,NEW.schema_version,NEW.scope_epoch,NEW.session_epoch,NEW.actor_principal_id,NEW.actor_session_epoch,
       NEW.expected_revision,NEW.job_id,NEW.run_id,NEW.job_kind,NEW.owner,NEW.lease_version,
       NEW.deadline_at,NEW.created_at,NEW.observed_at,NEW.expires_at)
-    IS DISTINCT FROM (OLD.id,OLD.scope_id,OLD.tenant_id,OLD.schema_version,OLD.scope_epoch,OLD.session_epoch,
+    IS DISTINCT FROM (OLD.id,OLD.scope_id,OLD.tenant_id,OLD.schema_version,OLD.scope_epoch,OLD.session_epoch,OLD.actor_principal_id,OLD.actor_session_epoch,
       OLD.expected_revision,OLD.job_id,OLD.run_id,OLD.job_kind,OLD.owner,OLD.lease_version,
       OLD.deadline_at,OLD.created_at,OLD.observed_at,OLD.expires_at)
   THEN RAISE EXCEPTION 'data_generation_intent_immutable'; END IF;
@@ -4128,6 +4092,8 @@ BEGIN
     WHERE g.id=NEW.generation_id AND g.scope_id=NEW.scope_id AND g.tenant_id=NEW.tenant_id
       AND g.expected_revision=OLD.revision AND g.state='validating' AND g.validated
       AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.cancellation=0
+      AND (g.actor_principal_id IS NULL OR EXISTS(SELECT 1 FROM data_principal_epochs actor
+        WHERE actor.tenant_id=g.tenant_id AND actor.principal_id=g.actor_principal_id AND actor.epoch=g.actor_session_epoch))
       AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp())
   THEN RAISE EXCEPTION 'data_head_fenced'; END IF;
   RETURN NEW;
@@ -4147,6 +4113,8 @@ BEGIN
   END IF;
   IF g.state<>'staging' OR g.lease_until<=clock_timestamp() OR g.deadline_at<=clock_timestamp() OR g.cancellation<>0
     OR NOT EXISTS(SELECT 1 FROM data_scope_epochs s WHERE s.id=g.scope_id AND s.epoch=g.scope_epoch AND s.session_epoch=g.session_epoch)
+    OR g.actor_principal_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM data_principal_epochs actor
+      WHERE actor.tenant_id=g.tenant_id AND actor.principal_id=g.actor_principal_id AND actor.epoch=g.actor_session_epoch)
   THEN RAISE EXCEPTION 'data_writer_fenced'; END IF;
   IF TG_TABLE_NAME NOT IN ('data_generation_batches','data_generation_pages') THEN
     IF NEW.schema_version<>g.schema_version THEN RAISE EXCEPTION 'data_schema_version'; END IF;
@@ -4349,7 +4317,7 @@ BEGIN
     SELECT array_agg(id ORDER BY id) INTO ids FROM (
       SELECT s.id FROM public.data_scope_epochs s WHERE s.source='user_sources' AND s.selector='complete'
         AND (previous IS NULL OR s.id>previous)
-        AND EXISTS(SELECT 1 FROM changed c WHERE c.tenant_id=s.tenant_id AND c.principal_id=s.principal_id)
+        AND EXISTS(SELECT 1 FROM changed c WHERE c.tenant_id=s.tenant_id)
       ORDER BY s.id LIMIT 250 FOR UPDATE
     ) scopes;
     EXIT WHEN ids IS NULL;
@@ -4364,7 +4332,7 @@ RETURNS trigger
 LANGUAGE plpgsql SET search_path TO 'pg_catalog', 'public', 'pg_temp'
 AS $$
 BEGIN
-  IF (NEW.tenant_id,NEW.principal_id,NEW.object_id) IS DISTINCT FROM (OLD.tenant_id,OLD.principal_id,OLD.object_id)
+  IF (NEW.tenant_id,NEW.object_id) IS DISTINCT FROM (OLD.tenant_id,OLD.object_id)
   THEN RAISE EXCEPTION 'agent_people_identity_immutable'; END IF;
   RETURN NEW;
 END$$;
@@ -4432,9 +4400,9 @@ AS $$
 DECLARE source_scope uuid;
 BEGIN
   IF NEW.observation_kind NOT IN ('block','access') OR NEW.token_mode<>'delegated' THEN RETURN NEW; END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
-  FOR source_scope IN SELECT id FROM public.data_scope_epochs WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.principal_id
-    AND token_mode='delegated' AND source='inventory_packages' ORDER BY id FOR UPDATE
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
+  FOR source_scope IN SELECT id FROM public.data_scope_epochs WHERE tenant_id=NEW.tenant_id AND scope_kind='tenant'
+    AND token_mode='tenant' AND source='inventory_packages' ORDER BY id FOR UPDATE
   LOOP
     UPDATE public.data_scope_epochs SET epoch=epoch+1 WHERE id=source_scope;
     UPDATE public.data_generations SET state='cancelled',cancellation=cancellation+1,reserved_bytes=byte_count
@@ -4513,6 +4481,8 @@ BEGIN
     OR EXISTS(SELECT 1 FROM inventory_roots WHERE baseline_id=NEW.id)
     OR EXISTS(SELECT 1 FROM unified_agent_memberships WHERE source_generation_id=NEW.id)
     OR EXISTS(SELECT 1 FROM inventory_exact_heads WHERE generation_id=NEW.id)
+    OR EXISTS(SELECT 1 FROM inventory_records WHERE catalog_generation=NEW.id
+      OR detail_generation=NEW.id OR control_generation=NEW.id)
   ) THEN RAISE EXCEPTION 'inventory_generation_reachable'; END IF;
   RETURN NEW;
 END$$;
@@ -4558,41 +4528,16 @@ BEGIN
   RETURN NULL;
 END$$;
 
-CREATE FUNCTION fence_inventory_application_configuration()
-RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public', 'pg_temp'
-AS $$
-DECLARE tenant text; capability text; item record;
-BEGIN
-  tenant:=CASE WHEN TG_OP='DELETE' THEN OLD.tenant_id ELSE NEW.tenant_id END;
-  capability:=CASE WHEN TG_OP='DELETE' THEN OLD.capability_id ELSE NEW.capability_id END;
-  IF capability<>'graph.package.read.application' THEN RETURN NULL; END IF;
-  IF TG_OP='UPDATE' AND (NEW.enabled,NEW.shared_data_scope) IS NOT DISTINCT FROM (OLD.enabled,OLD.shared_data_scope)
-    THEN RETURN NULL; END IF;
-  FOR item IN SELECT principal_id FROM public.data_scope_epochs WHERE tenant_id=tenant
-    AND source='inventory_packages' AND token_mode='application' GROUP BY principal_id ORDER BY principal_id
-  LOOP
-    PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||tenant||':'||item.principal_id,0));
-  END LOOP;
-  FOR item IN SELECT id FROM public.data_scope_epochs WHERE tenant_id=tenant
-    AND source='inventory_packages' AND token_mode='application' ORDER BY id FOR UPDATE
-  LOOP
-    UPDATE public.data_scope_epochs SET epoch=epoch+1 WHERE id=item.id;
-    UPDATE public.data_generations SET state='cancelled',cancellation=cancellation+1,reserved_bytes=byte_count
-      WHERE scope_id=item.id AND state IN ('staging','validating');
-  END LOOP;
-  RETURN NULL;
-END$$;
-
 CREATE FUNCTION protect_inventory_identity_cache()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public', 'pg_temp' SET plan_cache_mode TO 'force_generic_plan'
 AS $$
 DECLARE resource_identity text;
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
   SELECT source.source_identity INTO resource_identity FROM public.inventory_live_sources source
-    WHERE source.tenant_id=NEW.tenant_id AND source.principal_id=NEW.principal_id AND source.source='power_platform'
+    WHERE source.tenant_id=NEW.tenant_id AND source.source='power_platform'
+      AND source.authority_expires_at>clock_timestamp()
       AND source.source_generation_id=NEW.snapshot_id AND source.agent_id=substr(NEW.record_id,7)
       AND source.native_id=NEW.native_id AND source.environment_id=NEW.environment_id LIMIT 1;
   IF resource_identity IS NULL THEN RAISE EXCEPTION 'agent_identity_source_changed'; END IF;
@@ -4611,24 +4556,14 @@ BEGIN
     JOIN public.data_scope_epochs scope ON scope.id=f.scope_id
     WHERE f.kind='identifier' AND f.payload->>'kind'='entra_agent_id'
       AND md5(lower(f.value))=md5(NEW.candidate_id::text) AND lower(f.value)=NEW.candidate_id::text
-      AND scope.tenant_id=NEW.tenant_id AND scope.principal_id=NEW.principal_id
-      AND scope.source='inventory_power_platform' AND scope.token_mode='delegated')
+      AND scope.tenant_id=NEW.tenant_id AND scope.scope_kind='tenant'
+      AND scope.source='inventory_power_platform' AND scope.token_mode='tenant')
     SELECT 1 FROM candidates candidate JOIN public.inventory_live_sources other
       ON other.source_generation_id=candidate.generation_id AND other.source_identity=candidate.identity
-    WHERE other.tenant_id=NEW.tenant_id AND other.principal_id=NEW.principal_id AND other.source='power_platform'
+    WHERE other.tenant_id=NEW.tenant_id AND other.source='power_platform'
+      AND other.authority_expires_at>clock_timestamp()
       AND other.agent_id<>substr(NEW.record_id,7))
   THEN RAISE EXCEPTION 'agent_identity_source_changed'; END IF;
-  RETURN NEW;
-END$$;
-
-CREATE FUNCTION inventory_require_control_publication()
-RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public'
-AS $$
-BEGIN
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.reviewed_by,0));
-  IF EXISTS(SELECT 1 FROM public.inventory_control_pending WHERE tenant_id=NEW.tenant_id AND principal_id=NEW.reviewed_by)
-    THEN RAISE EXCEPTION 'inventory control publication pending'; END IF;
   RETURN NEW;
 END$$;
 
@@ -4659,14 +4594,14 @@ AS $$
 DECLARE target record;
 BEGIN
   IF NOT NEW.verified_readback THEN RETURN NEW; END IF;
-  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id||':'||NEW.principal_id,0));
+  PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
   FOR target IN
     SELECT scope.id,r.identity FROM public.data_scope_epochs scope
     JOIN public.inventory_roots root ON root.scope_id=scope.id AND root.current
     JOIN public.inventory_memberships member ON member.baseline_id=root.baseline_id
       AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
     JOIN public.power_platform_record_rows r ON r.generation_id=member.generation_id AND r.identity=member.identity
-    WHERE scope.tenant_id=NEW.tenant_id AND scope.principal_id=NEW.principal_id AND scope.token_mode='delegated'
+    WHERE scope.tenant_id=NEW.tenant_id AND scope.scope_kind='tenant' AND scope.token_mode='tenant'
       AND scope.source='inventory_power_platform' AND r.resource_type='microsoft.copilotstudio/agents'
       AND (${normalizeEnvironmentIdentitySql("r.environment_id")})=(${normalizeEnvironmentIdentitySql("NEW.environment_id")})
       AND r.native_id=NEW.resource_native_id
@@ -4680,7 +4615,8 @@ BEGIN
       WHERE scope_id=target.id AND state IN ('staging','validating');
     INSERT INTO public.inventory_native_control_pending(tenant_id,principal_id,scope_id,identity,observation_id)
       VALUES(NEW.tenant_id,NEW.principal_id,target.id,target.identity,NEW.id)
-      ON CONFLICT(scope_id,identity) DO UPDATE SET observation_id=EXCLUDED.observation_id,updated_at=clock_timestamp();
+      ON CONFLICT(scope_id,identity) DO UPDATE SET principal_id=EXCLUDED.principal_id,
+        observation_id=EXCLUDED.observation_id,updated_at=clock_timestamp();
   END LOOP;
   RETURN NEW;
 END$$;
@@ -4698,17 +4634,17 @@ CREATE FUNCTION inventory_observe_people()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'pg_catalog', 'public'
 AS $$
-DECLARE after_tenant text:=''; after_principal text:=''; actor record; changed_count integer;
+DECLARE after_tenant text:=''; actor record; changed_count integer;
 BEGIN
   LOOP
     changed_count:=0;
-    FOR actor IN SELECT DISTINCT tenant_id COLLATE "C" AS tenant_id,principal_id COLLATE "C" AS principal_id FROM changed
-      WHERE (tenant_id COLLATE "C",principal_id COLLATE "C")>(after_tenant COLLATE "C",after_principal COLLATE "C")
-      ORDER BY 1,2 LIMIT 250
+    FOR actor IN SELECT DISTINCT tenant_id COLLATE "C" AS tenant_id FROM changed
+      WHERE tenant_id COLLATE "C">after_tenant COLLATE "C"
+      ORDER BY 1 LIMIT 250
     LOOP
-      INSERT INTO public.inventory_people_revisions(tenant_id,principal_id) VALUES(actor.tenant_id,actor.principal_id)
-        ON CONFLICT(tenant_id,principal_id) DO UPDATE SET revision=inventory_people_revisions.revision+1;
-      after_tenant:=actor.tenant_id; after_principal:=actor.principal_id; changed_count:=changed_count+1;
+      INSERT INTO public.inventory_people_revisions(tenant_id) VALUES(actor.tenant_id)
+        ON CONFLICT(tenant_id) DO UPDATE SET revision=inventory_people_revisions.revision+1;
+      after_tenant:=actor.tenant_id; changed_count:=changed_count+1;
     END LOOP;
     EXIT WHEN changed_count=0;
   END LOOP;
@@ -5155,7 +5091,8 @@ BEGIN
       OR parent.deadline_at<=clock_timestamp() OR parent.cancellation<>0
       OR NOT EXISTS(SELECT 1 FROM public.data_scope_epochs s WHERE s.id=parent.scope_id
         AND s.epoch=parent.scope_epoch AND s.session_epoch=parent.session_epoch)
-
+      OR parent.actor_principal_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.data_principal_epochs actor
+        WHERE actor.tenant_id=parent.tenant_id AND actor.principal_id=parent.actor_principal_id AND actor.epoch=parent.actor_session_epoch)
       THEN RAISE EXCEPTION 'data_writer_fenced'; END IF;
     IF batch.first_schema<>parent.schema_version OR batch.last_schema<>parent.schema_version
       THEN RAISE EXCEPTION 'data_schema_version'; END IF;
@@ -5178,6 +5115,8 @@ BEGIN
       OR parent.deadline_at<=clock_timestamp() OR parent.cancellation<>0
       OR NOT EXISTS(SELECT 1 FROM public.data_scope_epochs s WHERE s.id=parent.scope_id
         AND s.epoch=parent.scope_epoch AND s.session_epoch=parent.session_epoch)
+      OR parent.actor_principal_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.data_principal_epochs actor
+        WHERE actor.tenant_id=parent.tenant_id AND actor.principal_id=parent.actor_principal_id AND actor.epoch=parent.actor_session_epoch)
       OR EXISTS(SELECT 1 FROM public.inventory_worker_pins p
         JOIN public.data_scope_epochs s ON s.id=p.scope_id WHERE p.worker_id=parent.job_id
           AND (p.epoch<>s.epoch OR p.expires_at<=clock_timestamp()))
@@ -5616,6 +5555,15 @@ CREATE INDEX package_record_rows_publisher
 CREATE INDEX package_record_rows_modified
   ON package_record_rows (scope_id, modified_at, identity);
 
+CREATE INDEX package_record_rows_catalog_generation
+  ON package_record_rows (catalog_generation);
+
+CREATE INDEX package_record_rows_detail_generation
+  ON package_record_rows (detail_generation);
+
+CREATE INDEX package_record_rows_control_generation
+  ON package_record_rows (control_generation);
+
 CREATE INDEX power_platform_record_rows_display
   ON power_platform_record_rows (scope_id, ("left"(sort_key, 64)) COLLATE "C", identity);
 
@@ -5631,6 +5579,15 @@ CREATE INDEX power_platform_record_rows_publisher
 CREATE INDEX power_platform_record_rows_modified
   ON power_platform_record_rows (scope_id, modified_at, identity);
 
+CREATE INDEX power_platform_record_rows_catalog_generation
+  ON power_platform_record_rows (catalog_generation);
+
+CREATE INDEX power_platform_record_rows_detail_generation
+  ON power_platform_record_rows (detail_generation);
+
+CREATE INDEX power_platform_record_rows_control_generation
+  ON power_platform_record_rows (control_generation);
+
 CREATE INDEX unified_agent_rows_display
   ON unified_agent_rows (scope_id, ("left"(sort_key, 64)) COLLATE "C", identity);
 
@@ -5645,6 +5602,15 @@ CREATE INDEX unified_agent_rows_publisher
 
 CREATE INDEX unified_agent_rows_modified
   ON unified_agent_rows (scope_id, modified_at, identity);
+
+CREATE INDEX unified_agent_rows_catalog_generation
+  ON unified_agent_rows (catalog_generation);
+
+CREATE INDEX unified_agent_rows_detail_generation
+  ON unified_agent_rows (detail_generation);
+
+CREATE INDEX unified_agent_rows_control_generation
+  ON unified_agent_rows (control_generation);
 
 CREATE INDEX inventory_exact_newer
   ON inventory_exact_heads (scope_id, observation_epoch, read_started_at, identity);
@@ -6379,23 +6345,11 @@ CREATE TRIGGER job_results_delete
   FOR EACH STATEMENT
     EXECUTE PROCEDURE public.advance_job_result_revision();
 
-CREATE TRIGGER fence_inventory_application_configuration
-  AFTER INSERT OR DELETE OR UPDATE
-  ON capability_configuration
-  FOR EACH ROW
-    EXECUTE PROCEDURE public.fence_inventory_application_configuration();
-
 CREATE TRIGGER protect_inventory_identity_cache
   BEFORE INSERT OR UPDATE
   ON agent_identity_cache
   FOR EACH ROW
     EXECUTE PROCEDURE public.protect_inventory_identity_cache();
-
-CREATE TRIGGER inventory_usage_control_fence
-  BEFORE INSERT OR UPDATE
-  ON agent_usage_associations
-  FOR EACH ROW
-    EXECUTE PROCEDURE public.inventory_require_control_publication();
 
 CREATE TRIGGER inventory_mutation_stage_immutable
   BEFORE UPDATE
@@ -6666,15 +6620,7 @@ REVOKE ALL PRIVILEGES
   FROM PUBLIC;
 
 REVOKE ALL PRIVILEGES
-  ON FUNCTION fence_inventory_application_configuration ()
-  FROM PUBLIC;
-
-REVOKE ALL PRIVILEGES
   ON FUNCTION protect_inventory_identity_cache ()
-  FROM PUBLIC;
-
-REVOKE ALL PRIVILEGES
-  ON FUNCTION inventory_require_control_publication ()
   FROM PUBLIC;
 
 REVOKE ALL PRIVILEGES

@@ -48,7 +48,7 @@ function fixture(beforeRead?: () => void) {
     if (typeof statement !== "string") throw new Error("Unexpected query shape.");
     if (statement.startsWith("SELECT set_config")) return result();
     if (statement.includes("FROM inventory_read_contexts c")) return result([{
-      root_scope_id: "scope", source: "inventory_canonical", token_mode: "delegated",
+      root_scope_id: "scope", source: "inventory_canonical", token_mode: "tenant",
       association_revision: "0", query_values: {}, report_context: data,
     }]);
     if (statement.includes("inventory_association_revision")) return result([{ revision: "0" }]);
@@ -123,7 +123,7 @@ describe("selected inventory request snapshots", () => {
     const { inventory, readQuery, client, data } = fixture();
     const context: Parameters<InventoryQueries["resolveControlReferencesInRead"]>[1] = {
       data, selectionId: "selection", expiresAt: at.getTime() + 60_000, scopeId: "scope",
-      baselineId: "baseline", revision: "1", source: "inventory_canonical", tokenMode: "delegated", query: {},
+      baselineId: "baseline", revision: "1", source: "inventory_canonical", tokenMode: "tenant", query: {},
     };
     readQuery.mockImplementation((_sql, values) => {
       const requested = JSON.parse(String(values?.at(-1))) as { ordinal: number; native: string }[];
@@ -199,6 +199,57 @@ describe("saved package detail reconstruction", () => {
     });
     await expect(inventory.packageDetail("selection", identity, "package"))
       .rejects.toMatchObject({ status: 413, code: "inventory_detail_bytes" });
+  });
+});
+
+describe("native inventory name pagination", () => {
+  it("does not let environment rows consume a Power Platform-only agent page", async () => {
+    const { inventory, client, readQuery, data } = fixture();
+    const context: Parameters<InventoryQueries["pageInRead"]>[1] = {
+      data, selectionId: "selection", expiresAt: at.getTime() + 60_000, scopeId: "scope",
+      baselineId: "baseline", revision: "1", source: "inventory_power_platform",
+      query: { inventoryScope: "power_platform_only" },
+    };
+    const counts = { total: "3", linked: "0", graphOnly: "0", powerPlatformOnly: "1", ambiguous: "0", conflicting: "0" };
+    const records = [
+      { identity: "environment-a", presence: null },
+      { identity: "environment-b", presence: null },
+      { identity: "agent", presence: "power_platform" },
+    ];
+    readQuery.mockImplementation((sql, values) => {
+      if (sql.startsWith("SELECT identity FROM (")) {
+        return result(records.filter(row => !sql.includes("r.presence='power_platform'") || row.presence === "power_platform").slice(0, 2));
+      }
+      if (sql.includes("candidates AS MATERIALIZED")) {
+        const ids = values?.[12] as string[];
+        return result(records.filter(row => row.presence === "power_platform" && ids.includes(row.identity)).map(row => ({
+          ...row, native_id: row.identity, domain: "power_platform", resource_type: "microsoft.copilotstudio/agents",
+          source_residual: {}, display_name: "Agent", environment_id: null, link_state: "unmatched",
+          availability: "unknown", management: "unknown", identity_info: {}, members: [], columns: {},
+          responses: null, active_users: null, last_activity: null, association_count: 0, candidate_count: 1, bytes: 100,
+        })));
+      }
+      if (sql.includes("summary_facts AS MATERIALIZED")) return result([{
+        summary: counts, scopeSummary: { ...counts, total: "1" }, filteredSummary: { ...counts, total: "1" },
+        mutationTargets: { packages: "0" },
+        inventoryOverview: { availableToUsers: "0", organizationCreated: "0", teamsAvailable: "0", createdOrAvailable: "0" },
+      }]);
+      if (sql.startsWith("SELECT r.baseline_id")) return result([{ baseline_id: "baseline", revision: "1", status: "idle" }]);
+      if (sql.startsWith("WITH roots AS")) return result();
+      if (sql.startsWith("SELECT EXISTS")) return result([{ expired: false }]);
+      if (sql.startsWith("SELECT count(*) FILTER(WHERE r.domain='packages')")) return result([{}]);
+      if (sql.startsWith("SELECT m.identity,r.observed_at") || sql.startsWith("WITH inputs AS")) return result();
+      throw new Error("Unexpected native inventory page query.");
+    });
+
+    const page = await inventory.pageInRead(client, context, {
+      revision: "revision", query_hash: "query", evaluated_at: at, validated_at: at,
+      expires_at: new Date(at.getTime() + 60_000),
+    }, "selection", identity, { limit: 1 });
+
+    expect(page.value.map(row => row.id)).toEqual(["agent"]);
+    expect(page.page.nextCursor).toBeNull();
+    expect(page.counts.scoped).toBe(1);
   });
 });
 

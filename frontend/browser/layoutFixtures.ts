@@ -62,13 +62,12 @@ const packages: PackagePage = {
     validatedAt: observedAt, publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
   page: { limit: 50, nextCursor: null, previousCursor: null },
   freshness: { state: "current", capturedRevision: "1", sources: [] },
-  mode: "delegated",
 };
 
 const graphObservation = {
   id: "22222222-2222-4222-8222-222222222222", snapshotId: "22222222-2222-4222-8222-222222222222",
   observedAt, expiresAt, current: true as const,
-  tokenMode: "delegated" as const, scopeKind: "broad" as const,
+  scopeKind: "broad" as const,
   observedCount: packages.counts.total, totalRecords: packages.counts.total,
 };
 const agentSummary = { total: 3, linked: 0, graphOnly: 3, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };

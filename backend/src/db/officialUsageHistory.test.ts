@@ -50,7 +50,7 @@ async function bundle(identity: SelectionIdentity, options: {
   return { bundleId, preview, accept: () => imports.acceptBundle(identity, bundleId, preview) };
 }
 async function history(identity: SelectionIdentity, limit = 50) {
-  const selected = await reports.capture(identity, "delegated", "history");
+  const selected = await reports.capture(identity, "history");
   return reports.page(selected.id, identity, { limit }) as Promise<ReportPage<ReportHistorySet>>;
 }
 async function observed(identity: SelectionIdentity, selectionId: string, setId: string) {
@@ -58,7 +58,7 @@ async function observed(identity: SelectionIdentity, selectionId: string, setId:
   return reports.page(selectionId, identity, { endpoint: "observations", child: setId, limit: 3 }) as Promise<ReportPage<ReportObservation>>;
 }
 async function selectedAgents(identity: SelectionIdentity, setId?: string, search?: string) {
-  const selected = await reports.capture(identity, "delegated", "official_agents", { ...(setId ? { setId } : {}), ...(search ? { search } : {}) });
+  const selected = await reports.capture(identity, "official_agents", { ...(setId ? { setId } : {}), ...(search ? { search } : {}) });
   return reports.page(selected.id, identity, { limit: 1 });
 }
 async function remove(identity: SelectionIdentity, setId: string) {

@@ -108,11 +108,11 @@ If a durable package job result is missing, queued, still running, waiting for a
 
 Use a dedicated Copilot Studio agent in an approved environment.
 
-Two unused inverse approval records created by `AgentControl.Admin` are required for one exact target. The same Admin may create both; the executing Admin principal must differ from every approving principal. Each approver selects the exact native target from their own current private inventory snapshot; different approvers must not reuse another principal's snapshot UUID. Admin includes Viewer inventory access, but tenant/principal isolation still prevents one Admin from reusing another principal's private snapshot UUID. The original approval contains the exact direct provider prestate and exact `lastUpdateTimeUtc`; the future inverse approval must set `prestateProviderUpdatedAt` to `null`. The application binds restoration to the original direction's verified readback timestamp. A caller cannot predict, fabricate or replace that future timestamp.
+Two unused inverse approval records created by `AgentControl.Admin` are required for one exact target. The same Admin may create both; the executing Admin principal must differ from every approving principal. Each approver selects the exact native target from the tenant's current shared inventory snapshot. The underlying snapshot UUID may be shared; actor-bound selection handles, approvals and provider authorization may not. The original approval contains the exact direct provider prestate and exact `lastUpdateTimeUtc`; the future inverse approval must set `prestateProviderUpdatedAt` to `null`. The application binds restoration to the original direction's verified readback timestamp. A caller cannot predict, fabricate or replace that future timestamp.
 
 Approval creation revalidates the current Admin and fences persistence against logout or session replacement without requesting a provider token. Execution retains its starting session generation through both durable-job submissions, job authorization, and qualification publication. Signing in again as the same principal does not authorize a previously interrupted cycle to continue.
 
-The executor also needs their own current private inventory observation resolving that same exact native resource, environment and bot, plus provider-issued delegated authorization for `CopilotStudio.AdminActions.Invoke` under approved consent. The executor's snapshot UUID may differ from the approver's; matching names or associations cannot bridge the difference. Agent Control does not reconstruct quarantine eligibility from optional `wids` claims or hard-deny solely because such a claim is absent; provider authorization and the provider response remain authoritative. An application credential or package qualification is not delegated quarantine authority. No additional grant or provider role is assigned by these commands.
+The executor needs a current tenant inventory observation resolving that same exact native resource, environment and bot, plus their own provider-issued delegated authorization for `CopilotStudio.AdminActions.Invoke` under approved consent. The executor's snapshot UUID may match the approver's; matching names or associations cannot substitute for the exact resource. Agent Control does not reconstruct quarantine eligibility from optional `wids` claims or hard-deny solely because such a claim is absent; provider authorization and the provider response remain authoritative. An application credential or package qualification is not delegated quarantine authority. No additional grant or provider role is assigned by these commands.
 
 Microsoft documentation rechecked on 2026-09-10 conflicts on the version: the [Copilot Studio guide](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-api-quarantine) specifies `api-version=1`, while the generated [status](https://learn.microsoft.com/en-us/rest/api/power-platform/copilotstudio/bots/get-bot-quarantine-status), [quarantine](https://learn.microsoft.com/en-us/rest/api/power-platform/copilotstudio/bots/set-bot-as-quarantined) and [restoration](https://learn.microsoft.com/en-us/rest/api/power-platform/copilotstudio/bots/set-bot-as-unquarantined) request examples specify `2024-10-01`. The implemented contract uses `1` only, with no version, namespace, token-mode or permission fallback. The three REST references describe HTTP 200 with `isBotQuarantined` and `lastUpdateTimeUtc`; no conditional-write header is documented. Timestamps detect observed changes but cannot prevent an external race after the final pre-read. Resolve version/rollout eligibility through an approved exact-target read before approving live writes; do not infer eligibility from fixtures.
 
@@ -127,7 +127,7 @@ X-CSRF-Token: <current approving Admin session CSRF value>
 
 {
 	"action": "quarantine",
-	"snapshotId": "<current private inventory snapshot UUID>",
+	"snapshotId": "<current tenant inventory snapshot UUID>",
 	"nativeId": "<exact inventory native resource ID>",
 	"prestate": false,
 	"prestateProviderUpdatedAt": "<exact lastUpdateTimeUtc from direct status>",
@@ -182,6 +182,14 @@ Before live execution, record the tenant, dedicated nonproduction environment/bo
 The only requested field is `isBotQuarantined`; `lastUpdateTimeUtc` is provider-owned evidence, never a field to restore. Use `GET /api/quarantine/jobs` and `GET /api/quarantine/jobs/{id}` to recover durable job IDs and results after connection loss. Read-only reconciliation accepts an empty body and current Admin/delegated authority without a qualified write. A new write requires a fresh preview, confirmation and idempotency key after reconciliation; an identical transport retry keeps the original intent/key. Never rerun the claimed canary `/execute` after an uncertain response. A changed restoration prestate requires incident review and separately approved recovery, not automatic inversion.
 
 Recovery is fixture-tested before any live approval through `scripts/restart-runtime.tests.ps1`, the quarantine job/canary repository and service tests, and the shared permission browser harness, all inside Docker. Jobs/items/attempts expire after seven days, direct observations and qualification evidence after 30 days, approvals after 30 minutes for dispatch, and ordinary audit after 90 days. Retention performs no provider requests. A 30-day evidence record does not extend the short approval window or make an expired job resumable. No live target or canary was approved for Phase 09; no provider status or write was attempted, and no live restoration or cleanup is claimed.
+
+The [restart fixture](../backend/scripts/restart-fixture.ts) requires an explicit
+`seed`, `verify`, `expire`, or `recover` command and a receipt path. Unknown commands
+and missing paths are rejected before database work. `verify` only compares saved
+fingerprints; `expire` checks persisted dispatch evidence before expiring leases.
+`recover` exercises bulk recovery and drops the receipt-selected test database.
+Passed events are emitted only after the operation and its resource cleanup
+succeed; combined operation and cleanup failures retain both errors.
 
 ## Approval record
 

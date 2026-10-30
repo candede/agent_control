@@ -6,6 +6,7 @@ import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
 import { LiveInventory } from "./liveInventory.js";
+import { DataGenerations } from "./dataGenerations.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(); });
@@ -14,7 +15,7 @@ const agentType = "microsoft.copilotstudio/agents";
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const nativeId = "native-a", botId = "22222222-2222-4222-8222-222222222222";
 const recordId = unifiedAgentRecordId({ source: "power_platform", nativeId, environmentId });
-const owner = () => ({ tenantId: "native-current-contract", principalId: randomUUID() });
+const owner = () => ({ tenantId: randomUUID(), principalId: randomUUID() });
 const resource = (displayName = "Native agent") => ({
   nativeId, environmentId, displayName, identifiers: [{ kind: "cds_bot_id" as const, value: botId }],
 });
@@ -32,13 +33,13 @@ describe("current typed inventory identity reads", () => {
         identifiers: [{ kind: "cds_bot_id", value: botId }] })]);
       expect(candidates.length).toBeLessThanOrEqual(6);
     });
-    await expect(live.record({ ...scope, principalId: randomUUID() }, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
+    await expect(live.record({ ...scope, principalId: randomUUID() }, recordId)).resolves.toMatchObject({ displayName: "Native agent" });
     await expect(live.record({ ...scope, tenantId: "other-tenant" }, recordId)).rejects.toMatchObject({ code: "agent_not_found" });
   });
 
   it.each(["replace", "withdraw"] as const)("does not mix snapshots when another transaction performs a %s", async change => {
     const scope = owner(), live = new LiveInventory(fixture.runtime);
-    await nativeInventoryFixture(fixture.runtime, scope, [resource("Before")]);
+    const native = await nativeInventoryFixture(fixture.runtime, scope, [resource("Before")]);
     await reconcileInventoryFixture(fixture.runtime, scope);
     let release!: () => void, entered!: () => void;
     const barrier = new Promise<void>(resolve => { release = resolve; }), started = new Promise<void>(resolve => { entered = resolve; });
@@ -52,7 +53,8 @@ describe("current typed inventory identity reads", () => {
     });
     await started;
     try {
-      await nativeInventoryFixture(fixture.runtime, scope, change === "replace" ? [resource("After")] : [], { resourceTypes: [agentType] });
+      if (change === "replace") await nativeInventoryFixture(fixture.runtime, scope, [resource("After")], { resourceTypes: [agentType] });
+      else await new DataGenerations(fixture.runtime).invalidate(native.scopeId, scope.tenantId);
       await reconcileInventoryFixture(fixture.runtime, scope);
     } finally { release(); }
     const before = await pending;
@@ -132,7 +134,7 @@ describe("active native refresh request identity", () => {
     const root = await refreshInventoryFixture(fixture.runtime, scope, second.id, "power_platform", [], [...powerPlatformResourceTypes]);
     expect(await jobs.getJob(scope, second.id)).toMatchObject({ status: "succeeded", snapshotId: root.baselineId });
     expect((await fixture.runtime.query(`SELECT r.baseline_id FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-      WHERE r.current AND r.domain='power_platform' AND s.tenant_id=$1 AND s.principal_id=$2`, [scope.tenantId, scope.principalId])).rows)
+      WHERE r.current AND r.domain='power_platform' AND s.tenant_id=$1 AND s.scope_kind='tenant'`, [scope.tenantId])).rows)
       .toEqual([{ baseline_id: root.baselineId }]);
     const list = await jobs.listJobs(scope);
     expect(list.value).toHaveLength(2);

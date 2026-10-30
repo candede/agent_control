@@ -6,7 +6,7 @@ import { AgentIdentityRepository, type AgentIdentitySource } from "./agentIdenti
 import { DataSyncRepository } from "./dataSync.js";
 import { inventoryInput, nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { LiveInventory } from "./liveInventory.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import { powerPlatformInventoryRecord } from "../services/inventoryRecordProjection.js";
 import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
@@ -52,7 +52,6 @@ async function capacitySource(tenantId: string, count: number) {
   input.scope.tenantId = tenantId;
   const intent = { domain: "power_platform" as const, mode: "baseline" as const, channel: "catalog" as const,
     resourceTypes: ["microsoft.copilotstudio/agents" as const], roleScope: "full" as const };
-  input.scope.selector = inventorySelector(intent);
   const store = new InventoryGenerations(fixture.runtime);
   await store.execute(input, intent, async lease => {
     for (let offset = 0; offset < count; offset += 100) {
@@ -85,13 +84,13 @@ async function capacitySource(tenantId: string, count: number) {
       const rows = (await fixture.operator.query(`INSERT INTO agent_identity_cache
         (tenant_id,principal_id,record_id,snapshot_id,native_id,environment_id,source_revision,candidate_id,
           application_id,checked_at,expires_at,runtime_status,runtime_provenance)
-        SELECT source.tenant_id,source.principal_id,'agent:'||source.agent_id,source.source_generation_id,
+        SELECT source.tenant_id,$2,'agent:'||source.agent_id,source.source_generation_id,
           source.native_id,source.environment_id,$3,identifier.value::uuid,identifier.value::uuid,
           statement_timestamp(),statement_timestamp()+interval '1 hour','available','verified-entra-agent-identity-client-id'
         FROM inventory_live_sources source JOIN inventory_facts identifier
           ON identifier.generation_id=source.source_generation_id AND identifier.identity=source.source_identity
           AND identifier.kind='identifier' AND identifier.payload->>'kind'='entra_agent_id'
-        WHERE source.tenant_id=$1 AND source.principal_id=$2 AND source.source='power_platform'
+        WHERE source.tenant_id=$1 AND source.source='power_platform'
           AND source.native_id COLLATE "C">$4
         ORDER BY source.native_id COLLATE "C" LIMIT $5 RETURNING native_id`,
       [tenantId, scope.principalId, "a".repeat(64), after, Math.min(100, amount - offset)])).rows;
@@ -150,7 +149,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
       await vi.waitFor(() => expect(guarded).toHaveBeenCalledTimes(2));
       await competing.query("BEGIN");
       const lock = await competing.query(`SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired`,
-        [`data-sync:${f.scope.tenantId}:${f.scope.principalId}`]);
+        [`data-sync:${f.scope.tenantId}`]);
       expect(lock.rows[0].acquired).toBe(false);
       await competing.query("SET LOCAL lock_timeout='100ms'");
       await expect(competing.query(`SELECT scope.id FROM data_scope_epochs scope
@@ -211,7 +210,7 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     const shorter = (await repository.readState(short.scope, short.source)).value!;
     expect(Date.parse(shorter.expiresAt) - Date.parse(shorter.checkedAt)).toBeLessThanOrEqual(600_000);
     const authority = (await fixture.runtime.query(`SELECT authority_expires_at FROM inventory_live_sources
-      WHERE tenant_id=$1 AND principal_id=$2 LIMIT 1`, [short.scope.tenantId, short.scope.principalId])).rows[0];
+      WHERE tenant_id=$1 LIMIT 1`, [short.scope.tenantId])).rows[0];
     expect(Date.parse(shorter.expiresAt)).toBe(authority.authority_expires_at.getTime());
     await fixture.operator.query(`UPDATE agent_identity_cache SET checked_at=clock_timestamp()-interval '1 hour',
       expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1`, [f.scope.tenantId]);
@@ -249,19 +248,22 @@ describe("source-bound agent identity cache (isolated PostgreSQL)", () => {
     }
   });
 
-  it("clears only the admitted account, prevents stale republishing and binds source deletion by generation", async () => {
+  it("clears tenant sources and source-bound actor caches without clearing another tenant", async () => {
     const f = await saved();
-    const other = await saved(f.scope.tenantId);
+    const other = { scope: { ...f.scope, principalId: randomUUID() }, source: f.source };
+    const isolated = await saved();
     await repository.save(f.scope, f.source, mapping, fence);
     await repository.save(other.scope, other.source, mapping, fence);
+    await repository.save(isolated.scope, isolated.source, mapping, fence);
     await new DataSyncRepository(fixture.runtime).submit(f.scope, { mode: "full", clearSavedData: true });
     expect(await repository.readState(f.scope, f.source)).toEqual({ status: "missing" });
     await expect(repository.save(f.scope, f.source, mapping, fence)).rejects.toMatchObject({ code: "agent_identity_source_changed" });
-    expect((await repository.readState(other.scope, other.source)).value).toMatchObject(mapping);
+    expect(await repository.readState(other.scope, other.source)).toEqual({ status: "missing" });
+    expect((await repository.readState(isolated.scope, isolated.source)).value).toMatchObject(mapping);
     expect((await fixture.runtime.query(`SELECT confdeltype FROM pg_constraint
       WHERE conrelid='agent_identity_cache'::regclass AND conname='agent_identity_cache_generation'`)).rows).toEqual([{ confdeltype: "c" }]);
-    await new DataSyncRepository(fixture.runtime).submit(other.scope, { mode: "full", clearSavedData: true });
-    expect((await fixture.operator.query("SELECT count(*)::int AS count FROM agent_identity_cache WHERE tenant_id=$1", [f.scope.tenantId])).rows[0].count).toBe(0);
+    expect((await fixture.operator.query("SELECT principal_id FROM agent_identity_cache WHERE tenant_id=$1", [f.scope.tenantId])).rows)
+      .toEqual([{ principal_id: other.scope.principalId }]);
   });
 
   it("rolls back publication when its last authorization fence fails", async () => {

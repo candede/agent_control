@@ -29,8 +29,8 @@ describe("selected saved-data lifecycle", () => {
 
   async function directory(identity: SelectionIdentity, objectId: string, name = "Zulu Owner") {
     const stages = new UserSourceStages(fixture.runtime);
-    return stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId,
-      principalId: identity.principalId } }), async lease => {
+    return stages.execute(generationInput({ actorPrincipalId: identity.principalId,
+      scope: { ...generationInput().scope, tenantId: identity.tenantId } }), async lease => {
       const key = await stages.query(lease, "discovery", "synthetic:lifecycle-directory");
       await stages.page(lease, key, "synthetic:lifecycle-directory", 1, 1);
       await stages.directory(lease, key, [{ serviceEvidenceVersion: 1,
@@ -45,8 +45,8 @@ describe("selected saved-data lifecycle", () => {
     const objectId = randomUUID(), environmentId = randomUUID();
     await directory(identity, objectId);
     const stages = new UserSourceStages(fixture.runtime);
-    const activity = await stages.execute(generationInput({ scope: { ...generationInput().scope,
-      tenantId: identity.tenantId, principalId: identity.principalId, source: "app_activity" } }), async lease => {
+    const activity = await stages.execute(generationInput({ actorPrincipalId: identity.principalId,
+      scope: { ...generationInput().scope, tenantId: identity.tenantId, source: "app_activity" } }), async lease => {
       const key = await stages.query(lease, "activity", "synthetic:lifecycle-activity");
       await stages.page(lease, key, "synthetic:lifecycle-activity", 0);
       await stages.finishQuery(lease, key);
@@ -118,7 +118,7 @@ describe("selected saved-data lifecycle", () => {
     const selected = await inventory.capture(identity, root.scopeId);
     const guarded = await inventory.capture(identity, root.scopeId, { search: "Zulu Owner" });
     const empty = await inventory.capture(identity, root.scopeId, { publisher: "absent-publisher" });
-    const report = await inventory.reports.capture(identity, "delegated", "copilot_users");
+    const report = await inventory.reports.capture(identity, "copilot_users");
     const first = await inventory.page(selected.id, identity), facets = await inventory.facets(selected.id, identity, "environmentId");
     expect(selected.expiresAt.getTime() - selected.evaluatedAt.getTime()).toBe(600_000);
     expect(guarded.expiresAt.getTime()).toBe(deadline);
@@ -171,7 +171,7 @@ describe("selected saved-data lifecycle", () => {
 
   it("keeps report pages and child output immutable across people-cache changes", async () => {
     const { identity, objectId } = await subject();
-    const selected = await inventory.reports.capture(identity, "delegated", "copilot_users");
+    const selected = await inventory.reports.capture(identity, "copilot_users");
     const first = await inventory.reports.page(selected.id, identity);
     const child = await inventory.reports.exact(selected.id, identity, objectId);
     await people(identity, objectId);
@@ -235,7 +235,7 @@ describe("selected saved-data lifecycle", () => {
     expect((await inventory.page(selected.id, identity)).selection.publicationRevisions).toEqual(before);
     const newer = await inventory.capture(identity, root.scopeId);
     expect((await inventory.page(newer.id, identity)).selection.publicationRevisions).toEqual(after);
-    const directoryScope = (await inventory.reports.page((await inventory.reports.capture(identity, "delegated", "copilot_users")).id, identity)).sources.directory.scopeId!;
+    const directoryScope = (await inventory.reports.page((await inventory.reports.capture(identity, "copilot_users")).id, identity)).sources.directory.scopeId!;
     await new DataGenerations(fixture.runtime).invalidate(directoryScope, identity.tenantId);
     expect(await sync.automaticRevisions(identity)).not.toEqual(after);
     await expect(inventory.page(selected.id, identity)).rejects.toMatchObject({ details: { reason: "changed" } });
@@ -247,7 +247,7 @@ describe("selected saved-data lifecycle", () => {
     const selected = await inventory.capture(identity, root.scopeId);
     await fixture.operator.query("UPDATE inventory_read_contexts SET report_context=report_context-'publicationRevisions' WHERE selection_id=$1", [selected.id]);
     await expect(inventory.page(selected.id, identity)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "unavailable" } });
-    const report = await inventory.reports.capture(identity, "delegated", "history");
+    const report = await inventory.reports.capture(identity, "history");
     await fixture.operator.query("UPDATE official_usage_read_contexts SET metadata=metadata-'publicationRevisions' WHERE selection_id=$1", [report.id]);
     await expect(inventory.reports.page(report.id, identity)).rejects.toMatchObject({ code: "selection_invalidated", details: { reason: "unavailable" } });
   }, 30_000);

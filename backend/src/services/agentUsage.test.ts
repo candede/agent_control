@@ -24,7 +24,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 afterAll(async () => { await fixture?.close(); });
 
 async function read(scope: AgentUsageScope, ids: readonly string[]) {
-  const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+  const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
   return usage.summaries(selection.id, identity, ids);
 }
 async function inventory(scope: AgentUsageScope, ids: readonly string[]) {
@@ -214,7 +214,7 @@ describe("native report-backed exact inventory usage", () => {
   it("pages the restored users table across every linked version with exact case-sensitive user totals", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B", "Report-Zero"] }]);
     await publishUsageReports(fixture.runtime, scope);
-    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
     const first = await usage.users(selection.id, identity, records[0].id, { limit: 2 });
     expect(first.value).toEqual([{ username: "Shared", displayName: "Shared", responses: 21 }, { username: "caseuser", displayName: "Two", responses: 5 }]);
     expect(first.counts).toEqual({ total: 4, filtered: 4 });
@@ -233,7 +233,7 @@ describe("native report-backed exact inventory usage", () => {
   it("keeps concealed names literal and invalidates user cursors when reviewed associations change", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A", "Report-B"] }, { packages: ["Other"] }]);
     await publishUsageReports(fixture.runtime, scope, 10, (_kind, text) => text.replaceAll("CaseUser", "concealed-identity"));
-    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
     const page = await usage.users(selection.id, identity, records[0].id, { limit: 1 });
     expect((await usage.users(selection.id, identity, records[0].id, { search: "concealed" })).value)
       .toMatchObject([{ username: "concealed-identity", responses: 4 }]);
@@ -246,7 +246,7 @@ describe("native report-backed exact inventory usage", () => {
       const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
       await publishUsageReports(fixture.runtime, scope, 10, (kind, text) => kind === "users"
         ? text.replace("CaseUser,One,1,4", `CaseUser,${name},1,4`) : text);
-      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+      const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
       const page = await usage.users(selection.id, identity, records[0].id, { search });
       expect(page.value).toEqual([{ username: "CaseUser", displayName: name, responses: 4 }]);
       expect(page.counts).toEqual({ total: 2, filtered: 1 });
@@ -283,7 +283,7 @@ describe("native report-backed exact inventory usage", () => {
       ? { packages: [], native: { nativeId: "Package-A", environmentId: null } } : { packages: [mismatch === "package-case" ? "package-a" : "Package-A"] }],
     mismatch === "expired" ? { expiresAt: new Date(Date.now() + 3000) } : {});
     if (mismatch === "snapshot") await fixture.operator.query(`UPDATE data_scope_epochs SET epoch=epoch+1
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_packages'`, [scope.tenantId, viewer.principalId]);
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_packages'`, [scope.tenantId]);
     if (mismatch === "expired") await awaitUsageInventoryExpiry(fixture.runtime, viewer);
     expect((await inventory(viewer, viewed.map(record => record.id)))[0]).toMatchObject({ status: "unlinked", responses: null });
   });
@@ -321,7 +321,7 @@ describe("native report-backed exact inventory usage", () => {
 
   it("does not turn read database failures into an empty successful summary", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope), identity = await usageIdentity(fixture.runtime, scope);
-    const selection = await reports.capture(identity, "delegated", "official_agents"), error = new Error("Database unavailable");
+    const selection = await reports.capture(identity, "official_agents"), error = new Error("Database unavailable");
     vi.spyOn(reports.history.connections, "selectedRead").mockRejectedValue(error);
     await expect(usage.summaries(selection.id, identity, [records[0].id])).rejects.toBe(error);
   });
@@ -330,7 +330,7 @@ describe("native report-backed exact inventory usage", () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     const accepted = await publishUsageReports(fixture.runtime, scope);
     await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()+interval '1 second' WHERE id=$1", [accepted.setId]);
-    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "delegated", "official_agents");
+    const identity = await usageIdentity(fixture.runtime, scope), selection = await reports.capture(identity, "official_agents");
     const callback = vi.fn(async (client: import("pg").PoolClient) => {
       await client.query("SELECT pg_sleep(1.05)");
       return records[0].id;

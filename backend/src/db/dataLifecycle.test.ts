@@ -40,7 +40,7 @@ describe("cross-domain bounded lifecycle", () => {
     const tenant = `revoke-${randomUUID()}`, principal = randomUUID(), generations = new DataGenerations(fixture.runtime);
     await generations.sessionEpoch(tenant, principal);
     await fixture.operator.query(`INSERT INTO data_scope_epochs(id,tenant_id,scope_kind,principal_id,token_mode,source,selector)
-      SELECT gen_random_uuid(),$1,'principal',$2,'delegated','directory','scope-'||n FROM generate_series(1,501) n`, [tenant, principal]);
+      SELECT gen_random_uuid(),$1,'principal',$2,'delegated','private_execution','scope-'||n FROM generate_series(1,501) n`, [tenant, principal]);
     const sizes: number[] = [], observed = new WeakSet<pg.PoolClient>(), spies: Array<{ mockRestore(): void }> = [];
     const acquire = (client: pg.PoolClient) => {
       if (observed.has(client)) return;
@@ -67,7 +67,7 @@ describe("cross-domain bounded lifecycle", () => {
   it("retains complete sources across sign-out while fencing old readers and writers and allowing fresh publication", async () => {
     const identity = { ...selectionIdentity, tenantId: "synthetic-tenant", principalId: randomUUID() };
     const generations = new DataGenerations(fixture.runtime), selections = new DataSelections(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, ...identity } });
+    const input = generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId });
     const saved = await generations.begin(input);
     await generations.append(saved, "directory", 0, [directoryRecord()]);
     await generations.validate(saved, { rows: 1, children: 0, batches: 1, pages: 0, wireRows: 0 });
@@ -151,15 +151,16 @@ describe("cross-domain bounded lifecycle", () => {
 
   it("collects beyond 20 historical roots while retaining 18 aged current selectors until explicit retirement, including after restart", async () => {
     const stages = new InventoryGenerations(fixture.runtime), principal = randomUUID();
-    const roots = [await inventoryBaseline(stages, principal, 1)];
+    const tenantId = randomUUID(), baseline = () => inventoryBaseline(stages, principal, 1, undefined, undefined, tenantId);
+    const roots = [await baseline()];
     const queries = new InventoryQueries(fixture.runtime, "synthetic-lifecycle-inventory-cursor-key");
-    const identity = { ...selectionIdentity, tenantId: "synthetic-tenant", principalId: principal };
+    const identity = { ...selectionIdentity, tenantId, principalId: principal };
     const selection = await queries.capture(identity, roots[0].scopeId);
-    for (let index = 1; index < 24; index++) roots.push(await inventoryBaseline(stages, principal, 1));
-    const aged: Array<{ baselineId: string; scopeId: string; principalId: string }> = [];
+    for (let index = 1; index < 24; index++) roots.push(await baseline());
+    const aged: Array<{ baselineId: string; scopeId: string; tenantId: string; principalId: string }> = [];
     for (let index = 0; index < 18; index++) {
       const principalId = randomUUID();
-      const root = await inventoryBaseline(stages, principalId, 1, new Date(), new Date(Date.now() + 2000));
+      const root = await inventoryBaseline(stages, principalId, 1, new Date(), new Date(Date.now() + 2000), randomUUID());
       aged.push({ ...root, principalId });
     }
     await new Promise(resolve => setTimeout(resolve, 2050));
@@ -177,7 +178,7 @@ describe("cross-domain bounded lifecycle", () => {
     expect(await membershipCount(roots[21].baselineId)).toBe(0);
     for (const root of aged) {
       expect(await membershipCount(root.baselineId)).toBe(1);
-      const owner = { ...identity, principalId: root.principalId };
+      const owner = { ...identity, tenantId: root.tenantId, principalId: root.principalId };
       const fresh = await queries.capture(owner, root.scopeId);
       expect((await queries.page(fresh.id, owner)).value).toHaveLength(1);
       await stages.clear(root.scopeId, owner.tenantId);
@@ -192,11 +193,11 @@ describe("cross-domain bounded lifecycle", () => {
     expect((await fixture.runtime.query("SELECT slices::int AS n FROM data_lifecycle_progress WHERE worker='inventory'")).rows[0].n).toBeGreaterThan(400);
   }, 30_000);
 
-  it("releases invalidated selection quota once without waiting ten minutes or purging another principal", async () => {
+  it("releases invalidated selection quota once without waiting ten minutes or purging another tenant", async () => {
     const store = new DataGenerations(fixture.runtime), selections = new DataSelections(fixture.runtime);
     const tenantId = `quota-${randomUUID()}`, identity = { ...selectionIdentity, tenantId };
-    const publish = async (principalId = identity.principalId) => {
-      const input = generationInput({ scope: { ...generationInput().scope, tenantId, principalId } });
+    const publish = async (principalId = identity.principalId, ownerTenant = tenantId) => {
+      const input = generationInput({ scope: { ...generationInput().scope, tenantId: ownerTenant }, actorPrincipalId: principalId });
       const lease = await store.begin(input);
       await store.append(lease, "directory", 0, [directoryRecord()]);
       await store.validate(lease, { rows: 1, children: 0, batches: 1, pages: 0, wireRows: 0 });
@@ -204,8 +205,8 @@ describe("cross-domain bounded lifecycle", () => {
       return { lease, root: { kind: "generation" as const, scopeId: lease.scopeId, generationId: lease.id,
         revision: String(BigInt(lease.expectedRevision) + 1n), expiresAt: input.expiresAt } };
     };
-    const first = await publish(), peer = await publish("unaffected-principal");
-    const peerIdentity = { ...identity, principalId: "unaffected-principal" };
+    const first = await publish(), peer = await publish("unaffected-principal", randomUUID());
+    const peerIdentity = { ...identity, tenantId: peer.lease.tenantId, principalId: "unaffected-principal" };
     const peerSelection = await selections.capture(peerIdentity, "/users", { values: {}, allowed: [] }, [peer.root]);
     for (let index = 0; index < 100; index++) await selections.capture(identity, "/users", { values: {}, allowed: [] }, [first.root]);
     await expect(selections.capture(identity, "/users", { values: {}, allowed: [] }, [first.root]))

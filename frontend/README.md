@@ -79,6 +79,10 @@ online. Permissions is recovery guidance after an actual failure, not a setup
 approval step. Purview/Defender searches run explicitly under current real
 authorization; configured application reads need no prior qualification query.
 
+Saved workspace status and exact-run details refresh independently. Background
+workspace updates preserve pending exact-run reads and their polling schedule.
+Check status retries both saved-status reads without starting provider collection.
+
 Sync inventory health checks read saved data independently of the Agents browsing
 selection and pause while hidden or offline. Each check has a 30-second deadline.
 Timeouts, network errors, HTTP 408/429 responses and server failures remain visible
@@ -90,6 +94,11 @@ Agents browsing failures appear separately in diagnostics and do not invalidate 
 successful inventory health receipt. Matching-detail refreshes and filtered exports
 still require a usable saved browsing selection; the saved-only retry also reloads
 a failed browsing selection without starting provider collection.
+
+Malformed inventory selection responses fail explicitly without issuing a selected
+read. Unclassified HTTP 401/403 errors, including blank problem codes, revalidate
+the current session; classified provider authorization failures remain scoped.
+Blank problem details retain a visible HTTP-status error message.
 
 Sync automatically renews expired saved Agents selections for filtered exports
 without collecting provider data. Reauthentication from inventory diagnostics

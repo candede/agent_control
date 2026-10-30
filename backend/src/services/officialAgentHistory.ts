@@ -79,7 +79,7 @@ export async function readAgentHistory(client: pg.PoolClient, reports: LargeTena
   if (cached) { cache.delete(key); cache.set(key, cached); return structuredClone(cached.value); }
   const previous = cursor?.direction === "previous", direction = previous ? "ASC" : "DESC";
   const source = context.inventorySelectionId ? selectedInventorySourcesSql("$1", "$3", "$4", "$5")
-    : `SELECT * FROM inventory_live_sources WHERE tenant_id=$1 AND principal_id=$3 AND agent_id=$4
+    : `SELECT * FROM inventory_live_sources WHERE tenant_id=$1 AND $3::text IS NOT NULL AND agent_id=$4
       AND authority_expires_at>GREATEST($5::timestamptz,clock_timestamp())`;
   // Root validation may choose broad-history join settings. This read starts with exact indexed agent IDs.
   await client.query("SELECT set_config('jit','off',true),set_config('enable_nestloop','on',true),set_config('enable_mergejoin','on',true)");

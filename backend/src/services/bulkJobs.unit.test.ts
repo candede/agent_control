@@ -59,7 +59,7 @@ const accessPrestate: PackageMutationState = {
 };
 
 function fakeRepository(state: PackageMutationState = prestate, action: JobRow["action"] = "block", accessUpdate?: PackageAccessUpdate) {
-  const lease = { jobId: "job", scope, owner: "worker", version: 1 };
+  const lease = { jobId: "job", scope, owner: "worker", version: 1, actorSessionEpoch: "0" };
   const job: JobRow = {
     ...durableJob, action, status: "running",
     capability: state.kind === "access" ? "graph.package.access.manage" : "graph.package.block.manage",

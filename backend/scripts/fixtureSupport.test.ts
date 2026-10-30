@@ -1,6 +1,6 @@
 import { Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { browserFixtureFilePattern, browserFixtureTestFiles, closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment } from "./fixtureSupport.js";
+import { browserFixtureFilePattern, browserFixtureTestFiles, closeFixtureResources, closeFixtureServer, configureBrowserFixtureEnvironment, createBrowserFixtureFetch } from "./fixtureSupport.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -30,10 +30,20 @@ describe("browser fixture environment", () => {
       expect(new RegExp(browserFixtureFilePattern("layout.spec.ts"), "i").test(path)).toBe(false);
     });
 
+  it.each(["\n", "\r", "\r\n", "\u2028", "\u2029"])(
+    "does not match a filename with a trailing line terminator: %j", suffix => {
+      expect(new RegExp(browserFixtureFilePattern("layout.spec.ts"), "i").test(`/repo/layout.spec.ts${suffix}`)).toBe(false);
+    });
+
   it.each(["", "../agent.spec.ts", "--grep", "agent.spec.ts,agent.spec.ts", "agent.*.spec.ts",
     Array.from({ length: 33 }, (_, index) => `agent${index}.spec.ts`).join(",")])("rejects unsafe or unbounded browser selection: %s", value => {
     expect(() => browserFixtureTestFiles(value)).toThrow("distinct spec filenames");
   });
+
+  it.each(["\n", "\r", "\r\n", "\u2028", "\u2029"])(
+    "rejects a selected filename with a trailing line terminator: %j", suffix => {
+      expect(() => browserFixtureTestFiles(`layout.spec.ts${suffix}`)).toThrow("distinct spec filenames");
+    });
 
   it("removes file-backed identity overrides without changing database settings", () => {
     const env = browserEnvironment({
@@ -93,6 +103,37 @@ describe("browser fixture environment", () => {
     const before = { ...env };
     expect(() => configureBrowserFixtureEnvironment(env)).toThrow("isolated browser test entry point");
     expect(env).toEqual(before);
+  });
+});
+
+describe("browser fixture fetch isolation", () => {
+  it.each([
+    "https://graph.microsoft.com/v1.0/users", "http://example.invalid",
+    "http://localhost.example.invalid", "https://localhost:3001", "ftp://127.0.0.1",
+  ])("rejects a non-fixture destination before dispatch: %s", url => {
+    const fetcher = vi.fn<typeof fetch>();
+    expect(() => createBrowserFixtureFetch(fetcher)(url)).toThrow("Live provider requests are forbidden");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://localhost:3001/api/ready",
+    new URL("http://127.0.0.1:3001/api/ready"),
+    new Request("http://127.0.0.1:3001/api/ready", { redirect: "follow" }),
+  ])("forwards loopback requests without following redirects: %s", async input => {
+    const response = new Response("fixture");
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(response);
+    const signal = new AbortController().signal;
+    const init: RequestInit = { method: "POST", body: "fixture", signal, redirect: "follow" };
+    await expect(createBrowserFixtureFetch(fetcher)(input, init)).resolves.toBe(response);
+    expect(fetcher).toHaveBeenCalledExactlyOnceWith(input, { ...init, redirect: "error" });
+    expect(init.redirect).toBe("follow");
+  });
+
+  it("propagates fetch failures rather than returning a synthetic success", async () => {
+    const failure = new Error("fixture server unavailable");
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(failure);
+    await expect(createBrowserFixtureFetch(fetcher)("http://localhost:3001")).rejects.toBe(failure);
   });
 });
 

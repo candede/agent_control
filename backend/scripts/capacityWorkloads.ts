@@ -16,7 +16,7 @@ import { UserSourceStages } from "../src/db/userSourceStages.js";
 import { StreamedInventory } from "../src/services/streamedInventory.js";
 import { GraphPackagesClient, packageInventoryReadPolicy } from "../src/services/graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "../src/services/powerPlatformResourceQuery.js";
-import { InventoryGenerations, inventorySelector } from "../src/db/inventoryGenerations.js";
+import { InventoryGenerations } from "../src/db/inventoryGenerations.js";
 import { InventoryReconciliation } from "../src/services/inventoryReconciliation.js";
 import { InventoryRuntime } from "../src/services/inventoryRuntime.js";
 import { InventoryQueries } from "../src/db/inventoryQueries.js";
@@ -52,30 +52,31 @@ async function together<T>(jobs: Promise<T>[]) {
   return outcomes.map(result => (result as PromiseFulfilledResult<T>).value);
 }
 export async function capacityIdentityProbe(database: pg.Pool, telemetry: CapacityTelemetry) {
-  const owner = "capacity-physical-10k";
-  const stream = new StreamedInventory(database,new GraphPackagesClient(fixtureFetch(10_000),packageInventoryReadPolicy),
-    new PowerPlatformResourceQueryClient(fixtureFetch(10_000)));
-  const nativeInput = capacityInput(owner,"inventory_power_platform");
+  const owner = "capacity-physical-10k", tenantId = randomUUID();
+  const provider = fixtureFetch(10_000,0,false,"mixed",0,tenantId);
+  const stream = new StreamedInventory(database,new GraphPackagesClient(provider,packageInventoryReadPolicy),
+    new PowerPlatformResourceQueryClient(provider));
+  const nativeInput = capacityInput(owner,"inventory_power_platform",tenantId);
   const types = ["microsoft.copilotstudio/agents"] as const;
-  nativeInput.scope.selector = inventorySelector({ domain: "power_platform",resourceTypes: types });
-  await stream.graphCatalog(capacityInput(owner),"synthetic",{ authorize: async () => {} });
-  const graph = await stream.details(capacityInput(owner),"synthetic",
+  await stream.graphCatalog(capacityInput(owner,"inventory_packages",tenantId),"synthetic",{ authorize: async () => {} });
+  const graph = await stream.details(capacityInput(owner,"inventory_packages",tenantId),"synthetic",
     ["package-000000","package-000001","package-000002","package-000003"],{ authorize: async () => {} });
-  const native = await stream.powerPlatformCatalog(nativeInput,"synthetic",types,{ authorize: async () => {},roleScope: "full" });
+  const native = await stream.powerPlatformCatalog(nativeInput,"synthetic",types,
+    { authorize: async () => {},expectedTenantId: tenantId,roleScope: "full" });
   return fixedMutationProbe(database,telemetry,graph,native,owner,10_000);
 }
 async function isolatedInventoryBaseline(database: pg.Pool, principal: string, count: number, profile: CapacityIdentityProfile) {
-  const stream = new StreamedInventory(database,new GraphPackagesClient(fixtureFetch(count,0,false,profile),packageInventoryReadPolicy),
-    new PowerPlatformResourceQueryClient(fixtureFetch(count,0,false,profile)));
-  const types = ["microsoft.copilotstudio/agents"] as const,nativeInput = capacityInput(principal,"inventory_power_platform");
-  nativeInput.scope.selector = inventorySelector({ domain: "power_platform",resourceTypes: types });
+  const tenantId = randomUUID(), provider = fixtureFetch(count,0,false,profile,0,tenantId);
+  const stream = new StreamedInventory(database,new GraphPackagesClient(provider,packageInventoryReadPolicy),
+    new PowerPlatformResourceQueryClient(provider));
+  const types = ["microsoft.copilotstudio/agents"] as const,nativeInput = capacityInput(principal,"inventory_power_platform",tenantId);
   const [catalog,native] = await together([
-    stream.graphCatalog(capacityInput(principal),"synthetic",{ authorize: async () => {} }),
-    stream.powerPlatformCatalog(nativeInput,"synthetic",types,{ authorize: async () => {},expectedTenantId: fixtureTenant,roleScope: "full" }),
+    stream.graphCatalog(capacityInput(principal,"inventory_packages",tenantId),"synthetic",{ authorize: async () => {} }),
+    stream.powerPlatformCatalog(nativeInput,"synthetic",types,{ authorize: async () => {},expectedTenantId: tenantId,roleScope: "full" }),
   ]);
-  const graph = profile==="mixed" ? await stream.exact(capacityInput(principal),"synthetic",
+  const graph = profile==="mixed" ? await stream.exact(capacityInput(principal,"inventory_packages",tenantId),"synthetic",
     ["package-000000","package-000001","package-000002","package-000003"],{ authorize: async () => {} }) : catalog;
-  const reconciliation = new InventoryReconciliation(database),input = capacityInput(principal,"inventory_canonical");
+  const reconciliation = new InventoryReconciliation(database),input = capacityInput(principal,"inventory_canonical",tenantId);
   await reconciliation.request(input,[graph,native]);
   const canonical = await reconciliation.runNext(input,async () => {});
   assert.ok(canonical);
@@ -127,7 +128,6 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
         ["package-000000", "package-000001", "package-000002", "package-000003"], { authorize: async () => {} });
     }
     const types = ["microsoft.copilotstudio/agents"] as const;
-    input.scope.selector = inventorySelector({ domain, resourceTypes: types });
     return stream.powerPlatformCatalog(input, "synthetic", types, { authorize: async () => {}, expectedTenantId: tenant, roleScope: "full" });
   };
   const userSource = async (kind: "directory" | "app_activity", count = 100_000, opposing = false) => {
@@ -151,7 +151,7 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
     const ids = ["package-000000","package-000001"];
     assert.ok((await queries.exact(pin.id,identity,ids)).every(row => row.residual.isBlocked===false));
     assert.ok((await queries.exact(opposing.id,opposingIdentity,ids)).every(row => row.residual.isBlocked===true));
-    const users = await reports.capture(opposingIdentity,"delegated","copilot_users",{ cohort: "licensed" });
+    const users = await reports.capture(opposingIdentity,"copilot_users",{ cohort: "licensed" });
     const page = await reports.page(users.id,opposingIdentity,{ limit: 100 });
     assert.equal(page.counts.total,10_000);
     assert.equal(page.counts.filtered,0);
@@ -299,9 +299,9 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
     let totalRequests = 0;
     for (let cycle = 1; cycle <= 5; cycle++) {
       const pin = await queries.capture(identity, graph.scopeId, { sortBy: "displayName" });
-      const reportPins = [];
+      const reportPins: Awaited<ReturnType<LargeTenantUsersReports["capture"]>>[] = [];
       for (const endpoint of ["copilot_users", "official_users", "official_agents", "relationships"] as const) {
-        reportPins.push(await reports.capture(identity, "delegated", endpoint, { sort: "name", order: cycle % 2 ? "asc" : "desc" }));
+        reportPins.push(await reports.capture(identity, endpoint, { sort: "name", order: cycle % 2 ? "asc" : "desc" }));
       }
       const warmups = [];
       for (let reader = -1; reader < reportPins.length; reader++) {
@@ -394,7 +394,7 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
                 const previous = selected;
                 if (ownedSelection) await releaseSelection(previous.id);
                 selected = reader>=4 && reader<8
-                  ? await reports.capture(identity,"delegated",
+                  ? await reports.capture(identity,
                     (["copilot_users","official_users","official_agents","relationships"] as const)[reader-4],
                     { sort: "name",order: cycle%2 ? "asc" : "desc" })
                   : await queries.capture(identity,graph!.scopeId,{ sortBy: "displayName" });
@@ -476,7 +476,7 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
         } catch (error) { replacementError = error; }
       }
       if (cycle === 2) {
-        const old = graph!;
+        const old: InventoryRoot = graph!;
         await assert.rejects(() => stages.execute(capacityInput(principal),
           { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
             await stages.appendBounded(lease, [packageInventoryRecord(allowlistedPackage(packageValue(0, 90)))]);
@@ -519,10 +519,10 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
   });
   await attempt("post-detail-pin-release-and-ten-minute-retention", () => {
     if (!detailBaseline) throw new Error("100k_sparse_baseline_unavailable");
-    const actor = { ...identity,principalId: detailPrincipal };
-    const engine = new OfficialReportExports(reports,{ tenantId: fixtureTenant,homeAccountId: detailPrincipal,
+    const actor = { ...identity,tenantId: detailBaseline.graph.tenantId,principalId: detailPrincipal };
+    const engine = new OfficialReportExports(reports,{ tenantId: actor.tenantId,homeAccountId: detailPrincipal,
       username: "capacity@example.invalid",displayName: "Synthetic detail capacity" },"synthetic-capacity-query-cursor-key-32");
-    return detailRetention(database,telemetry,detailPrincipal,engine,actor);
+    return detailRetention(database,telemetry,engine,actor);
   });
   await attempt("600-second-retry-heartbeat-cancellation", () => heartbeatWorkload(database, telemetry, graph));
   await attempt("actual-worker-death-expiry-takeover", () => workerTakeover(database, telemetry));
@@ -563,7 +563,8 @@ export async function fullCapacity(database: pg.Pool, telemetry: CapacityTelemet
 }
 
 export async function normalizedQuotaBoundaries(database: pg.Pool) {
-  const stages = new DataGenerations(database), input = capacityInput("capacity-plan-boundary","directory");
+  const tenantId = randomUUID();
+  const stages = new DataGenerations(database), input = capacityInput("capacity-plan-boundary","directory",tenantId);
   const plans = (offset: number): PlanRecord[] => Array.from({ length: 250 },(_,i) => ({
     identity: `${userId(0)}:plan-${offset+i}`,user_id: userId(0),plan_id: `plan-${offset+i}`,
     service: "synthetic",display_name: `Plan ${offset+i}`,state: "unknown",capability_status: null,assigned_at: null,residual: {},
@@ -579,13 +580,13 @@ export async function normalizedQuotaBoundaries(database: pg.Pool) {
   { status: 413,code: "data_directory_plan_count",details: { limit: 1000,observed: 1001 } });
   assert.equal((await database.query("SELECT generation_id FROM data_generation_heads WHERE scope_id=$1",[old.scopeId])).rows[0].generation_id,old.id);
   const inventory = new InventoryGenerations(database), owner = "capacity-normalized-fact-boundary";
-  const record = packageInventoryRecord(packageValue(0));
+  const record = packageInventoryRecord(allowlistedPackage(packageValue(0)));
   while (record.facts.length<10_000) record.facts.push({ kind: "capacity-child",value: String(record.facts.length),payload: {} });
-  const publish = (over: boolean) => inventory.execute(capacityInput(owner),
+  const publish = (over: boolean) => inventory.execute(capacityInput(owner,"inventory_packages",tenantId),
     { domain: "packages",mode: "baseline",channel: "catalog" },async lease => {
       await inventory.visit(lease,"normalized-boundary");
       const first = over ? { ...record,facts: [...record.facts,{ kind: "capacity-child",value: "10000",payload: {} }] } : record;
-      const records = [first,...Array.from({ length: 99 },(_,i) => packageInventoryRecord(packageValue(i+1)))];
+      const records = [first,...Array.from({ length: 99 },(_,i) => packageInventoryRecord(allowlistedPackage(packageValue(i+1))))];
       await inventory.appendBounded(lease,records);
       await inventory.acceptPage(lease,{ token: "normalized-boundary",nextToken: null,records,rawCount: 100,expectedCount: 100,page: 1 },100);
     },{ authorize: async () => {} });
@@ -595,7 +596,7 @@ export async function normalizedQuotaBoundaries(database: pg.Pool) {
   await assert.rejects(() => publish(true),{ status: 413,code: "inventory_facts",details: { limit: 10_000,observed: 10_001 } });
   assert.equal((await database.query("SELECT baseline_id FROM inventory_roots WHERE scope_id=$1 AND current",[root.scopeId])).rows[0].baseline_id,root.baselineId);
   const queries = new InventoryQueries(database,"synthetic-capacity-query-cursor-key-32");
-  const identity = { ...selectionIdentity,tenantId: fixtureTenant,principalId: owner };
+  const identity = { ...selectionIdentity,tenantId,principalId: owner };
   const selected = await queries.capture(identity,root.scopeId);
   try {
     assert.equal((await queries.page(selected.id,identity,{ limit: 100 })).value.length,100);
@@ -609,9 +610,10 @@ export async function normalizedQuotaBoundaries(database: pg.Pool) {
 async function mergeSplit(database: pg.Pool,telemetry: CapacityTelemetry) {
   const principal = "capacity-merge-split";
   const { graph,native } = await isolatedInventoryBaseline(database,principal,100,"mixed");
+  const tenantId = graph.tenantId;
   const reconciliation = new InventoryReconciliation(database), reader = new InventoryQueries(database,"synthetic-capacity-query-cursor-key-32");
-  const identity = { ...selectionIdentity,tenantId: fixtureTenant,principalId: principal };
-  const input = capacityInput(principal,"inventory_canonical"), scope = await reconciliation.request(input,[graph,native]);
+  const identity = { ...selectionIdentity,tenantId,principalId: principal };
+  const input = capacityInput(principal,"inventory_canonical",tenantId), scope = await reconciliation.request(input,[graph,native]);
   await reconciliation.runNext(input,async () => {});
   const members = async (root: InventoryRoot) => {
     const pin = await reader.capture(identity,root.scopeId);
@@ -631,10 +633,10 @@ async function mergeSplit(database: pg.Pool,telemetry: CapacityTelemetry) {
   try {
     for (const version of [30,31]) {
       const start = (await database.query("SELECT pg_current_wal_insert_lsn()::text AS lsn")).rows[0].lsn;
-      const stream = new StreamedInventory(database,new GraphPackagesClient(fixtureFetch(100,version,false,"merge-split"),packageInventoryReadPolicy));
+      const stream = new StreamedInventory(database,new GraphPackagesClient(fixtureFetch(100,version,false,"merge-split",0,tenantId),packageInventoryReadPolicy));
       const root = await capacityOperation(`merge-split:${version}:native`,() =>
-        stream.exact(capacityInput(principal),"synthetic",["package-000000"],{ authorize: async () => {} }));
-      const request = capacityInput(principal,"inventory_canonical");
+        stream.exact(capacityInput(principal,"inventory_packages",tenantId),"synthetic",["package-000000"],{ authorize: async () => {} }));
+      const request = capacityInput(principal,"inventory_canonical",tenantId);
       await capacityOperation(`merge-split:${version}:enqueue`,() => reconciliation.request(request,[root,native]));
       const canonical = await capacityOperation(`merge-split:${version}:canonical`,() => reconciliation.runNext(request,async () => {}));
       assert.ok(canonical); assert.equal(canonical.scopeId,scope.scopeId);
@@ -664,7 +666,7 @@ async function batchAndQueueBoundaries(database: pg.Pool) {
     const renewal = await database.connectRenewal();
     try { await renewal.query("SELECT 1"); } finally { renewal.release(); }
   } finally { for (const client of held) client.release(); await Promise.all(waiting); }
-  const stages = new DataGenerations(database), input = capacityInput("capacity-batch","directory");
+  const stages = new DataGenerations(database), input = capacityInput("capacity-batch","directory",randomUUID());
   const exact = await stages.execute(input,async lease => {
     const rows = Array.from({ length: 4 },(_,i) => directoryRecord(userId(i),{ residual: { value: "x".repeat(240000) } }));
     const remaining = 1048576-prepareGenerationBatch(lease,rows).bytes;
@@ -680,7 +682,7 @@ async function batchAndQueueBoundaries(database: pg.Pool) {
     await stages.append(lease,"directory",0,over);
   }),{ code: "data_batch_bytes" });
   assert.equal((await database.query("SELECT generation_id FROM data_generation_heads WHERE scope_id=$1",[exact.lease.scopeId])).rows[0].generation_id,exact.lease.id);
-  const rowInput = capacityInput("capacity-batch-rows","directory");
+  const rowInput = capacityInput("capacity-batch-rows","directory",randomUUID());
   const published = await stages.execute(rowInput,async lease => {
     await stages.append(lease,"directory",0,Array.from({ length: 250 },(_,i) => directoryRecord(userId(i))));
     await stages.validate(lease,{ rows: 250,children: 0,batches: 1,pages: 0,wireRows: 0 });
@@ -726,20 +728,22 @@ async function reportFileBoundary(database: pg.Pool, telemetry: CapacityTelemetr
   return { exactBytes: 256*1024**2,rejectedBytes: 256*1024**2+1,rows: 200_000,exact,oldPublication: prior.setId };
 }
 
-async function detailRetention(database: pg.Pool, telemetry: CapacityTelemetry, principal: string,
+async function detailRetention(database: pg.Pool, telemetry: CapacityTelemetry,
   exports: OfficialReportExports, identity: typeof selectionIdentity) {
+  const { tenantId,principalId } = identity;
   const selections = (await database.query(`SELECT id FROM data_read_selections
-    WHERE tenant_id=$1 AND principal_id=$2 AND invalidated_at IS NULL LIMIT 100`,[fixtureTenant,principal])).rows;
+    WHERE tenant_id=$1 AND principal_id=$2 AND invalidated_at IS NULL LIMIT 100`,[tenantId,principalId])).rows;
   const reader = new InventoryQueries(database,"synthetic-capacity-query-cursor-key-32");
   for (const selection of selections) await reader.selections.invalidate(selection.id,identity);
   const activeExports = (await database.query(`SELECT id FROM data_exports WHERE tenant_id=$1 AND principal_id=$2
-    AND status IN ('queued','building','ready') LIMIT 100`,[fixtureTenant,principal])).rows;
+    AND status IN ('queued','building','ready') LIMIT 100`,[tenantId,principalId])).rows;
   for (const value of activeExports) {
     try { await exports.engine.cancel(value.id,identity); }
     catch (error) { telemetry.write({ event: "retention-export-release",id: value.id,error: String(error) }); }
   }
-  const scopeRows = (await database.query(`SELECT id,source FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-    AND source IN ('inventory_packages','inventory_power_platform','inventory_canonical') LIMIT 16`,[fixtureTenant,principal])).rows;
+  const scopeRows = (await database.query(`SELECT id,source FROM data_scope_epochs WHERE tenant_id=$1
+    AND scope_kind='tenant' AND principal_id IS NULL AND token_mode='tenant' AND selector='complete'
+    AND source IN ('inventory_packages','inventory_power_platform','inventory_canonical') LIMIT 16`,[tenantId])).rows;
   const scopes = scopeRows.map(row => row.id);
   assert.ok(scopes.length > 0);
   let current = await reader.capture(identity,scopeRows.find(row => row.source==="inventory_packages")!.id);
@@ -761,10 +765,10 @@ async function detailRetention(database: pg.Pool, telemetry: CapacityTelemetry, 
           WHERE scope_id=ANY($1::uuid[]) ORDER BY baseline_id LIMIT 33`,[scopes])).rows;
         assert.ok(roots.length<=32,"retention root inventory must not be truncated");
         const stages = new InventoryGenerations(database);
-        for (const row of roots) await stages.gcSlice({ baselineId: row.baseline_id,scopeId: row.scope_id,tenantId: fixtureTenant } as InventoryRoot);
+        for (const row of roots) await stages.gcSlice({ baselineId: row.baseline_id,scopeId: row.scope_id,tenantId } as InventoryRoot);
         for (const scope of scopes) {
-          await stages.gcContent(scope,fixtureTenant);
-          await stages.gcMetadata(scope,fixtureTenant);
+          await stages.gcContent(scope,tenantId);
+          await stages.gcMetadata(scope,tenantId);
         }
       });
       if (slices % 20 === 1) {
@@ -830,18 +834,19 @@ async function detailRetention(database: pg.Pool, telemetry: CapacityTelemetry, 
 
 async function fixedMutationProbe(database: pg.Pool, telemetry: CapacityTelemetry, graph: InventoryRoot, native: InventoryRoot,
   principal: string, count: number) {
+  const tenantId = graph.tenantId;
   const reconciliation = new InventoryReconciliation(database);
-  let input = capacityInput(principal, "inventory_canonical");
+  let input = capacityInput(principal, "inventory_canonical",tenantId);
   await reconciliation.request(input, [graph, native]); await reconciliation.runNext(input, async () => {});
   const observer = await physicalWork(database, telemetry);
   try {
     const keys = Array.from({ length: 20 }, (_, index) => `package-${String(100+index).padStart(6, "0")}`);
     await observer.checkpoint();
     const start = (await database.query("SELECT pg_current_wal_insert_lsn()::text AS lsn")).rows[0].lsn;
-    const stream = new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(count, 7), packageInventoryReadPolicy));
+    const stream = new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(count,7,false,"mixed",0,tenantId), packageInventoryReadPolicy));
     const root = await capacityOperation(`probe-${count}:native`, () =>
-      stream.details(capacityInput(principal), "synthetic", keys, { authorize: async () => {} }));
-    input = capacityInput(principal, "inventory_canonical");
+      stream.details(capacityInput(principal,"inventory_packages",tenantId), "synthetic", keys, { authorize: async () => {} }));
+    input = capacityInput(principal, "inventory_canonical",tenantId);
     await capacityOperation(`probe-${count}:enqueue`, () => reconciliation.request(input, [root, native]));
     const canonical = await capacityOperation(`probe-${count}:canonical`, () => reconciliation.runNext(input, async () => {}));
     const wal = Number((await database.query("SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(),$1)::text AS bytes", [start])).rows[0].bytes);
@@ -860,7 +865,7 @@ async function fixedMutationProbe(database: pg.Pool, telemetry: CapacityTelemetr
 
 async function capacityBackup(database: pg.Pool, telemetry: CapacityTelemetry) {
   const stages = new InventoryGenerations(database);
-  const principal = "capacity-backup-churn", input = capacityInput(principal);
+  const principal = "capacity-backup-churn", input = capacityInput(principal,"inventory_packages",randomUUID());
   let root = await new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(1), packageInventoryReadPolicy))
     .graphCatalog(input, "synthetic", { authorize: async () => {} });
   while (database.idleCount) { const client = await database.connect(); client.release(true); }
@@ -875,7 +880,7 @@ async function capacityBackup(database: pg.Pool, telemetry: CapacityTelemetry) {
     try {
       while (!stop) {
         root = await new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(1, ++writes), packageInventoryReadPolicy))
-          .details(capacityInput(principal), "synthetic", ["package-000000"], { authorize: async () => {} });
+          .details(capacityInput(principal,"inventory_packages",input.scope.tenantId), "synthetic", ["package-000000"], { authorize: async () => {} });
         if (writes % 10 === 0) await stages.gcSlice(root);
         await delay(100);
       }
@@ -922,7 +927,7 @@ async function highDegreeReports(database: pg.Pool, telemetry: CapacityTelemetry
   }
   const accepted = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
   const reader = new LargeTenantUsersReports(database, "synthetic-capacity-query-cursor-key-32", 35);
-  const selected = await reader.capture(identity, "delegated", "relationships", { username: "user-000000@example.invalid" });
+  const selected = await reader.capture(identity, "relationships", { username: "user-000000@example.invalid" });
   const expected = createHash("sha256"), observed = createHash("sha256");
   for (let i = 0; i < 10_000; i++) expected.update(`agent-${key(i)}\n`);
   let cursor: string | undefined, count = 0, requests = 0;
@@ -939,17 +944,18 @@ async function highDegreeReports(database: pg.Pool, telemetry: CapacityTelemetry
 }
 
 async function detailSweeps(database: pg.Pool, telemetry: CapacityTelemetry, baseline: InventoryRoot, principal: string, native?: InventoryRoot) {
+  const tenantId = baseline.tenantId;
   const stages = new InventoryGenerations(database), reconciliation = new InventoryReconciliation(database);
   const lifecycle = new InventoryRuntime(database,async () => {});
   const sweeps = [];
   let current = baseline;
-  const prepareInput = capacityInput(principal, "inventory_canonical");
+  const prepareInput = capacityInput(principal, "inventory_canonical",tenantId);
   const roots = () => [current, ...(native ? [native] : [])];
   const scope = await reconciliation.request(prepareInput, roots());
   await reconciliation.runNext(prepareInput, async () => {});
   const observed = await physicalWork(database, telemetry), cancelled = new AbortController();
   let active: Promise<unknown> | undefined;
-  const identity = { ...selectionIdentity, tenantId: fixtureTenant, principalId: principal };
+  const identity = { ...selectionIdentity, tenantId, principalId: principal };
   const reader = new InventoryQueries(database, "synthetic-capacity-query-cursor-key-32");
   const readerStop = new AbortController(), exportStop = new AbortController();
   const ids = Array.from({ length: 20 }, (_, i) => `package-${String(200+i).padStart(6, "0")}`);
@@ -980,7 +986,7 @@ async function detailSweeps(database: pg.Pool, telemetry: CapacityTelemetry, bas
     return { old,requests,...result };
   };
   const exportReader = new LargeTenantUsersReports(database, "synthetic-capacity-query-cursor-key-32", 35);
-  const exportEngine = new OfficialReportExports(exportReader, { tenantId: fixtureTenant, homeAccountId: principal,
+  const exportEngine = new OfficialReportExports(exportReader, { tenantId, homeAccountId: principal,
     username: "capacity@example.invalid", displayName: "Synthetic capacity" }, "synthetic-capacity-query-cursor-key-32");
   const exportWork = async () => {
     let bytes = 0,chunks = 0;
@@ -1020,7 +1026,7 @@ async function detailSweeps(database: pg.Pool, telemetry: CapacityTelemetry, bas
   try {
   for (let sweep = 1; sweep <= 2; sweep++) {
     const producerStartedAt = performance.now();
-    const stream = new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(100_000,10+sweep,false,"sparse"), packageInventoryReadPolicy));
+    const stream = new StreamedInventory(database, new GraphPackagesClient(fixtureFetch(100_000,10+sweep,false,"sparse",0,tenantId), packageInventoryReadPolicy));
     let written = 0, closed = 0, changed = 0, starts = 0, publications = 0;
     const begin = (await database.query("SELECT pg_current_wal_insert_lsn()::text AS lsn")).rows[0].lsn;
     let worker: Promise<unknown> | undefined, workerFailure: unknown;
@@ -1039,9 +1045,9 @@ async function detailSweeps(database: pg.Pool, telemetry: CapacityTelemetry, bas
       }
       const values = Array.from({ length: 20 }, (_, i) => packageValue(batch*20+i, 10+sweep));
       const root = await capacityOperation(`native:${sweep}:${batch}`, () =>
-        stream.details(capacityInput(principal), "synthetic", values.map(value => value.id), { authorize: async () => {} }));
+        stream.details(capacityInput(principal,"inventory_packages",tenantId), "synthetic", values.map(value => value.id), { authorize: async () => {} }));
       current = root; written += root.inserted; closed += root.closed; changed += root.changed;
-      const input = capacityInput(principal, "inventory_canonical");
+      const input = capacityInput(principal, "inventory_canonical",tenantId);
       await capacityOperation(`enqueue:${sweep}:${batch}`, () => reconciliation.request(input, roots()));
       // Claim promptly, as the real worker does. The first publication barrier
       // holds one captured batch until the next real batch creates pending work.
@@ -1093,7 +1099,7 @@ async function detailSweeps(database: pg.Pool, telemetry: CapacityTelemetry, bas
     await worker;
     if (workerFailure) throw workerFailure;
     const stoppedAt = performance.now();
-    const input = capacityInput(principal, "inventory_canonical");
+    const input = capacityInput(principal, "inventory_canonical",tenantId);
     await capacityOperation(`enqueue-final:${sweep}`, () => reconciliation.request(input, roots()));
     await capacityOperation(`canonical-final:${sweep}`, () => reconciliation.runNext(input, async () => {}, cancelled.signal));
     const final = (await database.query("SELECT active_id,pending_inputs,published_inputs FROM inventory_reconciliation WHERE scope_id=$1", [scope.scopeId])).rows[0];
@@ -1180,15 +1186,22 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
   }, packageInventoryReadPolicy);
   const stopped = new AbortController();
   const reader = new InventoryQueries(database, "synthetic-capacity-query-cursor-key-32");
-  const identity = { ...selectionIdentity, tenantId: fixtureTenant, principalId: "capacity-main" };
+  const identity = { ...selectionIdentity, tenantId: graph?.tenantId ?? fixtureTenant, principalId: "capacity-main" };
   let pin = graph ? await reader.capture(identity, graph.scopeId) : undefined;
+  const pins = new Set(pin ? [pin.id] : []);
+  let rotation: Promise<void> | undefined;
   const ids = Array.from({ length: 20 }, (_, i) => `package-${String(200+i).padStart(6, "0")}`);
   const readers = Array.from({ length: 12 }, async (_, index) => {
     let requests = 0, failures = 0;
     while (!stopped.signal.aborted) {
       try {
         if (pin && graph) {
-          if (pin.expiresAt.getTime() < Date.now()+2000) pin = await reader.capture(identity, graph.scopeId);
+          if (pin.expiresAt.getTime() < Date.now()+2000) {
+            rotation ??= reader.capture(identity,graph.scopeId).then(replacement => {
+              pin = replacement; pins.add(replacement.id);
+            }).finally(() => { rotation = undefined; });
+            await rotation;
+          }
           assert.equal((await reader.exact(pin.id, identity, ids)).length, 20);
         } else await database.query("SELECT pg_sleep(0.01)");
         requests++;
@@ -1198,8 +1211,8 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
     return { index, requests, failures, dataset: graph ? 100_000 : 0 };
   });
   const started = Date.now();
-  try {
-    await stream.stages.execute(capacityInput("capacity-idle"), { domain: "packages", mode: "baseline", channel: "catalog" }, async (lease, signal) => {
+  return capacityWithCleanup(async () => {
+    await stream.stages.execute(capacityInput("capacity-idle","inventory_packages",randomUUID()), { domain: "packages", mode: "baseline", channel: "catalog" }, async (lease, signal) => {
       leaseId = lease.id; validationSignal = signal;
       for await (const page of provider.catalogPages("synthetic", { signal, visit: token => stream.stages.visit(lease, token) })) {
         await stream.stages.acceptPage(lease, page, 0);
@@ -1219,7 +1232,7 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
     assert.equal(response.status, 429); ready(); return response;
   }, packageInventoryReadPolicy);
   const countBefore = renewals;
-  const pending = stream.stages.execute(capacityInput("capacity-cancel"), { domain: "packages", mode: "baseline", channel: "catalog" },
+  const pending = stream.stages.execute(capacityInput("capacity-cancel","inventory_packages",randomUUID()), { domain: "packages", mode: "baseline", channel: "catalog" },
     async (lease, signal) => {
       cancelLease = lease;
       for await (const _page of cancelProvider.catalogPages("synthetic", { signal, visit: token => stream.stages.visit(lease, token) })) {
@@ -1238,15 +1251,22 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
   assert.equal(cancelAttempts, 1);
   return { elapsedMs: Date.now() - started, leaseId, renewals, validationRenewals, attempts, long, cancelAttempts, cancelled: row,
     readerDataset: graph ? 100_000 : 0 };
-  } finally {
+  },async () => {
     stopped.abort();
-    telemetry.write({ event: "heartbeat-readers", results: await Promise.allSettled(readers) });
-  }
+    const results = await Promise.allSettled(readers);
+    telemetry.write({ event: "heartbeat-readers", results });
+    const errors = results.flatMap(result => result.status === "rejected" ? [result.reason]
+      : result.value.failures ? [Object.assign(new Error("capacity_heartbeat_reader_failure"),{ details: result.value })] : []);
+    const releases = await Promise.allSettled([...pins].map(id => reader.selections.invalidate(id,identity)));
+    errors.push(...releases.filter(result => result.status === "rejected").map(result => result.reason));
+    if (errors.length) throw new AggregateError(errors,"capacity_heartbeat_concurrent_failure");
+  });
 }
 
 async function residualBoundary(database: pg.Pool) {
   const stages = new DataGenerations(database), input = generationInput({ reserveBytes: 128*MiB,
-    scope: { tenantId: fixtureTenant, kind: "principal", principalId: "capacity-residual", tokenMode: "delegated", source: "directory", selector: "complete" } });
+    scope: { tenantId: randomUUID(), kind: "tenant", principalId: null, tokenMode: "tenant", source: "directory", selector: "complete" },
+    actorPrincipalId: "capacity-residual" });
   const residual = (index: number) => {
     const text = Buffer.alloc(262144 - Buffer.byteLength('{"value": ""}'));
     let state = 0x12345678 ^ index;
@@ -1323,7 +1343,7 @@ async function workerTakeover(database: pg.Pool, telemetry: CapacityTelemetry) {
 
 async function wideDirectory(database: pg.Pool, telemetry: CapacityTelemetry) {
   const stages = new DataGenerations(database);
-  const input = capacityInput("capacity-wide", "directory");
+  const input = capacityInput("capacity-wide", "directory",randomUUID());
   return stages.execute(input, async (lease, signal) => {
     let ordinal = 0;
     for (let offset = 0; offset < 10_000; offset += 100) {
@@ -1349,14 +1369,15 @@ async function wideDirectory(database: pg.Pool, telemetry: CapacityTelemetry) {
 }
 
 async function deepInventory(database: pg.Pool, telemetry: CapacityTelemetry) {
+  const tenantId = randomUUID();
   const stream = new StreamedInventory(database,new GraphPackagesClient(fixtureFetch(100,0,false,"sparse",10_000),packageInventoryReadPolicy));
-  const baseline = await stream.graphCatalog(capacityInput("capacity-deep"),"synthetic",{ authorize: async () => {} });
+  const baseline = await stream.graphCatalog(capacityInput("capacity-deep","inventory_packages",tenantId),"synthetic",{ authorize: async () => {} });
   let failed = 0, succeeded = 0;
   const errors: unknown[] = [];
   for (let i = 0; i < 100; i++) {
     const previous = (await database.query("SELECT revision::text FROM inventory_roots WHERE scope_id=$1 AND current",[baseline.scopeId])).rows[0].revision;
     try {
-      await stream.details(capacityInput("capacity-deep"),"synthetic",[`package-${key(i)}`],{ authorize: async () => {} });
+      await stream.details(capacityInput("capacity-deep","inventory_packages",tenantId),"synthetic",[`package-${key(i)}`],{ authorize: async () => {} });
       succeeded++;
     } catch (error) {
       failed++; if (errors.length<8) errors.push(failure(error));
@@ -1406,10 +1427,10 @@ async function reportHistory(database: pg.Pool, telemetry: CapacityTelemetry) {
       pending.length = 0;
     }
   }
-  const pin = await reader.capture(identity, "delegated", "history");
+  const pin = await reader.capture(identity, "history");
   const page = await reader.page(pin.id, identity, { limit: 100 });
   assert.equal(page.counts.total, 32);
-  const old = await reader.capture(identity, "delegated", "official_users", { setId: accepted[0] });
+  const old = await reader.capture(identity, "official_users", { setId: accepted[0] });
   const exportEngine = new OfficialReportExports(reader, { tenantId: identity.tenantId, homeAccountId: identity.principalId,
     username: "history@example.invalid", displayName: "History" }, "synthetic-capacity-history-cursor-key-32");
   const exportId = await exportEngine.create(identity, { selectionId: old.id, kind: "official_users" });

@@ -8,11 +8,12 @@ import { LargeTenantUsersReports } from "../src/services/largeTenantUsersReports
 import { digest } from "../src/db/dataBounds.js";
 
 const fixture = await testDatabase();
-const identity = { ...selectionIdentity, tenantId: `native-union-${randomUUID()}` };
-const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-report-read-profile-secret", 35);
-const slow = new Map<string, { sql: string; values: unknown[]; milliseconds: number }>();
-const wrapped = new WeakSet<pg.PoolClient>();
+let failure: { error: unknown } | undefined;
 try {
+  const identity = { ...selectionIdentity, tenantId: `native-union-${randomUUID()}` };
+  const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-report-read-profile-secret", 35);
+  const slow = new Map<string, { sql: string; values: unknown[]; milliseconds: number }>();
+  const wrapped = new WeakSet<pg.PoolClient>();
   const set = await seedDisjointReportUnion(fixture.operator, identity.tenantId, 50000);
   await reports.history.ensure(identity.tenantId);
   await reports.history.connections.run(client => reports.history.accepted(client, identity.tenantId, set.id));
@@ -37,11 +38,13 @@ try {
   });
   for (const endpoint of ["official_users", "official_agents"] as const) {
     let start = performance.now();
-    const selection = await reports.capture(identity, "delegated", endpoint, { setId: set.id });
+    const selection = await reports.capture(identity, endpoint, { setId: set.id });
     console.log("CAPTURE_MS", endpoint, performance.now() - start);
     start = performance.now();
-    console.log("COUNTS", endpoint, (await reports.page(selection.id, identity)).counts);
-    console.log("PAGE_MS", endpoint, performance.now() - start);
+    const page = await reports.page(selection.id, identity);
+    const pageMilliseconds = performance.now() - start;
+    console.log("COUNTS", endpoint, page.counts);
+    console.log("PAGE_MS", endpoint, pageMilliseconds);
     start = performance.now();
     await reports.exact(selection.id, identity, endpoint === "official_users" ? "bridge-49999" : "agent-49999");
     console.log("EXACT_MS", endpoint, performance.now() - start);
@@ -54,11 +57,14 @@ try {
   await reports.history.connections.run(client => reports.history.accepted(client, smallIdentity.tenantId, small.id));
   slow.clear();
   for (const cohort of ["all", "zero", "low", "review"] as const) {
-    const start = performance.now();
-    const selection = await reports.capture(smallIdentity, "delegated", "official_users", { setId: small.id, cohort });
+    let start = performance.now();
+    const selection = await reports.capture(smallIdentity, "official_users", { setId: small.id, cohort });
     console.log("SMALL_CAPTURE_MS", cohort, performance.now() - start);
-    console.log("SMALL_COUNTS", cohort, (await reports.page(selection.id, smallIdentity)).counts);
-    console.log("SMALL_PAGE_MS", cohort, performance.now() - start);
+    start = performance.now();
+    const page = await reports.page(selection.id, smallIdentity);
+    const pageMilliseconds = performance.now() - start;
+    console.log("SMALL_COUNTS", cohort, page.counts);
+    console.log("SMALL_PAGE_MS", cohort, pageMilliseconds);
   }
   for (const [hash, query] of [...slow].sort((a, b) => b[1].milliseconds - a[1].milliseconds).slice(0, 4)) {
     const plan = await reports.selections.connections.selectedRead(async client => {
@@ -68,4 +74,13 @@ try {
     if (Buffer.byteLength(JSON.stringify(plan)) > 1048576) throw new Error("profile_result_bytes");
     console.log("EXPLAIN", hash, JSON.stringify(plan));
   }
-} finally { await fixture.close(); }
+} catch (error) {
+  failure = { error };
+  throw error;
+} finally {
+  try { await fixture.close(); }
+  catch (cleanupError) {
+    if (failure) throw new AggregateError([failure.error, cleanupError], "Report read profile and fixture cleanup failed.");
+    throw cleanupError;
+  }
+}

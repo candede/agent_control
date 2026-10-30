@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import pg from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { pool } from "./pool.js";
@@ -40,6 +41,8 @@ const job = {
   attempted_at: null,
   updated_at: new Date("2026-09-22T00:00:00.000Z"),
   finished_at: null,
+  deadline_at: new Date("2026-09-22T00:10:00.000Z"),
+  checked_at: new Date("2026-09-22T00:01:00.000Z"),
 };
 const queryHash = createHash("sha256").update(JSON.stringify({
   tokenMode: input.tokenMode, scopeKind: "broad", requestedIds: [],
@@ -55,6 +58,104 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("package refresh admission", () => {
+  it.each(["waiting_authorization", "running"])(
+    "reports retained deadline-expired %s jobs as terminal across saved reads", async status => {
+      const expired = { ...job, status, auto_details: true, scope_kind: "exact", checked_at: job.deadline_at };
+      query.mockResolvedValueOnce({ ...emptyResult, rows: [expired] })
+        .mockResolvedValueOnce({ ...emptyResult, rows: [expired] })
+        .mockResolvedValueOnce({ ...emptyResult, rows: [expired] })
+        .mockResolvedValueOnce({ ...emptyResult, rows: [{ last_attempt_at: null, last_success_at: null }] });
+      const repository = new PackageRefreshJobs();
+      const expected = {
+        status: "failed", errorCode: "package_refresh_expired", message: expect.stringContaining("Start a new refresh"),
+        updatedAt: job.deadline_at.toISOString(), finishedAt: job.deadline_at.toISOString(),
+        resultRevision: `${job.result_revision}:expired`,
+      };
+      expect(await repository.getJob(scope, job.id)).toMatchObject(expected);
+      expect(await repository.latestAutomaticDetailsJob(scope, scope.principalId)).toMatchObject(expected);
+      expect((await repository.listJobs(scope, scope.principalId)).value).toEqual([expect.objectContaining(expected)]);
+      for (const [statement] of query.mock.calls.slice(0, 3)) {
+        expect(statement).toContain("clock AS MATERIALIZED");
+        expect(statement).toContain("job.deadline_at,clock.checked_at");
+        expect(statement).toContain("job.expires_at>clock.checked_at");
+      }
+    },
+  );
+
+  it.each(["waiting_authorization", "running", "succeeded", "failed", "cancelled"])(
+    "preserves saved %s metadata when the execution deadline does not expire active work", async status => {
+      const value = { ...job, status, error_code: "saved_code", message: "Saved message.",
+        checked_at: ["waiting_authorization", "running"].includes(status)
+          ? new Date(job.deadline_at.getTime() - 1) : job.deadline_at };
+      query.mockResolvedValueOnce({ ...emptyResult, rows: [value] });
+      expect(await new PackageRefreshJobs().getJob(scope, job.id)).toMatchObject({
+        status, errorCode: "saved_code", message: "Saved message.", resultRevision: job.result_revision,
+        updatedAt: job.updated_at.toISOString(), finishedAt: null,
+      });
+    },
+  );
+
+  it("recovers expired waiting jobs as well as running jobs without resuming automatic provider work", async () => {
+    query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1 })
+      .mockResolvedValueOnce({ ...emptyResult, rowCount: 2 });
+    expect(await new PackageRefreshJobs().recoverInterrupted()).toBe(3);
+    expect(query.mock.calls[0][0]).toContain("status='running' AND NOT auto_details");
+    const expired = String(query.mock.calls[1][0]);
+    expect(expired).toContain("status IN ('running','waiting_authorization')");
+    expect(expired).toContain("expires_at<=clock_timestamp() OR deadline_at<=clock_timestamp()");
+    expect(expired).toContain("LIMIT 250 FOR UPDATE SKIP LOCKED");
+    expect(expired).toContain("SET status='failed',error_code='package_refresh_expired'");
+  });
+
+  it("reports expired unobserved targets as failed without hiding staged observations", async () => {
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(client, "query").mockImplementation(query);
+    vi.spyOn(dataConnections(pool), "selectedRead").mockImplementation(async operation => operation(client));
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [{ ...job, status: "running",
+      target_count: 2, checked_at: job.deadline_at }] })
+      .mockImplementationOnce(async (statement, parameters) => {
+        expect(statement).toContain("CASE WHEN $4::text='succeeded'");
+        expect(statement).toContain("ELSE $4::text END AS status");
+        expect(parameters).toEqual([job.id, -1, 51, "failed"]);
+        return { ...emptyResult, rows: [
+          { ordinal: 0, id: "observed", status: "observed_unpublished" },
+          { ordinal: 1, id: "unobserved", status: "failed" },
+        ] };
+      });
+    const result = await new PackageRefreshJobs().targets(scope, {
+      ...scope, authorizationHash: "viewer", sessionEpoch: "0",
+    }, job.id, {});
+    expect(result).toMatchObject({
+      revision: `${job.result_revision}:expired`, counts: { total: 2, filtered: 2 },
+      value: [{ id: "observed", status: "observed_unpublished" }, { id: "unobserved", status: "failed" }],
+    });
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates target cursors when an otherwise unchanged running job reaches its deadline", async () => {
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(client, "query").mockImplementation(query);
+    vi.spyOn(dataConnections(pool), "selectedRead").mockImplementation(async operation => operation(client));
+    let checkedAt = new Date(job.deadline_at.getTime() - 1);
+    query.mockImplementation(async statement => {
+      if (String(statement).includes("FOR SHARE OF p")) return { ...emptyResult, rows: [{
+        ...job, status: "running", target_count: 2, checked_at: checkedAt,
+      }] };
+      if (String(statement).includes("SELECT t.ordinal")) return { ...emptyResult, rows: [
+        { ordinal: 0, id: "first", status: "running" }, { ordinal: 1, id: "second", status: "running" },
+      ] };
+      throw new Error("Unexpected target page query.");
+    });
+    const repository = new PackageRefreshJobs();
+    const identity = { ...scope, authorizationHash: "viewer", sessionEpoch: "0" };
+    const first = await repository.targets(scope, identity, job.id, { limit: 1 });
+    expect(first.page.nextCursor).toEqual(expect.any(String));
+    checkedAt = job.deadline_at;
+    await expect(repository.targets(scope, identity, job.id, {
+      limit: 1, revision: first.revision, cursor: first.page.nextCursor!,
+    })).rejects.toMatchObject({ code: "selection_invalidated" });
+  });
+
   it("materializes scoped recent detail targets once instead of rescanning job history per catalog row", async () => {
     query.mockResolvedValue(emptyResult);
     await expect(new PackageRefreshJobs().claimDueDetails(scope, scope.principalId)).resolves.toBeNull();
@@ -63,7 +164,9 @@ describe("package refresh admission", () => {
     const statement = String(candidate![0]);
     expect(statement).toContain("WITH recent_detail_attempts AS MATERIALIZED");
     expect(statement).toContain("SELECT DISTINCT t.target_id,t.catalog_revision_hash");
-    expect(statement).toContain("attempted.tenant_id=$1 AND attempted.principal_id=$2 AND attempted.auto_details");
+    expect(statement).toContain("attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details");
+    expect(statement).toContain("attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2");
+    expect(statement).not.toContain("attempted.principal_id=$2");
     expect(statement).toContain("LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id");
     expect(statement).toContain("attempted.catalog_revision_hash=");
     expect(statement).toContain("r.native_id=ANY($3::text[]) OR attempted.target_id IS NULL");
@@ -82,7 +185,7 @@ describe("package refresh admission", () => {
       .rejects.toMatchObject({ status: 409, code: "package_refresh_expired" });
     expect(query).toHaveBeenCalledTimes(4);
     expect(query.mock.calls.some(([statement]) => String(statement).includes("INSERT"))).toBe(false);
-    expect(query.mock.calls[3][0]).toContain("job.expires_at>clock_timestamp()");
+    expect(query.mock.calls[3][0]).toContain("job.expires_at>clock.checked_at");
   });
 
   it("returns a retained idempotent job without creating another refresh", async () => {
@@ -193,7 +296,7 @@ describe("package refresh admission", () => {
     expect(query).toHaveBeenCalledTimes(2);
     expect(String(query.mock.calls[0][0])).toContain("auto_details AND status='waiting_authorization' AND attempted_at IS NULL");
     expect(String(query.mock.calls[0][0])).toContain("updated_at::text=$6");
-    expect(String(query.mock.calls[1][0])).toMatch(/^SELECT /);
+    expect(String(query.mock.calls[1][0])).toContain("SELECT job.id");
   });
 
   it("counts only retained jobs still within their dispatch deadline under the scope lock", async () => {
@@ -208,8 +311,8 @@ describe("package refresh admission", () => {
     await expect(repository.submit(scope, input)).resolves.toMatchObject({ status: "waiting_authorization" });
 
     expect(query.mock.calls[0][0]).toContain("pg_advisory_xact_lock");
-    expect(query.mock.calls[0][1]).toEqual([`data-sync:${scope.tenantId}:${scope.principalId}`]);
-    expect(query.mock.calls[1][1]).toEqual([`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+    expect(query.mock.calls[0][1]).toEqual([`data-sync:${scope.tenantId}`]);
+    expect(query.mock.calls[1][1]).toEqual([`package-refresh:${scope.tenantId}`]);
     const outstanding = query.mock.calls[3];
     expect(outstanding[0]).toContain("status IN ('waiting_authorization','running')");
     expect(outstanding[0]).toContain("expires_at>clock_timestamp()");

@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput } from "../../scripts/largeTenantFixtures.js";
 import { seedReportSet } from "../../scripts/officialReportFixtures.js";
+import { nativeInventoryFixture, reconcileInventoryFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
 import { DataSyncRepository, requireUserPublication } from "../db/dataSync.js";
 import { transaction } from "../db/pool.js";
 import { UserSourceStages } from "../db/userSourceStages.js";
@@ -22,6 +23,7 @@ import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import type { UserSourceKind } from "../types/userSources.js";
 import type { CapabilityId } from "../types/capability.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 import type { FetchLike } from "./graphPackages.js";
 
 vi.hoisted(() => {
@@ -70,9 +72,10 @@ describe("live Users orchestration and publication boundary", () => {
     const service = new CopilotUsageService(fixture.runtime, { provider, revalidateUser, delegatedToken, requireAvailable, admissions,
       observeOperation: async (_capability, _user, operation) => operation(() => {}) });
     const sources = new UserSourcesRepository(fixture.runtime, "synthetic-source-secret-never-production");
-    const status = () => sources.refreshStatus(identity, "delegated");
+    const status = () => sources.refreshStatus(identity);
     const seed = (source: UserSourceKind, observedAt = new Date(), expiresAt?: Date) => provider.refresh(new UserSourceStages(fixture.runtime), generationInput({
-      scope: { kind: "principal", tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: "delegated", source, selector: "complete" },
+      scope: { kind: "tenant", tenantId: identity.tenantId, principalId: null, tokenMode: "tenant", source, selector: "complete" },
+      actorPrincipalId: identity.principalId,
       sessionEpoch: identity.sessionEpoch, observedAt, ...(expiresAt ? { expiresAt } : {}),
     }), { authorize: async () => "synthetic-token" });
     return { service, user, identity, repository, publication, fetcher, provider, revalidateUser, delegatedToken, requireAvailable, admissions, sources, status, seed };
@@ -86,7 +89,7 @@ describe("live Users orchestration and publication boundary", () => {
     expect(progress).toHaveBeenCalledWith(1, expect.any(Function));
     expect(h.revalidateUser).toHaveBeenCalledTimes(4);
     expect(h.delegatedToken).toHaveBeenCalledTimes(4);
-    const selected = await h.sources.capture(h.identity, "delegated");
+    const selected = await h.sources.capture(h.identity);
     const people = await h.sources.people(selected.id, h.identity, [objectId]);
     expect(people).toHaveLength(1);
     expect(people[0]).toMatchObject({ objectId, displayName: "Person", userPrincipalName: "person@example.invalid" });
@@ -229,6 +232,9 @@ describe("live Users orchestration and publication boundary", () => {
     await h.repository.updateSource(h.identity, h.publication.runId, "users", {
       status: "succeeded", count: 1, message: "Saved current report identities.", canRetry: false,
     });
+    await streamedPackageFixture(fixture.runtime, h.identity, []);
+    await nativeInventoryFixture(fixture.runtime, h.identity, [], { resourceTypes: [...powerPlatformResourceTypes] });
+    await reconcileInventoryFixture(fixture.runtime, h.identity);
     for (const source of ["graph_packages", "power_platform"] as const) {
       await h.repository.recordSuccessMarker(h.identity, source, 0, new Date().toISOString());
     }
@@ -301,8 +307,8 @@ describe("live Users orchestration and publication boundary", () => {
     try {
       await expect(h.service.refreshUsers(h.user, undefined, { publication: h.publication, incompleteOnly: true })).rejects.toMatchObject({ status: 401 });
       expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM data_generation_heads h JOIN data_scope_epochs s ON s.id=h.scope_id
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='directory' AND h.generation_id IS NOT NULL`,
-      [h.identity.tenantId, h.identity.principalId])).rows[0].n).toBe(0);
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='directory' AND h.generation_id IS NOT NULL`,
+      [h.identity.tenantId])).rows[0].n).toBe(0);
     } finally { await revocation; await activateAccountSession(h.identity.tenantId, h.identity.principalId, async () => {}); }
   });
   it("feeds positive Users OR bridge identities into bounded exact verification and moves newly paid people out of the unpaid cohort", async () => {
@@ -327,7 +333,7 @@ describe("live Users orchestration and publication boundary", () => {
       return Response.json({ value, "@odata.count": value.length });
     });
     const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-report-secret-never-production", 30);
-    const unpaid = async () => reports.page((await reports.capture(h.identity, "delegated", "official_users", { licenseCohort: "active_without_paid" })).id, h.identity);
+    const unpaid = async () => reports.page((await reports.capture(h.identity, "official_users", { licenseCohort: "active_without_paid" })).id, h.identity);
     expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication })).toMatchObject({ status: "succeeded", count: 2 });
     expect((await unpaid()).counts.filtered).toBe(2);
     const exact = h.fetcher.mock.calls.map(([url]) => new URL(String(url)).searchParams.get("$filter")).filter(filter => filter && !filter.includes("assignedLicenses"));
@@ -337,7 +343,7 @@ describe("live Users orchestration and publication boundary", () => {
     paid = true;
     expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication })).toMatchObject({ status: "succeeded", count: 2 });
     expect((await unpaid()).counts.filtered).toBe(1);
-    expect((await reports.page((await reports.capture(h.identity, "delegated", "copilot_users", { cohort: "licensed" })).id, h.identity)).counts.filtered).toBe(1);
+    expect((await reports.page((await reports.capture(h.identity, "copilot_users", { cohort: "licensed" })).id, h.identity)).counts.filtered).toBe(1);
   });
   it("does not report preserved directory rows as users observed by an app-only retry", async () => {
     const h = await harness();
@@ -386,7 +392,7 @@ describe("live Users orchestration and publication boundary", () => {
       ? new Response(reportHeaders.join(",") + "\n") : Response.json({ value: [] }));
     expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication })).toMatchObject({ status: "succeeded", count: 0 });
     const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-report-secret-never-production", 30);
-    const page = await reports.page((await reports.capture(h.identity, "delegated", "copilot_users")).id, h.identity);
+    const page = await reports.page((await reports.capture(h.identity, "copilot_users")).id, h.identity);
     expect(page.counts).toEqual({ total: 0, filtered: 0 });
     expect(page.summary).toMatchObject({ checkedUsers: 0, licensedUsers: 0, usingAgentsUsers: null });
     expect(h.fetcher).toHaveBeenCalledTimes(2);

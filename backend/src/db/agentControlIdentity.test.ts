@@ -34,7 +34,7 @@ describe("corroborated current agent control identity", () => {
         input.scope.tenantId = scope.tenantId;
         if (expiresAt) input.expiresAt = expiresAt;
         const stages = new InventoryGenerations(fixture.runtime);
-        const record = packageInventoryRecord(detail);
+        const record = packageInventoryRecord(detail, mode === "baseline" ? "catalog" : "exact");
         const root = await stages.execute(input, { domain: "packages", mode,
           channel: mode === "baseline" ? "catalog" : "exact", ...(mode === "delta" ? { targets: [detail.id] } : {}) },
         async lease => {
@@ -49,7 +49,7 @@ describe("corroborated current agent control identity", () => {
       };
       await publish("another-reader", "baseline");
       await expect(resolve()).rejects.toMatchObject({ code: "quarantine_native_identity_unavailable" });
-      const proof = await publish(scope.principalId, "baseline", packaged, new Date(Date.now() + 2000));
+      const proof = await publish(scope.principalId, "delta", packaged, new Date(Date.now() + 2000));
       expect(await resolve()).toMatchObject([{ resourceNativeId: botId, environmentId, botId, snapshotId: native.baselineId }]);
       expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM inventory_facts
         WHERE generation_id=$1 AND kind='identifier' AND payload->>'kind'='cds_bot_id'`, [native.baselineId])).rows[0].n).toBe(0);
@@ -71,9 +71,9 @@ describe("corroborated current agent control identity", () => {
         JOIN inventory_memberships m ON m.generation_id=f.generation_id AND m.identity=f.identity
         JOIN inventory_roots r ON r.baseline_id=m.baseline_id AND r.current
         JOIN data_scope_epochs s ON s.id=r.scope_id
-        WHERE s.tenant_id=$1 AND s.principal_id=$2 AND r.domain='packages' AND f.kind='element'
+        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND r.domain='packages' AND f.kind='element'
           AND m.valid_from_revision<=r.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>r.revision)`,
-      [scope.tenantId, scope.principalId])).rows[0].n).toBe(0);
+      [scope.tenantId])).rows[0].n).toBe(0);
     } finally { await fixture.close(); }
   });
 });

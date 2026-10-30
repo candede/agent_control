@@ -53,5 +53,5 @@ function peopleScope(scope: DataSyncScope) {
       || value.length > maximum || /[\p{Cc}\p{Cs}]/u.test(value)) throw invalid();
     return value;
   };
-  return { tenantId: field("tenantId", 512), principalId: field("principalId", 1024), tokenMode: "delegated" as const };
+  return { tenantId: field("tenantId", 512), principalId: field("principalId", 1024) };
 }

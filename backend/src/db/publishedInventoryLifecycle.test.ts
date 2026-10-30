@@ -42,8 +42,8 @@ describe("published inventory reachability independent of freshness", () => {
     for (let pass = 0; pass < passes; pass++) {
       const roots = (await fixture.runtime.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
         r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-        WHERE r.tenant_id=$1 AND s.principal_id=$2 ORDER BY r.domain,r.first_revision`,
-      [identity.tenantId, identity.principalId])).rows;
+        WHERE r.tenant_id=$1 AND s.scope_kind='tenant' ORDER BY r.domain,r.first_revision`,
+      [identity.tenantId])).rows;
       for (const root of roots) {
         for (const result of [await store.gcSlice(root), await store.gcContent(root.scopeId, root.tenantId),
           await store.gcMetadataSlice(root.scopeId, root.tenantId)]) {
@@ -65,7 +65,7 @@ describe("published inventory reachability independent of freshness", () => {
       const person = randomUUID(), environmentId = randomUUID();
       const directory = new UserSourceStages(fixture.runtime);
       await directory.execute(generationInput({ scope: { ...generationInput().scope,
-        tenantId: identity.tenantId, principalId: identity.principalId }, expiresAt: deadline }), async lease => {
+        tenantId: identity.tenantId }, actorPrincipalId: identity.principalId, expiresAt: deadline }), async lease => {
         const key = await directory.query(lease, "discovery", "synthetic:retained-directory");
         await directory.page(lease, key, "synthetic:retained-directory", 1, 1);
         await directory.directory(lease, key, [fixtureDirectoryUser(person, "Retained person", "retained@example.invalid")]);
@@ -138,7 +138,7 @@ describe("published inventory reachability independent of freshness", () => {
         });
         expect((await inventory.page((await inventory.capture(identity, original.scopeId)).id, identity)).value
           .map(row => row.residual.displayName)).toEqual(["Before 0", "Before 1"]);
-        const report = await inventory.reports.capture(identity, "delegated", "copilot_users");
+        const report = await inventory.reports.capture(identity, "copilot_users");
         expect((await inventory.reports.page(report.id, identity)).sources.directory).toMatchObject({ state: "stale", rowCount: 1 });
         await expect(live.record(identity, `agent:${packageAgent.id}`)).rejects.toMatchObject({ code: "agent_not_found" });
         await expect(inventory.currentControl(fresh.id, identity, packageAgent.id, async () => "must not authorize"))
@@ -226,7 +226,7 @@ describe("published inventory reachability independent of freshness", () => {
 
   it("still abandons a writer whose worker lease is lost, independently of its publication freshness", async () => {
     const generations = new DataGenerations(fixture.runtime), value = generationInput();
-    value.scope.principalId = randomUUID();
+    value.scope.tenantId = randomUUID();
     const lease = await generations.begin(value);
     await fixture.operator.query("UPDATE data_generations SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [lease.id]);
     await generations.connections.run(client => retainRecordData(client, 250));

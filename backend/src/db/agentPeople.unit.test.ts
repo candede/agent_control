@@ -6,7 +6,7 @@ import { AgentPeopleRepository, type AgentPersonObservation } from "./agentPeopl
 afterEach(() => vi.restoreAllMocks());
 
 const scope = { tenantId: "people-tenant", principalId: "people-principal" };
-const generation = { sessionEpoch: "7", scopeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", scopeEpoch: "3" };
+const generation = { actorPrincipalId: scope.principalId, sessionEpoch: "7", scopeId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", scopeEpoch: "3" };
 const objectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const observation: AgentPersonObservation = {
   objectId, status: "resolved", displayName: "Saved person", userPrincipalName: null,
@@ -20,7 +20,7 @@ function result(rows: pg.QueryResultRow[] = [], command = "SELECT"): pg.QueryRes
 function fixture() {
   const database = new pg.Pool({ max: 4 });
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
-  vi.spyOn(database, "connect").mockResolvedValue(client);
+  vi.spyOn(database, "connect").mockImplementation(async () => client);
   vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected pool query"));
   const query = vi.fn<(statement: unknown, values?: unknown[]) => Promise<pg.QueryResult>>(async statement => {
     if (typeof statement !== "string") throw new Error("Unexpected query shape");
@@ -101,8 +101,8 @@ describe("agent people publication transaction fences", () => {
 
     await repository.save(scope, [observation], { generation, fence });
 
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("AND epoch=$4 AND session_epoch=$5 FOR UPDATE"),
-      [generation.scopeId, scope.tenantId, scope.principalId, generation.scopeEpoch, generation.sessionEpoch]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("AND epoch=$3 FOR UPDATE"),
+      [generation.scopeId, scope.tenantId, generation.scopeEpoch]);
     expect(query).toHaveBeenCalledWith("COMMIT");
     expect(query).not.toHaveBeenCalledWith("ROLLBACK");
     expect(fence).toHaveBeenCalled();

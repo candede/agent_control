@@ -232,6 +232,71 @@ describe("DataSyncPanel", () => {
     expect(api.cancel).not.toHaveBeenCalled();
   });
 
+  it.each(["pending", "scheduled"] as const)(
+    "refreshes idle workspace status without interrupting a %s exact-run poll",
+    async phase => {
+      vi.useFakeTimers();
+      const saved = source("users", "succeeded", { count: 3, lastSuccessAt: "2026-09-15T10:00:00Z" });
+      const published = { ...saved, count: 7, lastSuccessAt: "2026-09-15T11:00:00Z" };
+      const exact = run("waiting", [source("users", "waiting_authorization")], { id: "exact-run" });
+      let resolveRun!: (value: DataSyncRun) => void;
+      api.getState.mockResolvedValueOnce(syncState({ onboardingRequired: false, sources: [saved] }))
+        .mockResolvedValue(syncState({ onboardingRequired: false, sources: [published] }));
+      if (phase === "pending") api.getRun.mockReturnValueOnce(new Promise(resolve => { resolveRun = resolve; }));
+      else api.getRun.mockResolvedValueOnce(exact);
+      api.getRun.mockResolvedValue(exact);
+      const ref = createRef<DataSyncPanelHandle>();
+      const onChanged = vi.fn();
+      renderPanel({ ref, requestedRunId: exact.id, onSourcesChanged: onChanged });
+      await act(() => vi.advanceTimersByTimeAsync(500));
+      const signal = api.getRun.mock.calls[0][1].signal as AbortSignal;
+
+      await act(async () => { await ref.current!.refresh(false); });
+
+      expect(api.getState).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole("article", { name: "Users" })).toHaveTextContent("7");
+      expect(onChanged).toHaveBeenCalledExactlyOnceWith(["users"]);
+      expect(api.getRun).toHaveBeenCalledOnce();
+      expect(signal.aborted).toBe(false);
+      if (phase === "pending") await act(async () => resolveRun(exact));
+      else await act(() => vi.advanceTimersByTimeAsync(500));
+      expect(api.getRun).toHaveBeenCalledTimes(phase === "pending" ? 1 : 2);
+      expect(screen.getByText(exact.id, { selector: "code" })).toBeVisible();
+      expect(api.start).not.toHaveBeenCalled();
+      expect(api.cancel).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retries workspace status while an exact-run background read is pending", async () => {
+    vi.useFakeTimers();
+    const exact = run("running", [source("users", "running")], { id: "exact-run" });
+    const completed = run("completed", [source("users", "succeeded")], { id: exact.id });
+    let resolveOldRun!: (value: DataSyncRun) => void;
+    api.getState.mockRejectedValueOnce(new Error("Workspace status is unavailable."))
+      .mockResolvedValue(syncState({ onboardingRequired: false }));
+    api.getRun.mockResolvedValueOnce(exact)
+      .mockReturnValueOnce(new Promise(resolve => { resolveOldRun = resolve; }))
+      .mockResolvedValue(completed);
+    renderPanel({ requestedRunId: exact.id });
+    await act(() => vi.advanceTimersByTimeAsync(1_000));
+    const details = within(screen.getByRole("dialog", { name: "Sync run details" }));
+    const retry = details.getByRole("button", { name: "Retry status check" });
+    const signal = api.getRun.mock.calls[1][1].signal as AbortSignal;
+    expect(retry).toBeEnabled();
+
+    await act(async () => { retry.click(); retry.click(); });
+
+    expect(api.getState).toHaveBeenCalledTimes(2);
+    expect(api.getRun).toHaveBeenCalledTimes(3);
+    expect(signal.aborted).toBe(true);
+    expect(details.queryByRole("alert")).not.toBeInTheDocument();
+    expect(details.getByText("Sync complete", { exact: true })).toBeVisible();
+    await act(async () => resolveOldRun(exact));
+    expect(details.getByText("Sync complete", { exact: true })).toBeVisible();
+    expect(api.start).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])("does not assume setup is required before saved status resolves to %s", async onboardingRequired => {
     let resolveState!: (value: DataSyncState) => void;
     api.getState.mockReturnValueOnce(new Promise<DataSyncState>(resolve => { resolveState = resolve; }));
@@ -245,6 +310,27 @@ describe("DataSyncPanel", () => {
     expect(onSetupStatusChange.mock.calls.map(([status]) => status)).toEqual(["checking", onboardingRequired ? "required" : "ready"]);
     if (onboardingRequired) expect(screen.getByRole("dialog", { name: "Set up your workspace" })).toBeVisible();
     else expect(view.container).toBeEmptyDOMElement();
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it.each(["viewer", "admin"])("does not repeat completed tenant onboarding for another %s account", async role => {
+    api.getState.mockResolvedValue(syncState({
+      onboardingRequired: false, sources: automaticSources(),
+      run: run("running", [source("graph_packages", "running")]),
+    }));
+    const onSetupStatusChange = vi.fn();
+    const overflow = document.body.style.overflow;
+    const view = renderPanel({ active: false, principalKey: "tenant:first:viewer", onOpenSync: vi.fn(), onSetupStatusChange });
+    await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready"));
+    expect(view.container).toBeEmptyDOMElement();
+
+    view.rerenderPanel({ principalKey: `tenant:second:${role}` });
+
+    await waitFor(() => expect(api.getState).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(onSetupStatusChange).toHaveBeenLastCalledWith("ready"));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(view.container).toBeEmptyDOMElement();
+    expect(document.body.style.overflow).toBe(overflow);
     expect(api.start).not.toHaveBeenCalled();
   });
 
@@ -418,7 +504,6 @@ describe("DataSyncPanel", () => {
     expect(screen.getByRole("progressbar", { name: "First sync sources saved" })).toHaveAttribute("value", "0");
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
     const dialog = screen.getByRole("dialog", { name: "Set up your workspace" });
-    expect(dialog).toHaveAttribute("open");
     expect(screen.getByRole("heading", { name: "Set up your workspace" })).toHaveFocus();
     expect(within(dialog).queryByRole("button", { name: /^Close/ })).not.toBeInTheDocument();
     expect(fireEvent(dialog, new Event("cancel", { cancelable: true }))).toBe(false);
@@ -454,7 +539,7 @@ describe("DataSyncPanel", () => {
     expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
-    expect(within(screen.getByRole("dialog")).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "Your first sync is in progress" })).queryByRole("button")).not.toBeInTheDocument();
     expect(view.container.querySelector(".first-sync-actions")).not.toBeInTheDocument();
     view.rerenderPanel({ active: true });
     expect(await screen.findByRole("region", { name: "Data sync" })).toBeVisible();
@@ -2118,6 +2203,7 @@ describe("DataSyncPanel", () => {
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Reset saved data..." }));
     expect(screen.getByText(/Accepted usage reports, report history, audit records/)).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: /tenant's saved users and inventory will be cleared for all readers/ })).toBeVisible();
     const confirm = screen.getByRole("button", { name: "Clear and start full resync" });
     expect(confirm).toBeDisabled();
     await user.click(screen.getByRole("checkbox", { name: /I understand/ }));

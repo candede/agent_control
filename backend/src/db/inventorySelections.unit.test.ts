@@ -25,9 +25,9 @@ describe("inventory selection contracts", () => {
   it("returns no pins when the requested current root is unavailable", async () => {
     const client = Object.assign(new pg.Client(), { release: vi.fn() });
     const query = vi.spyOn(client, "query").mockResolvedValue(result());
-    await expect(inventorySelectionRoots(client, { id: "scope", tenantId: "tenant", tokenMode: "delegated" }, new Date()))
+    await expect(inventorySelectionRoots(client, { id: "scope", tenantId: "tenant" }, new Date()))
       .resolves.toEqual([]);
-    expect(query).toHaveBeenCalledWith(expect.stringContaining("r.current"), ["scope", "tenant", "delegated"]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("r.current"), ["scope", "tenant"]);
   });
 
   it("retains historical pins without requiring current publication or unexpired provider authority", async () => {
@@ -43,7 +43,8 @@ describe("inventory selection contracts", () => {
     expect(sql).toContain("g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch");
     expect(sql).toContain("g.state IN ('published','retired') AND g.validated");
     expect(sql).not.toMatch(/r\.current|expires_at/);
-    expect(query).toHaveBeenCalledWith(expect.any(String), ["saved-scope", "7", "saved-baseline", "tenant", ["reader"], ""]);
+    expect(query).toHaveBeenCalledWith(expect.any(String), ["saved-scope", "7", "saved-baseline", "tenant"]);
+    expect(sql).toContain("s.scope_kind='tenant' AND s.token_mode='tenant'");
   });
 
   it("rejects unavailable retained revisions rather than returning a successful empty read", async () => {
@@ -63,7 +64,7 @@ describe("inventory selection contracts", () => {
     expect(sql).toContain("membership.valid_to_revision>pin.revision");
     expect(sql).toContain("source.generation_id=member.source_generation_id AND source.identity=member.source_identity");
     expect(sql).toContain("selected.id=$4::uuid AND selected.tenant_id=$1 AND selected.principal_id=$2");
-    expect(sql).toContain("scope.tenant_id=$1 AND scope.principal_id=$2");
+    expect(sql).toContain("scope.tenant_id=$1 AND scope.scope_kind='tenant'");
     expect(sql).not.toMatch(/inventory_live_sources|data_generation_heads|\.current|expires_at/);
   });
 });

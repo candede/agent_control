@@ -5,7 +5,7 @@ import { observeDataWork } from "./dataMetrics.js";
 import { revalidateAuthorizedUser } from "../auth/msal.js";
 import { DataGenerations, type BeginGeneration } from "../db/dataGenerations.js";
 import { finalizeDataSyncRun } from "../db/dataSync.js";
-import { InventoryGenerations, inventorySelector, type InventoryIntent } from "../db/inventoryGenerations.js";
+import { InventoryGenerations } from "../db/inventoryGenerations.js";
 import { pool } from "../db/pool.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { hasAppRole } from "../types/capability.js";
@@ -20,20 +20,20 @@ import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 type Scope = { tenantId: string; principalId: string };
 type Domain = "packages" | "power_platform";
 
-export async function inventoryJobInput(database: pg.Pool, scope: Scope, domain: Domain, id: string,
-  intent: Pick<InventoryIntent, "environmentId" | "resourceTypes"> = {}): Promise<BeginGeneration> {
+export async function inventoryJobInput(database: pg.Pool, scope: Scope, domain: Domain, id: string): Promise<BeginGeneration> {
   const table = domain === "packages" ? "package_refresh_jobs" : "power_platform_refresh_jobs";
   const row = (await database.query(`SELECT j.attempted_at,j.deadline_at,
-      ${domain === "packages" ? "j.token_mode" : "'delegated'::text AS token_mode"},s.run_id FROM ${table} j
+      ${domain === "packages" ? "j.authorization_principal_id" : "j.principal_id"} AS actor_principal_id,s.run_id FROM ${table} j
     LEFT JOIN data_sync_run_sources s ON s.job_id=j.id AND s.tenant_id=j.tenant_id
     WHERE j.id=$1 AND j.tenant_id=$2 AND j.principal_id=$3 AND j.status='running'
       AND j.expires_at>clock_timestamp() AND j.deadline_at>clock_timestamp()`,
   [id, scope.tenantId, scope.principalId])).rows[0];
   if (!row) throw new AppError(409, "inventory_job_fenced", "The inventory refresh is no longer current.");
   return {
-    scope: { ...scope, kind: "principal", tokenMode: row.token_mode ?? "delegated",
-      source: `inventory_${domain}`, selector: inventorySelector({ domain, ...intent }) },
-    schemaVersion: 1, sessionEpoch: await new DataGenerations(database).sessionEpoch(scope.tenantId, scope.principalId),
+    scope: { tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant",
+      source: `inventory_${domain}`, selector: "complete" },
+    actorPrincipalId: row.actor_principal_id,
+    schemaVersion: 1, sessionEpoch: await new DataGenerations(database).sessionEpoch(scope.tenantId, row.actor_principal_id),
     jobId: id, jobKind: domain === "packages" ? "package_refresh" : "power_platform_refresh", runId: row.run_id ?? undefined,
     observedAt: row.attempted_at, expiresAt: new Date(Date.now() + 86_400_000),
     deadlineAt: row.deadline_at, reserveBytes: 1024 ** 3,
@@ -48,25 +48,25 @@ export function completeInventoryJob(input: BeginGeneration, domain: Domain) {
       ${domain === "power_platform" ? `unknown_field_count=(SELECT a.omitted_fields FROM inventory_attempts a
         JOIN data_generations g ON g.id=a.generation_id WHERE g.job_id=$1 AND g.state='published' ORDER BY g.observed_at DESC LIMIT 1),` : ""}
       error_code=NULL,message=NULL,finished_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status='running'
+      WHERE id=$1 AND tenant_id=$2 AND ${domain === "packages" ? "authorization_principal_id" : "principal_id"}=$3 AND status='running'
         AND expires_at>clock_timestamp() AND deadline_at>clock_timestamp()`,
-    [result.jobId, input.scope.tenantId, input.scope.principalId, result.rows]);
+    [result.jobId, input.scope.tenantId, input.actorPrincipalId, result.rows]);
     if (changed.rowCount !== 1) throw new AppError(409, "inventory_job_fenced", "The inventory refresh stopped before publication.");
     if (!input.runId) return;
-    if (!input.scope.principalId) throw new AppError(409, "inventory_run_fenced", "The source run requires a principal-scoped inventory refresh.");
+    if (!input.actorPrincipalId) throw new AppError(409, "inventory_run_fenced", "The source run requires an initiating actor.");
     const source = domain === "packages" ? "graph_packages" : "power_platform";
     const published = await client.query(`UPDATE data_sync_run_sources s SET status='succeeded',count=$5,
       last_success_at=clock_timestamp(),updated_at=clock_timestamp(),message='Complete source published.',can_retry=false
       FROM data_sync_runs r WHERE s.run_id=r.id AND s.run_id=$1 AND s.tenant_id=$2 AND s.principal_id=$3
         AND s.job_id=$4 AND s.source_id=$6 AND s.status='running' AND r.status IN ('running','waiting')
         AND r.expires_at>clock_timestamp()
-      RETURNING s.run_id`, [input.runId, input.scope.tenantId, input.scope.principalId, result.jobId, result.rows, source]);
+      RETURNING s.run_id`, [input.runId, input.scope.tenantId, input.actorPrincipalId, result.jobId, result.rows, source]);
     if (published.rowCount !== 1) throw new AppError(409, "inventory_run_fenced", "The source run stopped before publication.");
-    await client.query(`INSERT INTO data_sync_success_markers(tenant_id,principal_id,source_id,count,last_success_at,updated_at)
-      VALUES($1,$2,$3,$4,clock_timestamp(),clock_timestamp()) ON CONFLICT(tenant_id,principal_id,source_id)
+    await client.query(`INSERT INTO data_sync_success_markers(tenant_id,source_id,count,last_success_at,updated_at)
+      VALUES($1,$2,$3,clock_timestamp(),clock_timestamp()) ON CONFLICT(tenant_id,source_id)
       DO UPDATE SET count=EXCLUDED.count,last_success_at=EXCLUDED.last_success_at,updated_at=EXCLUDED.updated_at`,
-    [input.scope.tenantId, input.scope.principalId, source, result.rows]);
-    await finalizeDataSyncRun(client, { tenantId: input.scope.tenantId, principalId: input.scope.principalId! }, input.runId);
+    [input.scope.tenantId, source, result.rows]);
+    await finalizeDataSyncRun(client, { tenantId: input.scope.tenantId, principalId: input.actorPrincipalId }, input.runId);
   };
 }
 
@@ -118,7 +118,8 @@ export class InventoryRuntime {
     this.assertCurrent();
   }
   private async input(scope: Scope): Promise<BeginGeneration> {
-    return { scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_canonical", selector: "complete" },
+    return { scope: { tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant", source: "inventory_canonical", selector: "complete" },
+      actorPrincipalId: scope.principalId,
       schemaVersion: 1, sessionEpoch: await new DataGenerations(this.database).sessionEpoch(scope.tenantId, scope.principalId),
       observedAt: new Date(), expiresAt: new Date(Date.now() + 86_400_000), deadlineAt: new Date(Date.now() + 1_799_000),
       reserveBytes: 1024 ** 3, jobKind: "derived", jobId: randomUUID() };
@@ -137,18 +138,18 @@ export class InventoryRuntime {
       this.authorities.set(`${scope.tenantId}\0${scope.principalId}`, source);
     }
     const pending = await this.database.query(`SELECT 1 WHERE EXISTS(SELECT 1 FROM inventory_control_pending
-      WHERE tenant_id=$1 AND principal_id=$2) OR EXISTS(SELECT 1 FROM inventory_native_control_pending
-      WHERE tenant_id=$1 AND principal_id=$2)`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1) OR EXISTS(SELECT 1 FROM inventory_native_control_pending
+      WHERE tenant_id=$1)`, [scope.tenantId]);
     signal?.throwIfAborted();
     this.assertCurrent();
     if (pending.rowCount) return false;
     const roots = (await this.database.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
       r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r
       JOIN data_scope_epochs s ON s.id=r.scope_id JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
-      JOIN data_generations g ON g.id=v.generation_id WHERE r.current AND r.tenant_id=$1 AND s.principal_id=$2
-        AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
+      JOIN data_generations g ON g.id=v.generation_id WHERE r.current AND r.tenant_id=$1
+        AND s.scope_kind='tenant' AND s.token_mode='tenant' AND r.domain IN ('packages','power_platform')
         AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated
-      ORDER BY r.scope_id LIMIT 17`, [scope.tenantId, scope.principalId])).rows;
+      ORDER BY r.scope_id LIMIT 17`, [scope.tenantId])).rows;
     signal?.throwIfAborted();
     if (roots.length > 16) throw new AppError(413, "inventory_source_limit", "At most 16 source roots may form a canonical inventory.");
     if (roots.length) await this.reconciliation.request(await this.input(scope), roots, this.assertCurrent, signal);
@@ -160,13 +161,13 @@ export class InventoryRuntime {
   private async pruneControls(scope: Scope, signal: AbortSignal) {
     this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
       await client.query(`DELETE FROM inventory_control_pending WHERE (tenant_id,principal_id,target_id) IN (
         SELECT p.tenant_id,p.principal_id,p.target_id FROM inventory_control_pending p WHERE tenant_id=$1 AND principal_id=$2
           AND NOT EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
             JOIN inventory_revisions v ON v.scope_id=root.scope_id AND v.revision=root.revision JOIN data_generations g ON g.id=v.generation_id
-            WHERE root.current AND s.tenant_id=p.tenant_id AND s.principal_id=p.principal_id
-              AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='delegated'
+            WHERE root.current AND s.tenant_id=p.tenant_id AND s.scope_kind='tenant'
+              AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='tenant'
               AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
         ORDER BY p.target_id COLLATE "C" LIMIT 250)`, [scope.tenantId, scope.principalId]);
     }, false, signal, undefined, this.assertCurrent);
@@ -178,8 +179,8 @@ export class InventoryRuntime {
         AND EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
           JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
           JOIN data_generations g ON g.id=revision.generation_id
-          WHERE root.current AND s.tenant_id=p.tenant_id AND s.principal_id=p.principal_id
-            AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='delegated'
+          WHERE root.current AND s.tenant_id=p.tenant_id AND s.scope_kind='tenant'
+            AND s.source='inventory_packages' AND s.selector='complete' AND s.token_mode='tenant'
             AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated)
       ORDER BY p.updated_at,p.target_id COLLATE "C" LIMIT 20`, [scope.tenantId, scope.principalId])).rows;
     for (const target of pending) {
@@ -188,7 +189,8 @@ export class InventoryRuntime {
       const authorize = (authorizationSignal: AbortSignal) =>
         this.authorizeCurrent(scope, authorizationSignal);
       const input: BeginGeneration = {
-        scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_packages", selector: "complete" },
+        scope: { tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant", source: "inventory_packages", selector: "complete" },
+        actorPrincipalId: scope.principalId,
         schemaVersion: 1, sessionEpoch: await this.stages.generations.sessionEpoch(scope.tenantId, scope.principalId),
         jobId: target.observation_id, jobKind: "derived", observedAt: target.updated_at,
         expiresAt: new Date(Date.now() + 86_400_000), deadlineAt: new Date(Date.now() + 899_000), reserveBytes: 16 * 1_048_576,
@@ -216,7 +218,7 @@ export class InventoryRuntime {
   private async pruneNativeControls(scope: Scope, signal: AbortSignal) {
     this.assertCurrent();
     await this.stages.generations.connections.run(async client => {
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
       await client.query(`DELETE FROM inventory_native_control_pending WHERE (scope_id,identity) IN (
         SELECT p.scope_id,p.identity FROM inventory_native_control_pending p WHERE tenant_id=$1 AND principal_id=$2
           AND NOT EXISTS(SELECT 1 FROM inventory_roots root JOIN data_scope_epochs s ON s.id=root.scope_id
@@ -244,7 +246,8 @@ export class InventoryRuntime {
       signal.throwIfAborted();
       this.assertCurrent();
       const input: BeginGeneration = {
-        scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_power_platform", selector: target.selector },
+        scope: { tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant", source: "inventory_power_platform", selector: target.selector },
+        actorPrincipalId: scope.principalId,
         schemaVersion: 1, sessionEpoch: await this.stages.generations.sessionEpoch(scope.tenantId, scope.principalId),
         jobId: target.observation_id, jobKind: "derived", observedAt: target.receipt_observed_at,
         expiresAt: new Date(Date.now() + 86_400_000), deadlineAt: new Date(Date.now() + 899_000), reserveBytes: 16 * 1_048_576,
@@ -306,12 +309,12 @@ export class InventoryRuntime {
         EXISTS(SELECT 1 FROM inventory_control_pending WHERE tenant_id=$1 AND principal_id=$2)
         OR EXISTS(SELECT 1 FROM inventory_native_control_pending WHERE tenant_id=$1 AND principal_id=$2)
         OR EXISTS(SELECT 1 FROM inventory_reconciliation work JOIN data_scope_epochs scope ON scope.id=work.scope_id
-          WHERE scope.tenant_id=$1 AND scope.principal_id=$2 AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL)
+          WHERE scope.tenant_id=$1 AND scope.scope_kind='tenant' AND (work.status<>'idle' OR work.pending_inputs IS NOT NULL)
             AND EXISTS(SELECT 1 FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
               JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
               JOIN data_generations g ON g.id=v.generation_id
-              WHERE r.current AND s.tenant_id=scope.tenant_id AND s.principal_id=scope.principal_id
-                AND s.token_mode='delegated' AND r.domain IN ('packages','power_platform')
+              WHERE r.current AND s.tenant_id=scope.tenant_id AND s.scope_kind='tenant'
+                AND s.token_mode='tenant' AND r.domain IN ('packages','power_platform')
                 AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated))`,
       [scope.tenantId, scope.principalId]);
       signal.throwIfAborted();
@@ -351,23 +354,35 @@ export class InventoryRuntime {
   async pass(signal = new AbortController().signal) {
     signal.throwIfAborted();
     if (!await this.admissionsOpen(signal)) return false;
+    pruneAuthorities(this.authorities);
     const scopes = (await this.database.query(`SELECT tenant_id,principal_id,min(id) AS id FROM (
-      SELECT tenant_id,principal_id,id::text AS id FROM data_scope_epochs
-        WHERE source IN ('inventory_packages','inventory_power_platform') AND token_mode='delegated'
+      SELECT scope.tenant_id,g.actor_principal_id AS principal_id,scope.id::text AS id FROM data_scope_epochs scope
+        JOIN data_generation_heads head ON head.scope_id=scope.id JOIN data_generations g ON g.id=head.generation_id
+        WHERE scope.source IN ('inventory_packages','inventory_power_platform') AND scope.token_mode='tenant'
+          AND g.actor_principal_id IS NOT NULL
       UNION ALL SELECT tenant_id,principal_id,observation_id::text FROM inventory_control_pending
+      UNION ALL SELECT tenant_id,principal_id,observation_id::text FROM inventory_native_control_pending
       ) owners GROUP BY tenant_id,principal_id HAVING min(id)>$1 ORDER BY min(id) LIMIT 20`, [this.after])).rows;
     if (!scopes.length) { this.after = ""; await this.collect(signal); return false; }
     for (const row of scopes) {
       if (this.stopped || signal.aborted || maintenanceActive()) return false;
-      const scope = { tenantId: row.tenant_id, principalId: row.principal_id };
-      const authorityKey = `${scope.tenantId}\0${scope.principalId}`, source = this.authorities.get(authorityKey);
-      try {
-        if (source) await withAuthority(source, () => this.reconcile(scope, signal));
-        else {
-          await this.pruneControls(scope, signal);
-          await this.requireAdmissions(signal);
-          await this.pruneNativeControls(scope, signal);
+      const ownerScope = { tenantId: row.tenant_id, principalId: row.principal_id };
+      let source = this.authorities.get(`${row.tenant_id}\0${row.principal_id}`);
+      const ownerSource = source;
+      if (!source) {
+        for (const candidate of this.authorities.values()) {
+          if (candidate.principal.tenantId === row.tenant_id) { source = candidate; break; }
         }
+      }
+      const scope = { tenantId: row.tenant_id, principalId: source?.principal.principalId ?? row.principal_id };
+      const authorityKey = `${scope.tenantId}\0${scope.principalId}`;
+      try {
+        if (!ownerSource) {
+          await this.pruneControls(ownerScope, signal);
+          await this.requireAdmissions(signal);
+          await this.pruneNativeControls(ownerScope, signal);
+        }
+        if (source) await withAuthority(source, () => this.reconcile(scope, signal));
       } catch (error) {
         if (error instanceof AppError && error.status === 401) {
           if (this.authorities.get(authorityKey) === source) this.authorities.delete(authorityKey);
@@ -394,8 +409,8 @@ export class InventoryRuntime {
     const progress = (await client.query("SELECT cursor FROM data_lifecycle_progress WHERE worker='inventory' FOR UPDATE")).rows[0].cursor;
     const scope = (await client.query(`SELECT s.id,s.tenant_id,s.principal_id FROM data_scope_epochs s
       WHERE s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical') AND s.id::text>=$1
-        AND NOT EXISTS(SELECT 1 FROM inventory_control_pending p WHERE p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id)
-        AND NOT EXISTS(SELECT 1 FROM inventory_native_control_pending p WHERE p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id)
+        AND NOT EXISTS(SELECT 1 FROM inventory_control_pending p WHERE p.tenant_id=s.tenant_id)
+        AND NOT EXISTS(SELECT 1 FROM inventory_native_control_pending p WHERE p.tenant_id=s.tenant_id)
       ORDER BY s.id LIMIT 1`, [progress.scope ?? ""])).rows[0];
     if (!scope) {
       await client.query("UPDATE data_lifecycle_progress SET cursor='{}',slices=slices+1,updated_at=clock_timestamp() WHERE worker='inventory'");

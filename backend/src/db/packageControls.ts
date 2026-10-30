@@ -12,14 +12,14 @@ type Scope = { tenantId: string; principalId: string };
 
 export async function lockPackageInventoryScope(scope: Scope, client: pg.PoolClient) {
   validateScope(scope);
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}:${scope.principalId}`]);
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`package-refresh:${scope.tenantId}`]);
 }
 
 export async function readPackageInventoryGeneration(scope: Scope, database: Pick<pg.Pool, "query">) {
   validateScope(scope);
-  return (await database.query(`SELECT id FROM data_sync_runs WHERE tenant_id=$1 AND principal_id=$2 AND clear_saved_data
-    ORDER BY started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId])).rows[0]?.id ?? null;
+  return (await database.query(`SELECT id FROM data_sync_runs WHERE tenant_id=$1 AND clear_saved_data
+    ORDER BY started_at DESC,id DESC LIMIT 1`, [scope.tenantId])).rows[0]?.id ?? null;
 }
 
 export async function publishPackageReadback(scope: Scope, detail: CopilotPackageDetail, client: pg.PoolClient,
@@ -94,15 +94,21 @@ export async function readPackageControls(database: Pick<pg.Pool, "query">, scop
 }
 
 async function readControlIdentity(client: pg.PoolClient, scope: Scope, incoming: CopilotPackageDetail) {
-  const saved = (await client.query(`SELECT r.generation_id,r.identity,r.residual FROM data_scope_epochs s
+  const saved = (await client.query(`SELECT r.generation_id,r.identity,r.residual,
+    EXISTS(SELECT 1 FROM package_inventory_snapshots control
+      WHERE control.tenant_id=s.tenant_id AND control.principal_id=$2 AND control.token_mode='delegated'
+        AND control.requested_ids->>0=r.identity AND control.observation_kind IN ('block','access') AND control.is_current
+        AND control.identity_revalidation_required
+        AND control.observed_at>=COALESCE((r.residual#>>'{detailFreshness,observedAt}')::timestamptz,'-infinity'::timestamptz)
+    ) AS pending_identity_revalidation_required FROM data_scope_epochs s
     JOIN inventory_roots root ON root.scope_id=s.id AND root.current
     JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
     JOIN data_generations g ON g.id=revision.generation_id
     JOIN inventory_memberships m ON m.baseline_id=root.baseline_id AND m.valid_from_revision<=root.revision
       AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)
     JOIN package_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
-    WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.source='inventory_packages' AND s.token_mode='delegated'
-      AND r.identity=$3 AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp() AND r.expires_at>clock_timestamp()
+    WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.source='inventory_packages' AND s.token_mode='tenant' AND s.selector='complete'
+      AND r.identity=$3 AND g.session_epoch=s.session_epoch AND g.state IN ('published','retired') AND g.validated
     ORDER BY r.read_started_at DESC,r.generation_id DESC LIMIT 1`, [scope.tenantId, scope.principalId, incoming.id])).rows[0];
   if (!saved) return undefined;
   const facts: InventoryFact[] = [];
@@ -120,7 +126,9 @@ async function readControlIdentity(client: pg.PoolClient, scope: Scope, incoming
     }
     facts.push(...rows); after = rows.at(-1)!.ordinal;
   }
-  return restoreInventoryRecord(saved.residual, facts, "packages") as CopilotPackageDetail;
+  const previous = restoreInventoryRecord(saved.residual, facts, "packages") as CopilotPackageDetail;
+  if (saved.pending_identity_revalidation_required) previous.identityRevalidationRequired = true;
+  return previous;
 }
 
 function validateScope(scope: Scope) {

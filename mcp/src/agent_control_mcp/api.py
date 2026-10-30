@@ -27,7 +27,7 @@ from .auth import (
 )
 from .config import Settings
 from .errors import AdapterError
-from .inputs import AboutInput
+from .inputs import AboutInput, Input, InventoryQuery, StartHunt
 from .models import AgentAboutPage, Capabilities, CheckProgress
 from .origin import HEADER, origin_header
 from .storage import OAuthStore
@@ -48,6 +48,7 @@ def safe_json(value: JsonValue, depth: int = 0, secrets: tuple[str, ...] = ()) -
             if not re.search(
                 r"token|secret|password|assertion|authorization|cookie|credential", key, re.I
             )
+            and safe_json(key, secrets=secrets) == key
         }
     if isinstance(value, list):
         return [safe_json(item, depth + 1, secrets) for item in value[:100]]
@@ -152,16 +153,20 @@ class ApiInvocation:
         if self.output_bytes > MAX_OUTPUT:
             raise AdapterError(413, "output_limit", "Invocation output limit exceeded.")
 
-    async def assert_current(self) -> None:
+    def _assert_active(self) -> None:
         if self.closed or time.monotonic() - self.started >= 60:
             raise AdapterError(504, "invocation_deadline", "Invocation is closed or expired.")
         if not valid_claims(self.upstream.claims, self.api.settings):
             raise AdapterError(401, "reauthorization_required", "Reconnect this signed-in account.")
+
+    async def assert_current(self) -> None:
+        self._assert_active()
         if isinstance(self.upstream, ReferenceAccessToken) and await self.api.store.get(
             TenantAzureProvider.token_key(self.upstream.reference),
             collection="revoked",
         ):
             raise AdapterError(401, "reauthorization_required", "Reconnect this signed-in account.")
+        self._assert_active()
 
     async def token(self) -> AccessToken:
         async with self.exchange_lock:
@@ -210,6 +215,9 @@ class ApiInvocation:
         if not isinstance(request, operation.request):
             raise AdapterError(400, "invalid_request", "Use the operation's exact typed input.")
         values = request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+        if isinstance(request, StartHunt):
+            # Hunting requires these arrays even when no identity filters were supplied.
+            values["filters"] = request.filters.model_dump(mode="json", exclude_none=True)
         path = operation.path
         for field in operation.path_fields:
             value = values.pop(field)
@@ -221,7 +229,14 @@ class ApiInvocation:
         params: dict[str, str | list[str]] | None = None
         body: dict[str, JsonValue] | None = None
         if operation.method == "GET":
-            params = wire_query(values)
+            params = wire_query(
+                values,
+                facet_fields=(
+                    InventoryQuery.facet_fields
+                    if isinstance(request, InventoryQuery)
+                    else Input.facet_fields
+                ),
+            )
         elif name == "check_capabilities":
             params = wire_query(values)
             body = {}
@@ -231,7 +246,12 @@ class ApiInvocation:
                 query = values["query"]
                 if not isinstance(query, dict):
                     raise AdapterError(400, "invalid_request", "Expected a typed inventory query.")
-                body["query"] = {key: str(value) for key, value in wire_query(query).items()}
+                body["query"] = {
+                    key: str(value)
+                    for key, value in wire_query(
+                        query, facet_fields=InventoryQuery.facet_fields
+                    ).items()
+                }
         return await self._request(
             operation.method,
             path,
@@ -353,10 +373,12 @@ class ApiInvocation:
         raise AssertionError("Finite API retry loop exhausted without a result.")
 
 
-def wire_query(values: dict[str, JsonValue]) -> dict[str, str | list[str]]:
+def wire_query(
+    values: dict[str, JsonValue], *, facet_fields: frozenset[str] = Input.facet_fields
+) -> dict[str, str | list[str]]:
     result: dict[str, str | list[str]] = {}
     for key, value in values.items():
-        if key in {"company", "department", "type", "publisher", "availableTo", "host", "platform"}:
+        if key in facet_fields:
             result[key] = (
                 "~null"
                 if value is None

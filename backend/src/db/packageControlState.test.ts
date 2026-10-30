@@ -28,7 +28,7 @@ function original(): CopilotPackageDetail {
 }
 const sparse = (isBlocked: boolean, extra: Partial<CopilotPackageDetail> = {}) =>
   allowlistedPackage({ id: "rain", displayName: "Rain watch", isBlocked, ...extra });
-const newScope = () => ({ tenantId: "control-projection-tenant", principalId: randomUUID() });
+const newScope = () => ({ tenantId: randomUUID(), principalId: randomUUID() });
 async function start(scope: PackageDataScope, targets?: string[], mode: "delegated" | "application" = "delegated") {
   const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: mode,
     requestedIds: targets, idempotencyKey: randomUUID() });
@@ -48,7 +48,7 @@ async function collect(scope: PackageDataScope, work: Awaited<ReturnType<typeof 
   const stream = new StreamedInventory(fixture.runtime, provider);
   const hooks = { authorize: async () => {}, completeJob: completeInventoryJob(input, "packages") };
   const root = await (work.targets ? stream.exact(input, "synthetic", work.targets, hooks) : stream.graphCatalog(input, "synthetic", hooks));
-  if (work.mode === "delegated") await reconcileInventoryFixture(fixture.runtime, scope);
+  await reconcileInventoryFixture(fixture.runtime, scope);
   return root;
 }
 async function refresh(scope: PackageDataScope, values: CopilotPackageDetail[], targets?: string[],
@@ -171,9 +171,10 @@ describe("persisted package control observations", () => {
     expect(await readPackageControls(fixture.runtime, scope, ["rain"])).toMatchObject([{ state: { kind: "block", isBlocked: true } }]);
   });
 
-  it("retains historical membership without extending current authority after a control readback", async () => {
+  it("retains saved membership without extending expired provider authority after a control readback", async () => {
     const scope = newScope();
-    await refresh(scope, [original()], ["rain"], "delegated", new Date(Date.now() + 2500));
+    const expiresAt = new Date(Date.now() + 2500);
+    await refresh(scope, [original()], ["rain"], "delegated", expiresAt);
     await control(scope, sparse(true));
     const selected = await read(scope);
     const live = new LiveInventory(fixture.runtime), id = unifiedAgentRecordId({ source: "graph_packages", packageId: "rain" });
@@ -182,15 +183,17 @@ describe("persisted package control observations", () => {
       { interval: 100, timeout: 3500 }).toBe("agent_not_found");
     await expect(selected.queries.packageDetail(selected.selection.id, selected.identity, "rain"))
       .resolves.toMatchObject({ id: "rain", isBlocked: true });
-    expect((await read(scope)).detail).toMatchObject({ id: "rain", isBlocked: true, observation: { current: false } });
+    expect((await read(scope)).detail).toMatchObject({ id: "rain", isBlocked: true, observation: { current: true } });
     const current = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
-    expect(current.value[0].observations.packageSnapshots.rain).toMatchObject({ current: false, identityDetails: { current: false } });
+    expect(current.value[0].observations.packageSnapshots.rain).toMatchObject({ current: true,
+      identityDetails: { current: true } });
+    expect(Date.parse(current.value[0].observations.packageSnapshots.rain.expiresAt)).toBe(expiresAt.getTime());
     expect(await readPackageControls(fixture.runtime, scope, ["rain"])).toMatchObject([{ state: { kind: "block", isBlocked: true } }]);
   });
 
-  it("keeps control receipts inside tenant/principal/delegated boundaries without replacing live authority with application data", async () => {
+  it("keeps control receipts actor-private while application and delegated collections use the same tenant inventory", async () => {
     const scope = newScope();
-    await refresh(scope, [original()], ["rain"]);
+    const delegated = await refresh(scope, [original()], ["rain"]);
     await control(scope, sparse(true));
     const selected = await read(scope);
     for (const other of [{ ...scope, principalId: "different" }, { ...scope, tenantId: "different" }]) {
@@ -202,10 +205,11 @@ describe("persisted package control observations", () => {
       VALUES($1,'graph.package.read.application',true,true,$2) ON CONFLICT(tenant_id,capability_id)
       DO UPDATE SET enabled=true,shared_data_scope=true`, [scope.tenantId, scope.principalId]);
     const application = await refresh(scope, [original()], undefined, "application");
-    const reader = new InventoryQueries(fixture.runtime, "synthetic-control-application-cursor", 7, scope);
-    const captured = await reader.capture(selected.identity, application.scopeId, {}, "application");
+    const reader = new InventoryQueries(fixture.runtime, "synthetic-control-application-cursor");
+    expect(application.scopeId).toBe(delegated.scopeId);
+    const captured = await reader.capture(selected.identity, application.scopeId);
     expect((await reader.page(captured.id, selected.identity)).value[0].residual.isBlocked).toBe(false);
-    expect((await read(scope)).detail.isBlocked).toBe(true);
-    expect(inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw).value[0].packages[0].isBlocked).toBe(true);
+    expect((await read(scope)).detail.isBlocked).toBe(false);
+    expect(inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw).value[0].packages[0].isBlocked).toBe(false);
   });
 });

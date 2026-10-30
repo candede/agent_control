@@ -64,6 +64,6 @@ describe("current user-source initialization", () => {
 async function sourcePage(scope: DataSyncScope) {
   const identity = { ...selectionIdentity, ...scope };
   const reader = new UserSourcesRepository(fixture.runtime, "synthetic-initialization-read-secret");
-  const selected = await reader.capture(identity, "delegated");
+  const selected = await reader.capture(identity);
   return reader.page(selected.id, identity);
 }

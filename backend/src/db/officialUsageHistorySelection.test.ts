@@ -150,8 +150,8 @@ describe("live relational official history selection", () => {
     };
     const first = await publish(1), second = await publish(2);
     const viewer = { ...identity, principalId: "not-the-importer" };
-    const selected = await reports.capture(viewer, "delegated", "official_agents");
-    const history = await reports.capture(viewer, "delegated", "history");
+    const selected = await reports.capture(viewer, "official_agents");
+    const history = await reports.capture(viewer, "history");
     const exports = new OfficialReportExports(reports, { tenantId: viewer.tenantId, homeAccountId: viewer.principalId, username: "fixture@example.invalid", displayName: "Fixture" });
     const id = await exports.create(viewer, { selectionId: selected.id, kind: "official_agents" });
     await exports.build(id, viewer, "official_agents");
@@ -172,7 +172,7 @@ describe("live relational official history selection", () => {
       .rejects.toMatchObject({ code: "selection_invalidated" });
     await expect(exports.build(pending, viewer, "official_agents")).rejects.toMatchObject({ code: "selection_invalidated" });
     expect((await fixture.runtime.query("SELECT status FROM data_exports WHERE id=$1", [pending])).rows[0].status).not.toBe("ready");
-    const latest = await reports.capture(viewer, "delegated", "history");
+    const latest = await reports.capture(viewer, "history");
     expect((await reports.page(latest.id, viewer)).counts.total).toBe(operation === "correction" ? 3 : 1);
     expect((await fixture.runtime.query("SELECT invalidation_epoch::text FROM official_usage_history_state WHERE tenant_id=$1", [identity.tenantId])).rows[0].invalidation_epoch).toBe("1");
     const payloadCounts = async (setId: string | null = null) => (await fixture.runtime.query(`WITH versions AS (

@@ -72,7 +72,8 @@ describe("selected inventory fixture publication contracts", () => {
     expect(seeded.packages?.revision).toBe(String(1 + details.length));
     expect(f.epoch).toHaveBeenCalledExactlyOnceWith(f.scope.tenantId, f.scope.principalId);
     for (const [input] of f.execute.mock.calls) {
-      expect(input).toMatchObject({ sessionEpoch: "7", observedAt, expiresAt, scope: f.scope });
+      expect(input).toMatchObject({ sessionEpoch: "7", observedAt, expiresAt, actorPrincipalId: f.scope.principalId,
+        scope: { tenantId: f.scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant" } });
     }
     expect(f.reconcile).toHaveBeenCalledExactlyOnceWith(f.database, f.scope, { observedAt, expiresAt });
     const pages = Math.max(1, Math.ceil(count / 100));
@@ -114,7 +115,8 @@ describe("selected inventory fixture publication contracts", () => {
 });
 
 describe("selected inventory usage fixtures", () => {
-  it.each([[10, 2], [8, 3], [2, 3], [0, 2], [0, 0], [10, 10], [11, 10]])(
+  it.each([[10, 2], [8, 3], [2, 3], [0, 2], [0, 0], [10, 10], [11, 10],
+    [Number.MAX_SAFE_INTEGER, 3], [Number.MAX_SAFE_INTEGER, 10]])(
     "preserves %i total responses across %i user rows and all three reports", async (responses, users) => {
       const f = fixture();
       await seedSelectedInventory(f.database, { scope: f.scope, usage: [{ id: "agent", responses, users }] });
@@ -138,10 +140,28 @@ describe("selected inventory usage fixtures", () => {
     },
   );
 
+  it("preserves a safe aggregate at the response limit across multiple agents", async () => {
+    const f = fixture();
+    await seedSelectedInventory(f.database, { scope: f.scope, usage: [
+      { id: "agent-a", responses: Number.MAX_SAFE_INTEGER - 1 },
+      { id: "agent-b", responses: 1 },
+    ] });
+    const transform = f.reports.mock.calls[0][3]!;
+    for (const kind of ["agents", "userAgents", "users"] as const) {
+      const csv = transform(kind, "");
+      expect(await streamOfficialReport(Readable.from([Buffer.from(csv)]), undefined, new AbortController().signal,
+        { batch: async () => {} })).toMatchObject({ kind, rowCount: 2 });
+      const rows: Record<string, string>[] = parse(csv, { columns: true });
+      const field = kind === "users" ? "Agent responses received" : "Responses sent to users";
+      expect(rows.reduce((sum, row) => sum + Number(row[field]), 0)).toBe(Number.MAX_SAFE_INTEGER);
+    }
+  });
+
   const invalidUsage: SelectedInventoryFixtureInput["usage"][] = [
     Array.from({ length: 101 }, (_, index) => ({ id: `agent-${index}`, responses: 1 })),
-    ...[-1, 0.5, NaN, Infinity, 11].map(users => [{ id: "agent", responses: 1, users }]),
+    ...[-1, 0, 0.5, NaN, Infinity, 11].map(users => [{ id: "agent", responses: 1, users }]),
     ...[-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(responses => [{ id: "agent", responses }]),
+    [{ id: "agent-a", responses: Number.MAX_SAFE_INTEGER }, { id: "agent-b", responses: 1 }],
   ];
   it.each(invalidUsage.map(usage => ({ usage })))("rejects invalid usage before publication: $usage", async ({ usage }) => {
     const f = fixture();

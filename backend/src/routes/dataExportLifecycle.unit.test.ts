@@ -66,7 +66,7 @@ beforeEach(() => {
     await publication.validate();
     await publication.finish();
   });
-  createOfficialReportDataRouter({ reports, identity: async () => ({ identity, tokenMode: "delegated" }), enqueueExport: enqueue });
+  createOfficialReportDataRouter({ reports, identity: async () => ({ identity }), enqueueExport: enqueue });
 });
 afterEach(() => {
   expect(database.connect).not.toHaveBeenCalled();

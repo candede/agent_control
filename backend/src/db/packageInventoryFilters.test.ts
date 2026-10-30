@@ -15,6 +15,7 @@ describe("selected SQL package facets and filters", () => {
   afterAll(async () => { await fixture?.close(); });
   async function read(values: CopilotPackageDetail[], query: InventoryQuery = {}, selectedField?: Parameters<InventoryQueries["facets"]>[2]) {
     const input = inventoryInput(randomUUID()), store = new InventoryGenerations(fixture.runtime);
+    input.scope.tenantId = randomUUID();
     const records = values.map(packageInventoryRecord);
     const root = await store.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
       await store.visit(lease, "all");
@@ -23,7 +24,7 @@ describe("selected SQL package facets and filters", () => {
         expectedCount: records.length, page: 1 }, records.length);
     }, { authorize: async () => {} });
     const reader = new InventoryQueries(fixture.runtime, "synthetic-selected-package-filter-secret");
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, tenantId: input.scope.tenantId, principalId: input.actorPrincipalId! };
     const selected = await reader.capture(identity, root.scopeId, query);
     try {
       const page = await reader.page(selected.id, identity, { limit: 25, expectedQuery: query });

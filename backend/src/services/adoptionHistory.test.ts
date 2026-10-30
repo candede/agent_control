@@ -38,7 +38,7 @@ describe("official retained adoption history", () => {
     return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
   }
   async function history(identity: SelectionIdentity, selectionId?: string, cursor?: string) {
-    const id = selectionId ?? (await reports.capture(identity, "delegated", "adoption_history")).id;
+    const id = selectionId ?? (await reports.capture(identity, "adoption_history")).id;
     return reports.read(id, identity, (client, context) => readAdoptionHistory(client, reports, context, { limit: 1, cursor }));
   }
   const remove = (identity: SelectionIdentity, setId: string) => imports.confirmPreview(identity, setId, "delete")

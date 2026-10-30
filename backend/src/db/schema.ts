@@ -216,7 +216,8 @@ async function verifyInventoryGenerationSchema(database: Pick<pg.Pool, "query">)
   if (triggers !== 14) throw new Error("inventory_schema_guards");
   const indexes = ["inventory_one_root", "inventory_member_open", "inventory_member_asof", "inventory_member_reachability",
     "inventory_member_gc", "inventory_fact_match", "inventory_frontier_pending", "inventory_frontier_component", "unified_member_source",
-    "inventory_exact_newer", "inventory_exact_content"];
+    "inventory_exact_newer", "inventory_exact_content",
+    ...recordTables.flatMap(table => ["catalog_generation", "detail_generation", "control_generation"].map(column => `${table}_${column}`))];
   if ((await database.query("SELECT count(*)::int AS count FROM pg_indexes WHERE schemaname='public' AND indexname=ANY($1::text[])", [indexes])).rows[0].count !== indexes.length) {
     throw new Error("inventory_schema_indexes");
   }
@@ -398,12 +399,12 @@ const userSourceTables = [
 
 async function verifyUserSourceSchema(database: Pick<pg.Pool, "query">) {
   const definitions: Record<string, string> = {
-    user_source_attempts: "generation_id:uuid scope_id:uuid tenant_id:text source:text status:text error_code:text? message:text? observed_count:int4? report_refresh_date:date? report_period:text",
+    user_source_attempts: "generation_id:uuid scope_id:uuid tenant_id:text source:text status:text error_code:text? message:text? observed_count:int4? retained_count:int4 report_refresh_date:date? report_period:text",
     user_source_queries: "generation_id:uuid scope_id:uuid tenant_id:text query_key:text kind:text expected_count:int4? wire_count:int4 page_count:int4 complete:bool",
     user_source_query_members: "generation_id:uuid query_key:text identity:text",
     user_source_skus: "generation_id:uuid scope_id:uuid tenant_id:text sku_id:uuid plan_ids:_text",
     user_source_identity_inputs: "generation_id:uuid scope_id:uuid tenant_id:text identity:text checked:bool",
-    user_source_read_contexts: "selection_id:uuid tenant_id:text token_mode:text metadata:jsonb",
+    user_source_read_contexts: "selection_id:uuid tenant_id:text metadata:jsonb",
   };
   const columns = Object.entries(definitions).flatMap(([table, fields]) => fields.split(" ").map(field => {
     const [name, type] = field.split(":");
@@ -596,10 +597,11 @@ async function verifyInventoryRefreshTargetsSchema(database: Pick<pg.Pool, "quer
 
 async function verifyInventoryAuthoritySchema(database: Pick<pg.Pool, "query">) {
   const result = await database.query(`SELECT
-    position('public.inventory_roots' IN pg_get_functiondef('protect_agent_usage_association()'::regprocedure))>0 AS current_memberships,
-    EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='capability_configuration'::regclass
-      AND tgname='fence_inventory_application_configuration' AND tgenabled IN ('O','A')) AS application_fence`);
-  if (!["current_memberships", "application_fence"]
+    position('public.inventory_live_sources' IN pg_get_functiondef('protect_agent_usage_association()'::regprocedure))>0
+      AND position('source.authority_expires_at>clock_timestamp()' IN pg_get_functiondef('protect_agent_usage_association()'::regprocedure))>0 AS current_memberships,
+    EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='data_scope_epochs'::regclass
+      AND conname='tenant_inventory_owner' AND convalidated) AS tenant_owner`);
+  if (!["current_memberships", "tenant_owner"]
     .every(key => result.rows[0]?.[key] === true)) throw new Error("inventory_authority_schema");
 }
 

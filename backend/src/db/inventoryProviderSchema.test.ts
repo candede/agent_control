@@ -13,7 +13,7 @@ import { completeInventoryJob, inventoryJobInput } from "../services/inventoryRu
 import { inventoryPresentation } from "../services/inventoryPresentation.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import { powerPlatformInventoryRecord, restoreInventoryRecord } from "../services/inventoryRecordProjection.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import type { InventoryFact } from "../services/inventoryRecordProjection.js";
 import { tinyNativePages } from "../services/inventoryProviderTestSupport.js";
 
@@ -117,7 +117,6 @@ describe("published inventory provider metadata", () => {
     const store = new InventoryGenerations(fixture.runtime);
     const intent = { domain: "power_platform" as const, mode: "baseline" as const, channel: "catalog" as const,
       resourceTypes: ["microsoft.copilotstudio/agents"] as const, roleScope: "full" as const };
-    input.scope.selector = inventorySelector(intent);
     await expect(store.execute(input, intent, async lease => {
       await store.visit(lease, "invalid-sharing");
       await store.appendBounded(lease, [record]);
@@ -132,8 +131,7 @@ describe("published inventory provider metadata", () => {
     const job = await jobs.submit(scope, { roleScope: "full", requestedTypes: types,
       environmentScope: environmentId, idempotencyKey: randomUUID() });
     expect(await jobs.markRunning(scope, job.id)).toBe(true);
-    const input = await inventoryJobInput(fixture.runtime, scope, "power_platform", job.id,
-      { environmentId, resourceTypes: types });
+    const input = await inventoryJobInput(fixture.runtime, scope, "power_platform", job.id);
     const provider = new PowerPlatformResourceQueryClient(async (_url, init) => {
       const second = Boolean(JSON.parse(String(init!.body)).Options.SkipToken);
       return Response.json({ totalRecords: 2, count: 1, resultTruncated: !second, ignoredPageField: true,

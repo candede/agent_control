@@ -42,6 +42,16 @@ export function configureBrowserFixtureEnvironment(env: NodeJS.ProcessEnv = proc
   return tenant;
 }
 
+export function createBrowserFixtureFetch(fetcher: typeof fetch): typeof fetch {
+  return (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(url.hostname)) {
+      throw new Error("Live provider requests are forbidden in browser fixtures.");
+    }
+    return fetcher(input, { ...init, redirect: "error" });
+  };
+}
+
 export async function closeFixtureServer(server?: Pick<Server, "listening" | "close">) {
   if (!server?.listening) return;
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));

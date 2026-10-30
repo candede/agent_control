@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type pg from "pg";
+import { AppError } from "../errors.js";
 import { observeDataWork } from "../services/dataMetrics.js";
 import { measurePublication } from "../services/peakMemory.js";
 import { BatchResidency, assertResidualBytes, assertResidualDatabaseBounds, dataAdmissionError, dataLimitError, dataLimits, digest, encodeBatch, exactCount } from "./dataBounds.js";
@@ -17,6 +18,7 @@ export type GenerationLease = {
 };
 export type BeginGeneration = {
   scope: DataScope; schemaVersion: number; jobId: string; runId?: string;
+  actorPrincipalId?: string;
   sessionEpoch: string;
   jobKind: "data_sync" | "package_refresh" | "power_platform_refresh" | "derived" | "fixture";
   observedAt: Date; expiresAt: Date; deadlineAt: Date; reserveBytes: number;
@@ -77,18 +79,21 @@ export class DataGenerations {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
       if (input.runId || ["inventory_packages", "inventory_power_platform", "inventory_canonical"].includes(input.scope.source)) {
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-          [`data-sync:${input.scope.tenantId}:${input.scope.principalId}`]);
+          [`data-sync:${input.scope.tenantId}`]);
       }
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
       const s = input.scope;
-      if (s.principalId !== null) {
-        const epoch = await this.principalEpoch(client, s.tenantId, s.principalId);
+      const actor = input.actorPrincipalId ?? s.principalId;
+      if (s.kind === "tenant" && ["directory","app_activity","inventory_packages","inventory_power_platform","inventory_canonical"].includes(s.source)
+        && input.jobKind !== "fixture" && !actor) throw new Error("data_actor_required");
+      if (actor !== null) {
+        const epoch = await this.principalEpoch(client, s.tenantId, actor);
         if (epoch !== input.sessionEpoch) throw new Error("data_session_fenced");
       }
       const inserted = (await client.query(`INSERT INTO data_scope_epochs(id,tenant_id,scope_kind,principal_id,token_mode,source,selector,session_epoch)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(tenant_id,scope_kind,principal_id,token_mode,source,selector)
         DO NOTHING RETURNING *`,
-      [randomUUID(), s.tenantId, s.kind, s.principalId, s.tokenMode, s.source, s.selector, input.sessionEpoch])).rows[0];
+      [randomUUID(), s.tenantId, s.kind, s.principalId, s.tokenMode, s.source, s.selector, s.kind === "tenant" ? "0" : input.sessionEpoch])).rows[0];
       const scope = inserted ?? (await client.query(`SELECT * FROM data_scope_epochs
         WHERE tenant_id=$1 AND scope_kind=$2 AND principal_id IS NOT DISTINCT FROM $3::text
           AND token_mode=$4 AND source=$5 AND selector=$6 FOR UPDATE`,
@@ -100,15 +105,17 @@ export class DataGenerations {
         WHERE scope_id=$1 AND state IN ('staging','validating') AND (lease_until<=clock_timestamp() OR deadline_at<=clock_timestamp())`, [scope.id]);
       const counts = (await client.query(`SELECT count(*)::int AS active,
         count(*) FILTER(WHERE tenant_id=$1)::int AS tenant_active,
-        count(*) FILTER(WHERE scope_id=$2)::int AS scope_active FROM data_generations
+        count(*) FILTER(WHERE scope_id=$2 OR tenant_id=$1 AND scope_id IN (
+          SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND source=$3))::int AS scope_active FROM data_generations
         WHERE state IN ('staging','validating') AND lease_until>(SELECT clock_timestamp())
-          AND lease_until>clock_timestamp()`,[s.tenantId,scope.id])).rows[0];
+          AND lease_until>clock_timestamp()`,[s.tenantId,scope.id,s.source])).rows[0];
       const bytes = (await client.query(`SELECT coalesce(sum(generation_bytes),0)::text AS bytes
         FROM data_generation_charges WHERE tenant_id=$1 AND generation_bytes>0`,[s.tenantId])).rows[0].bytes;
       const uploads = (await client.query(`SELECT count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END)::int AS active,
         count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END) FILTER(WHERE tenant_id=$1)::int AS tenant_active
         FROM official_usage_ingestions WHERE state IN ('streaming','validating','accepting') AND lease_until>clock_timestamp()`, [s.tenantId])).rows[0];
-      if (counts.scope_active || counts.active + uploads.active >= 4 || counts.tenant_active + uploads.tenant_active >= 2) {
+      if (counts.scope_active) throw new AppError(409, "data_source_active", "This tenant source is already being collected.");
+      if (counts.active + uploads.active >= 4 || counts.tenant_active + uploads.tenant_active >= 2) {
         throw dataAdmissionError("data_ingestion_admission");
       }
       if (exactCount(bytes) + input.reserveBytes > dataLimits.tenantBytes) throw dataLimitError("data_tenant_bytes", dataLimits.tenantBytes, exactCount(bytes) + input.reserveBytes);
@@ -117,10 +124,12 @@ export class DataGenerations {
         epoch: scope.epoch, sessionEpoch: scope.session_epoch, expectedRevision: head.revision, schemaVersion: input.schemaVersion,
       };
       await client.query(`INSERT INTO data_generations(id,scope_id,tenant_id,schema_version,scope_epoch,session_epoch,
-        expected_revision,job_id,run_id,job_kind,owner,lease_version,lease_until,deadline_at,reserved_bytes,observed_at,expires_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,LEAST($12::timestamptz,clock_timestamp()+interval '60 seconds'),$12,$13,$14,$15)`,
+        expected_revision,job_id,run_id,job_kind,owner,lease_version,lease_until,deadline_at,reserved_bytes,observed_at,expires_at,
+        actor_principal_id,actor_session_epoch)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,LEAST($12::timestamptz,clock_timestamp()+interval '60 seconds'),$12,$13,$14,$15,$16,$17)`,
       [lease.id, scope.id, s.tenantId, input.schemaVersion, scope.epoch, scope.session_epoch, head.revision,
-        input.jobId, input.runId ?? null, input.jobKind, lease.owner, input.deadlineAt, input.reserveBytes, input.observedAt, input.expiresAt]);
+        input.jobId, input.runId ?? null, input.jobKind, lease.owner, input.deadlineAt, input.reserveBytes, input.observedAt, input.expiresAt,
+        actor, actor === null ? null : input.sessionEpoch]);
       await this.fence(client, lease);
       return lease;
     });
@@ -169,6 +178,9 @@ export class DataGenerations {
         }
         after = scopes.at(-1)!.id;
       }
+      // Writers lock scopes before generations, so actor-wide cancellation must follow the scope loop.
+      await client.query(`UPDATE data_generations SET state='cancelled',cancellation=cancellation+1,reserved_bytes=byte_count
+        WHERE tenant_id=$1 AND actor_principal_id=$2 AND state IN ('staging','validating')`, [tenant, principal]);
       return epoch as string;
     });
   }
@@ -177,7 +189,7 @@ export class DataGenerations {
     await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
     await client.query(`WITH selected_generation AS MATERIALIZED (
         SELECT scope_id,tenant_id,run_id FROM data_generations WHERE id=$1
-      ) SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||s.tenant_id||':'||s.principal_id,0))
+      ) SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||s.tenant_id,0))
       FROM selected_generation g JOIN data_scope_epochs s ON s.id=g.scope_id
       WHERE g.scope_id=$2 AND g.tenant_id=$3 AND (g.run_id IS NOT NULL
         OR s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical'))`,
@@ -187,13 +199,15 @@ export class DataGenerations {
   // Run-backed writers share the sync mutex before scope/head/lease/job locks.
   async fence(client: pg.PoolClient, lease: GenerationLease) {
     await this.lockSyncRun(client, lease);
-    const scope = await lockDataScope(client, lease.scopeId, lease.tenantId);
+    await lockDataScope(client, lease.scopeId, lease.tenantId);
     await client.query("SELECT scope_id FROM data_generation_heads WHERE scope_id=$1 FOR UPDATE", [lease.scopeId]);
     const row = (await client.query(`WITH selected_generation AS MATERIALIZED (
         SELECT * FROM data_generations WHERE id=$1 FOR UPDATE
       ) SELECT g.* FROM selected_generation g JOIN data_scope_epochs s ON s.id=g.scope_id
       WHERE g.scope_id=$2 AND g.tenant_id=$3 AND g.owner=$4 AND g.lease_version=$5
       AND g.scope_epoch=$6 AND g.session_epoch=$7 AND s.epoch=g.scope_epoch AND s.session_epoch=g.session_epoch
+      AND (g.actor_principal_id IS NULL OR EXISTS(SELECT 1 FROM data_principal_epochs actor
+        WHERE actor.tenant_id=g.tenant_id AND actor.principal_id=g.actor_principal_id AND actor.epoch=g.actor_session_epoch))
       AND g.cancellation=0 AND g.state IN ('staging','validating')
       AND g.lease_until>clock_timestamp() AND g.deadline_at>clock_timestamp()`,
     [lease.id, lease.scopeId, lease.tenantId, lease.owner, lease.version, lease.epoch, lease.sessionEpoch])).rows[0];
@@ -205,13 +219,13 @@ export class DataGenerations {
         WHERE r.id=$1 AND r.tenant_id=$3 AND r.principal_id=$4
         AND r.status IN ('running','waiting') AND r.expires_at>clock_timestamp()
         AND source.status IN ('queued','running') FOR SHARE OF r,source`,
-      [row.run_id, row.job_id, lease.tenantId, scope.principal_id])).rows[0];
+      [row.run_id, row.job_id, lease.tenantId, row.actor_principal_id])).rows[0];
       if (!run) throw new Error("data_source_job_fenced");
     }
     if (row.job_kind === "package_refresh" || row.job_kind === "power_platform_refresh") {
       const table = row.job_kind === "package_refresh" ? "package_refresh_jobs" : "power_platform_refresh_jobs";
-      if ((await client.query(`SELECT id FROM ${table} WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
-        AND status='running' AND expires_at>clock_timestamp() FOR SHARE`, [row.job_id, lease.tenantId, scope.principal_id])).rowCount !== 1) {
+      if ((await client.query(`SELECT id FROM ${table} WHERE id=$1 AND tenant_id=$2 AND ${row.job_kind === "package_refresh" ? "authorization_principal_id" : "principal_id"}=$3
+        AND status='running' AND expires_at>clock_timestamp() FOR SHARE`, [row.job_id, lease.tenantId, row.actor_principal_id])).rowCount !== 1) {
         throw new Error("data_source_job_fenced");
       }
     }
@@ -394,7 +408,7 @@ export class DataGenerations {
 
   invalidate(scopeId: string, tenantId: string, invalidateDomain?: (client: pg.PoolClient) => Promise<void>) {
     return this.connections.run(async client => {
-      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||tenant_id||':'||principal_id,0))
+      await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||tenant_id,0))
         FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND source IN ('inventory_packages','inventory_power_platform','inventory_canonical')`, [scopeId, tenantId]);
       await lockDataScope(client, scopeId, tenantId);
       await client.query("SELECT scope_id FROM data_generation_heads WHERE scope_id=$1 FOR UPDATE", [scopeId]);

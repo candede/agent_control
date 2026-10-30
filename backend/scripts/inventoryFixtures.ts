@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { generationInput, selectionIdentity } from "./largeTenantFixtures.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord, type InventoryRecord } from "../src/services/inventoryRecordProjection.js";
-import { InventoryGenerations, inventorySelector } from "../src/db/inventoryGenerations.js";
+import { InventoryGenerations } from "../src/db/inventoryGenerations.js";
 import type { GenerationLease } from "../src/db/dataGenerations.js";
 import type pg from "pg";
-import type { InventoryRoleScope, PowerPlatformResource, PowerPlatformResourceType } from "../src/types/powerPlatformInventory.js";
+import { isInventoryCount, type InventoryRoleScope, type PowerPlatformResource, type PowerPlatformResourceType } from "../src/types/powerPlatformInventory.js";
 import { completeInventoryJob, inventoryJobInput, InventoryRuntime } from "../src/services/inventoryRuntime.js";
 import { InventoryQueries, type InventoryQuery } from "../src/db/inventoryQueries.js";
 import { DataGenerations } from "../src/db/dataGenerations.js";
@@ -13,7 +13,7 @@ import { GraphPackagesClient } from "../src/services/graphPackages.js";
 import type { CopilotPackageDetail } from "../src/types/copilotPackage.js";
 
 export async function streamedPackageFixture(database: pg.Pool, scope: { tenantId: string; principalId: string },
-  values: CopilotPackageDetail[], options: { exact?: boolean; tokenMode?: "delegated" | "application" } = {}) {
+  values: CopilotPackageDetail[], options: { exact?: boolean } = {}) {
   if (values.length > 20) throw new Error("tiny_streamed_package_fixture_limit");
   const provider = new GraphPackagesClient(async url => {
     const path = new URL(String(url)).pathname;
@@ -26,7 +26,6 @@ export async function streamedPackageFixture(database: pg.Pool, scope: { tenantI
   const input = async () => {
     const value = inventoryInput(scope.principalId);
     value.scope.tenantId = scope.tenantId;
-    value.scope.tokenMode = options.tokenMode ?? "delegated";
     value.sessionEpoch = await stream.stages.generations.sessionEpoch(scope.tenantId, scope.principalId);
     return value;
   };
@@ -56,8 +55,8 @@ export async function inventorySelectionFixture(database: pg.Pool, scope: { tena
   const identity = { ...selectionIdentity, ...scope,
     sessionEpoch: await new DataGenerations(database).sessionEpoch(scope.tenantId, scope.principalId) };
   const root = (await database.query(`SELECT r.scope_id FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-    WHERE r.current AND s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated' AND r.domain=$3
-    ORDER BY r.scope_id LIMIT 2`, [scope.tenantId, scope.principalId, domain])).rows;
+    WHERE r.current AND s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND r.domain=$2
+    ORDER BY r.scope_id LIMIT 2`, [scope.tenantId, domain])).rows;
   if (root.length !== 1) throw new Error("synthetic_selection_requires_one_source");
   const selection = await queries.capture(identity, root[0].scope_id, query);
   const raw = await queries.page(selection.id, identity, { limit: 50 });
@@ -69,7 +68,13 @@ export async function refreshInventoryFixture(database: pg.Pool, scope: { tenant
   resourceTypes?: PowerPlatformResourceType[], options: { exactTargets?: string[]; expiresAt?: Date; roleScope?: InventoryRoleScope } = {}) {
   if (records.length > 100) throw new Error("tiny_refresh_fixture_limit");
   if (options.exactTargets && (domain !== "packages" || options.exactTargets.length > 100)) throw new Error("tiny_exact_fixture_limit");
-  const input = await inventoryJobInput(database, scope, domain, jobId, { resourceTypes });
+  const omittedFieldCount = domain === "power_platform" ? records.reduce((sum, record) => {
+    const count = record.residual.unknownFieldCount;
+    if (!isInventoryCount(count)) throw new Error("tiny_native_fixture_omitted_count");
+    return sum + count;
+  }, 0) : 0;
+  const input = await inventoryJobInput(database, scope, domain, jobId);
+  if (!input.actorPrincipalId) throw new Error("synthetic_refresh_requires_actor");
   if (options.expiresAt) input.expiresAt = options.expiresAt;
   const store = new InventoryGenerations(database);
   const root = await store.execute(input, { domain,
@@ -79,19 +84,20 @@ export async function refreshInventoryFixture(database: pg.Pool, scope: { tenant
     if (!options.exactTargets) await store.visit(lease, "refresh-fixture");
     await store.appendBounded(lease, records);
     if (!options.exactTargets) await store.acceptPage(lease, { token: "refresh-fixture", nextToken: null, records, rawCount: records.length,
-      expectedCount: records.length, page: 1 }, records.length);
+      expectedCount: records.length, page: 1, omittedFieldCount }, records.length);
   }, { authorize: async () => {}, completeJob: completeInventoryJob(input, domain) });
-  const canonical = inventoryInput(scope.principalId, "canonical");
-  canonical.scope.tenantId = scope.tenantId;
+  const actor = { tenantId: scope.tenantId, principalId: input.actorPrincipalId };
+  const canonical = inventoryInput(actor.principalId, "canonical");
+  canonical.scope.tenantId = actor.tenantId;
   canonical.sessionEpoch = input.sessionEpoch;
   const runtime = new InventoryRuntime(database, async () => {});
-  if (await runtime.enqueue(scope)) await runtime.reconciliation.runNext(canonical, async () => {});
+  if (await runtime.enqueue(actor)) await runtime.reconciliation.runNext(canonical, async () => {});
   return root;
 }
 
 export function inventoryInput(principalId: string = randomUUID(), source = "packages") {
-  return generationInput({ scope: { tenantId: "synthetic-tenant", kind: "principal", principalId,
-    tokenMode: "delegated", source: `inventory_${source}`, selector: "complete" } });
+  return generationInput({ scope: { tenantId: selectionIdentity.tenantId, kind: "tenant", principalId: null,
+    tokenMode: "tenant", source: `inventory_${source}`, selector: "complete" }, actorPrincipalId: principalId });
 }
 export function packageRecord(index: number, name = `Agent ${index}`) {
   return packageInventoryRecord({ id: `package-${index.toString().padStart(6, "0")}`, displayName: name, isBlocked: false } as Parameters<typeof packageInventoryRecord>[0]);
@@ -114,18 +120,20 @@ export async function nativeInventoryFixture(database: pg.Pool, scope: { tenantI
   const intent = { domain: "power_platform" as const, mode: "baseline" as const, channel: "catalog" as const,
     resourceTypes: options.resourceTypes ?? [...new Set(resources.map(value => value.type))], roleScope: "full" as const,
     environmentId: options.environmentId };
-  input.scope.selector = inventorySelector(intent);
   const store = new InventoryGenerations(database);
   return store.execute(input, intent, async lease => {
     const records = resources.map(powerPlatformInventoryRecord);
     await store.visit(lease, "native-fixture");
     await store.appendBounded(lease, records);
     await store.acceptPage(lease, { token: "native-fixture", nextToken: null, records, rawCount: records.length,
-      expectedCount: records.length, page: 1 }, records.length);
+      expectedCount: records.length, page: 1,
+      omittedFieldCount: resources.reduce((sum, resource) => sum + resource.unknownFieldCount, 0) }, records.length);
   }, { authorize: async () => {} });
 }
-export async function inventoryBaseline(store: InventoryGenerations, principal: string, count: number, observedAt = new Date(), expiresAt?: Date) {
+export async function inventoryBaseline(store: InventoryGenerations, principal: string, count: number, observedAt = new Date(), expiresAt?: Date,
+  tenantId = selectionIdentity.tenantId) {
   const input = { ...inventoryInput(principal), observedAt, ...expiresAt ? { expiresAt } : {} };
+  input.scope.tenantId = tenantId;
   input.sessionEpoch = await store.generations.sessionEpoch(input.scope.tenantId, principal);
   return store.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
     let page = 0;

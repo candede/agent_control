@@ -132,7 +132,7 @@ describe("registered canonical HTTP authentication", () => {
     const now = Date.now();
     vi.spyOn(Date, "now").mockReturnValue(now + 2000);
     expect((await call("/agent-inventory/health", apiToken())).status).toBe(200);
-    expect(sql[0].values).toEqual([tenant.tenantId, selected.homeAccountId]);
+    expect(sql[0].values).toEqual([tenant.tenantId]);
   });
 
   it.each([
@@ -156,11 +156,11 @@ describe("registered canonical HTTP authentication", () => {
     expect((await call("/agent-inventory/health", original)).status).toBe(401);
     expect((await call("/agent-inventory/health", fresh)).status).toBe(200);
     expect(sql).toHaveLength(3);
-    for (const query of sql) expect(query.values).toEqual([tenant.tenantId, `${uid}.${utid}`]);
+    for (const query of sql) expect(query.values).toEqual([tenant.tenantId]);
     expect(portalCache).not.toHaveBeenCalled();
   });
 
-  it.each(["native", "guest"])("keeps %s private saved-read scope identical without a portal cache or provider-data read", async kind => {
+  it.each(["native", "guest"])("keeps %s tenant saved-read scope identical without a portal cache or provider-data read", async kind => {
     if (kind === "guest") selected = account(guest, guestHome, guestTenant);
     await activateAccountSession(tenant.tenantId, selected.homeAccountId, async () => undefined);
     const browser = await fetch(`${origin}/api/agent-inventory/health`, { headers: { cookie: await cookie() } });
@@ -174,7 +174,7 @@ describe("registered canonical HTTP authentication", () => {
     expect(browser.status).toBe(200); expect(bearer.status).toBe(200);
     expect(await bearer.json()).toEqual(browserBody);
     expect(sql).toEqual(browserSql);
-    expect(sql[0].values).toEqual([tenant.tenantId, selected.homeAccountId]);
+    expect(sql[0].values).toEqual([tenant.tenantId]);
     expect(exchanges).toHaveLength(1); // Identity metadata bootstrap, never Graph data.
     expect(identityFetch.mock.calls.every(([url]) => String(url).startsWith("https://login.microsoftonline.com/"))).toBe(true);
   });

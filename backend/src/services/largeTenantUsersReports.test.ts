@@ -70,7 +70,7 @@ function sourceUser(n: number, state: CopilotServiceSummaryState = "enabled"): C
 async function directory(database: Parameters<typeof saveUsageInventory>[0], identity: SelectionIdentity, users: CopilotDirectoryUser[], expiresAt?: Date) {
   const stages = new UserSourceStages(database);
   return stages.execute(generationInput({ ...(expiresAt ? { expiresAt } : {}),
-    scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+    scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }), async lease => {
     const key = await stages.query(lease, "discovery", "synthetic:combined");
     await stages.page(lease, key, "synthetic:combined", users.length, users.length);
     for (let n = 0; n < users.length; n += 250) await stages.directory(lease, key, users.slice(n, n + 250));
@@ -95,20 +95,20 @@ describe("live selected users and reports", () => {
       });
       const generations = new DataGenerations(fixture.runtime);
       const lease = await generations.begin(generationInput({
-        scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId },
+        scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId,
       }));
       try {
         await fixture.runtime.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source,status)
           VALUES($1,$2,$3,'directory',$4)`, [lease.id, lease.scopeId, identity.tenantId, status]);
         const reader = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-        const selection = await reader.capture(identity, "delegated", "copilot_users", { cohort: "licensed" });
+        const selection = await reader.capture(identity, "copilot_users", { cohort: "licensed" });
         const saved = await reader.page(selection.id, identity);
         expect(saved.sources.directory).toMatchObject({ state: status === "running" ? "available" : "partial", attemptStatus: status, rowCount: 2 });
         expect(saved.summary).toMatchObject({
           licensedUsers: 1, usingAgentsUsers: 1, noAgentActivityUsers: 0,
         });
         expect(saved.value).toHaveLength(1);
-        const unpaid = await reader.capture(identity, "delegated", "official_users", { licenseCohort: "active_without_paid" });
+        const unpaid = await reader.capture(identity, "official_users", { licenseCohort: "active_without_paid" });
         expect((await reader.page(unpaid.id, identity)).value).toHaveLength(1);
       } finally { await generations.abort(lease); }
     },
@@ -126,13 +126,13 @@ describe("live selected users and reports", () => {
     }
     const generations = new DataGenerations(fixture.runtime);
     const lease = await generations.begin(generationInput({
-      scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId },
+      scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId,
     }));
     try {
       await fixture.runtime.query(`INSERT INTO user_source_attempts(generation_id,scope_id,tenant_id,source)
         VALUES($1,$2,$3,'directory')`, [lease.id, lease.scopeId, identity.tenantId]);
       const reader = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-      const selection = await reader.capture(identity, "delegated", "copilot_users");
+      const selection = await reader.capture(identity, "copilot_users");
       const saved = await reader.page(selection.id, identity);
       expect(saved.sources.directory).toMatchObject({ state: evidence === "missing" ? "unavailable" : "stale",
         attemptStatus: "running", generationId: evidence === "missing" ? null : expect.any(String) });
@@ -161,7 +161,7 @@ describe("live selected users and reports", () => {
     fixture.runtime.on("acquire",checkpointQueries);
     try {
       for (const order of ["asc","desc"] as const) {
-        const selection = await reader.capture(identity,"delegated",endpoint,{ sort: "name",order });
+        const selection = await reader.capture(identity,endpoint,{ sort: "name",order });
         const all: Array<Record<string,unknown>> = [],pages: Array<Array<Record<string,unknown>>> = [];
         let cursor: string | undefined,previous: string | null = null;
         do {
@@ -205,7 +205,7 @@ describe("live selected users and reports", () => {
     fixture.runtime.on("acquire",checkpointQueries);
     try {
       for (const endpoint of ["official_users","official_agents"] as const) {
-        const selection = await reader.capture(identity,"delegated",endpoint,{ sort: "name",order: "asc" });
+        const selection = await reader.capture(identity,endpoint,{ sort: "name",order: "asc" });
         const first = await reader.page(selection.id,identity,{ limit: 1 });
         const second = await reader.page(selection.id,identity,{ limit: 1,cursor: first.page.nextCursor! });
         expect(second.counts).toEqual({ total: 2,filtered: 2 });
@@ -243,27 +243,27 @@ describe("live selected users and reports", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_row_facts WHERE tenant_id=$1", [identity.tenantId])).rows[0].n).toBe(3);
     const queries = new LargeTenantUsersReports(fixture.runtime, "candidate-report-secret-never-production-000000", 30);
     for (const endpoint of ["official_agents", "official_users", "relationships", "history", "overview", "unresolved"] as const) {
-      const selected = await queries.capture({ ...identity, principalId: "viewer-not-importer" }, "delegated", endpoint);
+      const selected = await queries.capture({ ...identity, principalId: "viewer-not-importer" }, endpoint);
       const page = await queries.page(selected.id, { ...identity, principalId: "viewer-not-importer" });
       expect(page.value).toHaveLength(1);
       expect(page.counts).toEqual({ total: 1, filtered: 1 });
       expect(page.reports.historyRevision).toBe("1");
     }
-    const selectedHistory = await queries.capture(identity, "delegated", "history");
+    const selectedHistory = await queries.capture(identity, "history");
     expect((await queries.page(selectedHistory.id, identity, { endpoint: "observations", child: accepted.setId })).value).toHaveLength(3);
   });
 
   it("does not rewrite dependency tuples during repeated captures or idle history maintenance", async () => {
     const identity = { ...selectionIdentity, tenantId: "read-only-scope-initialization" };
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    await reports.capture(identity, "delegated", "copilot_users");
+    await reports.capture(identity, "copilot_users");
     const versions = async () => (await fixture.runtime.query(`SELECT id,xmin::text AS version FROM data_scope_epochs
       WHERE tenant_id=$1 ORDER BY id LIMIT 16`, [identity.tenantId])).rows;
     const before = await versions();
     expect(before.length).toBeGreaterThan(0);
     await Promise.all([
-      reports.capture(identity, "delegated", "official_users"),
-      reports.capture(identity, "delegated", "official_agents"),
+      reports.capture(identity, "official_users"),
+      reports.capture(identity, "official_agents"),
       reports.history.ensure(identity.tenantId).then(async () => {
         await reports.history.expire(identity.tenantId); await reports.history.collect(identity.tenantId);
       }),
@@ -297,7 +297,7 @@ describe("live selected users and reports", () => {
     });
 
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const selected = await reports.capture(identity, "delegated", "copilot_users");
+    const selected = await reports.capture(identity, "copilot_users");
     const page = await reports.page(selected.id, identity), rows = page.value as CombinedUser[];
     expect(rows.map(user => [user.directory.objectId.slice(-1), user.entitlement, user.reportedResponses, user.agentActivityState])).toEqual([
       ["1", "paid_active", 5, "active"], ["2", "paid_active", 0, "none"], ["3", "paid_active", 5, "active"],
@@ -305,15 +305,15 @@ describe("live selected users and reports", () => {
     ]);
     expect(page.summary).toMatchObject({ checkedUsers: 7, licensedUsers: 3, usingAgentsUsers: 2, noAgentActivityUsers: 1, activeWithoutPaidUsers: 3, unresolvedIdentities: 1 });
     expect(rows.map(user => user.userLastActivityDateUtc)).toEqual([today, today, today, today, today, today, null]);
-    const unpaid = await reports.capture(identity, "delegated", "copilot_users", { licenseCohort: "active_without_paid" });
+    const unpaid = await reports.capture(identity, "copilot_users", { licenseCohort: "active_without_paid" });
     expect((await reports.page(unpaid.id, identity)).counts).toEqual({ total: 7, filtered: 3 });
     expect((await reports.facets(selected.id, identity, { field: "company" })).value).toEqual([{ value: "Company", count: 4 }, { value: null, count: 3 }]);
     for (const [search, count] of [["USER1@EXAMPLE.INVALID", 1], ["cOmPaNy", 4], ["DEPARTMENT", 5]] as const) {
-      const searched = await reports.capture(identity, "delegated", "copilot_users", { search });
+      const searched = await reports.capture(identity, "copilot_users", { search });
       expect((await reports.page(searched.id, identity)).counts).toEqual({ total: 7, filtered: count });
     }
     expect((await reports.page(selected.id, identity, { endpoint: "plans", child: users[0].identity.objectId })).value).toHaveLength(1);
-    const official = await reports.capture(identity, "delegated", "official_users");
+    const official = await reports.capture(identity, "official_users");
     const reportUsers = (await reports.page(official.id, identity)).value as ReportUser[];
     expect(reportUsers.find(user => user.username === "user7@example.invalid")).toMatchObject({ missingUserReport: true, reportedResponses: null, bridgeResponses: 5, reviewCohort: "unknown" });
     expect((await reports.page(official.id, identity, { endpoint: "relationships", child: "user1@example.invalid" })).value).toHaveLength(1);
@@ -323,7 +323,7 @@ describe("live selected users and reports", () => {
       ["official_agents", ["name", "responses", "activeUsers", "licensedUsers", "unlicensedUsers", "lastActivity"]],
     ] as const) {
       for (const sort of sorts) {
-        const selectedSort = await reports.capture(identity, "delegated", endpoint, { sort, order: "desc" });
+        const selectedSort = await reports.capture(identity, endpoint, { sort, order: "desc" });
         const first = await reports.page(selectedSort.id, identity, { limit: 2 });
         expect(first.value.length).toBeGreaterThan(0);
         if (first.page.nextCursor) {
@@ -342,12 +342,12 @@ describe("live selected users and reports", () => {
       [{ agentId: "agent", responsesOnly: true }, 6], [{ creatorType: "Other" }, 0], [{ serviceState: "unknown" }, 1],
       [{ entitlement: "paid_active" }, 3], [{ appActivity: "unknown" }, 7], [{ startDate: today, endDate: today }, 6],
     ] as const) {
-      const filtered = await reports.capture(identity, "delegated", "copilot_users", filters);
+      const filtered = await reports.capture(identity, "copilot_users", filters);
       expect((await reports.page(filtered.id, identity)).counts.filtered, JSON.stringify(filters)).toBe(count);
     }
     const exports = new OfficialReportExports(reports, usageAudit(identity).actor);
     for (const kind of ["copilot_users", "official_users", "official_agents"] as const) {
-      const selectedExport = await reports.capture(identity, "delegated", kind);
+      const selectedExport = await reports.capture(identity, kind);
       const id = await exports.create(identity, { selectionId: selectedExport.id, kind });
       await exports.build(id, identity, kind);
       expect(await exports.engine.status(id, identity)).toMatchObject({ status: "ready" });
@@ -386,7 +386,7 @@ describe("live selected users and reports", () => {
         servicePlanId, true, [{ servicePlanId, assignedDateTime: "2026-01-01T00:00:00Z", capabilityStatus: "Enabled" }],
       ));
       const published = await stages.execute(generationInput({ reserveBytes: 8 * 1024 ** 3,
-        scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+        scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }), async lease => {
         const query = await stages.query(lease, "discovery", "synthetic:paid-count");
         await stages.page(lease, query, "synthetic:paid-count", checked, checked);
         for (let offset = 0; offset < checked; offset += 250) {
@@ -407,7 +407,7 @@ describe("live selected users and reports", () => {
       const publicationMs = performance.now() - started - collectionMs;
       expect(await plannerSettings(fixture.runtime)).toEqual(planning);
       const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-      const selected = await reports.capture(identity, "delegated", "copilot_users", { cohort: "licensed" });
+      const selected = await reports.capture(identity, "copilot_users", { cohort: "licensed" });
       const missing = await reports.page(selected.id, identity);
       expect(missing.counts).toEqual({ total: checked, filtered: licensed });
       expect(missing.value).toHaveLength(50);
@@ -418,7 +418,7 @@ describe("live selected users and reports", () => {
         agents: [`agent,Agent,Your org,10,0,10,${today}`],
         userAgents: Array.from({ length: 10 }, (_, index) => `agent,Agent,Your org,user${index + 1}@example.invalid,1,${today}`),
       });
-      const current = await reports.capture(identity, "delegated", "copilot_users", { cohort: "licensed", sort: "responses", order: "desc" });
+      const current = await reports.capture(identity, "copilot_users", { cohort: "licensed", sort: "responses", order: "desc" });
       const first = await reports.page(current.id, identity);
       expect(first.summary).toMatchObject({ checkedUsers: checked, licensedUsers: licensed, usingAgentsUsers: 10, noAgentActivityUsers: licensed - 10 });
       expect(first.counts).toEqual({ total: checked, filtered: licensed });
@@ -429,7 +429,7 @@ describe("live selected users and reports", () => {
       expect(next.counts).toEqual(first.counts);
       expect(next.summary).toEqual(first.summary);
       expect(Buffer.byteLength(JSON.stringify(next))).toBeLessThanOrEqual(1024 ** 2);
-      const all = await reports.capture(identity, "delegated", "copilot_users");
+      const all = await reports.capture(identity, "copilot_users");
       const exact = await reports.exact(all.id, identity, sourceUser(checked).identity.objectId);
       expect(exact.value).toMatchObject({ directory: { objectId: sourceUser(checked).identity.objectId },
         entitlement: licensed === checked ? "paid_active" : "paid_inactive" });
@@ -454,7 +454,7 @@ describe("live selected users and reports", () => {
     await publish(new OfficialReportImports(fixture.runtime), identity, { users: [`user,User,1,5,${today}`],
       agents: [`agent,Agent,User,1,0,5,${today}`], userAgents: [`agent,Agent,User,user,5,${today}`, `bridge,Bridge,User,user,3,${today}`] });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), usage = new OfficialAgentUsage(reports);
-    const selected = await reports.capture(identity, "delegated", "official_agents");
+    const selected = await reports.capture(identity, "official_agents");
     expect((await usage.summaries(selected.id, identity, records.map(record => record.id))).map(row => [row.status, row.responses, row.activeUsers]))
       .toEqual([["linked", 5, 1], ["unlinked", null, null]]);
     const candidates = await usage.candidates(selected.id, identity, records[1].id, {});
@@ -498,7 +498,7 @@ describe("live selected users and reports", () => {
     const partial = await imports.accept(identity, { stagingId: first.id, revision: first.revision, contentHash: first.contentHash, expectedActiveRevision: first.activeRevision });
     expect(partial.complete).toBe(false);
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const incomplete = await reports.capture(identity, "delegated", "official_users");
+    const incomplete = await reports.capture(identity, "official_users");
     expect((await reports.page(incomplete.id, identity)).reports.availability).toBe("incomplete");
     expect((await imports.accept(identity, { stagingId: first.id, revision: first.revision, contentHash: first.contentHash, expectedActiveRevision: first.activeRevision })).complete).toBe(false);
     for (const kind of ["agents", "userAgents"] as const) {
@@ -534,7 +534,7 @@ describe("live selected users and reports", () => {
       `agent-b,Agent B,Team B,user,1,${today}`, `agent-a,Agent A,Team A,user,1,${today}`, "agent-missing,Missing,,user,1,",
     ] });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const selected = await reports.capture(identity, "delegated", "official_users");
+    const selected = await reports.capture(identity, "official_users");
     const ids: string[] = [];
     let cursor: string | undefined;
     do {
@@ -577,7 +577,7 @@ describe("live selected users and reports", () => {
     expect(preview.rowCount).toBe(1000); expect(preview.examples).toHaveLength(20);
     for (const kind of ["users", "agents"] as const) await imports.stage(identity, { bundleId }, csvSource(kind, []));
     await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "delegated", "official_agents");
+    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "official_agents");
     const first = await reports.page(selected.id, identity, { limit: 100 });
     expect(first.value.length).toBeGreaterThan(0); expect(first.value.length).toBeLessThan(100);
     expect(first.page.nextCursor).not.toBeNull(); expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThan(1048576);
@@ -643,12 +643,12 @@ describe("live selected users and reports", () => {
         expect(await plannerSettings(fixture.runtime)).toEqual(planning);
         const acceptMs = performance.now() - accepting;
         const importMs = performance.now() - started - directoryMs;
-        const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "delegated", "copilot_users", { licenseCohort: "active_without_paid" });
+        const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "copilot_users", { licenseCohort: "active_without_paid" });
         const page = await reports.page(selected.id, identity);
         expect(page.counts).toEqual({ total: size, filtered: size / 2 });
         expect(page.value).toHaveLength(50);
         const measured = pageStatement!;
-        const reportUsers = await reports.capture(identity, "delegated", "official_users", { licenseCohort: "active_without_paid" });
+        const reportUsers = await reports.capture(identity, "official_users", { licenseCohort: "active_without_paid" });
         expect((await reports.page(reportUsers.id, identity)).counts).toEqual({ total: size, filtered: size / 2 });
         const readMs = performance.now() - started - directoryMs - importMs;
         await reports.read(selected.id, identity, async (client, context) => {
@@ -752,7 +752,7 @@ describe("live selected users and reports", () => {
       next();
     });
     const enqueue = vi.fn(async () => {});
-    app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity, tokenMode: "delegated" }), enqueueExport: enqueue }));
+    app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity }), enqueueExport: enqueue }));
     for (const [key, policy] of declaredRoutePolicies) {
       expect(policy.access).toBe("authenticated");
       if (policy.access === "authenticated" && !key.startsWith("GET ")) expect(policy.csrf).toBe(true);
@@ -796,13 +796,13 @@ describe("live selected users and reports", () => {
     await publish(new OfficialReportImports(fixture.runtime), identity, { users: [`${username},Ambiguous,1,5,${today}`],
       agents: ["agent,Agent,User,1,0,5,"], userAgents: [`agent,Agent,User,${username},5,${today}`] });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const selected = await reports.capture(identity, "delegated", "copilot_users");
+    const selected = await reports.capture(identity, "copilot_users");
     const combined = await reports.page(selected.id, identity);
     expect(combined.summary).toMatchObject({ licensedUsers: 3, usingAgentsUsers: 0, noAgentActivityUsers: 0, unresolvedIdentities: 1 });
     expect(combined.value.every(row => "directory" in row && row.reportedResponses === null && row.agentActivityState === "unknown")).toBe(true);
-    const official = await reports.capture(identity, "delegated", "official_users");
+    const official = await reports.capture(identity, "official_users");
     expect((await reports.page(official.id, identity)).value[0]).toMatchObject({ objectId: null, entitlement: null, reportedResponses: 5 });
-    const agents = await reports.capture(identity, "delegated", "official_agents");
+    const agents = await reports.capture(identity, "official_agents");
     expect((await reports.page(agents.id, identity)).value[0]).toMatchObject({ lastActivityDateUtc: null, responses: 5 });
   });
 
@@ -821,7 +821,7 @@ describe("live selected users and reports", () => {
     });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
     for (const endpoint of ["copilot_users", "official_users"] as const) {
-      const selected = await reports.capture(identity, "delegated", endpoint, { sort: "name" });
+      const selected = await reports.capture(identity, endpoint, { sort: "name" });
       const rows: Array<CombinedUser | ReportUser> = [];
       let cursor: string | undefined;
       do {
@@ -855,14 +855,14 @@ describe("live selected users and reports", () => {
         `${exactUpn},C exact UPN,1,7,${today}`], agents: [], userAgents: [],
     });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const combined = await reports.capture(identity, "delegated", "copilot_users", { sort: "name" });
+    const combined = await reports.capture(identity, "copilot_users", { sort: "name" });
     const first = await reports.page(combined.id, identity, { limit: 1 });
     const next = await reports.page(combined.id, identity, { limit: 1, cursor: first.page.nextCursor! });
     expect(first.summary.unresolvedIdentities).toBe(2);
     expect(next.value).toMatchObject([{ directory: { objectId: users[1].identity.objectId }, reportedResponses: 7 }]);
     expect((await reports.exact(combined.id, identity, users[2].identity.objectId)).value)
       .toMatchObject({ reportedResponses: null, reportMatch: "missing" });
-    const official = await reports.capture(identity, "delegated", "official_users");
+    const official = await reports.capture(identity, "official_users");
     const hidden = await reports.page(official.id, identity, { limit: 1 });
     const hiddenId = await reports.page(official.id, identity, { limit: 1, cursor: hidden.page.nextCursor! });
     const exact = await reports.page(official.id, identity, { limit: 1, cursor: hiddenId.page.nextCursor! });
@@ -885,7 +885,7 @@ describe("live selected users and reports", () => {
       userAgents: [`agent,Agent,User,unresolved@example.invalid,4,${today}`],
     });
     const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30);
-    const selected = await reports.capture(identity, "delegated", "copilot_users");
+    const selected = await reports.capture(identity, "copilot_users");
     const first = await reports.page(selected.id, identity, { limit: 2 });
     expect(first.counts).toEqual({ total: 6, filtered: 6 });
     expect(first.summary.unresolvedIdentities).toBe(4);
@@ -921,7 +921,7 @@ describe("live selected users and reports", () => {
       .toEqual(second.value[0]);
     expect((await another.page(selected.id, identity, { limit: 2, cursor: second.page.previousCursor! })).value).toEqual(first.value);
     await expect(another.page(selected.id, { ...identity, principalId: "other" })).rejects.toMatchObject({ code: "selection_invalidated" });
-    await new DataGenerations(fixture.runtime).invalidate(await reports.sources.ensureScope(identity, "delegated"), identity.tenantId);
+    await new DataGenerations(fixture.runtime).invalidate(await reports.sources.ensureScope(identity), identity.tenantId);
     expect((await another.page(selected.id, identity, { limit: 2 })).value).toEqual(first.value);
     await new DataGenerations(fixture.runtime).invalidate(first.sources.directory.scopeId!, identity.tenantId);
     await expect(another.page(selected.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
@@ -932,7 +932,7 @@ describe("live selected users and reports", () => {
     await directory(fixture.runtime, identity, [sourceUser(1)]);
     await publish(new OfficialReportImports(fixture.runtime), identity, { users: ["user1@example.invalid,User,1,5,2000-01-01"],
       agents: ["agent,Agent,User,1,0,5,2000-01-01"], userAgents: ["agent,Agent,User,user1@example.invalid,5,2000-01-01"] });
-    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "delegated", "copilot_users");
+    const reports = new LargeTenantUsersReports(fixture.runtime, secret, 30), selected = await reports.capture(identity, "copilot_users");
     const page = await reports.page(selected.id, identity);
     expect(page.reports.availability).toBe("stale");
     expect(page.reports.lineages.every(row => row.sourceFreshness === "unknown")).toBe(true);
@@ -955,10 +955,10 @@ describe("live selected users and reports", () => {
     for (const [n, record] of records.entries()) await seedUserFact(fixture.operator, input.scope.tenantId, set.versions.users, n, record.upn, 5);
     await generations.connections.selectedRead(async client => {
       const rows = (await client.query(`${reportRelationsSql} SELECT identity,responses::text FROM combined
-        WHERE entitlement IN ('no_paid','paid_inactive') AND responses>0`, [lease.id, null, false, input.scope.tenantId, set.id, 5])).rows;
+        WHERE entitlement IN ('no_paid','paid_inactive') AND responses>0`, [lease.id, null, new Date(), input.scope.tenantId, set.id, 5])).rows;
       expect(rows).toEqual([{ identity: "unpaid", responses: "5" }]);
       expect((await client.query(`${reportRelationsSql} SELECT count(*) AS n FROM combined WHERE responses IS NOT NULL`,
-        [lease.id, null, false, "other-tenant", set.id, 5])).rows[0].n).toBe("0");
+        [lease.id, null, new Date(), "other-tenant", set.id, 5])).rows[0].n).toBe("0");
     });
   });
 });

@@ -90,8 +90,8 @@ async function waitForRun(owner: typeof scope, id: string, status: "completed" |
     await vi.waitFor(async () => expect(await repository.getRun(owner, id)).toMatchObject({ status }), { timeout: 2000 });
   } catch (error) {
     const attempts = await fixture.runtime.query(`SELECT a.source,a.status,a.error_code FROM user_source_attempts a
-      JOIN data_scope_epochs s ON s.id=a.scope_id WHERE a.tenant_id=$1 AND s.principal_id=$2 ORDER BY a.source LIMIT 20`,
-    [owner.tenantId, owner.principalId]);
+      JOIN data_scope_epochs s ON s.id=a.scope_id WHERE a.tenant_id=$1 AND s.scope_kind='tenant' ORDER BY a.source LIMIT 20`,
+    [owner.tenantId]);
     throw new Error(`Automatic ${status} boundary: ${JSON.stringify({ run: await repository.getRun(owner, id), attempts: attempts.rows })}`, { cause: error });
   }
 }
@@ -121,8 +121,8 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect(sourceFetch).toHaveBeenCalledTimes(2);
     expect((await fixture.runtime.query(`SELECT attempt.source,attempt.status,attempt.observed_count FROM user_source_attempts attempt
       JOIN data_scope_epochs scope ON scope.id=attempt.scope_id AND scope.tenant_id=attempt.tenant_id
-      WHERE attempt.tenant_id=$1 AND scope.principal_id=$2 AND scope.token_mode='delegated'
-      ORDER BY attempt.source LIMIT 250`, [scope.tenantId, scope.principalId])).rows).toEqual([
+      WHERE attempt.tenant_id=$1 AND scope.scope_kind='tenant' AND scope.token_mode='tenant'
+      ORDER BY attempt.source LIMIT 250`, [scope.tenantId])).rows).toEqual([
       { source: "app_activity", status: "available", observed_count: 0 }, { source: "directory", status: "available", observed_count: 0 },
     ]);
     expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "packages")).raw.value.map(value => value.id)).toEqual([summary.id]);
@@ -131,7 +131,7 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect(enriching.detailJob).toMatchObject({ status: "running" });
     await vi.waitFor(() => expect(details).toHaveBeenCalledOnce(), { timeout: 10_000 });
     await fixture.operator.query(`UPDATE data_sync_success_markers SET last_success_at=clock_timestamp()-interval '6 hours 1 minute'
-      WHERE tenant_id=$1 AND principal_id=$2 AND source_id='graph_packages'`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1 AND source_id='graph_packages'`, [scope.tenantId]);
     await fixture.operator.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp()-interval '6 hours 1 minute'
       WHERE run_id=$1 AND source_id='graph_packages'`, [initial.run!.id]);
     const next = await service.automaticRefresh(user);
@@ -143,9 +143,9 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect(list).toHaveBeenCalledOnce();
     expect(details).toHaveBeenCalledOnce();
     expect((await fixture.runtime.query(`SELECT count(*)::integer AS count FROM data_generations g
-      JOIN data_scope_epochs s ON s.id=g.scope_id WHERE s.tenant_id=$1 AND s.principal_id=$2
+      JOIN data_scope_epochs s ON s.id=g.scope_id WHERE s.tenant_id=$1 AND s.scope_kind='tenant'
         AND s.source='inventory_packages' AND g.state IN ('staging','validating')`,
-    [scope.tenantId, scope.principalId])).rows[0].count).toBe(1);
+    [scope.tenantId])).rows[0].count).toBe(1);
     expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "packages")).raw.value.map(value => value.id)).toEqual([summary.id]);
     const beforeDetails = await repository.automaticRevisions(scope);
     release();
@@ -162,7 +162,7 @@ it("publishes initial inventory/users independently, then queues a same-selector
 });
 
 it("recovers the same principal after sign-in without replaying old authentication failures or restarting fresh work", async () => {
-  const reader = { ...user, homeAccountId: randomUUID() };
+  const reader = { ...user, tenantId: randomUUID(), homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   const expiredSignIn = Date.now() - 60_000;
   vi.mocked(revalidateAuthorizedUser).mockRejectedValue(new AppError(401, "interaction_required", "Token cache unavailable."));
@@ -191,7 +191,7 @@ it("recovers the same principal after sign-in without replaying old authenticati
 });
 
 it("finishes a partial automatic run when the last inventory child publishes after Users failed", async () => {
-  const reader = { ...user, homeAccountId: randomUUID() };
+  const reader = { ...user, tenantId: randomUUID(), homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   vi.mocked(revalidateAuthorizedUser).mockResolvedValue(reader);
   let release!: () => void;
@@ -212,7 +212,15 @@ it("finishes a partial automatic run when the last inventory child publishes aft
   });
   try {
     const submitted = await service.automaticRefresh(reader);
-    await vi.waitFor(() => expect(usersSettled).toBe(true), { timeout: 2000 });
+    try {
+      await vi.waitFor(() => expect(usersSettled).toBe(true), { timeout: 2000 });
+    } catch (error) {
+      const sources = await fixture.operator.query(`SELECT source_id,status,job_id,message
+        FROM data_sync_run_sources WHERE run_id=$1 ORDER BY source_id`, [submitted.run!.id]);
+      const activity = await fixture.operator.query(`SELECT state,wait_event_type,wait_event,left(query,150) AS query
+        FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() LIMIT 20`);
+      throw new Error(`Automatic Users boundary: ${JSON.stringify({ sources: sources.rows, activity: activity.rows })}`, { cause: error });
+    }
     const current = await repository.getRun(owner, submitted.run!.id);
     expect(current?.sources.find(source => source.source === "users")).toMatchObject({ status: "partial" });
     expect(current?.sources.find(source => source.source === "graph_packages")).toMatchObject({ status: "running" });

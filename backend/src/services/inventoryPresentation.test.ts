@@ -43,15 +43,15 @@ function savedPage(pendingPackages: number, invalidPackages: number): Parameters
       reportingPeriod: null, acceptedAt: null, expiresAt: null, lineages: [],
     },
     freshness: { state: "idle", capturedRevision: "1", sources: [
-      { source: "inventory_packages", generation_id: "packages", current: true, token_mode: "delegated",
+      { source: "inventory_packages", generation_id: "packages", current: true,
         scope_id: "package-scope", observed_at: observedAt, expires_at: expiresAt, catalog_complete: true,
         catalog_scope_complete: true,
         catalog_observed_at: observedAt, catalog_expires_at: expiresAt,
-        complete: true, channel: "catalog", expected_count: packages, row_count: packages },
+        complete: true, channel: "catalog", expected_count: packages, row_count: packages, collected_count: packages },
       { source: "inventory_power_platform", generation_id: "native", current: true, role_scope: "unknown",
         scope_id: "native-scope", complete: true, channel: "catalog", expected_count: 0,
         catalog_scope_complete: true, catalog_observed_at: observedAt, catalog_expires_at: expiresAt,
-        observed_at: observedAt, expires_at: expiresAt, catalog_complete: true, row_count: 0, agent_count: 0,
+        observed_at: observedAt, expires_at: expiresAt, catalog_complete: true, row_count: 0, collected_count: 0, agent_count: 0,
         resource_types: ["microsoft.copilotstudio/agents"], environment_id: null, page_count: 1 },
     ] },
     verificationCounts: { packages, native_agents: 0, represented: packages, unique_sources: packages,
@@ -89,7 +89,7 @@ function memberPage(native = false): Parameters<typeof inventoryPresentation>[0]
     raw.scopeSummary = { ...raw.summary };
     raw.filteredSummary = { ...raw.summary };
     Object.assign(raw.verificationCounts, { native_agents: 1, represented: 2, unique_sources: 2 });
-    Object.assign(raw.freshness.sources[1], { row_count: 1, agent_count: 1, expected_count: 1 });
+    Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
     raw.value[0].members.push({ ...powerPlatformInventoryRecord(resource), domain: "power_platform", scope_id: "native-scope",
       source_identity: "native-exact-key", generation_id: "native-member", observed_at: observedAt, expires_at: expiresAt,
       total: "1", evidence: [], identifiers: [], identifier_count: 0 });
@@ -440,7 +440,7 @@ describe("saved inventory projection invariants", () => {
   it("does not verify source counts when a native target has no logical row, including empty filtered pages", () => {
     const raw = savedPage(0, 0);
     Object.assign(raw.verificationCounts, { native_agents: 1, represented: 2, unique_sources: 2 });
-    Object.assign(raw.freshness.sources[1], { row_count: 1, agent_count: 1, expected_count: 1 });
+    Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
     const page = inventoryPresentation(raw);
     expect(page.verification).toMatchObject({ status: "needs_attention", checks: { sourceMemberships: false } });
     expect(inventoryAttentionReasons(page).join(" ")).toContain("membership accounting");
@@ -646,7 +646,7 @@ describe("saved inventory projection invariants", () => {
     const base = raw.freshness.sources[1];
     const sources = [
       { ...base, scope_id: "environment", generation_id: "environment", resource_types: ["microsoft.powerplatform/environments"],
-        row_count: 4, expected_count: 4, catalog_observed_at: "2026-09-20T11:59:59Z", catalog_expires_at: expiresAt },
+        row_count: 4, collected_count: 4, expected_count: 4, catalog_observed_at: "2026-09-20T11:59:59Z", catalog_expires_at: expiresAt },
       { ...base, scope_id: "limited", generation_id: "limited", environment_id: "Environment-A",
         catalog_observed_at: "2026-09-20T11:59:59Z", catalog_expires_at: expiresAt },
       { ...base, scope_id: "broad-old", generation_id: "old", catalog_observed_at: "2026-09-18T00:00:00Z", catalog_expires_at: expiresAt },
@@ -674,7 +674,7 @@ describe("saved inventory projection invariants", () => {
       raw.counts.filtered = 0;
       raw.filteredSummary = { ...raw.filteredSummary, total: 0, graphOnly: 0 };
       if (duplicate) raw.verificationCounts.represented++;
-      else raw.freshness.sources[0].row_count++;
+      else { raw.freshness.sources[0].row_count++; raw.freshness.sources[0].collected_count++; }
       const page = inventoryPresentation(raw);
       expect(page.verification).toMatchObject({ status: "needs_attention", checks: { sourceScopes: true, sourceMemberships: false } });
       expect(inventoryDetailsPending(page)).toBe(true);
@@ -794,8 +794,8 @@ describe("saved inventory person evidence", () => {
         raw.filteredSummary = { ...raw.summary };
         raw.counts.packageTargets = 0;
         Object.assign(raw.verificationCounts, { packages: 0, checked_packages: 0, native_agents: 1 });
-        Object.assign(raw.freshness.sources[0], { row_count: 0, expected_count: 0 });
-        Object.assign(raw.freshness.sources[1], { row_count: 1, agent_count: 1, expected_count: 1 });
+        Object.assign(raw.freshness.sources[0], { row_count: 0, collected_count: 0, expected_count: 0 });
+        Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
         const identity = { tenantId: "tenant", principalId: "reader", sessionEpoch: "1", authorizationHash: "viewer" };
         const source = (source: UserSourceMetadata["source"]): UserSourceMetadata => ({
           source, generationId: source === "directory" ? "directory-generation" : null,
@@ -807,7 +807,7 @@ describe("saved inventory person evidence", () => {
           data: { identity, evaluatedAt: new Date(observedAt), query: {}, report: raw.reports, publicationRevisions: raw.selection.publicationRevisions,
             metadata: { directory: source("directory"), app_activity: source("app_activity") } },
           selectionId: "selection", expiresAt: Date.parse(expiresAt), scopeId: "scope", baselineId: "baseline",
-          revision: "1", source: "inventory_canonical", tokenMode: "delegated", query: { sortBy: "owner", search: "J\u030c" },
+          revision: "1", source: "inventory_canonical", query: { sortBy: "owner", search: "J\u030c" },
         };
         const result = (rows: pg.QueryResultRow[]): pg.QueryResult => ({
           command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows,
@@ -842,7 +842,7 @@ describe("saved inventory person evidence", () => {
             return result([{ identity: "agent", observed_at: new Date(observedAt), people: references }]);
           }
           if (text.startsWith("SELECT requested.id")) {
-            expect(values).toEqual(["tenant", "reader", "directory-generation", [ownerId, creatorId], new Date(observedAt), "delegated", true]);
+            expect(values).toEqual(["tenant", "directory-generation", [ownerId, creatorId], new Date(observedAt), true]);
             return result([{
               id: creatorId, directory_id: status === "legacy" ? creatorId : null,
               display_name: "Known creator", upn: "creator@example.invalid",
@@ -977,7 +977,7 @@ describe("saved inventory metadata verification", () => {
       if (scenario === "future_detail") Object.assign(raw.verificationCounts, { checked_packages: 0, stale_packages: 2 });
       raw.reports.setId = "usage-report";
       Object.assign(raw.freshness.sources[0], { scope_id: packageScope, current: scenario !== "superseded" });
-      Object.assign(raw.freshness.sources[1], { scope_id: nativeScope, row_count: 1, agent_count: 1, expected_count: 1 });
+      Object.assign(raw.freshness.sources[1], { scope_id: nativeScope, row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
       raw.value.push({
         id: projected.identity, nativeId: projected.native_id, domain: "canonical", resourceType: null, residual: null,
         displayName: projected.display_name, environmentId: projected.environment_id,
@@ -1021,7 +1021,7 @@ describe("saved inventory metadata verification", () => {
         data: { identity, evaluatedAt: new Date(observedAt), query: {}, report: raw.reports,
           metadata: { directory: metadata("directory"), app_activity: metadata("app_activity") } },
         selectionId: "selection", expiresAt: Date.parse(expiresAt), scopeId: lease.scopeId, baselineId: lease.id,
-        revision: "1", source: "inventory_canonical", tokenMode: "delegated", query: {},
+        revision: "1", source: "inventory_canonical", query: {},
       }, selection: {} });
       vi.spyOn(inventory, "pageInRead").mockResolvedValue(raw);
       const children = [
@@ -1198,7 +1198,7 @@ describe("saved inventory exact export selection", () => {
       data: { identity, evaluatedAt: new Date(observedAt), query: {}, report: raw.reports,
         metadata: { directory: metadata("directory"), app_activity: metadata("app_activity") } },
       selectionId: "selection", expiresAt: Date.parse(expiresAt), scopeId: "scope", baselineId: "baseline",
-      revision: "7", source: "inventory_canonical", tokenMode: "delegated", query: { search: "off-filter" },
+      revision: "7", source: "inventory_canonical", query: { search: "off-filter" },
     };
     const result = (rows: object[] = []): pg.QueryResult => ({ command: "", rows, rowCount: rows.length, fields: [], oid: 0 });
     return { database, inventory, client, identity, context, raw, result };
@@ -1207,7 +1207,7 @@ describe("saved inventory exact export selection", () => {
   it("counts captured memberships independently of freshness while exposing source-accounting gaps", async () => {
     const { database, inventory, client, context, raw, result } = fixture();
     try {
-      Object.assign(raw.freshness.sources[0], { row_count: 2, expected_count: 2 });
+      Object.assign(raw.freshness.sources[0], { row_count: 2, collected_count: 2, expected_count: 2 });
       const query = vi.spyOn(client, "query").mockImplementation(async (statement: unknown, values?: unknown[]) => {
         const sql = String(statement);
         if (sql.startsWith("SELECT set_config")) return result();
@@ -1453,7 +1453,7 @@ describe("saved inventory exact export selection", () => {
         evidence: [], columns: {}, identifier_count: null, connector_counts: null,
       }));
       raw.value[0].members = [{ ...members[0], source_identity: members[0].identity, total: "101" }];
-      Object.assign(raw.freshness.sources[0], { scope_id: scopeId, row_count: 101, expected_count: 101 });
+      Object.assign(raw.freshness.sources[0], { scope_id: scopeId, row_count: 101, collected_count: 101, expected_count: 101 });
       Object.assign(raw.verificationCounts, { packages: 101, represented: 101, unique_sources: 101 });
       raw.counts.packageTargets = 101;
       vi.spyOn(inventory, "contextInRead").mockResolvedValue({ context, selection: {} });
@@ -1519,7 +1519,7 @@ describe("frontend inventory verification fixture contract", () => {
       native_agents: 1, represented: 3, unique_sources: 3, checked_packages: scenario.checked,
       stale_packages: scenario.stale, invalidated_packages: scenario.invalidated,
     });
-    Object.assign(raw.freshness.sources[1], { row_count: 1, agent_count: 1, expected_count: 1 });
+    Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
     raw.summary = { ...raw.summary, linked: scenario.conflict ? 0 : 1, graphOnly: 1,
       powerPlatformOnly: scenario.conflict ? 1 : 0, conflicting: scenario.conflict ? 1 : 0 };
     raw.scopeSummary = { ...raw.summary };

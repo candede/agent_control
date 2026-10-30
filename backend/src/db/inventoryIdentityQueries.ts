@@ -5,23 +5,21 @@ import { powerPlatformResourceTypes, type PowerPlatformResourceType } from "../t
 import { exactCount } from "./dataBounds.js";
 import { dataConnections } from "./dataConnections.js";
 import { normalizeEnvironmentIdentitySql, normalizeInventoryIdentifierSql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
+import { inventoryNativeRootChoicesSql } from "./inventoryInputScopes.js";
 
 type Scope = { tenantId: string; principalId: string };
 export type InventoryIdentityReadScope = { principalId: string; resourceTypes: PowerPlatformResourceType[] };
-export const currentNativeInventorySql = `WITH selected AS (
-  SELECT DISTINCT ON (kind) root.baseline_id,root.revision,kind FROM inventory_roots root
+export const currentNativeInventorySql = `WITH roots AS (
+  SELECT root.baseline_id,root.revision FROM inventory_roots root
   JOIN data_scope_epochs scope ON scope.id=root.scope_id
   JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
   JOIN data_generations generation ON generation.id=revision.generation_id
-  JOIN data_principal_epochs principal ON principal.tenant_id=scope.tenant_id AND principal.principal_id=scope.principal_id
-  JOIN inventory_attempts attempt ON attempt.generation_id=generation.id
-  CROSS JOIN LATERAL unnest(attempt.resource_types) kind
-  WHERE root.current AND root.domain='power_platform' AND root.tenant_id=$1 AND scope.principal_id=$2
-    AND scope.token_mode='delegated' AND generation.scope_epoch=scope.epoch
+  WHERE root.current AND root.domain='power_platform' AND root.tenant_id=$1 AND $2::text IS NOT NULL
+    AND scope.scope_kind='tenant' AND scope.token_mode='tenant' AND generation.scope_epoch=scope.epoch
     AND generation.session_epoch=scope.session_epoch
     AND generation.state='published' AND generation.validated
-    AND kind=ANY($3::text[])
-  ORDER BY kind,(coalesce(attempt.environment_id,'')='') DESC,root.catalog_observed_at DESC NULLS LAST,root.scope_id
+), selected AS (
+  SELECT * FROM (${inventoryNativeRootChoicesSql("roots")}) choices WHERE kind=ANY($3::text[])
 ), native AS (
   SELECT row.* FROM selected root JOIN inventory_memberships member ON member.baseline_id=root.baseline_id
     AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)

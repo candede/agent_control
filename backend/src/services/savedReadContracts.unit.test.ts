@@ -55,7 +55,7 @@ function fixture(endpoint: "copilot_users" | "adoption" = "copilot_users") {
   const selected: Awaited<ReturnType<InventoryQueries["contextInRead"]>> = {
     context: { data: { ...saved, publicationRevisions: saved.selection.publicationRevisions },
       selectionId: inventoryId, expiresAt: Date.parse(saved.selection.expiresAt), scopeId: "scope",
-      baselineId: "baseline", revision: "1", source: "inventory_canonical", tokenMode: "delegated",
+      baselineId: "baseline", revision: "1", source: "inventory_canonical", tokenMode: "tenant",
       query: { inventoryScope: "all", view: "all", source: "all" } },
     selection: { revision: "1", evaluated_at: saved.evaluatedAt, expires_at: new Date(saved.selection.expiresAt),
       validated_at: saved.evaluatedAt },

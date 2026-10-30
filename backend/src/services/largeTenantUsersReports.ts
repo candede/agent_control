@@ -8,7 +8,6 @@ import { reportRelationsSql, reportPeriodSortKey, selectedDirectoryReportRelatio
 import { reportUuid } from "../db/officialReportImports.js";
 import { CursorCodec, DataSelections, SelectionError, assertSelectionIdentity, canonicalQuery, type CursorBoundary, type DependencyRoot, type SelectionIdentity } from "./dataSelections.js";
 import type { ReportEndpoint, ReportMetadata, ReportPage, ReportQuery, ReportRow, ReportSummary } from "../types/officialReportData.js";
-import type { UserSourceScope } from "../types/userSources.js";
 import type { GenerationLease } from "../db/dataGenerations.js";
 import type { UserSourceStages } from "../db/userSourceStages.js";
 import { officialReportAnalytics, officialReportAnalyticsQuery, projectReportAnalytics, type ReportSql } from "./officialReportAnalytics.js";
@@ -91,7 +90,7 @@ export function reportQuery(endpoint: ReportEndpoint, input: ReportQuery = {}): 
 }
 
 export type ReportReadContext = {
-  identity: SelectionIdentity; tokenMode: UserSourceScope["tokenMode"]; endpoint: ReportEndpoint; query: ReportQuery; queryHash: string;
+  identity: SelectionIdentity; endpoint: ReportEndpoint; query: ReportQuery; queryHash: string;
   metadata: UserSourceMetadataSet; report: ReportMetadata; evaluatedAt: Date; selection: PublishedSelectedRead;
 };
 export type ReportCurrentData = Pick<ReportReadContext, "metadata" | "report" | "evaluatedAt" | "query"> & {
@@ -159,7 +158,7 @@ export class LargeTenantUsersReports {
     while (await this.history.expire(tenantId) > 0) { /* bounded maintenance transactions */ }
   }
 
-  async capture(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"], endpoint: ReportEndpoint, input: ReportQuery = {}) {
+  async capture(identity: SelectionIdentity, endpoint: ReportEndpoint, input: ReportQuery = {}) {
     assertSelectionIdentity(identity);
     const query = reportQuery(endpoint, input);
     await this.prepareHistoryCapture(identity.tenantId);
@@ -171,7 +170,7 @@ export class LargeTenantUsersReports {
         rowCount: null, state: "unavailable", reportRefreshDate: null, period: null, reportVersion: null,
       });
       const metadata = historyOnly ? { directory: absentSource("directory"), app_activity: absentSource("app_activity") }
-        : await this.sources.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
+        : await this.sources.metadataInRead(client, identity, evaluatedAt);
       const history = await this.history.root(client, identity.tenantId, evaluatedAt);
       const report = await this.metadata(client, identity.tenantId, query.setId, evaluatedAt, historyOnly);
       const publicationRevisions = await readAutomaticInventoryRevisions(identity, client);
@@ -179,11 +178,11 @@ export class LargeTenantUsersReports {
       let associationRevision: string | undefined;
       if (endpoint === "adoption" && report.lineages.some(lineage => lineage.kind === "userAgents")) {
         const scope = (await client.query<{ id: string }>(`SELECT id FROM data_scope_epochs
-          WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_canonical'
-            AND token_mode='delegated' AND selector='complete'`,
-        [identity.tenantId, identity.principalId])).rows[0];
+          WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_canonical'
+            AND token_mode='tenant' AND selector='complete'`,
+        [identity.tenantId])).rows[0];
         if (scope) {
-          const inventory = await inventorySelectionRoots(client, { ...scope, tenantId: identity.tenantId, tokenMode: "delegated" },
+          const inventory = await inventorySelectionRoots(client, { ...scope, tenantId: identity.tenantId },
             new Date(evaluatedAt.getTime() + 30 * 60_000));
           roots.push(...inventory);
           if (inventory.length) associationRevision = await inventoryAssociationRevision(client, identity.tenantId);
@@ -201,9 +200,9 @@ export class LargeTenantUsersReports {
       const next = Math.min(...transitions);
       return { roots, ...(Number.isFinite(next) ? { nextTransition: new Date(next) } : {}),
         persist: async (connection, selection) => {
-          await connection.query(`INSERT INTO official_usage_read_contexts(selection_id,tenant_id,token_mode,metadata,report_metadata,set_id,history_revision,history_epoch)
-            VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6,$7,$8)`,
-          [selection.id, identity.tenantId, tokenMode, JSON.stringify({ ...metadata, publicationRevisions, associationRevision }), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
+          await connection.query(`INSERT INTO official_usage_read_contexts(selection_id,tenant_id,metadata,report_metadata,set_id,history_revision,history_epoch)
+            VALUES($1,$2,$3::jsonb,$4::jsonb,$5,$6,$7)`,
+          [selection.id, identity.tenantId, JSON.stringify({ ...metadata, publicationRevisions, associationRevision }), JSON.stringify(report), report.setId, report.historyRevision, report.historyEpoch]);
         } };
     });
   }
@@ -273,7 +272,7 @@ export class LargeTenantUsersReports {
       }
       await client.query("SELECT set_config('jit','off',true)");
     }
-    return { identity, tokenMode: row.token_mode, endpoint: row.endpoint, query, queryHash: row.query_hash, metadata,
+    return { identity, endpoint: row.endpoint, query, queryHash: row.query_hash, metadata,
       report: row.report_metadata, evaluatedAt: row.evaluated_at,
       selection: { id: selectionId, revision: row.revision, expiresAt: row.expires_at.toISOString(), evaluatedAt: row.evaluated_at.toISOString(),
         validatedAt: row.validated_at.toISOString(), publicationRevisions } };
@@ -290,7 +289,7 @@ export class LargeTenantUsersReports {
     if (state.isolation !== "repeatable read") throw new Error("inventory_report_repeatable_read_required");
     const evaluatedAt = at ?? state.now as Date;
     await this.history.prepareRead(client, scope.tenantId);
-    const metadata = await this.sources.metadataInRead(client, { ...scope, tokenMode: "delegated" }, evaluatedAt);
+    const metadata = await this.sources.metadataInRead(client, scope, evaluatedAt);
     metadata.app_activity = { source: "app_activity", generationId: null, scopeId: null, revision: null,
       expiresAt: null, observedAt: null, attemptedAt: null, attemptStatus: null, attemptObservedCount: null,
       errorCode: null, message: "App activity is not captured for agent inventory.", rowCount: null, state: "unavailable",
@@ -763,8 +762,8 @@ export class LargeTenantUsersReports {
     fence();
     if (lease.tenantId !== identity.tenantId) throw new SelectionError("selection_invalidated");
     const owned = await this.database.query(`SELECT 1 FROM data_generations g JOIN data_scope_epochs s ON s.id=g.scope_id
-      WHERE g.id=$1 AND g.owner=$2 AND g.tenant_id=$3 AND s.principal_id=$4 AND g.session_epoch=$5 AND s.source='directory'`,
-    [lease.id, lease.owner, identity.tenantId, identity.principalId, lease.sessionEpoch]);
+      WHERE g.id=$1 AND g.owner=$2 AND g.tenant_id=$3 AND g.actor_principal_id=$4 AND g.actor_session_epoch=$5 AND s.source='directory'`,
+    [lease.id, lease.owner, identity.tenantId, identity.principalId, identity.sessionEpoch]);
     fence();
     if (!owned.rowCount) throw new SelectionError("selection_invalidated");
     let after = { key: "", username: "" };

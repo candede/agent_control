@@ -4,7 +4,7 @@ import { inventoryInput, reconcileInventoryFixture } from "./inventoryFixtures.j
 import { selectionIdentity } from "./largeTenantFixtures.js";
 import { publishFixtureDirectory } from "./userSourceFixture.js";
 import { publishUsageReports } from "../src/db/agentUsageTestSupport.js";
-import { InventoryGenerations, inventorySelector } from "../src/db/inventoryGenerations.js";
+import { InventoryGenerations } from "../src/db/inventoryGenerations.js";
 import { InventoryQueries, type InventoryQuery } from "../src/db/inventoryQueries.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord, type InventoryRecord } from "../src/services/inventoryRecordProjection.js";
 import { inventoryPresentation } from "../src/services/inventoryPresentation.js";
@@ -21,7 +21,10 @@ export type SelectedInventoryFixtureInput = {
   omitPackages?: boolean;
   omitResources?: boolean;
   directory?: CopilotDirectoryUser[];
-  /** Per-agent response totals, distributed across users (one user by default). */
+  /**
+   * Per-agent response totals with a safe-integer aggregate.
+   * Distributed across one user by default; zero users requires zero responses.
+   */
   usage?: { id: string; responses: number; users?: number }[];
   resourceTypes?: PowerPlatformResourceType[];
   roleScope?: "full" | "ai" | "unknown";
@@ -34,7 +37,8 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
   if (process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1") throw new Error("fixture_only");
   if ((options.packages?.length ?? 0) + (options.resources?.length ?? 0) > 1000) throw new Error("selected_fixture_limit");
   if (options.usage && (options.usage.length > 100 || options.usage.some(value => !isInventoryCount(value.responses)
-    || !isInventoryCount(value.users ?? 1) || (value.users ?? 1) > 10))) throw new Error("selected_usage_fixture_limit");
+    || !isInventoryCount(value.users ?? 1) || (value.users ?? 1) > 10 || (value.users === 0 && value.responses > 0))
+    || !isInventoryCount(options.usage.reduce((total, value) => total + value.responses, 0)))) throw new Error("selected_usage_fixture_limit");
   const scope = options.scope ?? { tenantId: `selected-${randomUUID()}`, principalId: randomUUID() };
   const store = new InventoryGenerations(database);
   const identity = { ...selectionIdentity, ...scope, sessionEpoch: await store.generations.sessionEpoch(scope.tenantId, scope.principalId) };
@@ -47,7 +51,6 @@ export async function seedSelectedInventory(database: pg.Pool, options: Selected
       ...(channel === "detail" ? { targets: records.map(record => record.native_id) } : {}),
       ...(domain === "power_platform" ? { resourceTypes: options.resourceTypes ?? [...powerPlatformResourceTypes],
         roleScope: options.roleScope ?? "full", ...(options.environmentId ? { environmentId: options.environmentId } : {}) } : {}) };
-    input.scope.selector = inventorySelector(intent);
     return store.execute(input, intent, async lease => {
       for (let offset = 0; offset < records.length || offset === 0; offset += 100) {
         const page = records.slice(offset, offset + 100);

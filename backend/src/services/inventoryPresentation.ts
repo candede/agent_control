@@ -54,15 +54,17 @@ function status(source: Source | undefined, kind: "graph_packages" | "power_plat
     const catalog = inventoryObservation(source.generation_id, source.catalog_observed_at, source.catalog_expires_at, source.current, evaluatedAt);
     if (!catalog.current) source = { ...source, catalog_complete: false };
   }
-  const complete = source.catalog_complete && source.complete;
+  const collectedCount = savedCount(source.collected_count);
+  const complete = source.catalog_complete && source.complete && (source.channel !== "catalog" || collectedCount === rowCount);
   const error = !common.current ? { source: kind, code: "snapshot_stale" as const,
     message: "The selected saved source is stale or no longer authoritative. Refresh it in Data sync." }
     : !complete ? { source: kind, code: "coverage_unknown" as const,
-      message: "The captured source does not contain a complete authorized catalog query." } : null;
+      message: source.channel === "catalog" && source.complete && rowCount > collectedCount
+        ? "The saved dataset retains earlier observations outside this completed collection's visibility."
+        : "The captured source does not contain a complete authorized catalog query." } : null;
   if (kind === "graph_packages") {
-    if (!["delegated", "application"].includes(source.token_mode)) return invalid("Saved Graph source token mode is invalid.");
-    const value: UnifiedAgentPackageObservation = { ...common, tokenMode: source.token_mode,
-      scopeKind: source.catalog_scope_complete ? "broad" : "exact", observedCount: rowCount, totalRecords: rowCount };
+    const value: UnifiedAgentPackageObservation = { ...common,
+      scopeKind: source.catalog_scope_complete ? "broad" : "exact", observedCount: collectedCount, totalRecords: rowCount };
     return error ? { state: "partial", observation: value, error } : { state: "available", observation: value, error: null };
   }
   if (!Array.isArray(source.resource_types) || new Set(source.resource_types).size !== source.resource_types.length
@@ -73,16 +75,16 @@ function status(source: Source | undefined, kind: "graph_packages" | "power_plat
   const requested = source.resource_types.includes("microsoft.copilotstudio/agents");
   const agentCount = savedCount(source.agent_count), pageCount = savedCount(source.page_count);
   if (pageCount > dataLimits.pages) throw dataLimitError("inventory_source_pages", dataLimits.pages, pageCount);
-  if (agentCount > rowCount || !requested && agentCount !== 0) return invalid("Saved native source counts disagree with its requested types.");
+  if (agentCount > rowCount || !requested && collectedCount > rowCount - agentCount) return invalid("Saved native source counts disagree with its requested types.");
   const expectedCount = source.expected_count === null ? null : savedCount(source.expected_count);
-  if (source.channel === "catalog" && source.complete && expectedCount !== null && expectedCount !== rowCount) {
+  if (source.channel === "catalog" && source.complete && expectedCount !== null && expectedCount !== collectedCount) {
     return invalid("Saved native provider total disagrees with its stored records.");
   }
-  const verified = complete && common.current && source.channel === "catalog" && expectedCount === rowCount && pageCount > 0;
+  const verified = complete && common.current && source.channel === "catalog" && expectedCount === collectedCount && pageCount > 0;
   const covered = verified && requested;
   const value: UnifiedAgentPowerPlatformObservation = { ...common, roleScope: source.role_scope, environmentScope: source.environment_id,
     coverage: covered ? "covered" : requested ? "unknown" : "not_requested", coveredCount: covered ? agentCount : null,
-    observedCount: rowCount, totalRecords: rowCount, pageCount,
+    observedCount: collectedCount, totalRecords: rowCount, pageCount,
     verification: verified ? { status: "verified", scope: "authorized_query", basis: "provider_total_and_saved_rows", checkedAt: common.observedAt,
       storedCount: rowCount, uniqueIdentityCount: rowCount, queriedTypes: source.resource_types } : null };
   return covered ? { state: "available", observation: value, error: null }
@@ -117,7 +119,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     && counts.packages >= page.summary.linked + page.summary.graphOnly
     && counts.native_agents === page.summary.linked + page.summary.powerPlatformOnly
     && (counts.packages === 0 ? page.summary.linked + page.summary.graphOnly === 0 : page.summary.linked + page.summary.graphOnly > 0)
-    && (graph.observation ? graph.observation.observedCount === counts.packages : counts.packages === 0)
+    && (graph.observation ? graph.observation.totalRecords === counts.packages : counts.packages === 0)
     && (nativeSourceRow ? savedCount(nativeSourceRow.agent_count) === counts.native_agents : counts.native_agents === 0);
   const rowIds = new Set<string>(), visibleSources = new Set<string>();
   let visiblePackages = 0, visibleNativeAgents = 0;

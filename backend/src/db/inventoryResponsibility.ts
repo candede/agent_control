@@ -70,7 +70,7 @@ export async function readInventoryResponsibility(client: pg.PoolClient, relatio
   const pageRows = rows.slice(0, limit);
   if (reverse) pageRows.reverse();
   const evidenceIds = objectId ? [objectId] : pageRows.map(row => row.id as string);
-  const evidence = new Map((await userSourcePeopleInRead(client, { ...identity, tokenMode: "delegated" },
+  const evidence = new Map((await userSourcePeopleInRead(client, identity,
     data.metadata.directory.generationId ? { generationId: data.metadata.directory.generationId,
       observedAt: new Date(data.metadata.directory.observedAt!) } : null, evidenceIds, data.evaluatedAt, includePeopleCache))
     .map(person => [person.objectId, person]));

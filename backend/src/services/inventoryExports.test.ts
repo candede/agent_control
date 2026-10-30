@@ -26,12 +26,13 @@ describe("durable selected inventory exports", () => {
   afterAll(async () => { await fixture?.close(); });
 
   async function select(count: number, canonical: boolean) {
-    const principalId = randomUUID(), identity = { ...selectionIdentity, principalId };
-    const source = await inventoryBaseline(new InventoryGenerations(fixture.runtime), principalId, count);
+    const principalId = randomUUID(), identity = { ...selectionIdentity, tenantId: randomUUID(), principalId };
+    const source = await inventoryBaseline(new InventoryGenerations(fixture.runtime), principalId, count, undefined, undefined, identity.tenantId);
     let root = source;
     if (canonical) {
       const reconcile = new InventoryReconciliation(fixture.runtime);
       const input = inventoryInput(principalId, "canonical");
+      input.scope.tenantId = identity.tenantId;
       await reconcile.request(input, [source]);
       root = (await reconcile.runNext(input, async () => {}))!;
     }
@@ -40,7 +41,7 @@ describe("durable selected inventory exports", () => {
   }
 
   it("exports complete saved About chunks through the existing bounded source child rows", async () => {
-    const scope = { tenantId: selectionIdentity.tenantId, principalId: randomUUID() };
+    const scope = { tenantId: randomUUID(), principalId: randomUUID() };
     const text = {
       "about:long": "Complete long Ω🧭 ".repeat(2200),
       "about:short": "Complete short Ω🧭 ".repeat(1800),
@@ -53,7 +54,7 @@ describe("durable selected inventory exports", () => {
     }]);
     const identity = await usageIdentity(fixture.runtime, scope);
     const roots = await fixture.runtime.query<{ id: string }>(`SELECT id FROM data_scope_epochs
-      WHERE tenant_id=$1 AND principal_id=$2 AND source='inventory_canonical'`, [scope.tenantId, scope.principalId]);
+      WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_canonical'`, [scope.tenantId]);
     expect(roots.rows).toHaveLength(1);
     const selection = await inventory.capture(identity, roots.rows[0].id, { inventoryScope: "all" });
     const kind = "unified_agents";
@@ -159,7 +160,7 @@ describe("durable selected inventory exports", () => {
   });
 
   it("seeks Graph source exports through a mixed canonical root without admitting native-only cursor rows", async () => {
-    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
     await streamedPackageFixture(fixture.runtime, scope, ["B package", "D package", "F package"].map((displayName, index) =>
       allowlistedPackage({ id: `export-package-${index}`, displayName, isBlocked: false })));
@@ -208,7 +209,7 @@ describe("durable selected inventory exports", () => {
   });
 
   it.each([false, true])("rejects a raw native ID that names two environments (canonical=%s)", async canonical => {
-    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
     let root = await nativeInventoryFixture(fixture.runtime, scope,
       [randomUUID(), randomUUID()].map(environmentId => ({ nativeId: "repeated-native-id", environmentId, identifiers: [] })));
@@ -225,7 +226,7 @@ describe("durable selected inventory exports", () => {
   });
 
   it.each(["graph_packages", "unified_agents"] as const)("keeps private access and sharing assignments out of %s CSV child rows", async kind => {
-    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
     let root = await streamedPackageFixture(fixture.runtime, scope, [allowlistedPackage({
       id: "exported-package", displayName: "Exported package", isBlocked: false, publisher: "=formula",
@@ -250,7 +251,7 @@ describe("durable selected inventory exports", () => {
 
   it.each(["power_platform_agents", "unified_agents"] as const)(
     "preserves exact saved counts and safe fields across 301 operation children in %s", async kind => {
-      const identity = { ...selectionIdentity, principalId: randomUUID() };
+      const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
       const scope = { tenantId: identity.tenantId, principalId: identity.principalId };
       let root = await nativeInventoryFixture(fixture.runtime, scope, [{
         tenantId: identity.tenantId, nativeId: "native", type: "microsoft.copilotstudio/agents",

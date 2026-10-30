@@ -11,27 +11,33 @@ import { reportIdentity } from "../src/services/reportIdentity.js";
 import { appRoles } from "../src/types/capability.js";
 import { AppError } from "../src/errors.js";
 import { StreamedInventory } from "../src/services/streamedInventory.js";
+import { allowlistedPackage } from "../src/services/packageObservation.js";
 import { generationInput } from "./largeTenantFixtures.js";
 import { inventoryInput, nativeInventoryFixture, packageRecord } from "./inventoryFixtures.js";
 import { fixtureDirectoryUser } from "./userSourceFixture.js";
-import { closeFixtureServer } from "./fixtureSupport.js";
+import { closeFixtureResources, closeFixtureServer } from "./fixtureSupport.js";
 
 // Standalone loopback control belongs only to the isolated browser fixture, never createApp.
-export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Pool, tenantId: string) {
+export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Pool,
+  tenants: ReadonlyArray<{ tenantId: string; domains: readonly string[] }>) {
   const store = new InventoryGenerations(database);
   const stream = new StreamedInventory(database);
   const runtime = new InventoryRuntime(database, async () => {});
-  const subjects = new Map<string, Awaited<ReturnType<typeof setup>>>();
+  const subjects = new Map<string, ReturnType<typeof setup>>();
+  let closing = false;
   async function setup(key: string) {
     const started = performance.now(), principalId = `fixture-lifecycle-${key}`;
+    const domain = `${key}.lifecycle.example.invalid`, tenantId = tenants.find(tenant => tenant.domains.includes(domain))?.tenantId;
+    if (!tenantId) throw new Error("missing_fixture_tenant");
+    const username = `fixture@${domain}`;
     const identity = await reportIdentity(database, { tenantId, homeAccountId: principalId,
-      displayName: "Synthetic account", username: "fixture@lifecycle.example.invalid", roles: [...appRoles],
+      displayName: "Synthetic account", username, roles: [...appRoles],
       providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] });
     const deadline = new Date(Date.now() - 86_400_000), observedAt = new Date(deadline.getTime() - 86_400_000);
     const input = (domain: string) => ({ ...inventoryInput(principalId, domain), sessionEpoch: identity.sessionEpoch,
       scope: { ...inventoryInput(principalId, domain).scope, tenantId }, observedAt, expiresAt: deadline });
     const directory = new UserSourceStages(database), person = randomUUID(), environment = randomUUID();
-    await directory.execute(generationInput({ scope: { ...generationInput().scope, tenantId, principalId },
+    await directory.execute(generationInput({ scope: { ...generationInput().scope, tenantId }, actorPrincipalId: principalId,
       sessionEpoch: identity.sessionEpoch, observedAt, expiresAt: deadline }), async lease => {
       const query = await directory.query(lease, "discovery", "synthetic:lifecycle-browser-directory");
       await directory.page(lease, query, "synthetic:lifecycle-browser-directory", 1, 1);
@@ -57,7 +63,8 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
         }
       }, { authorize: async () => {} });
     await runtime.enqueue(identity);
-    const canonical = (await runtime.reconciliation.runNext(input("canonical"), async () => {}))!;
+    const canonical = await runtime.reconciliation.runNext(input("canonical"), async () => {});
+    if (!canonical) throw new Error("fixture_canonical_unavailable");
     const sync = new DataSyncRepository(database);
     for (const [source, count] of [["graph_packages", 1001], ["power_platform", 2], ["users", 1]] as const) {
       await sync.recordSuccessMarker(identity, source, count, observedAt.toISOString());
@@ -66,26 +73,28 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
     const waiting = new Promise<void>(resolve => { release = resolve; });
     const ready = new Promise<void>(resolve => { entered = resolve; });
     let failed = false;
+    const replacementFailure = new AppError(504, "provider_timeout", "Synthetic failed replacement");
     const successor = store.execute({ ...input("packages"), observedAt: new Date(deadline.getTime() - 1) },
       { domain: "packages", mode: "delta", channel: "exact", targets: ["package-000000"] }, async lease => {
-        await stream.packageObservation(lease, { id: "package-000000", displayName: "After 0000", isBlocked: false }, "exact");
+        await stream.packageObservation(lease, allowlistedPackage({ id: "package-000000", displayName: "After 0000", isBlocked: false }), "exact");
         entered();
         await waiting;
-        if (key.endsWith("failed")) throw new AppError(504, "provider_timeout", "Synthetic failed replacement");
+        if (key.endsWith("failed")) throw replacementFailure;
       }, { authorize: async () => {} }).catch(error => {
-        expect(error).toMatchObject({ status: 504, code: "provider_timeout" });
+        if (error !== replacementFailure) throw error;
         failed = true;
       });
     await Promise.race([ready, successor.then(() => { throw new Error("fixture_successor_not_pending"); })]);
     if (key.endsWith("failed")) { release(); await successor; }
-    return { identity, source, canonical, native, input, release, successor, failed: () => failed,
+    return { identity, username, source, canonical, native, input, release, successor, failed: () => failed,
       started, deadline, gc: { slices: 0, maximumRows: 0, maximumBytes: 0, maximumMilliseconds: 0 } };
   }
   async function collect(subject: Awaited<ReturnType<typeof setup>>, passes = 2) {
+    const tenantId = subject.identity.tenantId;
     for (let pass = 0; pass < passes; pass++) {
       const roots = (await database.query(`SELECT r.scope_id AS "scopeId",r.tenant_id AS "tenantId",
         r.baseline_id AS "baselineId",r.revision,s.epoch FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-        WHERE r.tenant_id=$1 AND s.principal_id=$2`, [tenantId, subject.identity.principalId])).rows;
+        WHERE r.tenant_id=$1 AND s.scope_kind='tenant'`, [tenantId])).rows;
       for (const root of roots) {
         const started = performance.now();
         for (const slice of [await store.gcSlice(root), await store.gcContent(root.scopeId, tenantId),
@@ -105,6 +114,7 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
   }
   const server = createServer(async (request, response) => {
     try {
+      if (closing) throw new Error("fixture_closing");
       const url = new URL(request.url!, "http://127.0.0.1");
       const key = url.searchParams.get("key") ?? "";
       if (request.method !== "POST" || !/^(desktop|mobile)-(running|failed)$/.test(key)
@@ -113,11 +123,15 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
       }
       if (url.pathname === "/setup") {
         if (subjects.has(key)) throw new Error("duplicate_fixture_subject");
-        subjects.set(key, await setup(key));
+        subjects.set(key, setup(key).catch(error => {
+          subjects.delete(key);
+          throw error;
+        }));
       }
-      const subject = subjects.get(key);
+      const subject = await subjects.get(key);
       if (!subject && url.pathname === "/finish") { response.statusCode = 204; response.end(); return; }
       if (!subject) throw new Error("missing_fixture_subject");
+      const tenantId = subject.identity.tenantId;
       if (url.pathname === "/source" || url.pathname === "/finish") { subject.release(); await subject.successor; }
       if (url.pathname === "/canonical") {
         await runtime.enqueue(subject.identity);
@@ -129,14 +143,14 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
       if (url.pathname === "/retire") await store.clear(subject.canonical.scopeId, tenantId);
       await collect(subject);
       const generations = (await database.query(`SELECT state,count(*)::int AS n FROM data_generations
-        WHERE tenant_id=$1 AND scope_id IN (SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2)
-        AND expires_at<=clock_timestamp() GROUP BY state ORDER BY state`, [tenantId, subject.identity.principalId])).rows;
+        WHERE tenant_id=$1 AND scope_id IN (SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant')
+        AND expires_at<=clock_timestamp() GROUP BY state ORDER BY state`, [tenantId])).rows;
       const roots = (await database.query(`SELECT r.domain,r.revision FROM inventory_roots r JOIN data_scope_epochs s ON s.id=r.scope_id
-        WHERE r.current AND s.tenant_id=$1 AND s.principal_id=$2 ORDER BY r.domain`, [tenantId, subject.identity.principalId])).rows;
+        WHERE r.current AND s.tenant_id=$1 AND s.scope_kind='tenant' ORDER BY r.domain`, [tenantId])).rows;
       const selections = (await database.query(`SELECT id,endpoint FROM data_read_selections
         WHERE tenant_id=$1 AND principal_id=$2 ORDER BY id LIMIT 100`, [tenantId, subject.identity.principalId])).rows;
       response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ scenario: `lifecycle-${key}`, failed: subject.failed(), generations, roots, selections,
+      response.end(JSON.stringify({ scenario: `lifecycle-${key}`, username: subject.username, failed: subject.failed(), generations, roots, selections,
         gc: subject.gc, deadline: subject.deadline, elapsedMilliseconds: performance.now() - subject.started }));
     } catch (error) {
       console.error(error);
@@ -144,15 +158,27 @@ export async function savedReadBrowserFixture(database: pg.Pool, operator: pg.Po
       response.end(JSON.stringify({ error: String(error) }));
     }
   });
-  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.removeListener("error", reject);
+      resolve();
+    });
+  });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("fixture_control_unavailable");
   return {
     origin: `http://127.0.0.1:${address.port}`,
     async close() {
-      for (const subject of subjects.values()) subject.release();
-      await Promise.all([...subjects.values()].map(subject => subject.successor));
-      await closeFixtureServer(server);
+      closing = true;
+      await closeFixtureResources(
+        ...[...subjects.values()].map(pending => async () => {
+          const subject = await pending;
+          subject.release();
+          await subject.successor;
+        }),
+        () => closeFixtureServer(server),
+      );
     },
   };
 }

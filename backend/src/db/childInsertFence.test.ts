@@ -14,7 +14,7 @@ describe("atomic set-based child insert fences",() => {
   afterAll(async () => { await fixture?.close(); });
   const begin = async (kind: Kind) => {
     const input = generationInput();
-    input.scope.principalId = randomUUID();
+    input.scope.tenantId = randomUUID();
     if (kind==="inventory") input.scope.source = "inventory_packages";
     const lease = await store.begin(input);
     if (kind==="plans") await store.append(lease,"directory",0,[directoryRecord("parent",{ plan_count: 250 })]);

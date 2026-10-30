@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
@@ -44,7 +44,7 @@ describe("data sync run completion", () => {
         );
         expect(query).toHaveBeenCalledWith(
           expect.stringContaining("INSERT INTO data_sync_success_markers"),
-          [scope.tenantId, scope.principalId, "usage_reports", 0, acceptedAt],
+          [scope.tenantId, "usage_reports", 0, acceptedAt],
         );
         expect(query).toHaveBeenCalledWith(
           expect.stringContaining("completed_at=CASE WHEN $5"),
@@ -165,6 +165,78 @@ describe("data sync durable admission", () => {
   });
 });
 
+describe("tenant source collection conflicts", () => {
+  it("joins an equivalent active run without readmitting a source another account is collecting", async () => {
+    const f = admissionFixture();
+    const input = { mode: "initial", sources: ["users", "graph_packages"] } as const;
+    f.existingRequestHash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    f.collectorSources.add("graph_packages");
+    f.sourceRows[0].status = "running";
+    f.sourceRows.push({ ...f.sourceRows[0], source_id: "graph_packages", status: "failed", can_retry: true });
+    try {
+      await expect(f.repository.submit(f.scope, { ...input, sources: [...input.sources] })).resolves.toMatchObject({
+        created: false, run: { id: f.runId, status: "running" },
+      });
+      expect(f.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.startsWith("INSERT INTO"))).toBe(false);
+      expect(f.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.startsWith("SELECT 1 FROM data_sync_runs run"))).toBe(false);
+      expect(f.query).toHaveBeenCalledWith("COMMIT");
+    } finally { await f.database.end(); }
+  });
+
+  it.each([
+    { source: "users", conflict: true },
+    { source: "graph_packages", conflict: false },
+  ])("checks new work against the other account's $source collection", async ({ source, conflict }) => {
+    const f = admissionFixture();
+    f.collectorSources.add(source);
+    try {
+      const admission = f.repository.submit(f.scope, { mode: "incremental", sources: ["users"] });
+      if (conflict) {
+        await expect(admission).rejects.toMatchObject({ status: 409, code: "data_sync_active" });
+        expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+        expect(f.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.startsWith("INSERT INTO"))).toBe(false);
+      } else {
+        await expect(admission).resolves.toMatchObject({ created: true });
+        expect(f.query).toHaveBeenCalledWith("COMMIT");
+      }
+    } finally { await f.database.end(); }
+  });
+
+  it.each([{ requested: undefined }, { requested: ["users"] }] as const)(
+    "checks only the actual retry selection ($requested)", async ({ requested }) => {
+      const f = admissionFixture();
+      f.collectorSources.add("graph_packages");
+      f.sourceRows.push({ ...f.sourceRows[0], source_id: "graph_packages", status: "succeeded", can_retry: false });
+      try {
+        await expect(f.repository.retry(f.scope, f.runId, requested)).resolves.toEqual(["users"]);
+        expect(f.query).toHaveBeenCalledWith(
+          expect.stringContaining("SELECT 1 FROM data_sync_runs run"),
+          [f.scope.tenantId, f.scope.principalId, ["users"]],
+        );
+        expect(f.query).toHaveBeenCalledWith(
+          expect.stringContaining("attempt=attempt+1"),
+          [f.runId, f.scope.tenantId, f.scope.principalId, ["users"]],
+        );
+        expect(f.query).toHaveBeenCalledWith("COMMIT");
+      } finally { await f.database.end(); }
+    },
+  );
+
+  it.each([{ requested: undefined }, { requested: ["users"] }] as const)(
+    "still rejects an overlapping retry selection ($requested)", async ({ requested }) => {
+      const f = admissionFixture();
+      f.collectorSources.add("users");
+      try {
+        await expect(f.repository.retry(f.scope, f.runId, requested)).rejects.toMatchObject({
+          status: 409, code: "data_sync_active",
+        });
+        expect(f.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.includes("attempt=attempt+1"))).toBe(false);
+        expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+      } finally { await f.database.end(); }
+    },
+  );
+});
+
 function admissionFixture() {
   const database = new pg.Pool({ max: 4 });
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
@@ -175,6 +247,11 @@ function admissionFixture() {
   const f = {
     database, client, scope, runId, repository: new DataSyncRepository(database),
     expiredActive: false, readFailure: undefined as Error | undefined,
+    existingRequestHash: undefined as string | undefined, collectorSources: new Set<string>(),
+    sourceRows: [{
+      run_id: runId, source_id: "users", status: "failed", job_id: null, attempt: 1, count: null,
+      last_success_at: null, updated_at: now, message: "Retry required.", can_retry: true,
+    }],
     onWrite: async () => {},
   };
   const result = (rows: object[] = [], rowCount = rows.length): pg.QueryResult => ({
@@ -195,16 +272,20 @@ function admissionFixture() {
     if (statement.startsWith("SELECT 1 FROM official_usage_state report")) return result();
     if (statement.startsWith("SELECT id,mode,status,started_at,updated_at,completed_at")) {
       if (statement.includes(",automatic") && f.readFailure) throw f.readFailure;
-      return statement.includes("AND status IN") ? result() : result([{
-        id: Array.isArray(values) ? values[0] : runId, mode: "full", status: "partial",
-        started_at: now, updated_at: now, completed_at: now, automatic: false,
+      return statement.includes("AND status IN") && !f.existingRequestHash ? result() : result([{
+        id: statement.includes("AND status IN") ? runId : Array.isArray(values) ? values[0] : runId,
+        mode: "full", status: f.existingRequestHash ? "running" : "partial",
+        started_at: now, updated_at: now, completed_at: f.existingRequestHash ? null : now, automatic: false,
       }]);
     }
+    if (statement.startsWith("SELECT request_hash FROM data_sync_runs")) return result([{ request_hash: f.existingRequestHash }]);
     if (statement.startsWith("SELECT * FROM data_sync_run_sources") || statement.startsWith("SELECT run_id,source_id")) {
-      return result([{
-        run_id: runId, source_id: "users", status: "failed", job_id: null, attempt: 1, count: null,
-        last_success_at: null, updated_at: now, message: "Retry required.", can_retry: true,
-      }]);
+      return result(f.sourceRows);
+    }
+    if (statement.startsWith("SELECT 1 FROM data_sync_runs run")) {
+      if (!Array.isArray(values) || !Array.isArray(values[2])) throw new Error("Missing collector source selection.");
+      const requested = values[2];
+      return result([...f.collectorSources].some(source => requested.includes(source)) ? [{}] : []);
     }
     if (statement.startsWith("SELECT id FROM data_sync_runs")) return result();
     if (["BEGIN", "COMMIT", "ROLLBACK"].includes(statement) || statement.startsWith("SELECT pg_advisory_xact_lock")

@@ -95,14 +95,12 @@ export type PackagePage = {
   counts: { total: number; scoped: number; filtered: number };
   page: { limit: number; nextCursor: string | null; previousCursor: string | null };
   freshness: { state: string; capturedRevision: string; sources: unknown[] };
-  mode: "delegated" | "application";
 };
 
 type PackageListQuery = {
   selectionId?: string;
   cursor?: string;
   recordId?: string;
-  mode?: "delegated" | "application";
   search?: string;
   operationIdPrefix?: string;
   blocked?: boolean;
@@ -488,22 +486,29 @@ function inventoryQueryParams(query: Record<string, unknown>) {
   return params;
 }
 
+function inventorySelectionId(value: unknown) {
+  const id = value && typeof value === "object" && !Array.isArray(value) && "id" in value ? value.id : undefined;
+  if (typeof id !== "string" || !id.trim()) {
+    throw new ApiError(200, "invalid_response", "The server returned an invalid inventory selection.");
+  }
+  return id;
+}
+
 export async function getAgents(query: PackageListQuery = {}, options: { signal?: AbortSignal } = {}) {
   const generation = sessionGeneration;
   let selectionId = query.selectionId;
   if (!selectionId) {
     const criteria = { ...query };
     delete criteria.limit;
-    delete criteria.mode;
     const selected = await request<{ id: string }>("/api/agents/selections", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: Object.fromEntries(inventoryQueryParams(criteria)), mode: query.mode ?? "delegated" }), signal: options.signal,
+      body: JSON.stringify({ query: Object.fromEntries(inventoryQueryParams(criteria)) }), signal: options.signal,
     });
-    selectionId = selected.id;
+    assertCurrentRequest(generation, options.signal);
+    selectionId = inventorySelectionId(selected);
   }
   assertCurrentRequest(generation, options.signal);
   const params = new URLSearchParams({ selectionId, limit: String(query.limit ?? 50) });
-  if (query.mode) params.set("mode", query.mode);
   if (query.cursor) params.set("cursor", query.cursor);
   return request<PackagePage>(`/api/agents?${params}`, { signal: options.signal });
 }
@@ -522,13 +527,13 @@ export async function getUnifiedAgents(
       body: JSON.stringify({ query: Object.fromEntries(inventoryQueryParams(criteria)) }), signal: options.signal,
     });
     assertCurrentRequest(generation, options.signal);
-    if ("state" in selected) {
+    if (selected && typeof selected === "object" && "state" in selected) {
       if (!["not_collected", "preparing", "unavailable"].includes(selected.state) || typeof selected.message !== "string" || !selected.message) {
         throw new ApiError(500, "invalid_inventory_availability", "The server returned invalid inventory availability.");
       }
       return selected;
     }
-    selectionId = selected.id;
+    selectionId = inventorySelectionId(selected);
   }
   assertCurrentRequest(generation, options.signal);
   const params = new URLSearchParams({ selectionId, limit: String(query.limit ?? 50) });
@@ -924,8 +929,8 @@ export async function downloadDefenderHuntingCsv(id: string, options: AgentHunti
   return requestBlob(agentHuntingUrl(`/api/hunting/jobs/${encodeURIComponent(id)}/export.csv`, options), { headers: { Accept: "text/csv" }, signal: options.signal });
 }
 
-export async function getAgentDetails(selectionId: string, id: string, options: { signal?: AbortSignal; mode?: "delegated" | "application" } = {}) {
-  const params = new URLSearchParams({ selectionId, ...options.mode ? { mode: options.mode } : {} });
+export async function getAgentDetails(selectionId: string, id: string, options: { signal?: AbortSignal } = {}) {
+  const params = new URLSearchParams({ selectionId });
   return request<CopilotPackageDetail>(`/api/agents/${encodeURIComponent(id)}/detail?${params}`, { signal: options.signal });
 }
 
@@ -1261,8 +1266,8 @@ async function toApiError(response: Response, signal?: AbortSignal | null) {
     && "reason" in problem.details ? problem.details.reason : undefined;
   return new ApiError(
     response.status,
-    "code" in problem && typeof problem.code === "string" ? problem.code : "request_failed",
-    "detail" in problem && typeof problem.detail === "string" ? problem.detail : `Request failed with status ${response.status}.`,
+    "code" in problem && typeof problem.code === "string" && problem.code.trim() ? problem.code : "request_failed",
+    "detail" in problem && typeof problem.detail === "string" && problem.detail.trim() ? problem.detail : `Request failed with status ${response.status}.`,
     {
       details: reason === "expired" || reason === "unavailable" || reason === "changed" ? { reason } : undefined,
       requestId: safeRequestId("requestId" in problem ? problem.requestId : undefined)

@@ -2,7 +2,7 @@
 
 import re
 from datetime import UTC, date, datetime
-from typing import Annotated, Literal, Self
+from typing import Annotated, ClassVar, Literal, Self
 from urllib.parse import unquote
 from uuid import UUID
 
@@ -56,7 +56,8 @@ def record_id(value: str) -> str:
         if re.search(r"%(?![a-fA-F0-9]{2})", part):
             raise ValueError("Source identity contains malformed percent encoding.")
         decoded = unquote(part, errors="strict")
-        if len(decoded) > 512:
+        # The canonical API measures decoded identities in UTF-16 code units.
+        if len(decoded.encode("utf-16-le")) > 1024:
             raise ValueError("Source identity exceeds its canonical bound.")
         exact_id(decoded)
     return value
@@ -65,10 +66,11 @@ def record_id(value: str) -> str:
 RecordId = Annotated[
     str,
     StringConstraints(
-        min_length=1, max_length=512, pattern=r"^(agent:|graph_packages:|power_platform:)"
+        min_length=1, max_length=10000, pattern=r"^(agent:|graph_packages:|power_platform:)"
     ),
     AfterValidator(record_id),
 ]
+InvestigationRecordId = Annotated[RecordId, StringConstraints(max_length=2048)]
 Search = Annotated[str, StringConstraints(max_length=256, pattern=r"^[^\x00\r\n]*$")]
 FacetText = Annotated[str, StringConstraints(max_length=4096, pattern=r"^[^\x00\r\n]*$")]
 Limit = Annotated[int, Field(ge=1, le=100)]
@@ -104,14 +106,15 @@ UtcInstant = Annotated[
 
 
 class Input(WireModel):
+    facet_fields: ClassVar[frozenset[str]] = frozenset(
+        {"type", "publisher", "availableTo", "host", "platform", "company", "department"}
+    )
+
     @model_validator(mode="before")
     @classmethod
     def explicit_nulls(cls, value: object) -> object:
         if isinstance(value, dict) and any(
-            item is None
-            and key
-            not in {"type", "publisher", "availableTo", "host", "platform", "company", "department"}
-            for key, item in value.items()
+            item is None and key not in cls.facet_fields for key, item in value.items()
         ):
             raise ValueError("Omit optional values; only null-valued facet filters accept null.")
         return value
@@ -139,6 +142,8 @@ class Selected(Paging):
 
 
 class InventoryQuery(Input):
+    facet_fields: ClassVar[frozenset[str]] = Input.facet_fields | {"environmentId"}
+
     inventoryScope: Literal["catalog", "power_platform_only", "all"] | None = None
     type: FacetText | None = None
     view: (
@@ -229,14 +234,6 @@ class InventoryList(InventoryQuery, Paging):
         return self
 
 
-class PackageCapture(InventoryCapture):
-    mode: Literal["delegated"] | None = None
-
-
-class PackageList(InventoryList):
-    mode: Literal["delegated"] | None = None
-
-
 class InventoryFacet(Selected):
     field: Literal["type", "publisher", "availableTo", "host", "platform"]
     search: Search | None = None
@@ -309,7 +306,6 @@ class ResolvePeople(Input):
 class PackageDetailInput(Input):
     id: ExactId
     selectionId: Guid
-    mode: Literal["delegated"] | None = None
 
 
 class NativeActivityInput(Input):
@@ -635,7 +631,7 @@ class ResolvePrincipals(Input):
 
 
 class InvestigationInput(Input):
-    recordId: RecordId
+    recordId: InvestigationRecordId
 
 
 PurviewOperation = Literal[
@@ -698,13 +694,13 @@ class PurviewSearchFilters(Input):
 class StartPurview(Submission):
     tokenMode: Literal["delegated"]
     filters: PurviewSearchFilters
-    agentRecordId: RecordId | None = None
+    agentRecordId: InvestigationRecordId | None = None
 
 
 class PurviewHistory(JobList):
     offset: Offset | None = None
     userPrincipalName: ExactId | None = None
-    agentRecordId: RecordId | None = None
+    agentRecordId: InvestigationRecordId | None = None
 
 
 class PurviewRecordsInput(JobId):
@@ -713,7 +709,7 @@ class PurviewRecordsInput(JobId):
 
 
 class HuntingTarget(Input):
-    agentRecordId: RecordId | None = None
+    agentRecordId: InvestigationRecordId | None = None
     userObjectId: Guid | None = None
 
 

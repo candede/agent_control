@@ -32,22 +32,24 @@ beforeAll(async () => {
 afterAll(async () => { await fixture?.close(); });
 
 describe("agent people persistence", () => {
-  it("isolates tenant/account caches, projects null UPNs, and changes only the owning inventory revision", async () => {
+  it("shares tenant people and revisions, projects null UPNs, and fences each collector's own context", async () => {
     const scope = newScope();
     const context = { generation: await repository.generation(scope) };
     const other = { ...scope, principalId: randomUUID() };
     const before = await readAutomaticInventoryRevisions(scope, fixture.runtime);
     const otherBefore = await readAutomaticInventoryRevisions(other, fixture.runtime);
+    const foreign = { ...scope, tenantId: randomUUID() }, foreignBefore = await readAutomaticInventoryRevisions(foreign, fixture.runtime);
     await repository.save(scope, [observation({ userPrincipalName: null })], context);
     expect(await repository.read(scope, [id.toUpperCase()])).toEqual([expect.objectContaining({
       objectId: id, status: "resolved", displayName: "Unlicensed creator", userPrincipalName: null,
     })]);
-    expect(await repository.read(other, [id])).toEqual([]);
+    expect(await repository.read(other, [id])).toEqual(await repository.read(scope, [id]));
     expect(await repository.read({ ...scope, tenantId: randomUUID() }, [id])).toEqual([]);
     await repository.generation(other);
     await expect(repository.save(other, [observation()], context)).rejects.toMatchObject({ code: "selection_invalidated" });
     expect(await readAutomaticInventoryRevisions(scope, fixture.runtime)).not.toEqual(before);
-    expect(await readAutomaticInventoryRevisions(other, fixture.runtime)).toEqual(otherBefore);
+    expect(await readAutomaticInventoryRevisions(other, fixture.runtime)).not.toEqual(otherBefore);
+    expect(await readAutomaticInventoryRevisions(foreign, fixture.runtime)).toEqual(foreignBefore);
     expect(await repository.directoryIds(scope, [id])).toEqual([]);
   });
 
@@ -56,13 +58,16 @@ describe("agent people persistence", () => {
     const context = { generation: await repository.generation(scope) };
     const first = observation();
     await repository.save(scope, [first], context);
+    const [saved] = await repository.read(scope, [id]);
+    const other = { ...scope, principalId: randomUUID() }, otherContext = { generation: await repository.generation(other) };
     const failedAt = new Date(Date.parse(first.checkedAt) + 1_000).toISOString();
-    await repository.save(scope, [observation({ status: "lookup_failed", displayName: null, userPrincipalName: null,
-      checkedAt: failedAt, errorCode: "provider_timeout" })], context);
+    await repository.save(other, [observation({ status: "lookup_failed", displayName: null, userPrincipalName: null,
+      checkedAt: failedAt, errorCode: "provider_timeout" })], otherContext);
     expect((await repository.read(scope, [id]))[0]).toMatchObject({
       status: "lookup_failed", displayName: first.displayName, observedAt: first.checkedAt, checkedAt: failedAt,
-      errorCode: "provider_timeout",
+      errorCode: "provider_timeout", expiresAt: saved.expiresAt,
     });
+    expect(await repository.read(other, [id])).toEqual(await repository.read(scope, [id]));
     const missingAt = new Date(Date.parse(failedAt) + 1_000).toISOString();
     await repository.save(scope, [observation({ status: "not_found", displayName: null, userPrincipalName: null,
       checkedAt: missingAt })], context);
@@ -97,8 +102,8 @@ describe("agent people persistence", () => {
     }
     const before = await readAutomaticInventoryRevisions(scope, fixture.runtime);
     await fixture.operator.query(`UPDATE agent_people_cache SET checked_at=clock_timestamp()-interval '8 days',
-      expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1 AND principal_id=$2`,
-    [scope.tenantId, scope.principalId]);
+      expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=$1`,
+    [scope.tenantId]);
     expect(await repository.read(scope, ids)).toEqual([]);
     expect(await readAutomaticInventoryRevisions(scope, fixture.runtime)).not.toEqual(before);
     await retain(fixture.operator);
@@ -112,14 +117,14 @@ describe("agent people persistence", () => {
       identifiers: [], createdBy: id.toUpperCase(), details: { ownerId: secondId, lastModifiedBy: graphGuid } },
     { nativeId: "invalid-person", environmentId: "environment", identifiers: [], createdBy: "not-a-user-id", details: {} }]);
     expect(await repository.referencedIds(scope)).toEqual([id, graphGuid.toLowerCase(), secondId]);
-    expect(await repository.referencedIds({ ...scope, principalId: "other" })).toEqual([]);
+    expect(await repository.referencedIds({ ...scope, principalId: "other" })).toEqual([id, graphGuid.toLowerCase(), secondId]);
     await new DataGenerations(fixture.runtime).invalidate(root.scopeId, scope.tenantId);
     expect(await repository.referencedIds(scope)).toEqual([]);
   });
 
-  it.each(["scope", "session"] as const)("does not exclude people using a directory generation after %s invalidation", async boundary => {
+  it.each(["scope", "session"] as const)("uses tenant directory ownership after %s invalidation", async boundary => {
     const scope = newScope(), generations = new DataGenerations(fixture.runtime);
-    const input = generationInput({ scope: { ...generationInput().scope, ...scope } });
+    const input = generationInput({ scope: { ...generationInput().scope, tenantId: scope.tenantId }, actorPrincipalId: scope.principalId });
     const lease = await generations.begin(input);
     await generations.append(lease, "directory", 0, [directoryRecord(id), directoryRecord(secondId)]);
     await generations.validate(lease, { rows: 2, children: 0, batches: 1, pages: 0, wireRows: 0 });
@@ -127,7 +132,7 @@ describe("agent people persistence", () => {
     expect(await repository.directoryIds(scope, [id.toUpperCase()])).toEqual([id]);
     if (boundary === "scope") await generations.invalidate(lease.scopeId, scope.tenantId);
     else await generations.revokePrincipal(scope.tenantId, scope.principalId);
-    expect(await repository.directoryIds(scope, [id, secondId])).toEqual([]);
+    expect(await repository.directoryIds(scope, [id, secondId])).toEqual(boundary === "scope" ? [] : expect.arrayContaining([id, secondId]));
   });
 
   it("requires the current Users attempt for publication and rejects results after a scoped reset", async () => {
@@ -149,7 +154,7 @@ describe("agent people persistence", () => {
     const current = await repository.generation(scope);
     expect(current).toEqual({ ...context.generation, scopeEpoch: (BigInt(context.generation.scopeEpoch) + 1n).toString() });
     expect(await repository.read(scope, [id])).toEqual([]);
-    expect(await repository.read(other, [id])).toHaveLength(1);
+    expect(await repository.read(other, [id])).toEqual([]);
     await expect(repository.save(scope, [observation()], context)).rejects.toMatchObject({ code: "selection_invalidated" });
     await repository.save(scope, [observation()], { generation: current });
     expect(await repository.read(scope, [id])).toHaveLength(1);
@@ -159,7 +164,7 @@ describe("agent people persistence", () => {
     const scope = newScope(), generation = await repository.generation(scope);
     const sources = new UserSourcesRepository(fixture.runtime, process.env.SESSION_SECRET!);
     const identity = { ...scope, sessionEpoch: generation.sessionEpoch, authorizationHash: digest("cache-write-fence") };
-    const selection = await sources.capture(identity, "delegated");
+    const selection = await sources.capture(identity);
     await repository.save(scope, [observation()], { generation });
     await expect(sources.page(selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     expect(await repository.generation(scope)).toEqual(generation);

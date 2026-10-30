@@ -41,7 +41,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "inventory grants", rows: [inventoryGrants] },
     { name: "job pages", rows: [{ revision: true, triggers: 3 }] },
     { name: "refresh targets", rows: [{ targets: true, target_job: true, detail_metadata: true, permissions: true }] },
-    { name: "inventory authority", rows: [{ current_memberships: true, application_fence: true }] },
+    { name: "inventory authority", rows: [{ current_memberships: true, tenant_owner: true }] },
     { name: "live identity", rows: [{ live_sources: true, generation_reference: true, live_guard: true, normalized_keys: true }] },
     { name: "control queue", rows: [{ valid: true }] },
     { name: "mutation stages", rows: [{ valid: true }] },
@@ -145,7 +145,7 @@ describe("current schema source contracts", () => {
   });
 
   it("constructs the exact current objects once", () => {
-    for (const [kind, count] of [["TABLE", 104], ["VIEW", 3], ["FUNCTION", 80], ["TRIGGER", 107], ["COLLATION", 2]] as const) {
+    for (const [kind, count] of [["TABLE", 104], ["VIEW", 3], ["FUNCTION", 78], ["TRIGGER", 105], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
@@ -225,6 +225,13 @@ describe("current schema source contracts", () => {
     expect(enqueue).not.toContain("lower(NEW.resource_native_id)");
   });
 
+  it("reassigns a superseded native receipt to the actor who supplied its replacement", () => {
+    const enqueue = schemaSql.match(/CREATE FUNCTION inventory_fence_native_readback\(\)[\s\S]*?END\$\$/)?.[0];
+    const replacement = enqueue?.split("ON CONFLICT(scope_id,identity) DO UPDATE SET ")[1];
+    expect(replacement).toContain("principal_id=EXCLUDED.principal_id");
+    expect(replacement).toContain("observation_id=EXCLUDED.observation_id");
+  });
+
   it("uses the query normalization authority and binary keys for generated associations and live source lookup", () => {
     const associations = schemaSql.match(/CREATE TABLE agent_usage_associations \([\s\S]*?\n\);/)?.[0];
     const sources = schemaSql.match(/CREATE VIEW inventory_live_sources[\s\S]*?(?=\nCREATE )/)?.[0];
@@ -239,11 +246,39 @@ describe("current schema source contracts", () => {
     expect(sources).toContain("ELSE r.native_id");
   });
 
-  it.each([
-    { owner: "live sources", pattern: /CREATE VIEW inventory_live_sources[\s\S]*?(?=\nCREATE )/ },
-    { owner: "reviewed associations", pattern: /CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?END\$\$/ },
-  ])("keeps retained publications independent of sign-out in $owner without relaxing source fences", ({ pattern }) => {
-    const definition = schemaSql.match(pattern)?.[0];
+  it("requires unexpired effective authority for identity cache sources and competing identities", () => {
+    const guard = schemaSql.match(/CREATE FUNCTION protect_inventory_identity_cache\(\)[\s\S]*?END\$\$/)?.[0];
+    expect(guard).toBeDefined();
+    expect(guard).toContain("source.authority_expires_at>clock_timestamp()");
+    expect(guard).toContain("other.authority_expires_at>clock_timestamp()");
+  });
+
+  it("uses the same effective current-source authority for reviewed association inserts as service reads", () => {
+    const guard = schemaSql.match(/CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?END\$\$/)?.[0];
+    expect(guard).toBeDefined();
+    expect(guard).toContain("FROM public.inventory_live_sources source");
+    expect(guard).toContain("source.tenant_id=NEW.tenant_id");
+    expect(guard).toContain("source.authority_expires_at>clock_timestamp()");
+    expect(guard).toContain("source.source='graph_packages' AND source.native_id=NEW.native_id");
+    expect(guard).toContain(`source.normalized_environment_id=${normalizeEnvironmentIdentitySql("NEW.environment_id")}`);
+    expect(guard).toContain(`source.normalized_native_id=${normalizeNativeIdentitySql("NEW.native_id")}`);
+    expect(guard).toContain("r.resource_type='microsoft.copilotstudio/agents'");
+    expect(guard).toContain("hashtextextended('data-sync:'||NEW.tenant_id,0)");
+    expect(guard).not.toContain("source.principal_id");
+    expect(guard).not.toContain("public.inventory_roots");
+    expect(schemaSql).not.toContain("inventory_require_control_publication");
+    expect(schemaSql).not.toContain("inventory_usage_control_fence");
+  });
+
+  it("requires a known environment resource type before admitting absent Power Platform classifications", () => {
+    const classification = schemaSql.match(/CONSTRAINT power_platform_record_rows_classification CHECK[\s\S]*?(?=\n  , CONSTRAINT)/)?.[0];
+    expect(classification).toBeDefined();
+    expect(classification).toMatch(/OR \(resource_type IS NOT NULL\s+AND resource_type = CAST\('microsoft\.powerplatform\/environments' AS text\)/);
+    expect(classification).toContain("num_nonnulls(presence, link_state, availability, management) = 0");
+  });
+
+  it("keeps retained live publications independent of sign-out without relaxing source fences", () => {
+    const definition = schemaSql.match(/CREATE VIEW inventory_live_sources[\s\S]*?(?=\nCREATE )/)?.[0];
     expect(definition).toBeDefined();
     expect(definition).toMatch(/generation\.scope_epoch\s*=\s*scope\.epoch/);
     expect(definition).toMatch(/generation\.session_epoch\s*=\s*scope\.session_epoch/);
@@ -255,6 +290,14 @@ describe("current schema source contracts", () => {
 });
 
 describe("schema verification without a database", () => {
+  it("verifies that association writes use current live sources and effective authority expiry", async () => {
+    const database = databaseWithResults(...schemaResults().map(result => result.rows));
+    await expect(verifySchema(database)).resolves.toBeUndefined();
+    const statement = database.query.mock.calls.find(([sql]) => sql.includes("AS current_memberships"))?.[0];
+    expect(statement).toContain("public.inventory_live_sources");
+    expect(statement).toContain("source.authority_expires_at>clock_timestamp()");
+  });
+
   it("checks validated progress constraints for both streamed refresh sources against the provider bounds", async () => {
     const database = databaseWithResults(...schemaResults().map(result => result.rows));
     await expect(verifySchema(database)).resolves.toBeUndefined();

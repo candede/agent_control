@@ -5,7 +5,7 @@ import session, { type SessionData } from "express-session";
 import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { inventoryInput, packageRecord } from "../../scripts/inventoryFixtures.js";
-import { InventoryGenerations, inventorySelector } from "../db/inventoryGenerations.js";
+import { InventoryGenerations } from "../db/inventoryGenerations.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { InventoryReconciliation } from "../services/inventoryReconciliation.js";
 import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
@@ -72,6 +72,12 @@ vi.hoisted(() => {
   process.env.TENANTS_JSON = JSON.stringify([{
     tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-4222-8222-222222222222",
     clientSecret: "synthetic-inventory-secret", domains: ["example.invalid"],
+  }, {
+    tenantId: "33333333-3333-4333-8333-333333333333", clientId: "22222222-2222-4222-8222-222222222222",
+    clientSecret: "synthetic-fresh-secret", domains: ["fresh.invalid"],
+  }, {
+    tenantId: "44444444-4444-4444-8444-444444444444", clientId: "22222222-2222-4222-8222-222222222222",
+    clientSecret: "synthetic-large-secret", domains: ["large.invalid"],
   }]);
   process.env.SESSION_SECRET = "synthetic-inventory-session-secret";
 });
@@ -80,6 +86,7 @@ describe("inventory HTTP selected-read boundary", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
   let application: ReturnType<typeof createApp>, server: Server, base: string, cookie: string;
   let initiatingAuthority: DelegatedCredentialSource;
+  let originalRecords: ReturnType<typeof packageRecord>[];
   const principalId = randomUUID();
   const widePublisher = "界".repeat(4096);
   beforeAll(async () => {
@@ -99,6 +106,7 @@ describe("inventory HTTP selected-read boundary", () => {
             id: `child-${group}-${index}`, definition: JSON.stringify({ title: `Child ${index}` }),
           })),
         })) });
+      originalRecords = records;
       await stages.visit(lease, "first");
       await stages.appendBounded(lease, records);
       await stages.acceptPage(lease, { token: "first", nextToken: null, records, rawCount: 101, expectedCount: 101, page: 1 }, 101);
@@ -176,9 +184,9 @@ describe("inventory HTTP selected-read boundary", () => {
     const signature = createHmac("sha256", config.sessionSecret).update(sessionId).digest("base64").replace(/=+$/g, "");
     await new Promise<void>((resolve, reject) => application.store.set(sessionId, {
       cookie: new session.Cookie({ maxAge: 600_000 }),
-      tenantId: config.tenants[0].tenantId, accountId: freshPrincipal, clientId: config.tenants[0].clientId,
+      tenantId: config.tenants[1].tenantId, accountId: freshPrincipal, clientId: config.tenants[1].clientId,
       signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "fresh-inventory-csrf",
-      user: { tenantId: config.tenants[0].tenantId, homeAccountId: freshPrincipal,
+      user: { tenantId: config.tenants[1].tenantId, homeAccountId: freshPrincipal,
         username: "fresh@example.invalid", displayName: "Fresh viewer", roles: ["AgentControl.Viewer"] },
     }, error => error ? reject(error) : resolve()));
     const headers = { cookie: `agent-control.sid=${encodeURIComponent(`s:${sessionId}.${signature}`)}`,
@@ -195,7 +203,7 @@ describe("inventory HTTP selected-read boundary", () => {
     }
     await expectUnavailable("not_collected");
     const input = inventoryInput(freshPrincipal);
-    input.scope.tenantId = config.tenants[0].tenantId;
+    input.scope.tenantId = config.tenants[1].tenantId;
     const source = await new InventoryGenerations(fixture.runtime).execute(input,
       { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
         const store = new InventoryGenerations(fixture.runtime);
@@ -219,8 +227,8 @@ describe("inventory HTTP selected-read boundary", () => {
     const invalidated = await fetch(`${base}/agent-inventory?selectionId=${selected.id}`, { headers });
     expect(invalidated.status).toBe(409);
     expect(await invalidated.json()).toMatchObject({ code: "selection_invalidated" });
-    const scopeId = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-      AND source='inventory_canonical'`, [input.scope.tenantId, freshPrincipal])).rows[0].id;
+    const scopeId = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+      AND source='inventory_canonical'`, [input.scope.tenantId])).rows[0].id;
     await new DataGenerations(fixture.runtime).invalidate(scopeId, input.scope.tenantId);
     await expectUnavailable("unavailable", 1);
     await reconciliation.request(canonical, [source]);
@@ -254,7 +262,7 @@ describe("inventory HTTP selected-read boundary", () => {
   });
   it.each(["agent-inventory", "agents"])("captures wide %s criteria as metadata and reads their exact frozen scope through a bounded URL", async resource => {
     const body = JSON.stringify({ query: { publisher: `~string:${widePublisher}`, inventoryScope: "catalog", sortBy: "publisher" },
-      ...(resource === "agents" ? { mode: "delegated" } : {}) });
+    });
     expect((await fetch(`${base}/${resource}/selections`, {
       method: "POST", headers: { cookie, Origin: config.frontendOrigin, "Content-Type": "application/json" }, body,
     })).status).toBe(403);
@@ -373,7 +381,7 @@ describe("inventory HTTP selected-read boundary", () => {
     expect(items.counts.total).toBe(101);
     expect(items.page.nextCursor).toEqual(expect.any(String));
   });
-  it("binds package pages to their source and narrowly authorized application owner without replacing the reader", async () => {
+  it("reads one tenant package source without provider-mode selectors, borrowed authority or shared selection ownership", async () => {
     const delegated = await fetch(`${base}/agents?limit=50`, { headers: { cookie } }).then(response => response.json());
     expect(delegated.value).toHaveLength(50);
     expect(delegated.counts).toMatchObject({ total: 101, filtered: 101 });
@@ -383,7 +391,6 @@ describe("inventory HTTP selected-read boundary", () => {
       VALUES($1,'graph.package.read.application',true,true,$2) ON CONFLICT(tenant_id,capability_id)
       DO UPDATE SET enabled=true,shared_data_scope=true`, [config.tenants[0].tenantId, principalId]);
     input.scope.tenantId = config.tenants[0].tenantId;
-    input.scope.tokenMode = "application";
     const stages = new InventoryGenerations(fixture.runtime);
     const root = await stages.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
       const records = [packageRecord(0, "Application-owned package")];
@@ -394,29 +401,27 @@ describe("inventory HTTP selected-read boundary", () => {
     const identity = await reportIdentity(fixture.runtime, { tenantId: config.tenants[0].tenantId, homeAccountId: principalId,
       displayName: "Reader", username: "reader@example.invalid", roles: ["AgentControl.Admin"] });
     const ordinary = new InventoryQueries(fixture.runtime, config.sessionSecret);
-    await expect(ordinary.capture(identity, root.scopeId, {}, "application")).rejects.toMatchObject({ code: "selection_invalidated" });
-    const authorize = vi.spyOn(capabilities, "requireApplicationDataScope").mockResolvedValue({
-      enabled: true, sharedDataScope: true, previewQualified: false, revision: 1,
-    });
+    expect(await ordinary.capture(identity, root.scopeId)).toMatchObject({ id: expect.any(String) });
+    const authorize = vi.spyOn(capabilities, "requireApplicationDataScope")
+      .mockRejectedValue(new AppError(403, "not_configured", "Application authorization denied."));
     try {
       const capture = () => fetch(`${base}/agents/selections`, { method: "POST", headers: {
         cookie, Origin: config.frontendOrigin, "X-CSRF-Token": "inventory-csrf", "Content-Type": "application/json",
-      }, body: JSON.stringify({ mode: "application", query: {} }) });
+      }, body: JSON.stringify({ query: {} }) });
       const captured = await capture();
       expect(captured.status, await captured.clone().text()).toBe(201);
       const applicationSelection = await captured.json();
-      const response = await fetch(`${base}/agents?mode=application&selectionId=${applicationSelection.id}`, { headers: { cookie } });
+      const response = await fetch(`${base}/agents?selectionId=${applicationSelection.id}`, { headers: { cookie } });
       expect(response.status, await response.clone().text()).toBe(200);
       const applicationPage = await response.json();
-      expect(applicationPage.value).toHaveLength(1);
-      expect(applicationPage.value[0].displayName).toBe("Application-owned package");
-      expect(authorize).toHaveBeenCalledWith("graph.package.read.application", expect.objectContaining({ homeAccountId: principalId }));
+      expect(applicationPage.value).toHaveLength(50);
+      expect(applicationPage.counts.total).toBe(101);
+      expect(authorize).not.toHaveBeenCalled();
       const saved = (await fixture.runtime.query("SELECT principal_id FROM data_read_selections WHERE id=$1", [applicationPage.selection.id])).rows[0];
       expect(saved.principal_id).toBe(principalId);
-      await expect(ordinary.page(applicationPage.selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
-      const approved = new InventoryQueries(fixture.runtime, config.sessionSecret, 7,
-        { tenantId: identity.tenantId, principalId: config.tenants[0].clientId });
-      await expect(approved.page(applicationPage.selection.id, { ...identity, authorizationHash: "changed-role" })).rejects.toMatchObject({ code: "selection_invalidated" });
+      expect((await ordinary.page(applicationPage.selection.id, identity)).counts.total).toBe(101);
+      await expect(ordinary.page(applicationPage.selection.id, { ...identity, authorizationHash: "changed-role" }))
+        .rejects.toMatchObject({ code: "selection_invalidated" });
       const admitted = await fetch(`${base}/data-exports`, { method: "POST", headers: {
         cookie, Origin: config.frontendOrigin, "X-CSRF-Token": "inventory-csrf", "Content-Type": "application/json",
       }, body: JSON.stringify({ kind: "graph_packages", selectionId: applicationPage.selection.id }) });
@@ -424,16 +429,30 @@ describe("inventory HTTP selected-read boundary", () => {
       const exported = await admitted.json();
       await expect.poll(async () => (await fetch(`${base}/data-exports/${exported.id}`, { headers: { cookie } }).then(value => value.json())).status).toBe("ready");
       expect(await fetch(`${base}/data-exports/${exported.id}/download`, { headers: { cookie } }).then(value => value.text())).toContain("Application-owned package");
-      expect((await fetch(`${base}/agents?selectionId=${applicationPage.selection.id}`, { headers: { cookie } })).status).toBe(409);
+      expect((await fetch(`${base}/agents?selectionId=${applicationPage.selection.id}`, { headers: { cookie } })).status).toBe(200);
       await fixture.runtime.query("UPDATE capability_configuration SET enabled=false WHERE tenant_id=$1 AND capability_id='graph.package.read.application'", [identity.tenantId]);
       await fixture.runtime.query("UPDATE capability_configuration SET enabled=true WHERE tenant_id=$1 AND capability_id='graph.package.read.application'", [identity.tenantId]);
-      await expect(approved.page(applicationPage.selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
-      expect((await fetch(`${base}/data-exports/${exported.id}/download`, { headers: { cookie } })).status).toBe(409);
-      authorize.mockRejectedValueOnce(new AppError(403, "not_configured", "Application authorization denied."));
-      expect((await fetch(`${base}/agents?mode=application&selectionId=${applicationPage.selection.id}`, { headers: { cookie } })).status).toBe(403);
-      authorize.mockRejectedValueOnce(new AppError(403, "not_configured", "Application authorization denied."));
-      expect((await capture()).status).toBe(403);
-    } finally { authorize.mockRestore(); }
+      expect((await ordinary.page(applicationPage.selection.id, identity)).counts.total).toBe(101);
+      expect((await fetch(`${base}/data-exports/${exported.id}/download`, { headers: { cookie } })).status).toBe(200);
+      expect((await fetch(`${base}/agents?mode=application&selectionId=${applicationPage.selection.id}`, { headers: { cookie } })).status).toBe(400);
+      expect((await capture()).status).toBe(201);
+      expect(authorize).not.toHaveBeenCalled();
+    } finally {
+      authorize.mockRestore();
+      const restoredInput = inventoryInput(principalId);
+      restoredInput.scope.tenantId = identity.tenantId;
+      const restored = await stages.execute(restoredInput, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
+        await stages.visit(lease, "restore");
+        await stages.appendBounded(lease, originalRecords);
+        await stages.acceptPage(lease, { token: "restore", nextToken: null, records: originalRecords,
+          rawCount: originalRecords.length, expectedCount: originalRecords.length, page: 1 }, originalRecords.length);
+      }, { authorize: async () => {} });
+      const canonical = inventoryInput(principalId, "canonical");
+      canonical.scope.tenantId = identity.tenantId;
+      const reconciliation = new InventoryReconciliation(fixture.runtime);
+      await reconciliation.request(canonical, [restored]);
+      await reconciliation.runNext(canonical, async () => {});
+    }
   });
   it("reads exact canonical and source references, discovers counted sections, and pages children on one selection", async () => {
     const page = await fetch(`${base}/agent-inventory?limit=50`, { headers: { cookie } }).then(value => value.json());
@@ -587,9 +606,9 @@ describe("inventory HTTP selected-read boundary", () => {
     await withAuthority(initiatingAuthority, () => runtime.enqueue(scope, false));
     await runtime.pass();
     await runtime.drain();
-    const after = await fetch(`${base}/agent-inventory?limit=50`, { headers: { cookie } }).then(response => response.json());
-    expect(after.counts.total).toBe(1);
-    expect(after.value[0].displayName).toBe("Streamed provider row");
+    const after = await fetch(`${base}/agent-inventory?limit=50&search=Streamed%20provider%20row`, { headers: { cookie } }).then(response => response.json());
+    expect(after.counts.total).toBe(103);
+    expect(after.value.some((row: { displayName: string }) => row.displayName === "Streamed provider row")).toBe(true);
   });
 
   it("stages 5000 refresh targets without metadata arrays and serves current revision-bound HTTP pages", async () => {
@@ -645,7 +664,6 @@ describe("inventory HTTP selected-read boundary", () => {
     input.scope.tenantId = config.tenants[0].tenantId;
     const intent = { domain: "power_platform" as const, mode: "baseline" as const, channel: "catalog" as const,
       resourceTypes: [type, "microsoft.powerplatform/environments"], roleScope: "full" as const };
-    input.scope.selector = inventorySelector(intent);
     const stages = new InventoryGenerations(fixture.runtime);
     await stages.execute(input, intent, async lease => {
       const records = [
@@ -766,7 +784,12 @@ describe("inventory HTTP selected-read boundary", () => {
     expect((await resolver.resolve(scope, nativeId)).context.defender).toMatchObject({ status: "available",
       entraAgentIds: [c], entraAgentApplicationIds: [c],
       resolution: { cacheStatus: "resolved", runtimeProvenance: verifiedAgentIdentityClientIdProvenance } });
-    await expect(mappings.save({ ...scope, principalId: "foreign-reader" }, context.identitySource!,
+    const otherActor = { ...scope, principalId: "another-reader" };
+    expect(await mappings.readState(otherActor, context.identitySource!)).toMatchObject({ status: "missing" });
+    await expect(mappings.save(otherActor, context.identitySource!,
+      { objectId: c, applicationId: c, runtimeStatus: "available", runtimeProvenance: verifiedAgentIdentityClientIdProvenance },
+      async () => {})).resolves.toBeUndefined();
+    await expect(mappings.save({ ...scope, tenantId: randomUUID() }, context.identitySource!,
       { objectId: c, applicationId: c, runtimeStatus: "available", runtimeProvenance: verifiedAgentIdentityClientIdProvenance },
       async () => {})).rejects.toMatchObject({ code: "agent_identity_source_changed" });
   });
@@ -817,7 +840,7 @@ describe("inventory HTTP selected-read boundary", () => {
   it("streams 5001 real sources through canonical reconciliation, counted HTTP keysets and 5000 staged job targets", async () => {
     const started = performance.now(), owner = randomUUID(), total = 5001;
     const store = new InventoryGenerations(fixture.runtime), sourceInput = inventoryInput(owner);
-    sourceInput.scope.tenantId = config.tenants[0].tenantId;
+    sourceInput.scope.tenantId = config.tenants[2].tenantId;
     sourceInput.reserveBytes = 64 * 1024 ** 2;
     const source = await store.execute(sourceInput, { domain: "packages", mode: "baseline", channel: "catalog" }, async lease => {
       for (let offset = 0, page = 1; offset < total; offset += 100, page++) {
@@ -853,12 +876,12 @@ describe("inventory HTTP selected-read boundary", () => {
         }
       });
     } as typeof originalQuery);
-    const user = { tenantId: config.tenants[0].tenantId, homeAccountId: owner,
+    const user = { tenantId: config.tenants[2].tenantId, homeAccountId: owner,
       username: "large-inventory@example.invalid", displayName: "Large inventory", roles: ["AgentControl.Admin" as const] };
     const sid = randomUUID(), signature = createHmac("sha256", config.sessionSecret).update(sid).digest("base64").replace(/=+$/g, "");
     await new Promise<void>((resolve, reject) => application.store.set(sid, {
       cookie: new session.Cookie({ maxAge: 600_000 }), user, tenantId: user.tenantId, accountId: owner,
-      clientId: config.tenants[0].clientId, signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "large-inventory-csrf",
+      clientId: config.tenants[2].clientId, signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "large-inventory-csrf",
     }, error => error ? reject(error) : resolve()));
     const largeCookie = `agent-control.sid=${encodeURIComponent(`s:${sid}.${signature}`)}`;
     const read = async (path: string) => {
@@ -917,4 +940,33 @@ describe("inventory HTTP selected-read boundary", () => {
     process.stdout.write("LARGE_INVENTORY_HTTP " + JSON.stringify({ sources: total, pages, targets: metadata.total,
       itemPage: items.value.length, elapsedMs: Math.round(performance.now() - started), providerMutations: 0 }) + "\n");
   }, 120_000);
+  it("automatically derives saved tenant inventory through a new Viewer after the source collector signs out, without provider reads", async () => {
+    const tenantId = config.tenants[0].tenantId, epochs = new DataGenerations(fixture.runtime);
+    const canonical = (await fixture.runtime.query(`SELECT id FROM data_scope_epochs
+      WHERE tenant_id=$1 AND source='inventory_canonical' AND selector='complete'`, [tenantId])).rows[0].id;
+    await epochs.invalidate(canonical, tenantId);
+    await epochs.revokePrincipal(tenantId, principalId);
+    const user = { tenantId, homeAccountId: randomUUID(), displayName: "Saved-data Viewer",
+      username: "viewer@example.invalid", roles: ["AgentControl.Viewer"] };
+    const stored: SessionData = { cookie: new session.Cookie({ maxAge: 600_000 }), tenantId,
+      accountId: user.homeAccountId, clientId: config.tenants[0].clientId, user,
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), csrfToken: "saved-data-viewer" };
+    const authority = createBrowserCredentials(await browserRequestPrincipal(stored, null, epochs), epochs);
+    const provider = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Provider reads forbidden"));
+    const authorize = vi.fn(async () => {});
+    try {
+      const runtime = new InventoryRuntime(fixture.runtime, authorize), owner = { tenantId, principalId: user.homeAccountId };
+      await withAuthority(authority, () => runtime.enqueue(owner, false));
+      await runtime.pass();
+      await runtime.drain();
+      expect(authorize).toHaveBeenCalledWith(owner, expect.any(AbortSignal));
+      const identity = await reportIdentity(fixture.runtime, user), queries = new InventoryQueries(fixture.runtime, config.sessionSecret);
+      const selection = await queries.capture(identity, canonical);
+      expect((await queries.page(selection.id, identity, { limit: 1 })).counts.total).toBeGreaterThan(0);
+      expect((await fixture.runtime.query(`SELECT actor_principal_id FROM data_generations
+        WHERE id=(SELECT generation_id FROM data_generation_heads WHERE scope_id=$1)`, [canonical])).rows[0])
+        .toEqual({ actor_principal_id: user.homeAccountId });
+      expect(provider).not.toHaveBeenCalled();
+    } finally { provider.mockRestore(); }
+  });
 });

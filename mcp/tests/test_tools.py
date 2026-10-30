@@ -2,7 +2,7 @@ import asyncio
 import copy
 import json
 from contextlib import suppress
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 import httpx2
 import pytest
@@ -168,7 +168,6 @@ def response_for(operation, source_fixtures):
             "page": {"limit": 1, "nextCursor": None, "previousCursor": None},
             "counts": {"total": 1, "scoped": 1, "filtered": 1, "packageTargets": 1},
             "freshness": {"state": "idle", "capturedRevision": "1", "sources": []},
-            "mode": "delegated",
         }
     if model is inventory.InventoryFacets:
         return {"value": [{"value": None, "label": "Unknown"}], "total": 1, "nextCursor": "page-2"}
@@ -565,6 +564,7 @@ async def test_explicit_delegated_search_hunt_and_local_recovery_body_parity(
         if name == "start_hunt":
             expected["userObjectId"] = GUID
             expected["filters"]["userObjectId"] = GUID
+            expected["filters"].update(agentIds=[], blueprintIds=[], actorObjectIds=[])
         sent = entra.api_calls[-1]
         assert sent.url.path == operation.path
         assert sent.headers["Idempotency-Key"] == "fixed-submission"
@@ -617,6 +617,66 @@ async def test_final_sdk_envelope_at_the_exact_representable_byte_boundary(
             len(CallToolResult.model_validate(result).model_dump_json(by_alias=True).encode())
             == size
         )
+    assert len(entra.api_calls) == 1
+
+
+@pytest.mark.parametrize("over_limit", [False, True])
+async def test_error_sdk_envelope_at_the_exact_byte_boundary(over_limit, rpc, entra):
+    error = {
+        "status": 400,
+        "code": "invalid_request",
+        "message": "Invalid selection.",
+        "requestId": GUID,
+        "retryAfterSeconds": 17,
+        "details": {
+            "evidence": ["\n" * 4096 for _ in range(42)],
+            "padding": ["", "", ""],
+        },
+    }
+
+    def envelope(document):
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(document, ensure_ascii=False))],
+            is_error=True,
+        )
+
+    base = len(envelope(error).model_dump_json(by_alias=True).encode())
+    padding = 524288 - base + int(over_limit)
+    assert 0 < padding <= 3 * 4096
+    error["details"]["padding"] = [
+        "a" * min(4096, max(0, padding - index * 4096)) for index in range(3)
+    ]
+    size = len(envelope(error).model_dump_json(by_alias=True).encode())
+    assert size == 524288 + int(over_limit)
+    response = httpx2.Response(
+        400,
+        headers={
+            "Content-Type": "application/problem+json",
+            "Retry-After": "17",
+            "X-Request-ID": GUID,
+        },
+        json={
+            "status": error["status"],
+            "code": error["code"],
+            "detail": error["message"],
+            "details": error["details"],
+        },
+    )
+    assert len(response.content) < 524288
+    entra.api_responses.append(response)
+    result = await rpc("list_capabilities")
+    assert result["isError"]
+    returned_error = json.loads(result["content"][0]["text"])
+    if over_limit:
+        assert returned_error["status"] == 413
+        assert returned_error["code"] == "output_limit"
+        assert returned_error["requestId"] == GUID
+        assert returned_error["retryAfterSeconds"] == 17
+    else:
+        assert returned_error == error
+    assert (
+        len(CallToolResult.model_validate(result).model_dump_json(by_alias=True).encode()) <= 524288
+    )
     assert len(entra.api_calls) == 1
 
 
@@ -856,6 +916,145 @@ def test_source_references_preserve_opaque_case_and_normalize_only_canonical_uui
     assert i.InvestigationInput(recordId="agent:" + GUID.upper()).recordId == RECORD
     for source in ("graph_packages:Case%2FPackage", "power_platform:ENV%3A1:Native%2FCase"):
         assert i.InvestigationInput(recordId=source).recordId == source
+
+
+@pytest.mark.parametrize(
+    "record_id",
+    [
+        "graph_packages:" + "A" * 512,
+        "graph_packages:" + quote("/" * 512, safe=""),
+        "graph_packages:" + quote("\u6f22" * 512, safe=""),
+        "graph_packages:" + quote("\U0001f9ed" * 256, safe=""),
+        "power_platform:" + quote("\u6f22" * 512, safe="") + ":" + quote("\u6f22" * 512, safe=""),
+        "power_platform::" + quote("/" * 512, safe=""),
+    ],
+)
+def test_source_reference_bounds_apply_to_decoded_identities(record_id):
+    assert i.InventoryQuery(recordId=record_id).recordId == record_id
+    assert i.AgentSelected(recordId=record_id, selectionId=GUID).recordId == record_id
+    assert i.UsageInput(recordId=record_id).recordId == record_id
+
+
+@pytest.mark.parametrize("native_id", ["A" * 513, "\u6f22" * 513, "\U0001f9ed" * 257])
+def test_source_reference_bounds_match_canonical_utf16_units(native_id):
+    with pytest.raises(ValidationError):
+        i.InventoryQuery(recordId="graph_packages:" + quote(native_id, safe=""))
+
+
+def test_investigation_source_references_keep_their_separate_wire_bound():
+    record_id = "graph_packages:" + quote("\u00e9" * 338 + "a" * 5, safe="")
+    assert len(record_id) == 2048
+    assert i.InvestigationInput(recordId=record_id).recordId == record_id
+    assert i.HuntingTarget(agentRecordId=record_id).agentRecordId == record_id
+    assert i.PurviewHistory(agentRecordId=record_id).agentRecordId == record_id
+    with pytest.raises(ValidationError):
+        i.InvestigationInput(recordId=record_id + "a")
+    with pytest.raises(ValidationError):
+        i.HuntingTarget(agentRecordId=record_id + "a")
+    with pytest.raises(ValidationError):
+        i.PurviewHistory(agentRecordId=record_id + "a")
+
+
+@pytest.mark.parametrize(
+    "name", ["capture_agent_inventory", "capture_packages", "list_agents", "list_packages"]
+)
+@pytest.mark.parametrize("environment_id", [None, "Case/Environment", "~null", "~string:Literal"])
+async def test_inventory_environment_filters_use_facet_tags(
+    name, environment_id, rpc, entra, source_fixtures
+):
+    operation = next(operation for operation in OPERATIONS if operation.name == name)
+    entra.api_responses.append(httpx2.Response(200, json=response_for(operation, source_fixtures)))
+    request = (
+        {"query": {"environmentId": environment_id}}
+        if operation.method == "POST"
+        else {"selectionId": GUID, "environmentId": environment_id}
+    )
+    result = await rpc(name, request)
+    assert not result.get("isError"), result
+    sent = entra.api_calls[-1]
+    expected = "~null" if environment_id is None else "~string:" + environment_id
+    if operation.method == "POST":
+        assert json.loads(sent.content)["query"] == {"environmentId": expected}
+    else:
+        assert parse_qs(sent.url.query.decode())["environmentId"] == [expected]
+    assert len(entra.api_calls) == 1
+
+
+@pytest.mark.parametrize("environment_id", ["Case/Environment", "~null", "~string:Literal"])
+async def test_native_activity_environment_remains_an_untagged_identity(
+    environment_id, rpc, entra, source_fixtures
+):
+    operation = next(
+        operation for operation in OPERATIONS if operation.name == "get_native_agent_activity"
+    )
+    entra.api_responses.append(httpx2.Response(200, json=response_for(operation, source_fixtures)))
+    result = await rpc(
+        operation.name,
+        {"nativeId": "Native/Case", "snapshotId": GUID, "environmentId": environment_id},
+    )
+    assert not result.get("isError"), result
+    assert parse_qs(entra.api_calls[-1].url.query.decode())["environmentId"] == [environment_id]
+    with pytest.raises(ValidationError):
+        i.NativeActivityInput(nativeId="Native/Case", snapshotId=GUID, environmentId=None)
+
+
+@pytest.mark.parametrize(
+    "template,operations",
+    [
+        ("agents_inventory", None),
+        ("agent_activity", ["InvokeAgent"]),
+        ("agent_tools", ["ExecuteToolBySDK"]),
+    ],
+)
+async def test_hunt_defaults_include_required_arrays_without_optional_nulls(
+    template, operations, rpc, entra, source_fixtures
+):
+    operation = next(operation for operation in OPERATIONS if operation.name == "start_hunt")
+    filters = {
+        "templateId": template,
+        "startDateTime": "2026-10-16T00:00:00Z",
+        "endDateTime": "2026-10-16T01:00:00Z",
+    }
+    if operations is not None:
+        filters["operations"] = operations
+    entra.api_responses.append(httpx2.Response(202, json=response_for(operation, source_fixtures)))
+    result = await rpc(operation.name, {"tokenMode": "delegated", "filters": filters})
+    assert not result.get("isError"), result
+    assert json.loads(entra.api_calls[-1].content) == {
+        "tokenMode": "delegated",
+        "filters": {
+            **filters,
+            "agentIds": [],
+            "blueprintIds": [],
+            "actorObjectIds": [],
+            "operations": operations or [],
+        },
+    }
+    assert len(entra.api_calls) == 1
+
+
+async def test_hunt_serialization_preserves_explicit_identity_filters(rpc, entra, source_fixtures):
+    operation = next(operation for operation in OPERATIONS if operation.name == "start_hunt")
+    filters = {
+        "templateId": "agent_activity",
+        "startDateTime": "2026-10-16T00:00:00Z",
+        "endDateTime": "2026-10-16T01:00:00Z",
+        "agentIds": ["Case/Agent"],
+        "blueprintIds": [GUID.upper()],
+        "actorObjectIds": [SOURCE.upper()],
+        "entraAgentApplicationIds": [GUID.upper()],
+        "operations": ["InvokeAgent"],
+    }
+    entra.api_responses.append(httpx2.Response(202, json=response_for(operation, source_fixtures)))
+    result = await rpc(operation.name, {"tokenMode": "delegated", "filters": filters})
+    assert not result.get("isError"), result
+    expected = {
+        **filters,
+        "blueprintIds": [GUID],
+        "actorObjectIds": [SOURCE],
+        "entraAgentApplicationIds": [GUID],
+    }
+    assert json.loads(entra.api_calls[-1].content)["filters"] == expected
 
 
 async def test_stateful_submissions_never_replayed_and_invalid_json_not_empty(rpc, entra):

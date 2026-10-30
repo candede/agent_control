@@ -76,14 +76,22 @@ are not supported restore inputs. See [operations](operations.md).
 
 Private delegated key is `(tenantId, MSAL account.homeAccountId)`, retained as
 `session.accountId`, `user.homeAccountId` and SQL `principal_id`.
-`requestScope`, `reportIdentity`, `data_principal_epochs`, `data_scope_epochs`,
-generations/selections/cursors, private caches, job/refresh/sync owners,
+`requestScope`, `reportIdentity`, `data_principal_epochs`,
+selections/cursors, private caches, job/refresh/sync actors,
 capability evidence, quarantine and audit use this key. Sessions' generated
 `principal_id` reads `sess->>'accountId'`. Tenant official report history and
-reviewed usage associations are tenant-wide, but directory/native membership
-joins remain principal-private. Optional browser application-mode sources use
-the configured API application principal plus configured shared scope,
-not another user's credentials.
+reviewed usage associations are tenant-wide. Directory/licensing/activity,
+Graph packages, Power Platform, canonical inventory and saved people joins also
+have one tenant owner (`scope_kind=tenant`, `principal_id=NULL`, `token_mode=tenant`).
+Viewer and Admin roles read that saved data without provider source-read permission.
+Provider refreshes still use the initiating actor's current authorization and
+credentials; application-mode packages publish to the same tenant root.
+Collector/session fencing and private execution receipts remain actor-bound.
+Never use another user's delegated token. Selection and cursor handles cannot
+be transferred between actors, roles or tenants.
+Power Platform environment/type filters describe the actual provider query,
+not separate saved-data owners. Successful narrower queries update the same
+tenant source and preserve unseen agents, environments and original observations.
 
 ### Supported mapping, and its evidence limit
 
@@ -252,6 +260,8 @@ and transport deadlines remain safe503/504 errors rather than forcing an
 invalid-grant reset. OAuth endpoints have a30s handling deadline; callback
 errors are normalized/non-cacheable and never forward provider diagnostic text.
 Cancellation propagates, and expiry/revocation is checked after awaited work.
+Invocation lifetime and upstream claims are checked both before and after each
+awaited revocation lookup, before API dispatch or response release.
 No cookies, redirects, proxy environment or caller-supplied URL/auth headers
 enter API dispatch. The adapter's named calls use the finite catalog in
 `mcp/src/agent_control_mcp/tools.py`; caller-selected endpoints/methods are
@@ -259,7 +269,11 @@ unreachable, not hidden tools. The catalog follows the canonical map below;
 there is no second API authorization-policy map or domain query implementation.
 Successful API request UUIDs are retained in the invocation; bounded errors
 preserve status/code/correlation/cooldown and sanitized details, not raw
-provider responses. POST/PATCH/DELETE submissions are never automatically replayed,
+provider responses. Credential-bearing detail keys are omitted with their values,
+including in nested objects. The 524288-byte ceiling includes final SDK error envelopes,
+not only successful text/structured results. An oversized error becomes an explicit
+413 `output_limit`, retaining correlation and cooldown but omitting oversized details.
+POST/PATCH/DELETE submissions are never automatically replayed,
 and MCP introduces no provider writer.
 OBO claims challenges use the same bounded `access_token` claim-name, field and
 value allowlist as the API; ID-token requests and arbitrary nested diagnostics
@@ -377,9 +391,16 @@ Synthetic SDK/browser capture tests verify identical canonical methods, bodies,
 defaults, errors and returned audit/outcome DTOs; they are not live provider,
 database durability or human-confirmation proof.
 
-Unspecified API defaults stay unspecified. Null facet values are encoded
-distinctly from literal `"~null"` strings; unrelated optional inputs must be
-omitted rather than null. Source/report/package identities retain exact case;
+Unspecified API defaults stay unspecified. Defender hunt submissions include the
+API-required `agentIds`, `blueprintIds`, `actorObjectIds` and `operations` arrays,
+using empty arrays when omitted; optional Entra identity namespaces remain omitted.
+Null facet values, including inventory `environmentId`, are encoded distinctly
+from literal `"~null"` strings; native-activity environment identities remain
+untagged. Unrelated optional inputs must be omitted rather than null.
+Source-qualified record references allow up to10000 encoded characters while each
+decoded source identity remains bounded to512 UTF-16 code units. Investigation
+references retain their separate2048-character API bound.
+Source/report/package identities retain exact case;
 directory/selection/job UUIDs normalize to lowercase. API errors retain safe
 status/code, correlation, cooldown and structured details. Unknown/partial/
 missing states and incomparable report windows never become successful empty
@@ -686,6 +707,11 @@ domain shapes, not a new universal data envelope. Selected pages keep `value`
 previousCursor`, `selection` with id/revision/evaluatedAt/expiresAt/validatedAt
 and publication revisions, source/report/freshness/partial evidence.
 Continuation is explicit, total versus returned counts stay separate.
+Inventory freshness sources preserve both `row_count` (saved memberships) and
+`collected_count` (the latest collection), including PostgreSQL bigint strings.
+These counts can differ when a narrower collection retains earlier saved rows.
+The current source projection has no `token_mode`; saved tenant data is not
+partitioned by the collector's authentication mode.
 Native quarantine identities retain their saved field provenance, including
 explicit null when provenance was not supplied. Optional package provider
 telemetry remains separate from report usage: runtime hours and exception rates
@@ -818,9 +844,9 @@ not merely hide `tools/list` results.
 | `GET /api/agent-inventory/:recordId/about` | required selectionId/sourceScopeId/sourceIdentity,field long/native/short,cursor? ->AgentAboutPage;16384 Unicode characters/segment,full saved bytes via continuation | getAgentAbout/SavedAgentAbout/AgentOverview; long then native then short; automatically loads complete text without load-more controls or inline provenance | read_agent_about | V |
 | `GET /api/agent-responsibility` | `objectId?,search?<=256,selectionId?,cursor?,limit=50<=100` ->people or selected person's agents/roles | getAgentResponsibility/Users responsibility | list_agent_responsibility | V |
 | `POST /api/agent-inventory/people/resolve` | `{recordId,force?:false}` ->saved people/changed; derive referenced IDs | resolveAgentPeople/Look up people | resolve_agent_people | V; graph.directory.read |
-| `POST /api/agents/selections` | `{query:I,mode?:delegated}` ->201 package selection | getAgents capture, optional browser application mode | capture_packages | V; application scope conditional |
-| `GET /api/agents` | I + paging, `mode?:delegated` ->PackagePage | getAgents/package/access views | list_packages | V; application scope conditional |
-| `GET /api/agents/:id/detail` | exact `selectionId`, `mode?:delegated` ->saved CopilotPackageDetail | getAgentDetails/package editor | get_package | V |
+| `POST /api/agents/selections` | `{query:I}` ->201 actor-bound tenant package selection | getAgents capture | capture_packages | V |
+| `GET /api/agents` | I + paging ->tenant PackagePage | getAgents/package/access views | list_packages | V |
+| `GET /api/agents/:id/detail` | exact `selectionId` ->saved CopilotPackageDetail | getAgentDetails/package editor | get_package | V |
 | `GET /api/inventory/resources/:nativeId/related` | required `snapshotId`, `environmentId?:""`; no type ->saved source-aware activity | retained API; modal uses investigation context | get_native_agent_activity | V |
 | `GET /api/inventory/quarantine-selection` | required `snapshotId`, repeated exact `selected` IDs (empty default) ->resolved native selection | retained native selection API | resolve_studio_targets | V |
 
@@ -828,6 +854,8 @@ not merely hide `tools/list` results.
 
 `R` is endpoint-specific above. These are saved reads; no provider call or CSV
 reparse. `reportData.readReportPage/readReportDetail` also serve lazy children.
+`HTTP only` identifies a canonical session/bearer read without a named MCP tool;
+it does not make the endpoint browser-only (`—`).
 
 | Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
@@ -840,6 +868,9 @@ reparse. `reportData.readReportPage/readReportDetail` also serve lazy children.
 | `GET /api/copilot-usage/users/:objectId/agents` | R(copilot_users), child relationship filters ->relationships page | Users per-person agent drilldown | list_user_used_agents | V |
 | `GET /api/copilot-usage/users/:objectId/agent-relationships` | required selectionId/inventorySelectionId,relationship used/created/owned/modified,limit50<=100,cursor? ->SavedRelationshipPage;distinct native evidence/canonical/report-only IDs | readUserAgentRelationships/shared responsibility adapter; existing responsibility route unchanged | list_user_agent_relationships | V |
 | `GET /api/copilot-usage/adoption` | R(adoption), group limit=min(request,10) ->AdoptionPage | AdoptionView/champions and department agents | list_adoption_groups | V |
+| `GET /api/copilot-usage/adoption/summary` | R(adoption), unfiltered organization summary | AdoptionView organization totals | HTTP only | V |
+| `GET /api/copilot-usage/adoption/departments` | R(adoption_departments), limit,cursor?/pageNumber? ->selected department page | AdoptionView department groups | HTTP only | V |
+| `GET /api/official-usage/history/adoption` | R(adoption_history), unfiltered retained history,limit,cursor? ->selected adoption history | AdoptionView retained report history | HTTP only | V |
 | `GET /api/copilot-usage/adoption/facets` | R(adoption),field,search? ->facets | AdoptionView company/department | list_adoption_facets | V |
 | `GET /api/copilot-usage/adoption/champions` | required exact-group adoption selectionId/full inventorySelectionId,limit50<=100,cursor? ->ChampionAgentPage;top3 portal rank,only their complete used/created edges | readChampionAgents/shared Adoption adapter; department array unchanged | list_champion_agents | V |
 | `GET /api/official-usage/aggregate` | R(official_agents) ->ReportPage<ReportAgent> | reportPages.agents/snapshot inspector | list_report_agents | V |

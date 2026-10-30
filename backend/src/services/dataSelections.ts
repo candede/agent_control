@@ -104,8 +104,7 @@ export class CursorCodec {
 
 export class DataSelections {
   readonly connections;
-  constructor(readonly database: pg.Pool, private readonly validateDomainRoot?: DomainRootValidator,
-    private readonly authorizeForeignScope?: (scope: Awaited<ReturnType<typeof lockDataScope>>, identity: SelectionIdentity) => boolean) {
+  constructor(readonly database: pg.Pool, private readonly validateDomainRoot?: DomainRootValidator) {
     this.connections = dataConnections(database);
   }
   async capture(identity: SelectionIdentity, endpoint: string, query: { values: Record<string, unknown>; allowed: readonly string[] }, roots: readonly DependencyRoot[], nextTransition?: Date): Promise<Selection> {
@@ -143,7 +142,7 @@ export class DataSelections {
       const epochs = [];
       for (const root of ordered) {
         const scope = await lockDataScope(client, root.scopeId, identity.tenantId, "share");
-        if (scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) {
+        if (scope.principal_id !== null && scope.principal_id !== identity.principalId) {
           throw new SelectionError("selection_invalidated");
         }
         epochs.push(scope);
@@ -216,7 +215,7 @@ export class DataSelections {
     for (const pin of pins) {
       const scope = await lockDataScope(client, pin.scope_id, identity.tenantId, isSelectedRead(client) ? "share" : "update");
       if (scope.session_epoch !== pin.session_epoch
-        || scope.principal_id !== null && scope.principal_id !== identity.principalId && !this.authorizeForeignScope?.(scope, identity)) throw new SelectionError("selection_invalidated");
+        || scope.principal_id !== null && scope.principal_id !== identity.principalId) throw new SelectionError("selection_invalidated");
       scopeChanged ||= scope.epoch !== pin.scope_epoch;
     }
     if (owned.invalidated_at) throw new SelectionError("selection_invalidated", "changed");

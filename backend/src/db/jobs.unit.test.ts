@@ -34,7 +34,7 @@ function fixture() {
     correlation_id: "44444444-4444-4444-8444-444444444444", reconciliation_status: "not_required",
     reconciled_at: null,
   };
-  const lease: Lease = { jobId: job.id, scope, owner: job.lease_owner!, version: job.lease_version };
+  const lease: Lease = { jobId: job.id, scope, owner: job.lease_owner!, version: job.lease_version, actorSessionEpoch: "0" };
   const database = new pg.Pool();
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
   vi.spyOn(database, "connect").mockImplementation(async () => client);
@@ -44,6 +44,10 @@ function fixture() {
     if (typeof statement !== "string") throw new Error("Unexpected query shape.");
     if (statement.startsWith("SELECT pg_advisory_lock")) return result();
     if (statement.startsWith("SELECT pg_advisory_unlock")) return result([{ unlocked: true }]);
+    if (statement.startsWith("INSERT INTO data_principal_epochs")) {
+      expect(_values).toEqual([scope.tenantId, scope.principalId]);
+      return result();
+    }
     if (statement.startsWith("SELECT epoch FROM data_principal_epochs")) {
       expect(_values).toEqual([scope.tenantId, scope.principalId]);
       return result([{ epoch: "0" }]);
@@ -61,6 +65,53 @@ function fixture() {
 }
 
 describe("package mutation persistence boundaries without a database", () => {
+  it.each(["first-use", "revoked"] as const)("fences a %s actor before dispatch", async state => {
+    const f = fixture();
+    const normalQuery = f.query.getMockImplementation()!;
+    let epoch: string | undefined = state === "revoked" ? "7" : undefined;
+    let principalLocked = false;
+    f.query.mockImplementation(async (...args) => {
+      const statement = String(args[0]);
+      if (statement.startsWith("SELECT pg_advisory_xact_lock")) return f.result();
+      if (statement.startsWith("INSERT INTO data_principal_epochs")) {
+        epoch ??= "0";
+        return normalQuery(...args);
+      }
+      if (statement.startsWith("SELECT epoch FROM data_principal_epochs")) {
+        principalLocked = epoch !== undefined && statement.endsWith("FOR SHARE");
+        return f.result(epoch === undefined ? [] : [{ epoch }]);
+      }
+      if (statement.startsWith("WITH inventory AS")) {
+        expect(principalLocked).toBe(true);
+        return f.result();
+      }
+      if (statement.startsWith("SELECT deadline_at>clock_timestamp()")) return f.result([{ valid: true }]);
+      if (statement.startsWith("SELECT source_generation_id")) return f.result([{
+        source_generation_id: "source-generation", source_identity: "source-identity", agent_id: "canonical-agent",
+        target_id: f.item.target_id, unexpired: true,
+      }]);
+      if (statement.startsWith("SELECT count(*)::int AS total")) return f.result([{ total: 1, valid: 1 }]);
+      if (statement.startsWith("UPDATE job_items SET sent_at")) return f.result([{ id: f.item.id }]);
+      return normalQuery(...args);
+    });
+
+    const dispatch = f.repository.markSent(f.lease, f.item.id, f.item.prestate_hash);
+    if (state === "first-use") {
+      await expect(dispatch).resolves.toBeUndefined();
+      expect(epoch).toBe("0");
+      expect(f.query).toHaveBeenCalledWith(expect.stringContaining("UPDATE job_items SET sent_at"),
+        [f.item.id, f.lease.jobId, f.item.prestate_hash]);
+      expect(f.query).toHaveBeenCalledWith("COMMIT");
+    } else {
+      await expect(dispatch).rejects.toMatchObject({ status: 409, code: "confirmation_mismatch" });
+      expect(epoch).toBe("7");
+      expect(f.query).not.toHaveBeenCalledWith(expect.stringContaining("UPDATE job_items SET sent_at"), expect.anything());
+      expect(f.query).toHaveBeenCalledWith("ROLLBACK");
+      expect(f.query).not.toHaveBeenCalledWith("COMMIT");
+    }
+    expect(f.client.release).toHaveBeenCalledOnce();
+  });
+
   it.each(["execution", "reconciliation"] as const)("rejects oversized %s evidence before persisting a terminal or verified receipt", async mode => {
     const f = fixture();
     const observed = {
@@ -237,6 +288,65 @@ describe("package mutation persistence boundaries without a database", () => {
     expect(f.query).toHaveBeenCalledWith("COMMIT");
     expect(f.client.release).toHaveBeenCalledOnce();
   });
+
+  it.each(["direct", "staged"] as const)("counts partial jobs with unfinished items toward %s admission", async mode => {
+    const f = fixture();
+    const intent: JobIntentInput = {
+      action: "block", scope: "bulk", requestPath: "/api/agents/block",
+      actor: { tenantId: f.scope.tenantId, homeAccountId: f.scope.principalId,
+        username: f.job.actor_username, displayName: f.job.actor_name },
+      targets: [{ id: f.item.target_id, displayName: f.item.display_name, prestate: f.item.prestate }],
+    };
+    const confirmation = createJobConfirmation(intent);
+    const normalQuery = f.query.getMockImplementation()!;
+    f.query.mockImplementation(async (...args) => {
+      const statement = String(args[0]);
+      if (statement.startsWith("SELECT pg_advisory_xact_lock") || statement.startsWith("WITH inventory AS")
+        || statement.startsWith("SELECT * FROM jobs WHERE tenant_id")
+        || statement.startsWith("SELECT id,confirmation_hash,request_hash FROM jobs")) return f.result();
+      if (statement.startsWith("SELECT count(*)::int AS count FROM jobs")) return f.result([{ count: 5 }]);
+      if (statement.trimStart().startsWith("SELECT selection_id,intent,target_count")) return f.result([{
+        selection_id: f.job.id, intent, target_count: 1, request_hash: confirmation.requestHash,
+        confirmation_hash: confirmation.confirmationHash, summary: confirmation.summary,
+      }]);
+      if (statement.startsWith("WITH current_sources AS MATERIALIZED")) return f.result([{ total: 1, valid: 1 }]);
+      return normalQuery(...args);
+    });
+    const input = { confirmationHash: confirmation.confirmationHash, idempotencyKey: "at-limit", requestPath: intent.requestPath };
+
+    await expect(mode === "direct" ? f.repository.submit(f.scope, { ...intent, ...input })
+      : f.repository.submitStaged(f.client, { ...f.scope, authorizationHash: "admin", sessionEpoch: "0" }, f.job.id, input))
+      .rejects.toMatchObject({ status: 429, code: "job_limit" });
+
+    const admission = f.query.mock.calls.find(([statement]) => String(statement).startsWith("SELECT count(*)::int AS count FROM jobs"));
+    expect(admission?.[0]).toMatch(/status='partial'\s+AND EXISTS\s*\(\s*SELECT 1 FROM job_items WHERE job_id=jobs\.id AND status IN \('queued','running'\)\)/);
+    expect(admission?.[1]).toEqual([f.scope.tenantId, f.scope.principalId]);
+    expect(f.query.mock.calls.some(([statement]) => String(statement).startsWith("INSERT INTO jobs"))).toBe(false);
+  });
+
+  it.each(["verified_applied", "verified_not_applied", "conflict"] as const)(
+    "keeps active attempts ahead of paused states when aggregating %s reconciliation", async status => {
+      const f = fixture();
+      const normalQuery = f.query.getMockImplementation()!;
+      f.query.mockImplementation(async (...args) => String(args[0]).startsWith("SELECT item.*,attempt.lease_version")
+        ? f.result([{ ...f.item, status: "inconclusive", reconciliation_status: "required",
+          action: f.job.action, lease_version: f.lease.version }]) : normalQuery(...args));
+      vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async (id, update) => ({
+        id, operationId: f.job.id, scope: "bulk", action: "block", targetBlockedState: true, agentId: f.item.target_id,
+        actor: { tenantId: f.scope.tenantId, homeAccountId: f.scope.principalId,
+          username: f.job.actor_username, displayName: f.job.actor_name },
+        startedAt: new Date().toISOString(), status: update.status, requestPath: f.job.request_path,
+      }));
+
+      await f.repository.recordReconciliation(f.scope, f.item.id, status,
+        { kind: "block", isBlocked: status === "verified_applied" }, "Synthetic observation.");
+
+      const settlement = f.query.mock.calls.find(([statement]) => String(statement).startsWith("UPDATE jobs SET status=CASE"));
+      expect(settlement?.[0]).toMatch(/SET status=CASE\s+WHEN EXISTS \(SELECT 1 FROM job_items WHERE job_id=\$1 AND status='running'\) THEN 'running'\s+WHEN EXISTS \(SELECT 1 FROM job_items WHERE job_id=\$1 AND status='inconclusive'\) THEN 'partial'/);
+      expect(settlement?.[1]).toEqual([f.job.id]);
+      expect(f.query).toHaveBeenCalledWith("COMMIT");
+    },
+  );
 
   it.each(["execution", "reconciliation"] as const)("releases the target lock after successful %s", async mode => {
     const f = fixture(), operation = vi.fn(async () => "verified");

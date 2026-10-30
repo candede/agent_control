@@ -15,7 +15,7 @@ describe("selected package inventory operation references", () => {
 
   it("applies literal, actor-scoped, retained bulk references before exact counting and keyset paging", async () => {
     const input = inventoryInput(randomUUID());
-    const identity = { ...selectionIdentity, principalId: input.scope.principalId! };
+    const identity = { ...selectionIdentity, principalId: input.actorPrincipalId! };
     const store = new InventoryGenerations(fixture.runtime);
     const ids = ["PKG", "pkg", "second", "other-principal", "other-tenant", "expired", "future", "single", "prefix-wildcard"];
     const records = ids.map(id => packageInventoryRecord(allowlistedPackage({ id, displayName: id, isBlocked: false })));

@@ -25,7 +25,6 @@ describe("typed inventory classification", () => {
       const store = new InventoryGenerations(fixture.runtime);
       const intent = { domain, mode: "baseline" as const, channel: "catalog" as const,
         ...(domain === "power_platform" ? { resourceTypes: ["microsoft.copilotstudio/agents"] } : {}) };
-      if (domain === "power_platform") input.scope.selector = JSON.stringify(["", intent.resourceTypes]);
       const table = domain === "packages" ? "package_record_rows" : "power_platform_record_rows";
       const root = await store.execute(input, intent, async lease => {
         await store.visit(lease, "catalog");
@@ -71,4 +70,30 @@ describe("typed inventory classification", () => {
       }, { authorize: async () => {} })).rejects.toThrow("inventory_scalar_fact_retired");
     } finally { await fixture.close(); }
   }, 30_000);
+
+  it.each([
+    { resourceType: null, allowed: false },
+    { resourceType: "microsoft.copilotstudio/agents", allowed: false },
+    { resourceType: "unknown", allowed: false },
+    { resourceType: "microsoft.powerplatform/environments", allowed: true },
+  ])("admits absent classifications only for known environments: $resourceType", async ({ resourceType, allowed }) => {
+    const fixture = await testDatabase();
+    const store = new InventoryGenerations(fixture.runtime);
+    try {
+      const lease = await store.generations.begin(inventoryInput(randomUUID(), "power_platform"));
+      try {
+        await fixture.runtime.query(`INSERT INTO inventory_keys
+          (generation_id,scope_id,tenant_id,identity,schema_version,content_hash)
+          VALUES($1,$2,$3,'unclassified',1,repeat('a',64))`, [lease.id, lease.scopeId, lease.tenantId]);
+        const insert = fixture.runtime.query(`INSERT INTO power_platform_record_rows
+          (generation_id,scope_id,tenant_id,identity,schema_version,content_hash,display_name,sort_key,native_id,
+            resource_type,observed_at,expires_at,read_started_at,residual)
+          SELECT id,scope_id,tenant_id,'unclassified',1,repeat('a',64),'Unclassified','unclassified','native',
+            $2,observed_at,expires_at,observed_at,'{}'::jsonb FROM data_generations WHERE id=$1`,
+        [lease.id, resourceType]);
+        if (allowed) await expect(insert).resolves.toMatchObject({ rowCount: 1 });
+        else await expect(insert).rejects.toMatchObject({ code: "23514", constraint: "power_platform_record_rows_classification" });
+      } finally { await store.generations.abort(lease); }
+    } finally { await fixture.close(); }
+  });
 });

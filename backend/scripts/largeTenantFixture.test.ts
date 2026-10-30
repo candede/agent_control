@@ -149,7 +149,7 @@ describe("large tenant fixture and frozen semantic seeds", () => {
         ORDER BY name`)).rows;
       process.stdout.write(JSON.stringify({ event: "test_postgres_checkpoint_settings",settings })+"\n");
       const identity = { ...selectionIdentity, tenantId: `template-isolation-${randomUUID()}` };
-      await new LargeTenantUsersReports(first.runtime, "synthetic-template-schema-secret-32", 30).sources.ensureScope(identity, "delegated");
+      await new LargeTenantUsersReports(first.runtime, "synthetic-template-schema-secret-32", 30).sources.ensureScope(identity);
       second = await testDatabase();
       expect(second.name).not.toBe(first.name);
       expect((await second.runtime.query("SELECT count(*)::int AS n FROM data_scope_epochs WHERE tenant_id=$1", [identity.tenantId])).rows[0].n).toBe(0);
@@ -278,21 +278,21 @@ describe("large tenant fixture and frozen semantic seeds", () => {
       }
       for (const kind of ["agents", "users", "userAgents"] as const) await imports.stage(identity, { bundleId }, source(kind), metadata);
       await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-      const aggregateSelection = await reports.capture(identity, "delegated", "official_agents");
+      const aggregateSelection = await reports.capture(identity, "official_agents");
       const aggregate = await reports.page(aggregateSelection.id, identity);
       expect(aggregate.reports.availability).toBe("active");
       expect(aggregate.reports.reportingPeriod?.days).toBe(30);
       expect(aggregate.reports.lineages.map(lineage => lineage.kind).sort()).toEqual(["agents", "userAgents", "users"]);
       expect(aggregate.summary).toMatchObject({ reportedResponses: 9, bridgeResponses: 9, userReportedResponses: 5,
         distinctActiveReportUsers: 2, activeUsersAreNonAdditive: true });
-      const selected = await reports.capture(identity, "delegated", "official_users");
+      const selected = await reports.capture(identity, "official_users");
       const view = await reports.page<ReportUser>(selected.id, identity);
       expect(view.counts).toEqual({ total: 3, filtered: 3 });
       expect(view.reports.lineages.find(lineage => lineage.kind === "users")?.rowCount).toBe(2);
       expect(view.reports.lineages.find(lineage => lineage.kind === "userAgents")?.rowCount).toBe(2);
       expect(view.value.find(row => row.username === "unresolved-token")).toMatchObject({ missingUserReport: true, reviewCohort: "unknown", reportedResponses: null });
       expect(view.value.find(row => row.username === "zero@example.invalid")).toMatchObject({ missingUserReport: false, reportedResponses: 0 });
-      const filtered = await reports.capture(identity, "delegated", "official_users", { search: "Exact" });
+      const filtered = await reports.capture(identity, "official_users", { search: "Exact" });
       expect((await reports.page(filtered.id, identity)).counts).toEqual({ total: 3, filtered: 1 });
       const incomplete = { ...identity, tenantId: `fixture-incomplete-${randomUUID()}` }, incompleteBundle = randomUUID();
       for (const kind of ["agents", "userAgents"] as const) {
@@ -300,7 +300,7 @@ describe("large tenant fixture and frozen semantic seeds", () => {
         await imports.accept(incomplete, { stagingId: preview.id, revision: preview.revision,
           contentHash: preview.contentHash, expectedActiveRevision: preview.activeRevision });
       }
-      const missing = await reports.capture(incomplete, "delegated", "official_users");
+      const missing = await reports.capture(incomplete, "official_users");
       const unavailable = await reports.page(missing.id, incomplete);
       expect(unavailable.reports.availability).toBe("incomplete");
       expect(unavailable.summary.userReportedResponses).toBeNull();

@@ -52,20 +52,38 @@ step. Saved reads and explicit cancellation retain their normal authorization.
 
 ## First sign-in and synchronization
 
+Users, Graph packages, Power Platform and their saved inventory are shared within
+each tenant. Viewer/Admin app roles can read those records without permission to
+collect them from Microsoft. Signing in with a different account does not create
+another copy or require a personal first sync.
+
 Eligible signed-in Viewer/Admin sessions start read-only collection
-automatically while visible and online. Setup tracks Users, Graph packages and
-Power Platform, opening the workspace when those sources are saved. CSV imports
-and package-detail enrichment do not block setup. Retry/cancel and sign-in
-recovery appear only when needed; Permissions is recovery guidance after a
-genuine permission failure, not a prerequisite visit.
+automatically while visible and online, using their own current provider
+authorization. Freshness and collection admission are shared per tenant/source,
+so different accounts do not independently download the same source. The tenant's
+initial sync uses the first-sync modal, which closes automatically when all three
+inventory sources are saved. It is not repeated for each account. Subsequent
+source progress is nonblocking; saved data remains accessible while a source is
+updating or failing. CSV imports and package-detail enrichment do not
+block the workspace. Retry/cancel and sign-in recovery appear only when needed;
+Permissions is recovery guidance after a genuine permission failure, not a
+prerequisite visit.
 
 Sync shows current-attempt observations separately from last saved counts and
 last successful publication. A running count is not a provider total or ETA.
 Failed/partial attempts do not replace a complete saved source.
 
-Normal sign-out revokes session authority and unfinished writes, not complete
-saved sources. A fresh sign-in can capture new reads over those retained sources;
-observation age alone does not remove them.
+Retained package refresh jobs report deadline-expired waiting/running work as
+failed in job history, automatic-detail status and target pages, even before
+recovery settles the stored state. Target-page revisions change at that boundary;
+recapture the first target page instead of continuing an earlier cursor.
+Recovery also settles expired waiting jobs without restarting provider work.
+
+Normal sign-out revokes the initiating account's session authority and unfinished
+writes, not complete saved tenant sources or other accounts' reads. Credentials,
+capability checks and job control retain their actor ownership. A fresh sign-in
+can capture new reads over those shared sources; observation age alone does not
+remove them.
 An exhausted manual or automatic authorization-waiting run releases its active
 slot, so a fresh sign-in can automatically retry eligible sources without
 manually resuming that run. Live provider-authorization handoffs are still joined,
@@ -96,9 +114,10 @@ saved-data read. Ordinary failed attempts wait one hour before an automatic
 retry; real provider backoff and newer-sign-in recovery remain authoritative.
 Missing or invalidated current sources are collected automatically without
 waiting for the six-hour interval, even when historical syncs succeeded recently.
-Setup readiness checks usable saved publications, not historical success markers;
-last successful counts and dates remain visible. Real failed-attempt cooldowns
-still apply.
+Source readiness checks usable shared publications, not personal collection
+history or historical success markers; it does not lock the workspace. Last
+successful counts and dates remain visible. Real failed-attempt cooldowns still
+apply.
 Healthy idle checks run every five minutes. Initial collection and active work
 use faster status checks, and genuinely unavailable inventory retries after
 thirty seconds. None of these status checks recollects Microsoft data by itself.
@@ -200,6 +219,11 @@ work but cannot undo completed effects. Resume requires current authorization.
 **Check uncertain results** reconciles read-only; a later retry needs a fresh
 preview. Status polling never performs recovery writes.
 
+Reconciling one item does not pause another active item in the same job. If its
+worker is interrupted, the expired lease remains eligible for normal recovery.
+The five-unfinished-job limit includes partial jobs that still have queued or
+running items; partial jobs with only terminal outcomes do not occupy a slot.
+
 Package status/history return counts and `resultRevision`; bounded item pages
 must use that revision. Refresh status/restart paging after
 `selection_invalidated`. Preview counts cover the whole target set even when
@@ -237,6 +261,12 @@ Use the deployment's service logs and safe request/job correlation. Do not print
 environment variables, tenant registries, secret files, tokens, continuation
 URLs, report contents or raw provider bodies. Normal provider diagnostics use
 bounded categories and sanitized correlation.
+
+API failures use `application/problem+json` with a request ID. Malformed
+application error codes that cannot be URI-encoded produce a generic HTTP 500
+problem. Provider cooldowns in `details.retryAfterMs` become `Retry-After`
+whole seconds, rounded up, unless the error supplies an explicit
+`retryAfterSeconds`. Only positive safe-integer delays are emitted.
 
 ## Operator-only local helpers
 
@@ -520,6 +550,20 @@ writes. The query capacity fixture now traverses all100/1000 pages of its fixed
 capacity pass or evidence that an unfiltered100k-row export fits a workflow
 budget. Preserve unsuccessful and inconclusive capacity gates, never raise caps
 or replace complete evidence with a favorable first page.
+
+The capacity initial-sync helper checks the pool's actual host as well as the
+isolated environment and synthetic database name before starting work. It drains
+the sync orchestrator first, then waits for both child source services even when
+cleanup fails. Cleanup errors are aggregated without discarding the original
+sync or publication error.
+
+Independent capacity workloads use separate synthetic tenants, not separate
+principals, because saved inventory and user sources are tenant-owned. Their
+provider responses, reconciliation, selected reads, exports, and retention use
+the same workload tenant. Heartbeat receipts fail on reader or cleanup errors;
+concurrent readers share selection rotation and release their selections after
+stopping. These are fixture isolation and evidence rules, not runtime approval
+requirements.
 
 ## Production operations
 

@@ -23,7 +23,7 @@ export class UserSourceStages {
   async execute(input: BeginGeneration, work: (lease: GenerationLease, signal: AbortSignal) => Promise<void>,
     options: { signal?: AbortSignal; completeJob?: UserSourceCompletion; beforePublish: (signal: AbortSignal) => Promise<void>;
       beforeCommit?: () => void }) {
-    if (!["directory", "app_activity"].includes(input.scope.source) || input.scope.kind !== "principal"
+    if (!["directory", "app_activity"].includes(input.scope.source) || input.scope.kind !== "tenant"
       || input.scope.selector !== "complete" || input.schemaVersion !== 1
       || !["data_sync", "fixture"].includes(input.jobKind)) throw new Error("user_source_scope");
     const deadlineAt = input.deadlineAt.getTime();
@@ -58,6 +58,8 @@ export class UserSourceStages {
         fence(providerSignal);
         await work(lease, providerSignal);
         fence(providerSignal);
+        const retained = await this.preserveUnseen(lease, input.scope.source as UserSourceKind, () => fence(providerSignal));
+        fence(providerSignal);
         await this.validate(lease);
         fence(providerSignal);
         await options.beforePublish(providerSignal);
@@ -73,11 +75,12 @@ export class UserSourceStages {
           onCommitted: revision => { publishedResult = { generationId: lease.id, scopeId: lease.scopeId, revision, ...counts }; },
           completeJob: async (client, result) => {
             fence(providerSignal);
-            await client.query(`UPDATE user_source_attempts SET status='available',message=$2,
-              report_refresh_date=(SELECT min(report_refresh_date) FROM app_activity_rows WHERE generation_id=$1)
+            await client.query(`UPDATE user_source_attempts SET status='available',message=$2,retained_count=$3,
+              report_refresh_date=(SELECT min(report_refresh_date) FROM app_activity_rows WHERE generation_id=$1
+                AND NOT residual ? 'retainedObservedAt')
               WHERE generation_id=$1`, [lease.id, input.scope.source === "directory"
-              ? `Checked ${result.rows} directory users; this is not tenant headcount or basic Copilot Chat usage.`
-              : `Saved ${result.rows} Microsoft 365 Copilot ${activityPeriod} app activity rows.`]);
+              ? `Checked ${result.rows-retained} directory users; this is not tenant headcount or basic Copilot Chat usage.${retained ? ` Retained ${retained} previously saved unseen users with their original evidence.` : ""}`
+              : `Saved ${result.rows-retained} Microsoft 365 Copilot ${activityPeriod} app activity rows.${retained ? ` Retained ${retained} unseen rows with their original report dates.` : ""}`, retained]);
             fence(providerSignal);
             await options.completeJob?.(client, { ...result, source: input.scope.source as UserSourceKind, generationId: lease.id });
             fence(providerSignal);
@@ -111,6 +114,57 @@ export class UserSourceStages {
       }
       throw error;
     } finally { clearTimeout(timer); }
+  }
+
+  async preserveUnseen(lease: GenerationLease, source: UserSourceKind, fence: () => void): Promise<number> {
+    const previous = await this.guarded(lease, async client => (await client.query<{ id: string; observed_at: Date; actor_principal_id: string | null }>(`
+      SELECT g.id,g.observed_at,g.actor_principal_id FROM data_generation_heads h
+      JOIN data_generations g ON g.id=h.generation_id JOIN data_scope_epochs s ON s.id=h.scope_id
+      WHERE h.scope_id=$1 AND h.tenant_id=$2 AND g.state='published'
+        AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch`, [lease.scopeId, lease.tenantId])).rows[0]);
+    if (!previous) return 0;
+    const table = source === "directory" ? "directory_user_rows" : "app_activity_rows";
+    let after = "", retained = 0;
+    for (;;) {
+      fence();
+      const rows = await this.guarded(lease, async client => (await client.query<{ value: RecordKinds["directory"] | RecordKinds["activity"]; identity: string }>(`
+        WITH candidates AS MATERIALIZED (
+        SELECT old.identity,to_jsonb(old)-ARRAY['generation_id','scope_id','tenant_id','schema_version','content_hash'] AS value
+        FROM ${table} old WHERE old.generation_id=$1 AND old.identity COLLATE "C">$3
+          AND NOT EXISTS(SELECT 1 FROM ${table} incoming WHERE incoming.generation_id=$2
+            AND incoming.${source === "directory" ? "identity" : "upn_key"}=old.${source === "directory" ? "identity" : "upn_key"})
+        ORDER BY old.identity COLLATE "C" LIMIT 100), sized AS (
+          SELECT *,sum(octet_length(value::text)) OVER(ORDER BY identity COLLATE "C") AS bytes FROM candidates)
+        SELECT identity,value FROM sized WHERE bytes<=524288 ORDER BY identity COLLATE "C"`, [previous.id, lease.id, after])).rows);
+      if (!rows.length) break;
+      const records = rows.map(({ value, identity }) => ({ ...value,
+        identity: source === "directory" ? identity : `retained:${digest(`${previous.id}:${identity}`)}`,
+        residual: { ...value.residual, retainedObservedAt: value.residual.retainedObservedAt ?? previous.observed_at.toISOString(),
+          retainedCollectorPrincipalId: value.residual.retainedCollectorPrincipalId ?? previous.actor_principal_id } }));
+      if (source === "directory") {
+        await this.append(lease, "directory", records as RecordKinds["directory"][]);
+        let planAfter = "";
+        for (;;) {
+          fence();
+          const plans = await this.guarded(lease, async client => (await client.query<{ value: RecordKinds["plans"]; identity: string }>(`
+            WITH candidates AS MATERIALIZED (
+            SELECT identity,to_jsonb(plan)-ARRAY['generation_id','scope_id','tenant_id','schema_version','content_hash'] AS value
+            FROM directory_service_plan_rows plan WHERE generation_id=$1 AND user_id=ANY($2::text[])
+              AND identity COLLATE "C">$3 ORDER BY identity COLLATE "C" LIMIT 250), sized AS (
+                SELECT *,sum(octet_length(value::text)) OVER(ORDER BY identity COLLATE "C") AS bytes FROM candidates)
+            SELECT identity,value FROM sized WHERE bytes<=524288 ORDER BY identity COLLATE "C"`,
+          [previous.id, rows.map(row => row.identity), planAfter])).rows);
+          if (!plans.length) break;
+          await this.append(lease, "plans", plans.map(row => row.value));
+          planAfter = plans.at(-1)!.identity;
+        }
+      } else {
+        await this.append(lease, "activity", records as RecordKinds["activity"][]);
+      }
+      retained += records.length;
+      after = rows.at(-1)!.identity;
+    }
+    return retained;
   }
 
   private encoded(rows: readonly unknown[], values: readonly unknown[]) {
@@ -295,6 +349,7 @@ export class UserSourceStages {
     for (const row of rows) {
       if (!row || typeof row !== "object" || Array.isArray(row) || !row.residual
         || typeof row.residual !== "object" || Array.isArray(row.residual)
+        || Object.hasOwn(row.residual, "retainedObservedAt") || Object.hasOwn(row.residual, "retainedCollectorPrincipalId")
         || !["D28", "D30"].includes(row.period) || typeof row.upn_key !== "string" || !row.upn_key || row.upn_key.length > 512
         || row.upn_key !== row.upn_key.trim().toLowerCase() || /[\0\r\n\p{Cs}]/u.test(row.upn_key)
         || typeof row.identity !== "string" || !row.identity || row.identity.length > 512 || /[\0\r\n\p{Cs}]/u.test(row.identity)
@@ -373,7 +428,7 @@ export class UserSourceStages {
           AND NOT EXISTS(SELECT 1 FROM directory_user_rows d WHERE d.generation_id=$1 AND (d.identity=i.identity OR d.upn_key=i.identity))) AS unchecked,
         (SELECT count(DISTINCT report_refresh_date)>1 OR count(*)<>count(report_refresh_date)
           OR bool_or(period<>(SELECT report_period FROM user_source_attempts WHERE generation_id=$1))
-          FROM app_activity_rows WHERE generation_id=$1) AS dates,
+          FROM app_activity_rows WHERE generation_id=$1 AND NOT residual ? 'retainedObservedAt') AS dates,
         EXISTS(SELECT 1 FROM user_source_attempts a WHERE generation_id=$1 AND
           (a.source='directory' AND EXISTS(SELECT 1 FROM app_activity_rows WHERE generation_id=$1)
           OR a.source='app_activity' AND EXISTS(SELECT 1 FROM directory_user_rows WHERE generation_id=$1))) AS mixed`, [lease.id])).rows[0];

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import { NativeInventory } from "./nativeInventory.js";
@@ -21,6 +21,10 @@ beforeAll(async () => {
   inventory = new NativeInventory(fixture.runtime);
 });
 afterAll(async () => { await fixture?.close(); });
+beforeEach(() => {
+  scope.tenantId = randomUUID();
+  actor.tenantId = scope.tenantId;
+});
 
 async function seedInventory(principalId = scope.principalId, observedAt = new Date(), targetBotId = botId, targetEnvironmentId = environmentId) {
   const owner = { tenantId: scope.tenantId, principalId };
@@ -48,11 +52,13 @@ async function unqualifiedInput(action: QuarantineAction = "quarantine") {
 }
 
 describe.sequential("Copilot Studio quarantine repository", () => {
-  it("resolves only one current principal-scoped native environment and bot target", async () => {
+  it("shares one current tenant-native target between actors without exposing another tenant", async () => {
     const snapshotId = await seedInventory();
     const target = await inventory.resolveQuarantineTargets(scope, snapshotId, ["native-agent"]);
     expect(target).toMatchObject([{ resourceNativeId: "native-agent", environmentId, botId, inventoryQuarantineState: false }]);
     await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: "other" }, snapshotId, ["native-agent"]))
+      .resolves.toEqual(target);
+    await expect(inventory.resolveQuarantineTargets({ ...scope, tenantId: randomUUID() }, snapshotId, ["native-agent"]))
       .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
     await expect(inventory.resolveQuarantineTargets(scope, snapshotId, ["Canary agent"]))
       .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
@@ -60,17 +66,29 @@ describe.sequential("Copilot Studio quarantine repository", () => {
 
   it("rejects stale inventory and duplicate bulk selection", async () => {
     const staleSnapshot = await seedInventory("stale-operator", new Date(Date.now() - 25 * 60 * 60 * 1000));
-    await expect(inventory.resolveQuarantineTargets({ tenantId: "tenant-a", principalId: "stale-operator" }, staleSnapshot, ["native-agent"]))
+    await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: "stale-operator" }, staleSnapshot, ["native-agent"]))
       .rejects.toMatchObject({ code: "quarantine_inventory_stale" });
     const snapshotId = await seedInventory("duplicate-operator");
-    await expect(inventory.resolveQuarantineTargets({ tenantId: "tenant-a", principalId: "duplicate-operator" }, snapshotId, ["native-agent", "native-agent"]))
+    await expect(inventory.resolveQuarantineTargets({ ...scope, principalId: "duplicate-operator" }, snapshotId, ["native-agent", "native-agent"]))
       .rejects.toMatchObject({ code: "duplicate_target" });
+  });
+
+  it("rejects genuine shared native ambiguity instead of choosing another environment's target", async () => {
+    const saved = await nativeInventoryFixture(fixture.runtime, scope, [environmentId, randomUUID()].map(environment => ({
+      nativeId: "native-agent", environmentId: environment,
+      identifiers: [{ kind: "environment_id", value: environment }, { kind: "cds_bot_id", value: randomUUID() }],
+    })));
+    await reconcileInventoryFixture(fixture.runtime, scope);
+    for (const principalId of [scope.principalId, "another-reader"]) {
+      await expect(inventory.resolveQuarantineTargets({ ...scope, principalId }, saved.baselineId, ["native-agent"]))
+        .rejects.toMatchObject({ code: "quarantine_target_ambiguous" });
+    }
   });
 
   it("reuses direct observations across GUID casing aliases without changing source evidence", async () => {
     const sourceEnvironment = `Default-a${randomUUID().slice(1)}`.toUpperCase(), sourceBot = `b${randomUUID().slice(1)}`.toUpperCase();
     const snapshotId = await seedInventory("status-operator", new Date(), sourceBot, sourceEnvironment);
-    const statusScope = { tenantId: "tenant-a", principalId: "status-operator" };
+    const statusScope = { ...scope, principalId: "status-operator" };
     const target = (await inventory.resolveQuarantineTargets(statusScope, snapshotId, ["native-agent"]))[0];
     expect(await repository.latestObservation(statusScope, target)).toBeUndefined();
     const status = { ...frozen(target).directStatus, environmentId: sourceEnvironment.toLowerCase(), botId: sourceBot.toLowerCase() };
@@ -116,7 +134,8 @@ describe.sequential("Copilot Studio quarantine repository", () => {
   });
 
   it("recovers a sent item as inconclusive and blocks new work until GET reconciliation", async () => {
-    const existing = (await repository.list(scope)).value.find(job => job.status === "queued")!;
+    const { scope, input } = await unqualifiedInput();
+    const existing = await repository.submit(scope, input);
     const lease = await repository.claim(scope, existing.id, "44444444-4444-4444-8444-444444444444");
     const current = await repository.beginItem(lease!);
     await repository.markSent(lease!, current!.item, authority);
@@ -124,8 +143,8 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     expect(await repository.recoverInterrupted(scope.tenantId)).toBeGreaterThan(0);
     expect(await repository.get(scope, existing.id)).toMatchObject({ status: "inconclusive", canReconcile: true });
 
-    const snapshotId = await seedInventory("blocked-operator");
-    const blockedScope = { tenantId: "tenant-a", principalId: "blocked-operator" };
+    const snapshotId = await seedInventory("blocked-operator", new Date(), input.targets[0].botId, input.targets[0].environmentId);
+    const blockedScope = { ...scope, principalId: "blocked-operator" };
     const inventoryTarget = (await inventory.resolveQuarantineTargets(blockedScope, snapshotId, ["native-agent"]))[0];
     const blockedActor = { ...actor, homeAccountId: "blocked-operator" };
     const base = { action: "quarantine" as const, targets: [frozen(inventoryTarget)], actor: blockedActor, authority, requestPath: "/api/quarantine/jobs" };
@@ -134,18 +153,70 @@ describe.sequential("Copilot Studio quarantine repository", () => {
       .rejects.toMatchObject({ code: "quarantine_reconciliation_required" });
   });
 
+  it.each([false, true])("recovers cancelled active work without replay (sent=%s)", async sent => {
+    const submitted = await unqualifiedInput();
+    const job = await repository.submit(submitted.scope, submitted.input);
+    const lease = (await repository.claim(submitted.scope, job.id, randomUUID()))!;
+    const current = (await repository.beginItem(lease))!;
+    if (sent) await repository.markSent(lease, current.item, authority);
+
+    expect(await repository.cancel(submitted.scope, job.id)).toMatchObject({ status: "running", canResume: false });
+    await fixture.operator.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
+    expect(await repository.recoverJob(submitted.scope, job.id)).toBe(1);
+    expect(await repository.get(submitted.scope, job.id)).toMatchObject({
+      status: sent ? "inconclusive" : "cancelled", canResume: false, canReconcile: sent,
+      results: [expect.objectContaining({ status: sent ? "inconclusive" : "cancelled",
+        reconciliationStatus: sent ? "required" : "not_required" })],
+    });
+  });
+
+  it.each(["before", "during"] as const)("keeps active work recoverable when reconciliation runs %s the next item", async timing => {
+    const owner = { ...scope, principalId: randomUUID() };
+    const agents = [0, 1].map(index => ({
+      nativeId: `native-agent-${index}`, environmentId, botId: randomUUID(),
+    }));
+    const root = await nativeInventoryFixture(fixture.runtime, owner, agents.map(agent => ({
+      nativeId: agent.nativeId, environmentId: agent.environmentId, displayName: agent.nativeId,
+      identifiers: [{ kind: "environment_id", value: agent.environmentId }, { kind: "cds_bot_id", value: agent.botId }],
+    })));
+    await reconcileInventoryFixture(fixture.runtime, owner);
+    const targets = (await inventory.resolveQuarantineTargets(owner, root.baselineId, agents.map(agent => agent.nativeId))).map(target => frozen(target));
+    const base = { action: "quarantine" as const, targets, actor: { ...actor, homeAccountId: owner.principalId },
+      authority, requestPath: "/api/quarantine/jobs" };
+    const job = await repository.submit(owner, { ...base, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(base).confirmationHash });
+    const lease = (await repository.claim(owner, job.id, randomUUID()))!;
+    const first = (await repository.beginItem(lease))!;
+    await repository.markSent(lease, first.item, authority);
+    await repository.finishItem(lease, first.item, "inconclusive");
+    const second = timing === "during" ? (await repository.beginItem(lease))! : undefined;
+    await repository.recordReconciliation(owner, first.job, first.item, "verified_applied", {
+      environmentId: first.item.environment_id, botId: first.item.bot_id, isBotQuarantined: true,
+      lastUpdateTimeUtc: "2026-09-09T19:00:01Z", observedAt: new Date().toISOString(), correlationId: randomUUID(),
+    }, "Provider GET confirmed the first item.");
+    const active = second ?? (await repository.beginItem(lease))!;
+    await repository.markSent(lease, active.item, authority);
+
+    expect(await repository.get(owner, job.id)).toMatchObject({ status: "running", succeeded: 1, canResume: false });
+    await fixture.operator.query("UPDATE copilot_quarantine_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
+    expect(await repository.recoverJob(owner, job.id)).toBe(1);
+    expect(await repository.get(owner, job.id)).toMatchObject({
+      status: "inconclusive", succeeded: 1, inconclusive: 1, canReconcile: true,
+    });
+  });
+
   it("blocks native GUID casing aliases at both submission and final dispatch after an uncertain write", async () => {
     const upperEnvironment = `a${randomUUID().slice(1)}`.toUpperCase(), upperBot = `b${randomUUID().slice(1)}`.toUpperCase();
-    async function request(principalId: string, environment: string, bot: string) {
+    async function request(principalId: string, environment: string, bot: string, existingSnapshotId?: string) {
       const owner = { ...scope, principalId };
-      const snapshotId = await seedInventory(principalId, new Date(), bot, environment);
-      const target = frozen((await inventory.resolveQuarantineTargets(owner, snapshotId, ["native-agent"]))[0]);
+      const snapshotId = existingSnapshotId ?? await seedInventory(principalId, new Date(), bot, environment);
+      const saved = (await inventory.resolveQuarantineTargets(owner, snapshotId, ["native-agent"]))[0];
+      const target = frozen({ ...saved, environmentId: environment, botId: bot });
       const base = { action: "quarantine" as const, targets: [target], actor: { ...actor, homeAccountId: principalId },
         authority, requestPath: "/api/quarantine/jobs" };
-      return { owner, input: { ...base, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(base).confirmationHash } };
+      return { owner, snapshotId, input: { ...base, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(base).confirmationHash } };
     }
     const original = await request(randomUUID(), upperEnvironment, upperBot);
-    const alias = await request(randomUUID(), upperEnvironment.toLowerCase(), upperBot.toLowerCase());
+    const alias = await request(randomUUID(), upperEnvironment.toLowerCase(), upperBot.toLowerCase(), original.snapshotId);
     const originalJob = await repository.submit(original.owner, original.input);
     const queuedAlias = await repository.submit(alias.owner, alias.input);
     const originalLease = (await repository.claim(original.owner, originalJob.id, randomUUID()))!;
@@ -168,17 +239,21 @@ describe.sequential("Copilot Studio quarantine repository", () => {
   });
 
   it("lists bounded tenant audit events without credentials or provider response bodies", async () => {
+    const snapshotId = await seedInventory();
+    const target = frozen((await inventory.resolveQuarantineTargets(scope, snapshotId, ["native-agent"]))[0]);
+    const base = { action: "quarantine" as const, targets: [target], actor, authority, requestPath: "/api/quarantine/jobs" };
+    await repository.submit(scope, { ...base, idempotencyKey: randomUUID(), confirmationHash: createQuarantineConfirmation(base).confirmationHash });
     const audit = await repository.listAudit(scope, 10);
     expect(audit.value.length).toBeGreaterThan(0);
     expect(audit.value[0]).toMatchObject({ actor: { username: expect.stringMatching(/@example\.invalid$/) }, target: { environmentId, botId }, requestedState: true });
     expect(JSON.stringify(audit)).not.toMatch(/ephemeral-token|Bearer|accessToken|private-provider-response/);
-    expect((await repository.listAudit({ tenantId: "tenant-a", principalId: "other-principal" }, 10)).value).toEqual([]);
+    expect((await repository.listAudit({ ...scope, principalId: "other-principal" }, 10)).value).toEqual([]);
   });
 
   it("moves only unclaimed queued work to explicit authorization wait during process-start recovery", async () => {
     const startupBotId = "55555555-5555-4555-8555-555555555555";
     const snapshotId = await seedInventory("startup-operator", new Date(), startupBotId);
-    const startupScope = { tenantId: "tenant-a", principalId: "startup-operator" };
+    const startupScope = { ...scope, principalId: "startup-operator" };
     const target = frozen((await inventory.resolveQuarantineTargets(startupScope, snapshotId, ["native-agent"]))[0]);
     const base = { action: "quarantine" as const, targets: [target], actor: { ...actor, homeAccountId: startupScope.principalId }, authority, requestPath: "/api/quarantine/jobs" };
     const confirmation = createQuarantineConfirmation(base);

@@ -100,6 +100,9 @@ export class PackageInventoryService {
     const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId(user.tenantId!));
     const collectionKey = detailCollectionKey(scope);
     const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    signal?.throwIfAborted();
+    assertAccountSessionValidation(validation);
+    if (!this.draining) await inventoryRuntime(this.repository.database).enqueue(scope, true, signal);
     const validateCapability = this.dependencies.beginOperationValidation("graph.package.read.delegated", user);
     if (this.detailCancelledAt.has(collectionKey)) {
       signal?.throwIfAborted();
@@ -609,8 +612,8 @@ export class PackageInventoryService {
       if (committed) {
         diagnostics.finish("collected");
         try {
-          if (current.tokenMode === "delegated") await currentPackageWork(
-            followupSignal => inventoryRuntime(this.repository.database).enqueue(scope, true, followupSignal), signal, assertCurrent);
+          await currentPackageWork(
+            followupSignal => inventoryRuntime(this.repository.database).enqueue(actor, true, followupSignal), signal, assertCurrent);
         } catch (error) {
           operationalLog("warn", "package_inventory_followup_failed", { stage: "canonical_reconciliation", ...graphErrorTelemetry(error) });
         }

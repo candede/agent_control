@@ -172,7 +172,7 @@ describe("source-qualified inventory record bounds", () => {
       const response = await request("POST", `/${resource}/selections`, { query: { recordId } });
       expect(response.status, JSON.stringify(response.body)).toBe(201);
       expect(InventoryQueries.prototype.capture).toHaveBeenLastCalledWith(identity, "inventory-scope",
-        expect.objectContaining({ recordId }), ...(resource === "agents" ? ["delegated"] : []));
+        expect.objectContaining({ recordId }));
     }
   });
 

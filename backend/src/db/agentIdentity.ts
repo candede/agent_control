@@ -21,7 +21,8 @@ export type AgentIdentityCacheState = (
 ) & { checkedAt?: string; expiresAt?: string; lastErrorCode?: string };
 export type AgentIdentityFailure = { status: Exclude<AgentIdentityResolutionOutcome, "resolved">; code: string };
 
-const sourceWhere = `membership.tenant_id=$1 AND membership.principal_id=$2 AND membership.source='power_platform'
+const sourceWhere = `membership.tenant_id=$1 AND $2::text IS NOT NULL AND membership.source='power_platform'
+  AND membership.authority_expires_at>clock_timestamp()
   AND resource.generation_id=$3 AND membership.agent_id=substr($7,7)
   AND resource.native_id=$4 AND resource.environment_id=$5 AND resource.resource_type='microsoft.copilotstudio/agents'
   AND resource.residual->>'agentKind'='copilot_studio_agent'
@@ -35,7 +36,8 @@ const sourceWhere = `membership.tenant_id=$1 AND membership.principal_id=$2 AND 
     AND identifier.payload->>'kind'='entra_agent_id' AND lower(identifier.value) IS DISTINCT FROM $6)
   AND NOT EXISTS(SELECT 1 FROM inventory_live_sources other JOIN inventory_facts identifier
     ON identifier.generation_id=other.source_generation_id AND identifier.identity=other.source_identity
-    WHERE other.tenant_id=$1 AND other.principal_id=$2 AND other.source='power_platform'
+    WHERE other.tenant_id=$1 AND other.source='power_platform'
+      AND other.authority_expires_at>clock_timestamp()
       AND other.agent_id<>membership.agent_id AND identifier.kind='identifier'
       AND identifier.payload->>'kind'='entra_agent_id'
       AND md5(lower(identifier.value))=md5($6) AND lower(identifier.value)=$6)`;
@@ -56,7 +58,7 @@ export class AgentIdentityRepository {
     }>(`
       SELECT cache.candidate_id,cache.application_id,cache.checked_at,cache.expires_at,
         cache.expires_at>clock_timestamp() AS fresh,cache.outcome,cache.runtime_status,cache.last_error_code,cache.runtime_provenance ${sourceJoin}
-      JOIN agent_identity_cache cache ON cache.tenant_id=membership.tenant_id AND cache.principal_id=membership.principal_id
+      JOIN agent_identity_cache cache ON cache.tenant_id=membership.tenant_id AND cache.principal_id=$2
         AND cache.snapshot_id=resource.generation_id AND cache.native_id=resource.native_id AND cache.environment_id=resource.environment_id
       WHERE ${sourceWhere} AND cache.candidate_id=$6::uuid AND cache.record_id=$7 AND cache.source_revision=$8`,
     [...parameters, source.recordId, source.sourceRevision]);
@@ -110,7 +112,7 @@ export class AgentIdentityRepository {
     const parameters = sourceParameters(scope, source);
     return dataConnections(this.database).run(async client => {
       await client.query("SET LOCAL lock_timeout='3s'; SET LOCAL statement_timeout='5s'");
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`agent-identity:${scope.tenantId}`]);
       await fence();
       const current = await client.query(`SELECT snapshot.id,membership.source_scope_id,membership.canonical_scope_id

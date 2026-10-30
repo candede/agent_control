@@ -16,7 +16,7 @@ function emptyInventory(): UnifiedAgentInventoryPage {
     identityCollection: { checkedPackages: 0, pendingPackages: 0 },
     sources: {
       graphPackages: { state: "available", observation: {
-        id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, tokenMode: "delegated", scopeKind: "broad",
+        id: "graph-snapshot", snapshotId: "graph-snapshot", current: true, scopeKind: "broad",
         observedAt: "2026-09-16T15:14:20Z", expiresAt: "2026-09-23T15:14:20Z", observedCount: 0, totalRecords: 0,
       }, error: null },
       powerPlatform: { state: "available", observation: {

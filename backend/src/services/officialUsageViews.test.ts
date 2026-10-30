@@ -49,11 +49,11 @@ async function publish(identity: SelectionIdentity, rows = baseline()) {
   return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
 }
 async function users(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50) {
-  const selection = await reports.capture(identity, "delegated", "official_users", query);
+  const selection = await reports.capture(identity, "official_users", query);
   return reports.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportUser>>;
 }
 async function agents(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50) {
-  const selection = await reports.capture(identity, "delegated", "official_agents", query);
+  const selection = await reports.capture(identity, "official_agents", query);
   return reports.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportAgent>>;
 }
 async function relationships(identity: SelectionIdentity, selectionId: string, child: string, limit = 50, childQuery?: ReportQuery) {
@@ -71,7 +71,7 @@ function directoryUser(index: number, upn: string, state: CopilotServiceSummaryS
 }
 async function directory(identity: SelectionIdentity, rows: CopilotDirectoryUser[]) {
   const stages = new UserSourceStages(fixture.runtime);
-  return stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }), async lease => {
+  return stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }), async lease => {
     const key = await stages.query(lease, "discovery", "synthetic:native-view-directory");
     await stages.page(lease, key, "synthetic:native-view-directory", rows.length, rows.length);
     for (let start = 0; start < rows.length; start += 250) await stages.directory(lease, key, rows.slice(start, start + 250));
@@ -83,7 +83,7 @@ describe("native report row semantics and exact children", () => {
   it.each(["official_users", "official_agents"] as const)("preserves the disjoint 50k plus 50k %s union without materializing a tenant", async endpoint => {
     const settingsSql = "SELECT current_setting('enable_nestloop') AS nested,current_setting('enable_mergejoin') AS merge,current_setting('jit') AS jit";
     const settings = (await fixture.runtime.query(settingsSql)).rows;
-    const selection = await reports.capture(unionIdentity, "delegated", endpoint, { setId: unionSet });
+    const selection = await reports.capture(unionIdentity, endpoint, { setId: unionSet });
     await reports.read(selection.id, unionIdentity, async (client, context) => {
       const first = await reports.pageInRead(client, context, { limit: 50 });
       expect(first.counts).toEqual({ total: 100000, filtered: 100000 }); expect(first.value).toHaveLength(50);
@@ -164,7 +164,7 @@ describe("native report row semantics and exact children", () => {
       const identity = owner(); await directory(identity, [directoryUser(1, "person@example.invalid", "enabled")]);
       if (evidence !== "absent") await publish(identity, { agents: [], users: [],
         userAgents: evidence === "unresolved" ? ["agent,Agent,Custom,unresolved,1,"] : [] });
-      const selected = await reports.capture(identity, "delegated", "copilot_users");
+      const selected = await reports.capture(identity, "copilot_users");
       expect((await reports.page(selected.id, identity)).value).toMatchObject([{ agentActivityState: state }]);
     });
   it("preserves case-distinct pseudonyms, full Users totals and separately paged report-only relationships", async () => {
@@ -350,16 +350,21 @@ describe("native current licensing and organization evidence", () => {
       expect(page.summary).toMatchObject({ paidActiveReportUsers: ["enabled", "warning", "partially_enabled"].includes(state) ? 1 : 0,
         activeWithoutPaidUsers: ["disabled", "suspended", "locked_out"].includes(state) ? 1 : 0, unknownLicenseActiveReportUsers: state === "unknown" ? 1 : 0 });
     });
-  it("does not leak unpaid licensing across principals or infer an object identity from display names", async () => {
+  it("shares saved licensing across tenant actors without guessing identities from display names or another tenant", async () => {
     const identity = owner();
     await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,4,"] });
     await directory(identity, [directoryUser(1, "person@example.invalid", "disabled", "Private", "Private")]);
     const other = { ...identity, principalId: "different-reader" }, page = await users(other, { licenseCohort: "active_without_paid" });
-    expect(page.value).toEqual([]); expect(page.sources.directory.state).toBe("unavailable");
-    expect(page.summary.activeWithoutPaidUsers).toBeNull();
-    expect((await users(other)).value).toMatchObject([{ username: "person@example.invalid", objectId: null, company: null, department: null }]);
+    expect(page.value).toMatchObject([{ username: "person@example.invalid", company: "Private", department: "Private" }]);
+    expect(page.sources.directory.state).toBe("available");
+    expect(page.summary.activeWithoutPaidUsers).toBe(1);
     await directory(other, [{ ...directoryUser(2, "unrelated@example.invalid"), identity: { ...directoryUser(2, "unrelated@example.invalid").identity, displayName: "person@example.invalid" } }]);
-    expect((await users(other, { licenseCohort: "active_without_paid" })).value).toEqual([]);
+    expect((await users(other, { licenseCohort: "active_without_paid" })).value).toMatchObject([{ username: "person@example.invalid", company: "Private" }]);
+    const foreign = owner();
+    await publish(foreign, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,4,"] });
+    await directory(foreign, [{ ...directoryUser(2, "unrelated@example.invalid"),
+      identity: { ...directoryUser(2, "unrelated@example.invalid").identity, displayName: "person@example.invalid" } }]);
+    expect((await users(foreign)).value).toMatchObject([{ username: "person@example.invalid", objectId: null, company: null, department: null }]);
   });
   it.each(["report", "directory"] as const)("preserves %s ambiguity instead of calling it verified unpaid", async ambiguity => {
     const identity = owner(), first = directoryUser(1, "case@example.invalid"), second = directoryUser(2, "CASE@example.invalid");
@@ -395,7 +400,7 @@ describe("native current licensing and organization evidence", () => {
     expect((await users(identity, { licenseCohort: "active_without_paid", company: "Tail company", department: "Tail department", search: "person-500" }, 1)).value)
       .toMatchObject([{ username: "person-500@example.invalid" }]);
   });
-  it("preserves pinned metadata and excludes failed latest-attempt licensing on new captures without erasing reports", async () => {
+  it("preserves pinned metadata and usable saved licensing on new captures after a failed attempt", async () => {
     const identity = owner();
     await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,1,"] });
     await directory(identity, [directoryUser(1, "person@example.invalid")]);
@@ -403,15 +408,16 @@ describe("native current licensing and organization evidence", () => {
     expect(prior.counts.filtered).toBe(1);
     expect(prior.summary.unknownLicenseActiveReportUsers).toBe(0);
     const stages = new UserSourceStages(fixture.runtime);
-    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }),
       async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
     const reread = await reports.page(prior.selection.id, identity);
     expect(Date.parse(reread.selection.validatedAt)).toBeGreaterThanOrEqual(Date.parse(prior.selection.validatedAt));
     expect(reread).toEqual({ ...prior, selection: { ...prior.selection, validatedAt: reread.selection.validatedAt } });
     const page = await users(identity, { licenseCohort: "active_without_paid" });
-    expect(page.value).toEqual([]); expect(page.sources.directory).toMatchObject({ state: "partial", attemptStatus: "failed" });
-    expect(page.summary).toMatchObject({ activeWithoutPaidUsers: null, paidActiveReportUsers: null, unknownLicenseActiveReportUsers: 1 });
-    expect((await reports.facets(page.selection.id, identity, { field: "company" })).value).toEqual([]);
+    expect(page.value).toMatchObject([{ username: "person@example.invalid", entitlement: "no_paid" }]);
+    expect(page.sources.directory).toMatchObject({ state: "partial", attemptStatus: "failed" });
+    expect(page.summary).toMatchObject({ activeWithoutPaidUsers: 1, paidActiveReportUsers: 0, unknownLicenseActiveReportUsers: 0 });
+    expect((await reports.facets(page.selection.id, identity, { field: "company" })).value).toEqual([{ value: null, count: 1 }]);
     expect((await users(identity)).value).toMatchObject([{ username: "person@example.invalid", reportedResponses: 1 }]);
   });
 });
@@ -483,19 +489,19 @@ describe("bounded native user CSV relationship batches", () => {
     }
     expect(seen.size).toBe(350);
   });
-  it("does not serialize failed latest-attempt licensing as a verified unpaid verdict", async () => {
+  it("keeps the last saved licensing verdict readable when a later collection fails", async () => {
     const identity = owner();
     await publish(identity, { agents: [], userAgents: [], users: ["person@example.invalid,Person,1,1,"] });
     await directory(identity, [directoryUser(1, "person@example.invalid")]);
     const stages = new UserSourceStages(fixture.runtime);
-    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId, principalId: identity.principalId } }),
+    await expect(stages.execute(generationInput({ scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }),
       async () => { throw new Error("synthetic directory failure"); }, { beforePublish: async () => {} })).rejects.toThrow("synthetic directory failure");
     const page = await users(identity);
     expect(page.sources.directory.state).toBe("partial");
     const { exports, job } = await build(identity, page.selection.id);
     let count = 0;
     for await (const row of download(identity, exports, job)) {
-      expect(row).toMatchObject({ username: "person@example.invalid", entitlement: "unknown", licenseAssignmentStatus: "unavailable" });
+      expect(row).toMatchObject({ username: "person@example.invalid", entitlement: "no_paid", licenseAssignmentStatus: "no_active_paid_license" });
       count++;
     }
     expect(count).toBe(1);

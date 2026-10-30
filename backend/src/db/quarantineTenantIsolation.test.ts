@@ -12,6 +12,7 @@ let inventory: NativeInventory;
 const environmentId = "11111111-1111-4111-8111-111111111111";
 const botId = "22222222-2222-4222-8222-222222222222";
 const authority = { contractRevision: "a".repeat(64), permissionRevision: "b".repeat(64), configurationRevision: 1 };
+const tenantInventories = new Map<string, Promise<string>>();
 
 beforeAll(async () => {
   fixture = await testDatabase();
@@ -38,9 +39,16 @@ async function running(scope: QuarantineScope) {
       { kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: botId }],
     provenance: {}, details: { isQuarantined: false },
   };
-  const saved = await nativeInventoryFixture(fixture.runtime, scope, [resource]);
-  await reconcileInventoryFixture(fixture.runtime, scope);
-  const target = (await inventory.resolveQuarantineTargets(scope, saved.baselineId, [resource.nativeId]))[0];
+  let publication = tenantInventories.get(scope.tenantId);
+  if (!publication) {
+    publication = (async () => {
+      const saved = await nativeInventoryFixture(fixture.runtime, scope, [resource]);
+      await reconcileInventoryFixture(fixture.runtime, scope);
+      return saved.baselineId;
+    })();
+    tenantInventories.set(scope.tenantId, publication);
+  }
+  const target = (await inventory.resolveQuarantineTargets(scope, await publication, [resource.nativeId]))[0];
   const directStatus = { environmentId, botId, isBotQuarantined: false, lastUpdateTimeUtc: "2026-09-01T00:00:00Z",
     observedAt: new Date().toISOString(), correlationId: randomUUID() };
   const input = {

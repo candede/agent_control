@@ -42,7 +42,7 @@ describe("inventory dashboard exact report context", () => {
       summary: totals, scopeSummary: totals,
       verification: createUnifiedVerification({ graphPackageCount: 2000, powerPlatformAgentCount: 0, logicalAgentCount: 2000 }, { sourceScopes: false }),
       sources: { ...inventory.sources, graphPackages: { state: "available", observation: {
-        id: "catalog", snapshotId: "catalog", current: true, tokenMode: "delegated", scopeKind: "broad",
+        id: "catalog", snapshotId: "catalog", current: true, scopeKind: "broad",
         observedAt: "2026-09-20T12:00:00.000Z", expiresAt: "2030-01-01T00:00:00.000Z", observedCount: 2000, totalRecords: 2000,
       }, error: null } },
       inventoryOverview: { availableToUsers: 1250, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 1250 },

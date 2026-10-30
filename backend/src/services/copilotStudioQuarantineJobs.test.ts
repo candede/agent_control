@@ -263,12 +263,12 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     expect(await repository.isQualified(value, authority, [frozen])).toBe(false);
   });
 
-  it("denies egress when the frozen target is absent from current private inventory", async () => {
+  it("denies egress when the frozen target is absent from current tenant inventory", async () => {
     const value = scope();
     const job = await submitted(value);
     await fixture.operator.query(`UPDATE inventory_roots root SET current=false FROM data_scope_epochs scope
-      WHERE root.scope_id=scope.id AND scope.tenant_id=$1 AND scope.principal_id=$2 AND root.domain='power_platform'`,
-    [value.tenantId, value.principalId]);
+      WHERE root.scope_id=scope.id AND scope.tenant_id=$1 AND scope.scope_kind='tenant' AND root.domain='power_platform'`,
+    [value.tenantId]);
     const provider = { getStatus: vi.fn(async () => status(false)), setQuarantine: vi.fn(async () => status(true)) };
     await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
     expect(provider.getStatus).not.toHaveBeenCalled();
@@ -375,8 +375,8 @@ describe.sequential("durable Copilot Studio quarantine execution", () => {
     const provider = { getStatus: vi.fn(async () => status(false)), setQuarantine: vi.fn(async () => { throw new Error("connection lost"); }) };
     await runCopilotStudioQuarantineJob(job.id, value, false, repository, provider, authorize);
     await fixture.operator.query(`UPDATE inventory_roots root SET current=false FROM data_scope_epochs scope
-      WHERE root.scope_id=scope.id AND scope.tenant_id=$1 AND scope.principal_id=$2 AND root.domain='power_platform'`,
-    [value.tenantId, value.principalId]);
+      WHERE root.scope_id=scope.id AND scope.tenant_id=$1 AND scope.scope_kind='tenant' AND root.domain='power_platform'`,
+    [value.tenantId]);
     const reconcileProvider = { getStatus: vi.fn(async () => status(false)) };
     const result = await reconcileCopilotStudioQuarantineJob(job.id, value, repository, reconcileProvider, authorize);
     expect(reconcileProvider.getStatus).not.toHaveBeenCalled();

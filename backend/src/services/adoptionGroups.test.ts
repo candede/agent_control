@@ -30,7 +30,8 @@ describe("read-only adoption groups", () => {
   async function setup(users: CopilotDirectoryUser[]) {
     const identity = { ...selectionIdentity, tenantId: randomUUID(), principalId: randomUUID() };
     const stages = new UserSourceStages(fixture.runtime);
-    const saveUsers = (users: CopilotDirectoryUser[]) => stages.execute(generationInput({ scope: { ...generationInput().scope, ...identity } }), async lease => {
+    const saveUsers = (users: CopilotDirectoryUser[]) => stages.execute(generationInput({
+      scope: { ...generationInput().scope, tenantId: identity.tenantId }, actorPrincipalId: identity.principalId }), async lease => {
       const key = await stages.query(lease, "discovery", "synthetic:adoption");
       await stages.page(lease, key, "synthetic:adoption", users.length, users.length);
       for (let offset = 0; offset < users.length; offset += 250) await stages.directory(lease, key, users.slice(offset, offset + 250));
@@ -39,7 +40,7 @@ describe("read-only adoption groups", () => {
     await saveUsers(users);
     const reader = new LargeTenantUsersReports(fixture.runtime, secret, 7);
     const read = async (query: ReportQuery = {}, limit = 5) => {
-      const selection = await reader.capture(identity, "delegated", "adoption", query);
+      const selection = await reader.capture(identity, "adoption", query);
       return reader.read(selection.id, identity, (client, context) => readAdoptionGroups(client, reader, context, { limit }));
     };
     return { identity, reader, read, saveUsers };
@@ -56,7 +57,7 @@ describe("read-only adoption groups", () => {
   it("rejects the bounded group-row sentinel instead of extracting an unbounded cohort or returning a partial success", async () => {
     const { identity, reader, read } = await setup(Array.from({ length: 16_385 }, (_, index) => user(index + 1)));
     await expect(read()).rejects.toMatchObject({ status: 413, code: "adoption_page_too_large" });
-    const selection = await reader.capture(identity, "delegated", "adoption_departments");
+    const selection = await reader.capture(identity, "adoption_departments");
     const departments = await reader.read(selection.id, identity, (client, context) =>
       readAdoptionDepartments(client, reader, context, { limit: 8 }));
     expect(departments.value).toMatchObject([{ company: "Contoso", department: "HR", people: 16_385, activePeople: null }]);
@@ -85,7 +86,7 @@ describe("read-only adoption groups", () => {
     expect((await read({ search: "\u01f0" })).counts.filtered).toBe(2);
     expect((await read({ company: "\u01f0", department: "\u01f0" })).counts.filtered).toBe(1);
     expect((await read({ company: "J\u030c", department: "J\u030c" })).counts.filtered).toBe(1);
-    const selected = await reader.capture(identity, "delegated", "adoption");
+    const selected = await reader.capture(identity, "adoption");
     expect((await reader.facets(selected.id, identity, { field: "company", search: "\u01f0" })).value)
       .toEqual([{ value: "J\u030c", count: 2 }]);
     expect((await reader.facets(selected.id, identity, { field: "department", search: "\u01f0" })).value)
@@ -154,18 +155,18 @@ describe("read-only adoption groups", () => {
         `Microsoft,Microsoft,Microsoft,user1@example.invalid,10,${today}`,
         `B,B,Your org,user2@example.invalid,10,${today}`],
     });
-    const selection = await reader.capture(identity, "delegated", "adoption", { adoptionAgents: "with" });
+    const selection = await reader.capture(identity, "adoption", { adoptionAgents: "with" });
     const page = (cursor?: string) => reader.read(selection.id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 1, cursor }));
     const first = await page();
     expect(first.summary).toEqual({ people: 2, champs: 2, agents: 3 });
-    await fixture.operator.query(`UPDATE inventory_reconciliation SET status=$3,
-      pending_inputs=CASE WHEN $3='idle' THEN published_inputs ELSE NULL END,
+    await fixture.operator.query(`UPDATE inventory_reconciliation SET status=$2,
+      pending_inputs=CASE WHEN $2='idle' THEN published_inputs ELSE NULL END,
       pending_deadline=clock_timestamp()+interval '30 minutes'
-      WHERE tenant_id=$1 AND scope_id IN (SELECT id FROM data_scope_epochs WHERE principal_id=$2)`,
-    [identity.tenantId, identity.principalId, state === "pending" ? "idle" : "running"]);
+      WHERE tenant_id=$1`,
+    [identity.tenantId, state === "pending" ? "idle" : "running"]);
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_live_sources
-      WHERE tenant_id=$1 AND principal_id=$2`, [identity.tenantId, identity.principalId])).rows[0].count).toBe(0);
+      WHERE tenant_id=$1`, [identity.tenantId])).rows[0].count).toBe(0);
     expect(await page()).toEqual(expect.objectContaining({
       value: first.value, counts: first.counts, summary: first.summary,
     }));
@@ -179,13 +180,13 @@ describe("read-only adoption groups", () => {
     expect(fresh.value.map(group => group.agents)).toEqual([first.value[0].agents, second.value[0].agents]);
     expect(fresh.value[0].people[0]).toMatchObject({ agents: 2, responses: 20 });
     expect((await read({ adoptionAgents: "without" })).counts.filtered).toBe(0);
-    const users = await reader.capture(identity, "delegated", "copilot_users");
+    const users = await reader.capture(identity, "copilot_users");
     const modal = await reader.page(users.id, identity, { limit: 10, endpoint: "relationships", child: user(1).identity.objectId });
     expect(modal.counts.filtered).toBe(2);
   });
   it("automatically captures published usage without inventory and freezes old report selections", async () => {
     const { identity, reader, read } = await setup([user(1)]);
-    const beforeUsage = await reader.capture(identity, "delegated", "adoption");
+    const beforeUsage = await reader.capture(identity, "adoption");
     const page = (id: string) => reader.read(id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 5 }));
     const today = new Date().toISOString().slice(0, 10);
@@ -194,7 +195,7 @@ describe("read-only adoption groups", () => {
       agents: [], userAgents: [`Report-only,Reported assistant,Microsoft,user1@example.invalid,10,${today}`],
     });
     expect(await page(beforeUsage.id)).toMatchObject({ summary: { agents: null } });
-    const populated = await reader.capture(identity, "delegated", "adoption");
+    const populated = await reader.capture(identity, "adoption");
     const saved = await page(populated.id);
     expect(saved).toMatchObject({ summary: { agents: 1 }, value: [{
       agents: [{ id: "report:Report-only", name: "Reported assistant", inventoryId: null, creatorType: "Microsoft" }],
@@ -221,7 +222,7 @@ describe("read-only adoption groups", () => {
     const { identity, reader } = await setup([user(1)]);
     await saveUsageInventory(fixture.runtime, identity, []);
     await publish(identity, { users: [], agents: [], userAgents: [] });
-    const capture = () => reader.capture(identity, "delegated", "adoption");
+    const capture = () => reader.capture(identity, "adoption");
     const page = (id: string, who = identity) => reader.read(id, who,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 5 }));
     const changed = await capture();
@@ -245,22 +246,23 @@ describe("read-only adoption groups", () => {
       agents: [`Retained,Retained,Your org,1,0,10,${today}`],
       userAgents: [`Retained,Retained,Your org,user1@example.invalid,10,${today}`],
     });
-    const old = await reader.capture(identity, "delegated", "adoption");
+    const old = await reader.capture(identity, "adoption");
     await revokeAccountSessions(fixture.runtime, identity.tenantId, identity.principalId);
     const generations = new DataGenerations(fixture.runtime);
     const renewed = { ...identity, sessionEpoch: await generations.sessionEpoch(identity.tenantId, identity.principalId) };
     await expect(reader.read(old.id, identity, (client, context) => readAdoptionSummary(client, reader, context)))
       .rejects.toMatchObject({ code: "selection_invalidated" });
-    const selected = await reader.capture(renewed, "delegated", "adoption");
+    const selected = await reader.capture(renewed, "adoption");
     const summary = await reader.read(selected.id, renewed, (client, context) => readAdoptionSummary(client, reader, context));
     expect(summary.value[0]).toMatchObject({ organization: { checkedUsers: 1 }, champions: 1 });
-    const departments = await reader.capture(renewed, "delegated", "adoption_departments");
+    const departments = await reader.capture(renewed, "adoption_departments");
     expect(await reader.read(departments.id, renewed, (client, context) =>
       readAdoptionDepartments(client, reader, context, { limit: 10 })))
       .toMatchObject({ value: [{ company: "Contoso", department: "HR", people: 1, activePeople: 1 }] });
     const stages = new UserSourceStages(fixture.runtime);
     const lease = await generations.begin(generationInput({
-      scope: { ...generationInput().scope, ...renewed }, sessionEpoch: renewed.sessionEpoch,
+      scope: { ...generationInput().scope, tenantId: renewed.tenantId }, actorPrincipalId: renewed.principalId,
+      sessionEpoch: renewed.sessionEpoch,
     }));
     try {
       const inputs = await reader.captureReportIdentities(renewed);
@@ -271,7 +273,7 @@ describe("read-only adoption groups", () => {
   it("keeps departments separate across companies and pages forward/backward in both sort directions", async () => {
     const { identity, reader } = await setup([user(1, "A"), user(2, "B"), user(3, "C"), user(4, "D")]);
     for (const order of ["asc", "desc"] as const) {
-      const selected = await reader.capture(identity, "delegated", "adoption", { order });
+      const selected = await reader.capture(identity, "adoption", { order });
       const page = (cursor?: string) => reader.read(selected.id, identity,
         (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, cursor }));
       const first = await page(), second = await page(first.page.nextCursor!);
@@ -287,7 +289,7 @@ describe("read-only adoption groups", () => {
   it.each(["asc", "desc"] as const)("pages %s groups with long Unicode organization labels", async order => {
     const { identity, reader } = await setup(Array.from({ length: 5 }, (_, index) =>
       user(index + 1, "\u337f".repeat(256), "\u337f".repeat(255) + index)));
-    const selected = await reader.capture(identity, "delegated", "adoption", { order });
+    const selected = await reader.capture(identity, "adoption", { order });
     const read = (cursor?: string) => reader.read(selected.id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, cursor }));
     const first = await read(), second = await read(first.page.nextCursor!), last = await read(second.page.nextCursor!);
@@ -303,11 +305,11 @@ describe("read-only adoption groups", () => {
     const { identity, reader, saveUsers } = await setup(users);
     const read = (id: string, options: { cursor?: string; anchor?: string } = {}) => reader.read(id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, ...options }));
-    const initial = await reader.capture(identity, "delegated", "adoption", { order });
+    const initial = await reader.capture(identity, "adoption", { order });
     const first = await read(initial.id), second = await read(initial.id, { cursor: first.page.nextCursor! });
     expect(second.page.anchor).toBe(second.value[0].id);
     await saveUsers([...users, user(7, order === "asc" ? "A" : "Z")]);
-    const fresh = await reader.capture(identity, "delegated", "adoption", { order });
+    const fresh = await reader.capture(identity, "adoption", { order });
     await expect(read(fresh.id, { cursor: first.page.nextCursor! })).rejects.toThrow("invalid_cursor");
     const resumed = await read(fresh.id, { anchor: second.page.anchor });
     expect(resumed.value.map(group => group.company)).toEqual(order === "asc" ? ["C", "D"] : ["F", "E"]);
@@ -325,7 +327,7 @@ describe("read-only adoption groups", () => {
   it("resolves anchors only inside matching groups and handles missing groups without inventing rows", async () => {
     const { identity, reader, read } = await setup([user(1, "A"), user(2, "B"), user(3, "C")]);
     const all = await read();
-    const selected = await reader.capture(identity, "delegated", "adoption", { company: "B" });
+    const selected = await reader.capture(identity, "adoption", { company: "B" });
     const anchored = (anchor: string) => reader.read(selected.id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 2, anchor }));
     for (const anchor of [all.value[0].id, "f".repeat(64)]) {
@@ -340,7 +342,7 @@ describe("read-only adoption groups", () => {
   });
   it.each(["asc", "desc"] as const)("jumps directly to numbered %s pages within one filtered selection", async order => {
     const { identity, reader } = await setup(Array.from({ length: 12 }, (_, index) => user(index + 1, "Contoso", `Department ${String(index + 1).padStart(2, "0")}`)));
-    const selected = await reader.capture(identity, "delegated", "adoption", { order, search: "contoso" });
+    const selected = await reader.capture(identity, "adoption", { order, search: "contoso" });
     const read = (pageNumber: number) => reader.read(selected.id, identity,
       (client, context) => readAdoptionGroups(client, reader, context, { limit: 5, pageNumber }));
     const last = await read(3);
@@ -350,7 +352,7 @@ describe("read-only adoption groups", () => {
     expect(last.counts).toEqual({ total: 12, filtered: 12 });
     expect((await read(Number.MAX_SAFE_INTEGER)).value).toEqual(last.value);
     expect((await read(1)).page).toMatchObject({ number: 1, offset: 0, previousCursor: null });
-    const filtered = await reader.capture(identity, "delegated", "adoption", { department: "Department 05" });
+    const filtered = await reader.capture(identity, "adoption", { department: "Department 05" });
     const only = await reader.read(filtered.id, identity, (client, context) =>
       readAdoptionGroups(client, reader, context, { limit: 5, pageNumber: 3 }));
     expect(only.value.map(group => group.department)).toEqual(["Department 05"]);
@@ -358,7 +360,7 @@ describe("read-only adoption groups", () => {
   });
   it("rejects invalid and ambiguous numbered page requests", async () => {
     const { identity, reader } = await setup([user(1)]);
-    const selected = await reader.capture(identity, "delegated", "adoption", {});
+    const selected = await reader.capture(identity, "adoption", {});
     for (const pageNumber of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
       await expect(reader.read(selected.id, identity, (client, context) =>
         readAdoptionGroups(client, reader, context, { limit: 5, pageNumber }))).rejects.toThrow("invalid_cursor");
@@ -432,7 +434,7 @@ describe("read-only adoption groups", () => {
     expect((await read({ company: null, department: null })).value[0].company).toBe("Company not provided");
     expect((await read({ adoptionAgents: "with", search: "hr" })).counts.filtered).toBe(1);
     expect((await read({ adoptionAgents: "without", search: "hr" })).counts.filtered).toBe(1);
-    const selected = await reader.capture(identity, "delegated", "adoption", { company: "A", department: "HR" });
+    const selected = await reader.capture(identity, "adoption", { company: "A", department: "HR" });
     const departments = await reader.facets(selected.id, identity, { field: "department", limit: 1 });
     expect(departments.counts).toEqual({ total: 2, filtered: 2 });
     expect(departments.value).toEqual([{ value: "Finance", count: 1 }]);
@@ -441,7 +443,7 @@ describe("read-only adoption groups", () => {
     expect((await reader.facets(selected.id, identity, { field: "department", limit: 1, cursor: next.page.previousCursor! })).value).toEqual(departments.value);
     expect((await reader.facets(selected.id, identity, { field: "company" })).value.map(option => option.value)).toEqual(["A", "C"]);
     await expect(reader.facets(selected.id, identity, { field: "creatorType" })).rejects.toThrow("invalid_cursor");
-    const unfiltered = await reader.capture(identity, "delegated", "adoption", {});
+    const unfiltered = await reader.capture(identity, "adoption", {});
     const companies = await reader.facets(unfiltered.id, identity, { field: "company" });
     expect(companies.value).toEqual([{ value: "A", count: 2 }, { value: "B", count: 1 }, { value: "C", count: 1 }, { value: null, count: 1 }]);
   });
@@ -466,7 +468,7 @@ describe("read-only adoption groups", () => {
         `Used,Used,Microsoft,user3@example.invalid,5,${today}`],
     });
     async function read(company?: string | null) {
-      const selected = await reader.capture(identity, "delegated", "adoption_departments", company === undefined ? {} : { company });
+      const selected = await reader.capture(identity, "adoption_departments", company === undefined ? {} : { company });
       return reader.read(selected.id, identity, (client, context) =>
         readAdoptionDepartments(client, reader, context, { limit: 8 }));
     }
@@ -475,13 +477,13 @@ describe("read-only adoption groups", () => {
     expect(all.value.find(group => group.company === "Contoso" && group.department === "HR")).toMatchObject({ people: 2, activePeople: 1 });
     expect(all.value.find(group => group.company === "Fabrikam")).toMatchObject({ people: 1, activePeople: 0 });
     expect(all.value.find(group => group.company === null)).toMatchObject({ department: null, people: 1, activePeople: 0 });
-    const summarySelection = await reader.capture(identity, "delegated", "adoption");
+    const summarySelection = await reader.capture(identity, "adoption");
     const summary = await reader.read(summarySelection.id, identity, (client, context) =>
       readAdoptionSummary(client, reader, context));
     expect(summary.value[0].champions).toBe(2);
     expect(summary.value[0].organization.unresolvedIdentities).toBe(1);
     expect(summary.page).toEqual({ limit: 1, nextCursor: null, previousCursor: null });
-    const filteredSelection = await reader.capture(identity, "delegated", "adoption", { company: "Contoso" });
+    const filteredSelection = await reader.capture(identity, "adoption", { company: "Contoso" });
     await expect(reader.read(filteredSelection.id, identity, (client, context) =>
       readAdoptionSummary(client, reader, context))).rejects.toMatchObject({ code: "invalid_cursor" });
     const contoso = await read(" contoso ");
@@ -494,7 +496,7 @@ describe("read-only adoption groups", () => {
 
   it.each(["asc", "desc"] as const)("pages department summaries %s without losing groups or crossing cursor contracts", async order => {
     const { identity, reader } = await setup([user(1, "A", "A"), user(2, "A", "B"), user(3, "B", "A")]);
-    const selected = await reader.capture(identity, "delegated", "adoption_departments", { order });
+    const selected = await reader.capture(identity, "adoption_departments", { order });
     const read = (cursor?: string) => reader.read(selected.id, identity, (client, context) =>
       readAdoptionDepartments(client, reader, context, { limit: 1, cursor }));
     const first = await read(), second = await read(first.page.nextCursor!), third = await read(second.page.nextCursor!);
@@ -529,7 +531,7 @@ describe("read-only adoption groups", () => {
     await publish(identity, { users: groups.flatMap(group => Array.from({ length: group.people }, (_, offset) =>
       `user${++index}@example.invalid,User ${index},${offset < group.active ? 1 : 0},${offset < group.active ? 1 : 0},${today}`)),
     agents: [`Used,Used,Microsoft,0,0,14,${today}`], userAgents: [] });
-    const selected = await reader.capture(identity, "delegated", "adoption_departments", { company: "Contoso", order });
+    const selected = await reader.capture(identity, "adoption_departments", { company: "Contoso", order });
     const read = (cursor?: string) => reader.read(selected.id, identity, (client, context) =>
       readAdoptionDepartments(client, reader, context, { limit: 2, cursor }));
     const first = await read(), second = await read(first.page.nextCursor!), third = await read(second.page.nextCursor!);

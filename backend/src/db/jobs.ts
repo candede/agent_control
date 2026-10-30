@@ -54,7 +54,7 @@ export type JobRow = {
 };
 export type ReconciliationStatus = "not_required" | "required" | "verified_applied" | "verified_not_applied" | "conflict";
 export type JobItem = { id: string; job_id: string; target_id: string; display_name: string; ordinal: number; status: "queued" | "running" | ItemOutcome; sent_at: Date | null; message: string | null; error_code: string | null; prestate_hash: string; prestate: PackageMutationState; poststate_hash: string | null; poststate: PackageMutationState | null; correlation_id: string | null; reconciliation_status: ReconciliationStatus; reconciled_at: Date | null };
-export type Lease = { jobId: string; owner: string; version: number; scope: DataScope };
+export type Lease = { jobId: string; owner: string; version: number; scope: DataScope; actorSessionEpoch: string };
 export type FinishItemEvidence = {
   message?: string; errorCode?: string; poststate?: PackageMutationState; readbackCount?: number;
 } & ({ readback: CopilotPackageDetail; inventoryGeneration: string | null } | { readback?: never; inventoryGeneration?: never });
@@ -159,7 +159,9 @@ export class JobRepository {
         if (existing.rows[0].request_hash !== requestHash || existing.rows[0].confirmation_hash !== input.confirmationHash) throw new AppError(409, "idempotency_mismatch", "This idempotency key already belongs to a different request.");
         return existing.rows[0].id;
       }
-      const outstanding = await client.query("SELECT count(*)::int AS count FROM jobs WHERE tenant_id=$1 AND principal_id=$2 AND status IN ('queued','running','waiting_authorization')", [scope.tenantId, scope.principalId]);
+      const outstanding = await client.query(`SELECT count(*)::int AS count FROM jobs WHERE tenant_id=$1 AND principal_id=$2
+        AND (status IN ('queued','running','waiting_authorization') OR (status='partial' AND EXISTS (
+          SELECT 1 FROM job_items WHERE job_id=jobs.id AND status IN ('queued','running'))))`, [scope.tenantId, scope.principalId]);
       if (outstanding.rows[0].count >= 5) throw new AppError(429, "job_limit", "At most five unfinished jobs are allowed per principal.");
       const id = randomUUID();
       await client.query(`INSERT INTO jobs (id,tenant_id,principal_id,token_mode,capability,action,request_hash,idempotency_key,access_update,confirmation_hash,confirmation_summary,confirmed_at,reassign_user_id,actor_name,actor_username,request_path,scope,origin)
@@ -251,7 +253,8 @@ export class JobRepository {
       return existing.id as string;
     }
     if ((await client.query(`SELECT count(*)::int AS count FROM jobs WHERE tenant_id=$1 AND principal_id=$2
-      AND status IN ('queued','running','waiting_authorization')`, [scope.tenantId, scope.principalId])).rows[0].count >= 5) {
+      AND (status IN ('queued','running','waiting_authorization') OR (status='partial' AND EXISTS (
+        SELECT 1 FROM job_items WHERE job_id=jobs.id AND status IN ('queued','running'))))`, [scope.tenantId, scope.principalId])).rows[0].count >= 5) {
       throw new AppError(429, "job_limit", "At most five unfinished jobs are allowed per principal.");
     }
     const id = randomUUID();
@@ -350,15 +353,19 @@ export class JobRepository {
   async claim(id: string, scope: DataScope, owner: string, authorizedResume = false): Promise<Lease | undefined> {
     requireProviderAdmissions();
     return transaction(this.database, async client => {
-    const result = await client.query<JobRow>(`UPDATE jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
+    const result = await client.query<JobRow & { actor_session_epoch: string }>(`UPDATE jobs SET status='running',lease_owner=$4,lease_version=lease_version+1,
       lease_until=clock_timestamp()+interval '120 seconds',attempts=attempts+1,updated_at=clock_timestamp()
       WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND cancel_requested=false AND attempts<10 AND deadline_at>clock_timestamp()
       AND (lease_until IS NULL OR lease_until<clock_timestamp())
       AND (status='queued' OR ($5 AND status IN ('waiting_authorization','partial')))
       AND (NOT $5 OR request_path !~ $6)
-      AND EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='queued') RETURNING *`, [id, scope.tenantId, scope.principalId, owner, authorizedResume, packageCanaryPathPattern]);
+      AND EXISTS (SELECT 1 FROM job_items WHERE job_id=jobs.id AND status='queued') RETURNING *,
+        coalesce((SELECT epoch FROM data_principal_epochs principal
+          WHERE principal.tenant_id=jobs.tenant_id AND principal.principal_id=jobs.principal_id),0)::text AS actor_session_epoch`,
+    [id, scope.tenantId, scope.principalId, owner, authorizedResume, packageCanaryPathPattern]);
     if (authorizedResume && result.rows[0]) await this.lifecycle(client, result.rows[0], "resume-control");
-    return result.rows[0] ? { jobId: id, scope, owner, version: result.rows[0].lease_version } : undefined;
+    return result.rows[0] ? { jobId: id, scope, owner, version: result.rows[0].lease_version,
+      actorSessionEpoch: result.rows[0].actor_session_epoch } : undefined;
     });
   }
 
@@ -423,7 +430,10 @@ export class JobRepository {
   async markSent(lease: Lease, itemId: string, observedPrestateHash: string, signal?: AbortSignal, assertCurrent?: () => void) {
     requireProviderAdmissions();
     await transaction(this.database, async client => {
-      await lockInventorySources(client, lease.scope);
+      const actorEpoch = await lockInventorySources(client, lease.scope);
+      if (actorEpoch !== lease.actorSessionEpoch) {
+        throw new AppError(409, "confirmation_mismatch", "The initiating actor's session changed before dispatch.");
+      }
       const job = await this.fence(client, lease);
       if (job.cancel_requested) throw new AppError(409, "cancelled", "Cancellation stopped unsent work.");
       const budget = await client.query("SELECT deadline_at>clock_timestamp() AS valid FROM jobs WHERE id=$1", [lease.jobId]);
@@ -438,7 +448,12 @@ export class JobRepository {
 
   async finishItem(lease: Lease, itemId: string, outcome: ItemOutcome, evidence: FinishItemEvidence = {}, signal?: AbortSignal, assertCurrent?: () => void) {
     await transaction(this.database, async client => {
-      if (evidence.readback) await lockPackageInventoryScope(lease.scope, client);
+      if (evidence.readback) {
+        if (await lockInventorySources(client, lease.scope) !== lease.actorSessionEpoch) {
+          throw new AppError(401, "interaction_required", "The initiating account changed before control readback publication.");
+        }
+        await lockPackageInventoryScope(lease.scope, client);
+      }
       const job = await this.fence(client, lease);
       const poststate = evidence.poststate ? requirePersistablePackageMutationState(evidence.poststate) : null;
       const poststateHash = poststate ? packageMutationStateHash(poststate) : null;
@@ -579,8 +594,9 @@ export class JobRepository {
 
   private async aggregate(client: pg.PoolClient, id: string) {
     await client.query(`UPDATE jobs SET status=CASE
+      WHEN EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status='running') THEN 'running'
       WHEN EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status='inconclusive') THEN 'partial'
-      WHEN EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status IN ('queued','running')) THEN 'waiting_authorization'
+      WHEN EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status='queued') THEN 'waiting_authorization'
       WHEN cancel_requested OR EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status='cancelled') THEN 'cancelled'
       WHEN NOT EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status<>'failed') THEN 'failed'
       WHEN EXISTS (SELECT 1 FROM job_items WHERE job_id=$1 AND status='failed') THEN 'partial'

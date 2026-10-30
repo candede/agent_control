@@ -43,6 +43,10 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
     response.setHeader("X-Request-ID", response.locals.requestId);
     next();
   });
+  app.use("/api", (_request, response, next) => {
+    response.setHeader("Cache-Control", "private, no-store");
+    next();
+  });
   if (config.nodeEnv !== "test") app.use(httpTelemetry);
   app.use(helmet({
     strictTransportSecurity: config.frontendOrigin.startsWith("https://") ? { maxAge: 31_536_000, includeSubDomains: true } : false,
@@ -84,8 +88,7 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
     cookie: { httpOnly: true, sameSite: "lax", secure: config.frontendOrigin.startsWith("https://"), maxAge: 8*60*60*1000 } }));
   app.use("/api", requestAuthentication(database, identityFetch));
   app.use("/api", apiAdmission);
-  app.use("/api", (request, response, next) => {
-    response.setHeader("Cache-Control", "private, no-store");
+  app.use("/api", (request, _response, next) => {
     if (request.authentication?.principal.transport !== "bearer" && !["GET","HEAD","OPTIONS"].includes(request.method) && request.get("Origin") !== config.frontendOrigin) return next(new AppError(403,"invalid_origin","A same-origin request is required. Open the configured public URL and ensure the tunnel/reverse proxy preserves the browser Origin header. For an existing Dev Tunnel port, use devtunnel port update with --origin-header unchanged; host flags alone may not update the port. This is a connection configuration issue, not a missing permission.", {
       expectedOrigin: config.frontendOrigin,
       receivedOrigin: request.get("Origin") ?? null,
@@ -106,7 +109,7 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   const reports = reportRuntime(database);
   app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(),
     createOfficialReportDataRouter({ reports: reports.reports,
-      identity: async request => ({ identity: await reportIdentity(database, requestUser(request)), tokenMode: "delegated" }),
+      identity: async request => ({ identity: await reportIdentity(database, requestUser(request)) }),
       enqueueExport: async job => { reports.enqueue(job.id, job.identity); } }),
     createInventoryDataRouter(database), createInventoryMutationsRouter(database), createSharedAgentControlsRouter(database), createAgentJobReadRouter(database), createAgentRefreshTargetsRouter(database), createUnifiedAgentsRouter(database),
     createInventoryReadRouter(database), inventoryRouter, copilotStudioQuarantineRouter, purviewAuditRouter, defenderHuntingRouter, auditRouter, agentsRouter);

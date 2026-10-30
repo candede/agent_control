@@ -47,8 +47,8 @@ describe("streamed package refresh contract", () => {
     try {
       await runtime.settleControls(scope, new AbortController().signal);
       expect((await fixture.runtime.query(`SELECT r.row_count FROM inventory_roots r
-        JOIN data_scope_epochs s ON s.id=r.scope_id WHERE s.tenant_id=$1 AND s.principal_id=$2
-          AND s.source='inventory_canonical' AND r.current`, [scope.tenantId, scope.principalId])).rows)
+        JOIN data_scope_epochs s ON s.id=r.scope_id WHERE s.tenant_id=$1 AND s.scope_kind='tenant'
+          AND s.source='inventory_canonical' AND r.current`, [scope.tenantId])).rows)
         .toEqual([{ row_count: 2 }]);
     } finally { await runtime.drain(); }
   });

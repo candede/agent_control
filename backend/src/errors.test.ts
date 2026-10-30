@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { config } from "./config.js";
 import { AppError, errorHandler, errorTelemetry, normalizeError } from "./errors.js";
+import { graphResponseError } from "./services/graphPackages.js";
 
 const originalNodeEnv = config.nodeEnv;
 
@@ -11,6 +12,28 @@ afterEach(() => {
 });
 
 describe("error telemetry", () => {
+  it("logs and delegates a failure after headers without rewriting the response", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = new AppError(503, "data_queue_full", "Synthetic stream failure.");
+    error.retryAfterSeconds = 5;
+    const response = {
+      headersSent: true, locals: { requestId: "request-stream" },
+      setHeader: vi.fn(), status: vi.fn(), type: vi.fn(), json: vi.fn(),
+    };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    const next = vi.fn();
+    errorHandler(error, { route: { path: "/fixture" } } as Request, response as unknown as Response, next);
+    expect(next).toHaveBeenCalledExactlyOnceWith(error);
+    expect(response.setHeader).not.toHaveBeenCalled();
+    expect(response.status).not.toHaveBeenCalled();
+    expect(response.type).not.toHaveBeenCalled();
+    expect(response.json).not.toHaveBeenCalled();
+    expect(JSON.parse(log.mock.calls[0][0])).toMatchObject({
+      event: "request_error", requestId: "request-stream", status: 503, errorCode: "data_queue_full",
+    });
+  });
+
   it("preserves bounded admission Retry-After without changing other error contracts", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const error = new AppError(503, "data_queue_full", "data_queue_full");
@@ -22,6 +45,95 @@ describe("error telemetry", () => {
     expect(response.setHeader).toHaveBeenCalledWith("Retry-After", "5");
     expect(response.status).toHaveBeenCalledWith(503);
   });
+
+  it.each([429, 503])("preserves a received Graph HTTP %i cooldown in the problem response", status => {
+    vi.spyOn(console, status >= 500 ? "error" : "warn").mockImplementation(() => undefined);
+    const error = graphResponseError(new globalThis.Response(null, {
+      status, headers: { "Retry-After": "17" },
+    }));
+    const response = { locals: { requestId: "request-provider" }, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    errorHandler(error, { route: { path: "/fixture" } } as Request, response as unknown as Response, vi.fn());
+    expect(response.setHeader).toHaveBeenCalledExactlyOnceWith("Retry-After", "17");
+    expect(response.json).toHaveBeenCalledWith({
+      type: "https://agent-control.invalid/problems/graph_error",
+      title: status === 429 ? "Request limit reached" : "Service unavailable",
+      status, detail: `Microsoft Graph request failed with status ${status}.`,
+      code: "graph_error", requestId: "request-provider",
+      details: { httpStatus: status, retryAfterMs: 17_000, ...(status === 429 ? { throttled: true } : {}) },
+    });
+  });
+
+  it.each([
+    [1, "1"], [999, "1"], [1_000, "1"], [1_001, "2"],
+    [Number.MAX_SAFE_INTEGER, "9007199254741"],
+  ])("rounds a %i-millisecond provider cooldown up to %s seconds", (retryAfterMs, seconds) => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = new AppError(429, "provider_throttled", "Try later.", { retryAfterMs });
+    const response = { locals: {}, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    errorHandler(error, {} as Request, response as unknown as Response, vi.fn());
+    expect(response.setHeader).toHaveBeenCalledExactlyOnceWith("Retry-After", seconds);
+  });
+
+  it.each([undefined, null, -1, 0, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "1000"])(
+    "does not turn invalid provider cooldown %s into a Retry-After header", retryAfterMs => {
+      vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const error = new AppError(429, "provider_throttled", "Try later.", { retryAfterMs });
+      const response = { locals: {}, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+      response.status.mockReturnValue(response);
+      response.type.mockReturnValue(response);
+      errorHandler(error, {} as Request, response as unknown as Response, vi.fn());
+      expect(response.setHeader).not.toHaveBeenCalled();
+      expect(response.status).toHaveBeenCalledWith(429);
+    },
+  );
+
+  it("keeps an explicit retry delay authoritative over provider diagnostics", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = new AppError(503, "provider_error", "Try later.", { retryAfterMs: 120_000 });
+    error.retryAfterSeconds = 5;
+    const response = { locals: {}, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    errorHandler(error, {} as Request, response as unknown as Response, vi.fn());
+    expect(response.setHeader).toHaveBeenCalledExactlyOnceWith("Retry-After", "5");
+  });
+
+  it("does not evaluate a provider cooldown accessor", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const getter = vi.fn(() => { throw new Error("private cooldown metadata"); });
+    const details = Object.defineProperty({}, "retryAfterMs", { get: getter });
+    const error = new AppError(429, "provider_throttled", "Try later.", details);
+    const response = { locals: {}, status: vi.fn(), type: vi.fn(), json: vi.fn(), setHeader: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    errorHandler(error, {} as Request, response as unknown as Response, vi.fn());
+    expect(getter).not.toHaveBeenCalled();
+    expect(response.setHeader).not.toHaveBeenCalled();
+    expect(response.status).toHaveBeenCalledWith(429);
+  });
+
+  it("serves a generic problem instead of throwing while URI-encoding a malformed code", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const error = new AppError(502, "provider_\uD800", "Provider failed.", { private: "metadata" });
+    const response = { locals: { requestId: "request-invalid-code" }, status: vi.fn(), type: vi.fn(), json: vi.fn() };
+    response.status.mockReturnValue(response);
+    response.type.mockReturnValue(response);
+    const next = vi.fn();
+    errorHandler(error, {} as Request, response as unknown as Response, next);
+    expect(response.status).toHaveBeenCalledWith(500);
+    expect(response.type).toHaveBeenCalledWith("application/problem+json");
+    expect(response.json).toHaveBeenCalledExactlyOnceWith({
+      type: "https://agent-control.invalid/problems/internal_error",
+      title: "Request failed", status: 500, detail: "An unexpected error occurred",
+      code: "internal_error", requestId: "request-invalid-code",
+    });
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it("classifies timeouts and cancellation without serializing exception text or details", () => {
     expect(errorTelemetry(new DOMException("private-token", "TimeoutError"), "provider_error"))
       .toEqual({ errorCode: "provider_error", errorKind: "timeout" });
@@ -125,7 +237,7 @@ describe("error telemetry", () => {
 });
 
 describe("normalizeError", () => {
-  it.each([400, 403, 404, 413])("preserves HTTP dependency errors with inherited data status %i", status => {
+  it.each([400, 403, 404, 413, 415])("preserves HTTP dependency errors with inherited data status %i", status => {
     const prototype = Object.assign(Object.create(Error.prototype), { status });
     const error = Object.setPrototypeOf(new Error("Synthetic HTTP failure"), prototype);
     expect(normalizeError(error)).toMatchObject({ status, code: "request_rejected" });
@@ -144,6 +256,19 @@ describe("normalizeError", () => {
   it("preserves intentional application errors", () => {
     const error = new AppError(400, "invalid_request", "Invalid request");
 
+    expect(normalizeError(error)).toBe(error);
+  });
+
+  it.each(["provider_\uD800", "provider_\uDC00", "provider_\uDC00\uD800"])(
+    "rejects application codes that cannot be URI-encoded", code => {
+      expect(normalizeError(new AppError(502, code, "Provider failed."))).toMatchObject({
+        status: 500, code: "internal_error", message: "An unexpected error occurred",
+      });
+    },
+  );
+
+  it("preserves URI-encodable application codes, including valid surrogate pairs", () => {
+    const error = new AppError(502, "provider_\uD83D\uDE00", "Provider failed.");
     expect(normalizeError(error)).toBe(error);
   });
 

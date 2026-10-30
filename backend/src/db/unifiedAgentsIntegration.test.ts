@@ -22,7 +22,7 @@ import type { PowerPlatformResource, PowerPlatformResourceType } from "../types/
 import { deleteUsageSet, publishUsageReports, usageAudit, usageIdentity, usageIntent } from "./agentUsageTestSupport.js";
 import { AgentPeopleRepository } from "./agentPeople.js";
 import type { InventoryQuery } from "./inventoryQueries.js";
-import { InventoryGenerations, inventorySelector } from "./inventoryGenerations.js";
+import { InventoryGenerations } from "./inventoryGenerations.js";
 import { LiveInventory } from "./liveInventory.js";
 import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
 import { checkpointQueries, observePeakMemory, observeQueryWork } from "../services/peakMemory.js";
@@ -90,7 +90,6 @@ async function publishRaw(scope: Scope, count: number, raw: (index: number) => R
   const stream = new StreamedInventory(fixture.runtime, undefined, provider), input = inventoryInput(scope.principalId, "power_platform");
   input.scope.tenantId = scope.tenantId;
   if (count > 100) input.reserveBytes = 64 * 1024 ** 2;
-  input.scope.selector = inventorySelector({ domain: "power_platform", resourceTypes: types });
   return stream.powerPlatformCatalog(input, "synthetic", types, { roleScope: "full", authorize: async () => {} });
 }
 
@@ -256,7 +255,9 @@ describe("typed unified inventory integration", () => {
     await reconcileInventoryFixture(fixture.runtime, scope);
     const updated = await read(scope);
     expect(updated.page.value.every(row => row.environment?.observation.snapshotId === renamed.baselineId)).toBe(true);
-    expect((await selected.queries.page(selected.selection.id, selected.identity)).value).toEqual(selected.raw.value);
+    const historical = structuredClone(selected.raw.value);
+    for (const row of historical) if (row.environment) row.environment.observation.current = false;
+    expect((await selected.queries.page(selected.selection.id, selected.identity)).value).toEqual(historical);
     expect((await exportRows(selected)).find(row => row.recordType === "agent")?.environmentName).toBe("Finance production");
   });
 
@@ -290,7 +291,7 @@ describe("typed unified inventory integration", () => {
     await reconcileInventoryFixture(fixture.runtime, other);
     const authorized = await read(other, { view: "used" });
     expect(authorized.page.value[0].usage).toMatchObject({ status: "linked", responses: 10, activeUsers: 2 });
-    expect(authorized.page.value[0].id).not.toBe(filtered.page.value[0].id);
+    expect(authorized.page.value[0].id).toBe(filtered.page.value[0].id);
     const reviewed = await usageIntent(fixture.runtime, scope, "Report-A", { source: "graph_packages", packageId: "used" });
     const replacement = await publishUsageReports(fixture.runtime, scope, 11);
     expect((await read(scope, { view: "used" })).page.counts.filtered).toBe(0);
@@ -319,7 +320,7 @@ describe("typed unified inventory integration", () => {
     expect((await before.queries.page(before.selection.id, before.identity)).value).toEqual(before.raw.value);
     expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
       JOIN inventory_memberships m ON m.baseline_id=root.baseline_id WHERE root.current AND root.domain='packages'
-      AND scope.tenant_id=$1 AND scope.principal_id=$2 AND m.identity IN ('early','late')`, [scope.tenantId, scope.principalId])).rows[0].count).toBe(0);
+      AND scope.tenant_id=$1 AND scope.scope_kind='tenant' AND m.identity IN ('early','late')`, [scope.tenantId])).rows[0].count).toBe(0);
   });
 
   it("withdraws identity proof off GET, splits safely and never authorizes removed native targets", async () => {
@@ -339,7 +340,7 @@ describe("typed unified inventory integration", () => {
     await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: [agentType] });
     await expect(new LiveInventory(fixture.runtime).record(scope, native.id)).rejects.toMatchObject({ code: "agent_not_found" });
     await reconcileInventoryFixture(fixture.runtime, scope);
-    expect((await read(scope)).page.summary).toMatchObject({ graphOnly: 1, powerPlatformOnly: 0 });
+    expect((await read(scope)).page.summary).toMatchObject({ graphOnly: 1, powerPlatformOnly: 1 });
   });
 
   describe("5000 logical agents from 10000 genuinely streamed source targets", () => {

@@ -21,9 +21,7 @@ export class OfficialReportExports {
   readonly inventory;
   constructor(readonly reports: LargeTenantUsersReports, readonly actor: AuditActor, secret = config.sessionSecret) {
     if (!actor.tenantId) throw AppError.unauthorized();
-    const clientId = config.tenants.find(tenant => tenant.tenantId === actor.tenantId)?.clientId;
-    this.inventory = new InventoryQueries(reports.database, secret, reports.staleAfterDays,
-      clientId ? { tenantId: actor.tenantId, principalId: clientId } : undefined);
+    this.inventory = new InventoryQueries(reports.database, secret, reports.staleAfterDays);
     this.engine = new DataExports(reports.database, this.inventory.selections, reportExportAudit);
   }
   async create(identity: SelectionIdentity, value: unknown, assertCurrent?: () => void) {

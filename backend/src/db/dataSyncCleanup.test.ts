@@ -39,13 +39,14 @@ const newScope = (): DataSyncScope => ({ tenantId: `tenant-${randomUUID()}`, pri
 const identity = (scope: DataSyncScope) => ({ ...selectionIdentity, ...scope });
 async function userPage(scope: DataSyncScope) {
   const reader = new UserSourcesRepository(fixture.runtime, "synthetic-native-cleanup-source-secret");
-  const selected = await reader.capture(identity(scope), "delegated");
+  const selected = await reader.capture(identity(scope));
   return reader.page(selected.id, identity(scope));
 }
 function collectSource(scope: DataSyncScope, source: "directory" | "app_activity", publication: UserSourcePublication, failure?: Error) {
   const stages = new UserSourceStages(fixture.runtime);
   return stages.execute(generationInput({
-    scope: { ...generationInput().scope, ...scope, source }, jobKind: "data_sync", ...publication,
+    scope: { ...generationInput().scope, tenantId: scope.tenantId, source }, actorPrincipalId: scope.principalId,
+    jobKind: "data_sync", ...publication,
   }), async lease => {
     if (failure) throw failure;
     const key = await stages.query(lease, source === "directory" ? "discovery" : "activity", "synthetic:cleanup-empty");
@@ -91,7 +92,7 @@ describe("clean full data sync admission", () => {
     const selected = await inventorySelectionFixture(fixture.runtime, scope);
     await seedSnapshots(otherPrincipal);
     await seedSnapshots(otherTenant);
-    const othersBefore = await Promise.all([scopedSnapshots(otherPrincipal), scopedSnapshots(otherTenant)]);
+    const otherTenantBefore = await scopedSnapshots(otherTenant);
     await seedAcceptedUsage(scope);
     const jobs = new JobRepository(fixture.runtime);
     const intent: JobIntentInput = {
@@ -137,7 +138,8 @@ describe("clean full data sync admission", () => {
       expect.objectContaining({ source: "usage_reports", status: "succeeded", count: 3 }),
     ]);
     expect(await tableRows(preservedTables)).toEqual(preserved);
-    expect(await Promise.all([scopedSnapshots(otherPrincipal), scopedSnapshots(otherTenant)])).toEqual(othersBefore);
+    expect(await scopedSnapshots(otherTenant)).toEqual(otherTenantBefore);
+    expect(await scopedSnapshots(otherPrincipal)).toMatchObject({ inventoryRoots: [], inventoryRecords: [], userSources: { value: [] } });
     await expect(selected.queries.page(selected.selection.id, selected.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
     expect((await scopedSnapshots(scope)).inventoryRecords).toEqual([]);
     expect((await userPage(scope)).sources.directory).toMatchObject({ state: "unavailable", generationId: null, rowCount: null, observedAt: null });
@@ -338,10 +340,10 @@ async function scopedSnapshots(scope: DataSyncScope) {
     FROM inventory_roots root JOIN data_scope_epochs scope ON scope.id=root.scope_id
     JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
     JOIN data_generations generation ON generation.id=revision.generation_id
-    WHERE root.current AND scope.tenant_id=$1 AND scope.principal_id=$2
+    WHERE root.current AND scope.tenant_id=$1 AND scope.scope_kind='tenant'
       AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
       AND generation.state='published' AND generation.expires_at>clock_timestamp()
-    ORDER BY root.scope_id LIMIT 17`, [scope.tenantId, scope.principalId])).rows;
+    ORDER BY root.scope_id LIMIT 17`, [scope.tenantId])).rows;
   expect(inventoryRoots.length).toBeLessThan(17);
   const inventoryRecords = (await fixture.runtime.query(`SELECT record.generation_id,record.identity,record.domain
     FROM inventory_roots root JOIN inventory_memberships membership ON membership.baseline_id=root.baseline_id

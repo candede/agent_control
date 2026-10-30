@@ -1,4 +1,5 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { retain } from "../../scripts/database.js";
 import { inventorySelectionFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { testDatabase } from "../../scripts/testDatabase.js";
@@ -13,6 +14,7 @@ import type { InventoryQuery } from "./inventoryQueries.js";
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let jobs: PackageRefreshJobs;
 const scope = { tenantId: "tenant-package", principalId: "reader-package" };
+beforeEach(() => { scope.tenantId = randomUUID(); scope.principalId = randomUUID(); });
 const selections: Awaited<ReturnType<typeof inventorySelectionFixture>>[] = [];
 beforeAll(async () => { fixture = await testDatabase(); jobs = new PackageRefreshJobs(fixture.runtime); });
 afterEach(async () => {
@@ -55,7 +57,7 @@ async function refreshThroughProvider(owner: PackageDataScope, jobId: string, va
   const root = await (options.targets
     ? stream.exact(input, "synthetic", options.targets, hooks)
     : stream.graphCatalog(input, "synthetic", hooks));
-  if (input.scope.tokenMode === "delegated") await reconcileInventoryFixture(fixture.runtime, owner);
+  await reconcileInventoryFixture(fixture.runtime, owner);
   return root;
 }
 async function selected(query: InventoryQuery = {}, owner = scope) {
@@ -130,6 +132,7 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
   });
 
   it("retains broad membership and provenance while exact observations succeed or a later scan fails", async () => {
+    await refreshThroughProvider(scope, await running("broad-membership"), [packageValue("a"), packageValue("b", true)]);
     await refreshThroughProvider(scope, await running("package-exact", ["c"]), [packageValue("c")], { targets: ["c"] });
     const before = await selected();
     expect(before.raw.value.map(row => row.id)).toEqual(["a", "b", "c"]);
@@ -143,6 +146,7 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
   });
 
   it("resolves only bounded exact authorized targets and rejects a foreign principal", async () => {
+    await refreshThroughProvider(scope, await running("exact-selection"), [packageValue("a"), packageValue("c")]);
     const read = await selected();
     expect((await read.queries.exact(read.selection.id, read.identity, ["c", "a", "missing"]))
       .map(row => ({ id: row.identity, package: row.residual }))).toMatchObject([
@@ -155,6 +159,7 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
   });
 
   it("rejects incomplete, duplicate and out-of-scope publication without replacing the saved root", async () => {
+    await refreshThroughProvider(scope, await running("valid-before-failures"), [packageValue("a"), packageValue("b"), packageValue("c")]);
     const before = (await selected()).raw;
     const incomplete = await running("package-incomplete");
     await expect(refreshThroughProvider(scope, incomplete, [packageValue("partial"), packageValue("unread")],

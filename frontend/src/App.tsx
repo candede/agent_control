@@ -489,7 +489,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [routeHistoryState]);
   const syncSetupStatus = syncSetup?.owner === principalKey ? syncSetup.status : "checking";
   const syncSetupRequired = syncSetupStatus === "required";
-  const waitingForInitialInventory = syncSetupStatus !== "ready" && activeView !== "sync";
   const handleSyncSetupStatusChange = useCallback((status: WorkspaceSetupStatus) => {
     setSyncSetup({ owner: principalKey, status });
   }, [principalKey]);
@@ -1188,12 +1187,12 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   useEffect(() => {
     if (!user || !hasRole(user, "AgentControl.Viewer")
-      || !["agents", "sync", "audit"].includes(activeView) || waitingForInitialInventory) return;
+      || !["agents", "sync", "audit"].includes(activeView)) return;
     const controller = new AbortController();
     inventoryHistoryAbortController.current = controller;
     loadInventoryRefreshHistory(controller);
     return () => controller.abort();
-  }, [activeView, agentReloadRevision, inventoryHistoryReloadRevision, principalKey, user, waitingForInitialInventory]);
+  }, [activeView, agentReloadRevision, inventoryHistoryReloadRevision, principalKey, user]);
 
   useEffect(() => {
     if (!user) {
@@ -1244,23 +1243,23 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       return;
     }
     if (activeView !== "agents" && activeView !== "sync" && activeView !== "audit" && !userAgentOverlay
-      || waitingForInitialInventory || pendingStoredAgentSelectionCount !== undefined || agentSearchPending) {
+      || pendingStoredAgentSelectionCount !== undefined || agentSearchPending) {
       agentListAbortController.current?.abort();
       return;
     }
     const forceCurrentSnapshot = forceCurrentAgentReload.current;
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
-  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, userAgentOverlay, waitingForInitialInventory]);
+  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, userAgentOverlay]);
 
   useEffect(() => {
     if (!inventoryUnavailable || loadingAgents || !hasRole(user, "AgentControl.Viewer")
-      || !["agents", "sync", "audit"].includes(activeView) && !userAgentOverlay || waitingForInitialInventory) return;
+      || !["agents", "sync", "audit"].includes(activeView) && !userAgentOverlay) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible" && navigator.onLine) loadSavedAgents(true);
     }, 5_000);
     return () => window.clearInterval(timer);
-  }, [activeView, inventoryUnavailable, loadingAgents, user, userAgentOverlay, waitingForInitialInventory]);
+  }, [activeView, inventoryUnavailable, loadingAgents, user, userAgentOverlay]);
 
 
   useEffect(() => {
@@ -1369,8 +1368,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       })
     : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
-  const blockingWorkspace = hasRole(user, "AgentControl.Viewer") && syncSetupStatus !== "ready"
-    && visibleActiveView !== "sync" && visibleActiveView !== "permissions" && visibleActiveView !== "dashboard";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.Admin");
   const automaticAction = findWorkbenchAction(workbenchMetadata?.actions, "data-sync.auto-refresh");
@@ -1447,6 +1444,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function handleUsersRouteChange(route: UsersRouteState, replace = false) {
+    if (!ownsAgentScope(principalKey)) return;
     const search = usersRouteSearch(route);
     const next = workbenchUrl("users", search);
     savedViewSearches.current.set("users", search.toString());
@@ -3507,11 +3505,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           label="Prepare inventory CSV" autoStart onSelectionInvalidated={handleInventoryExportInvalidation}
           onPendingChange={inventoryExport.kind === "power_platform_agents" ? setExportingPowerPlatformCsv : setExportingCsv} />
       </div> : null}
-      {blockingWorkspace ? syncSetupStatus === "checking"
-        && (visibleActiveView === "agents" || visibleActiveView === "users" || visibleActiveView === "audit")
-        ? <WorkspaceSkeleton view={visibleActiveView} showSummary={visibleActiveView === "users" ? usersRoute.section !== "adoption" && usersRoute.view !== "activity"
-          : visibleActiveView === "audit" || canReadSensitiveUsage} /> : null
-        : visibleActiveView === "agents" && hasRole(user, "AgentControl.Viewer")
+      {visibleActiveView === "agents" && hasRole(user, "AgentControl.Viewer")
           && initialAgentReadOwner !== principalKey
           ? <WorkspaceSkeleton view="agents" showSummary={canReadSensitiveUsage} />
         : visibleActiveView === "dashboard" ? <AdoptionDashboard key={`dashboard:${principalKey}`}
@@ -3806,7 +3800,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         <div className="error-banner" role="alert">{agentDetailError}</div>
       ) : null}
 
-      {!blockingWorkspace && selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
+      {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
           selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}

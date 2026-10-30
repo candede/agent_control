@@ -34,14 +34,14 @@ describe("record-backed Graph provider protocol", () => {
   function setup(fetcher: FetchLike) {
     const stages = new UserSourceStages(fixture.runtime);
     const defaults = generationInput();
-    const input = { ...defaults, scope: { ...defaults.scope, principalId: randomUUID() } };
+    const input = { ...defaults, scope: { ...defaults.scope, tenantId: randomUUID() }, actorPrincipalId: randomUUID() };
     const wait = vi.fn(async () => undefined);
     return { stages, input, wait, collect: (options: Partial<Options> = {}) =>
       new UserSourceProvider(fetcher, wait).refresh(stages, input, { authorize: async () => "synthetic-token", ...options }) };
   }
-  async function noHead(principal: string) {
+  async function noHead(scope: { tenantId: string }) {
     expect((await fixture.runtime.query(`SELECT h.generation_id FROM data_generation_heads h
-      JOIN data_scope_epochs s ON s.id=h.scope_id WHERE s.principal_id=$1 ORDER BY h.scope_id LIMIT 2`, [principal])).rows)
+      JOIN data_scope_epochs s ON s.id=h.scope_id WHERE s.tenant_id=$1 AND s.scope_kind='tenant' ORDER BY h.scope_id LIMIT 2`, [scope.tenantId])).rows)
       .toEqual([{ generation_id: null }]);
   }
   function requested(source: "discovery" | "identity", response: (url: URL) => Response | Promise<Response>): FetchLike {
@@ -61,7 +61,7 @@ describe("record-backed Graph provider protocol", () => {
       const run = setup(fetcher);
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
         .rejects.toMatchObject({ code: "provider_count_mismatch" });
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
       expect(fetcher).toHaveBeenCalledTimes(source === "discovery" ? 2 : 3);
     }
   });
@@ -74,7 +74,7 @@ describe("record-backed Graph provider protocol", () => {
       const run = setup(requested(source, () => Response.json({ value: example.values, "@odata.count": example.count })));
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn, objectId]) }))
         .rejects.toMatchObject({ code: "provider_count_mismatch" });
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
     const run = setup(requested(source, () => Response.json({
       value: [user(), { ...user(), id: objectId.toUpperCase() }], "@odata.count": 1,
@@ -95,7 +95,7 @@ describe("record-backed Graph provider protocol", () => {
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn, objectId]) }))
         .rejects.toMatchObject({ code: "provider_count_mismatch" });
       expect(page).toBe(2);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
   });
 
@@ -116,7 +116,7 @@ describe("record-backed Graph provider protocol", () => {
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
         .rejects.toMatchObject({ code: "provider_schema" });
       expect(requests).toBe(continuation ? 2 : 1);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
   });
 
@@ -133,7 +133,7 @@ describe("record-backed Graph provider protocol", () => {
     await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
       .rejects.toMatchObject({ status: 502, code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledTimes(source === "catalog" ? 1 : source === "discovery" ? 2 : 3);
-    await noHead(run.input.scope.principalId);
+    await noHead(run.input.scope);
   });
 
   it.each(["no_paid_plans", "company_scope", "different_paid_plans"] as const)("rejects conflicting catalog eligibility: %s", async conflict => {
@@ -152,7 +152,7 @@ describe("record-backed Graph provider protocol", () => {
       });
       await expect(run.collect()).rejects.toMatchObject({ code: "provider_schema" });
       expect(calls).toBe(paged ? 2 : 1);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
   });
 
@@ -192,7 +192,7 @@ describe("record-backed Graph provider protocol", () => {
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn, objectId]) }))
         .rejects.toMatchObject({ code: "provider_schema" });
       expect(page).toBe(continuation ? 2 : 1);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
   });
 
@@ -211,7 +211,7 @@ describe("record-backed Graph provider protocol", () => {
       }));
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) })).rejects.toMatchObject({ status: 502 });
       expect(calls).toBe(1);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     });
 
   it.each(["same_page", "separate_queries", "product_discovery"] as const)("rejects conflicting exact evidence across %s", async variation => {
@@ -227,7 +227,7 @@ describe("record-backed Graph provider protocol", () => {
     await expect(run.collect({ identities: lease => run.stages.identities(lease, [
       objectId, upn, ...Array.from({ length: 19 }, (_, n) => `missing${n}@example.invalid`), "z@example.invalid",
     ]) })).rejects.toMatchObject({ code: "provider_schema" });
-    await noHead(run.input.scope.principalId);
+    await noHead(run.input.scope);
   });
 
   it("bounds encoded exact URLs without dropping long escaped identities", async () => {
@@ -257,7 +257,7 @@ describe("record-backed Graph provider protocol", () => {
     const run = setup(fetcher);
     await expect(run.collect({ signal: controller.signal, identities: lease => run.stages.identities(lease, [upn]) })).rejects.toBe(failure);
     expect(fetcher).toHaveBeenCalledTimes(source === "catalog" ? 1 : source === "discovery" ? 2 : 3);
-    await noHead(run.input.scope.principalId);
+    await noHead(run.input.scope);
   });
 
   it.each(["discovery", "identity"] as const)("awaits %s progress persistence and cancellation before continuation", async source => {
@@ -277,7 +277,7 @@ describe("record-backed Graph provider protocol", () => {
         identities: lease => run.stages.identities(lease, [upn, objectId]) })).rejects.toBe(failure);
       expect(calls).toBe(1);
       expect(progress).toHaveBeenLastCalledWith(1);
-      await noHead(run.input.scope.principalId);
+      await noHead(run.input.scope);
     }
   });
 
@@ -299,14 +299,14 @@ describe("record-backed Graph provider protocol", () => {
     await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn, objectId]) })).rejects.toMatchObject({ status });
     expect(requests).toBe(status === 403 ? 2 : 4);
     expect(run.wait).toHaveBeenCalledTimes(status === 403 ? 0 : 2);
-    await noHead(run.input.scope.principalId);
+    await noHead(run.input.scope);
   });
 
   it("does not replace catalog permission failure with a SKU allowlist", async () => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json({ error: { code: "Authorization_RequestDenied" } }, { status: 403 }));
     const run = setup(fetcher);
     await expect(run.collect()).rejects.toMatchObject({ status: 403 });
-    expect(fetcher).toHaveBeenCalledOnce(); await noHead(run.input.scope.principalId);
+    expect(fetcher).toHaveBeenCalledOnce(); await noHead(run.input.scope);
   });
 
   it.each(["catalog", "discovery", "identity"] as const)("cancels oversized %s responses at their existing byte ceiling", async source => {
@@ -318,7 +318,7 @@ describe("record-backed Graph provider protocol", () => {
     });
     await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
       .rejects.toMatchObject({ code: "provider_response_size_limit", message: "Graph page exceeds its byte limit." });
-    expect(cancel).toHaveBeenCalledOnce(); await noHead(run.input.scope.principalId);
+    expect(cancel).toHaveBeenCalledOnce(); await noHead(run.input.scope);
   });
 
   it("collects every 2167-user enterprise page above 2 MB without retaining a tenant array", async () => {

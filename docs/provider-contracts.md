@@ -9,7 +9,7 @@ establish implementation behavior, not live consent, licensing or data visibilit
 
 | Feature | API/mode | Permission | Additional requirement |
 | --- | --- | --- | --- |
-| Package inventory | Graph delegated/application | `CopilotPackages.Read.All` | Agent 365 licensing; configured shared scope for application mode |
+| Package inventory collection | Graph delegated/application | `CopilotPackages.Read.All` | Agent 365 licensing; configured credentials and provider application consent for application collection. Saved tenant reads require no Graph permission. |
 | Package access/block/unblock | Graph delegated | `CopilotPackages.ReadWrite.All` | Agent Control Admin and Agent 365 licensing |
 | User/group lookup | Graph delegated | `User.ReadBasic.All`, `Group.Read.All` | Authorized directory visibility |
 | User/license sync | Graph delegated | `User.Read.All`, `LicenseAssignment.Read.All` | Directory Readers or Global Reader |
@@ -24,7 +24,14 @@ establish implementation behavior, not live consent, licensing or data visibilit
 App roles do not grant provider access. Application mode requires configured
 tenant/client credentials, enabled application access and configured shared
 scope. Viewer/Admin may submit ordinary authorized shared reads directly.
-Delegated observations stay principal-private. No earlier per-query approval,
+Inventory observations are tenant-owned regardless of the collector's token mode;
+private hunt and Audit Search results retain their existing actor/sharing scope.
+Directory/activity and inventory refreshes preserve unseen saved records and
+their original observation dates. Power Platform query type/environment filters
+do not create separate datasets. Catalog absence is not authoritative deletion;
+verified exact absence still removes the corresponding supported target.
+Saved inventory reads require Viewer/Admin authority, not source-read permissions.
+No earlier per-query approval,
 qualification job or retained qualified scope is required.
 
 **Permissions > Check status** performs bounded readiness checks. Some

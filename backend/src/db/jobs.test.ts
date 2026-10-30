@@ -209,6 +209,64 @@ describe("Durable scoped jobs", () => {
     expect(await jobs.get(job.id, scope)).toMatchObject({ status: "partial", inconclusive: 1, skipped: 1, canResume: false });
   });
 
+  it.each((["verified_applied", "verified_not_applied"] as const).flatMap(status =>
+    [false, true].map(sent => ({ status, sent }))))(
+    "keeps an active attempt recoverable during $status reconciliation (sent: $sent)", async ({ status, sent }) => {
+      const job = await jobs.submit(scope, input(["first", "second", "third"]));
+      const lease = (await jobs.claim(job.id, scope, randomUUID()))!;
+      const first = (await jobs.beginItem(lease))!;
+      await jobs.markSent(lease, first.item.id, first.item.prestate_hash);
+      await jobs.finishItem(lease, first.item.id, "inconclusive");
+      const second = (await jobs.beginItem(lease))!;
+      if (sent) await jobs.markSent(lease, second.item.id, second.item.prestate_hash);
+
+      await jobs.recordReconciliation(scope, first.item.id, status,
+        { kind: "block", isBlocked: status === "verified_applied" }, "Verified provider observation.");
+
+      expect(await jobs.get(job.id, scope)).toMatchObject({
+        status: "running", currentAgentName: second.item.display_name, queued: 1, canResume: false,
+        reconciliationRequired: 0, inconclusive: status === "verified_applied" ? 0 : 1,
+      });
+      await fixture.operator.query("UPDATE jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", [job.id]);
+      expect(await jobs.recover(scope.tenantId, false, job.id)).toBeGreaterThan(0);
+      expect(await jobs.get(job.id, scope)).toMatchObject({
+        status: !sent && status === "verified_applied" ? "waiting_authorization" : "partial",
+        queued: sent ? 1 : 2, canResume: true, reconciliationRequired: sent ? 1 : 0,
+        inconclusive: (status === "verified_applied" ? 0 : 1) + (sent ? 1 : 0),
+      });
+      expect((await fixture.runtime.query("SELECT status,sent_at FROM job_items WHERE id=$1", [second.item.id])).rows[0])
+        .toEqual({ status: sent ? "inconclusive" : "queued", sent_at: sent ? expect.any(Date) : null });
+      await jobs.cancel(job.id, scope);
+    },
+  );
+
+  it("counts partial jobs with pending work toward the five-job limit, but releases their slot after cancellation", async () => {
+    const owner = { ...scope, principalId: randomUUID() };
+    const request = () => {
+      const original = input(["first", "second"]);
+      const intent = { ...original, actor: { ...original.actor, homeAccountId: owner.principalId } };
+      return { ...intent, confirmationHash: createJobConfirmation(intent).confirmationHash };
+    };
+    const pending: string[] = [];
+    for (let index = 0; index < 5; index++) {
+      const job = await jobs.submit(owner, request());
+      pending.push(job.id);
+      const lease = (await jobs.claim(job.id, owner, randomUUID()))!;
+      const first = (await jobs.beginItem(lease))!;
+      await jobs.markSent(lease, first.item.id, first.item.prestate_hash);
+      await jobs.finishItem(lease, first.item.id, "inconclusive");
+      await jobs.pauseForAuthorization(lease);
+      expect(await jobs.get(job.id, owner)).toMatchObject({ status: "partial", queued: 1, canResume: true });
+    }
+
+    await expect(jobs.submit(owner, request())).rejects.toMatchObject({ status: 429, code: "job_limit" });
+    await jobs.cancel(pending[0], owner);
+    expect(await jobs.get(pending[0], owner)).toMatchObject({ status: "partial", queued: 0, inconclusive: 1 });
+    const admitted = await jobs.submit(owner, request());
+    expect(admitted).toMatchObject({ status: "queued", total: 2 });
+    for (const id of [...pending.slice(1), admitted.id]) await jobs.cancel(id, owner);
+  });
+
   it("does not release an expired lease or an unfinished item for authorization", async () => {
     const job = await jobs.submit(scope, input(["unfinished"]));
     const lease = (await jobs.claim(job.id, scope, randomUUID()))!;

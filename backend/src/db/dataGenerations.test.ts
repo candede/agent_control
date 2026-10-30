@@ -1,14 +1,22 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeBatch } from "./dataBounds.js";
 import { DataGenerations, generationHeartbeat, prepareGenerationBatch } from "./dataGenerations.js";
 import { createRefreshExecutionSignal } from "../services/refreshExecution.js";
 import { fixturePassword, testDatabase } from "../../scripts/testDatabase.js";
-import { directoryRecord, generationInput } from "../../scripts/largeTenantFixtures.js";
+import { directoryRecord, generationInput as fixtureGenerationInput } from "../../scripts/largeTenantFixtures.js";
 import { initializeSchema, grantRuntime } from "../../scripts/database.js";
 import { schemaFingerprint, verifySchema } from "./schema.js";
 import { BoundedPool } from "./boundedPool.js";
 import { DataSyncRepository } from "./dataSync.js";
 import { verifyDataGenerationAccountingSchema,verifyDataGenerationCharges } from "./dataGenerationAccountingSchema.js";
+
+let tenantId = randomUUID();
+beforeEach(() => { tenantId = randomUUID(); });
+function generationInput(overrides: Parameters<typeof fixtureGenerationInput>[0] = {}) {
+  const input = fixtureGenerationInput(overrides);
+  return { ...input, scope: { ...input.scope, tenantId: overrides.scope?.tenantId ?? tenantId } };
+}
 
 describe("bounded generation batches", () => {
   describe("independent fenced heartbeats", () => {
@@ -78,6 +86,10 @@ describe("bounded generation batches", () => {
       expect(values).toEqual([1,1,1]);
     });
     afterAll(async () => { await fixture?.close(); });
+    afterEach(async () => {
+      await fixture.operator.query(`UPDATE data_generations SET state='cancelled',cancellation=cancellation+1,reserved_bytes=byte_count
+        WHERE state IN ('staging','validating')`);
+    });
     it("seeks the exact generation before evaluating sync and writer fences",async () => {
       const lease = await store.begin(generationInput({ scope: { ...generationInput().scope,selector: "point-fence" } }));
       try {
@@ -175,7 +187,7 @@ describe("bounded generation batches", () => {
     });
 
     it("takes the sync mutex before generation locks while a source status transaction owns its child row", async () => {
-      const input = generationInput({ scope: { ...generationInput().scope, principalId: "sync-lock-order" } });
+      const input = generationInput({ actorPrincipalId: "sync-lock-order" });
       const scope = { tenantId: input.scope.tenantId, principalId: "sync-lock-order" };
       const sync = new DataSyncRepository(fixture.runtime);
       const { run } = await sync.submit(scope, { mode: "initial", sources: ["users"] });
@@ -185,7 +197,7 @@ describe("bounded generation batches", () => {
       let pending: Promise<unknown> | undefined;
       try {
         await statusWriter.query("BEGIN");
-        await statusWriter.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}:${scope.principalId}`]);
+        await statusWriter.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`data-sync:${scope.tenantId}`]);
         await statusWriter.query("SELECT run_id FROM data_sync_run_sources WHERE run_id=$1 AND source_id='users' FOR UPDATE", [run.id]);
         let entered!: (pid: number) => void;
         const started = new Promise<number>(resolve => { entered = resolve; });
@@ -208,6 +220,9 @@ describe("bounded generation batches", () => {
       }
       expect(await pending).toBeNull();
       await sync.cancel(scope, run.id);
+      expect((await fixture.runtime.query("SELECT state FROM data_generations WHERE id=$1", [lease.id])).rows[0].state).toBe("cancelled");
+      const successor = await store.begin({ ...input, actorPrincipalId: randomUUID() });
+      await store.abort(successor);
     });
 
     it("keeps two batches invisible, rejects a revoked writer and retains a previous good head", async () => {
@@ -311,7 +326,7 @@ describe("bounded generation batches", () => {
       await store.publish(lease);
     });
     it("rejects new and existing stale session work after durable principal revocation", async () => {
-      const input = generationInput({ scope: { ...generationInput().scope, principalId: "revoked" } });
+      const input = generationInput({ actorPrincipalId: "revoked" });
       const lease = await store.begin(input);
       expect(await store.revokePrincipal(input.scope.tenantId, "revoked")).toBe("1");
       await expect(store.begin(input)).rejects.toThrow("data_session_fenced");
@@ -330,13 +345,14 @@ describe("bounded generation batches", () => {
       await store.abort(derived);
     });
     it("serializes revocation racing a commit at the durable scope lock", async () => {
-      const input = generationInput({ scope: { ...generationInput().scope, principalId: "commit-race" } });
+      const input = generationInput({ actorPrincipalId: "commit-race" });
       const lease = await store.begin(input);
       await store.validate(lease, { rows: 0, children: 0, batches: 0, pages: 0, wireRows: 0 });
       const blocker = await fixture.operator.connect();
       try {
         await blocker.query("BEGIN");
-        const blockerPid = (await blocker.query("SELECT id,pg_backend_pid() AS pid FROM data_scope_epochs WHERE id=$1 FOR UPDATE", [lease.scopeId])).rows[0].pid;
+        const blockerPid = (await blocker.query(`SELECT epoch,pg_backend_pid() AS pid FROM data_principal_epochs
+          WHERE tenant_id=$1 AND principal_id=$2 FOR UPDATE`, [input.scope.tenantId, input.actorPrincipalId])).rows[0].pid;
         const revoked = store.revokePrincipal(input.scope.tenantId, "commit-race");
         await vi.waitFor(async () => {
           const waiting = (await fixture.operator.query(`SELECT EXISTS(SELECT 1 FROM pg_stat_activity

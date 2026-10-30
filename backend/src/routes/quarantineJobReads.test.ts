@@ -54,7 +54,7 @@ async function running(tenantId: string, principal = principalId, claim = true, 
   const scope = { tenantId, principalId: principal };
   const environmentId = randomUUID();
   const resources = Array.from({ length: count }, (_, n) => ({
-    nativeId: `native-agent-${n}`, environmentId, displayName: "Agent", lifecycle: "published",
+    nativeId: `native-agent-${environmentId}-${n}`, environmentId, displayName: "Agent", lifecycle: "published",
     identifiers: [{ kind: "environment_id", value: environmentId }, { kind: "cds_bot_id", value: randomUUID() }],
   }));
   const source = await nativeInventoryFixture(fixture.runtime, scope, resources);

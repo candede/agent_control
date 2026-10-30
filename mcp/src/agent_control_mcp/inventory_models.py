@@ -34,7 +34,6 @@ class Observation(WireModel):
 
 
 class PackageObservation(Observation):
-    tokenMode: Literal["delegated", "application"]
     scopeKind: Literal["broad", "exact"]
     observedCount: SafeInteger
     totalRecords: SafeInteger
@@ -483,8 +482,8 @@ class FreshnessSource(WireModel):
     scope_id: str
     source: Literal["inventory_packages", "inventory_power_platform"]
     selector: str
-    token_mode: Literal["delegated", "application"]
     row_count: int | str
+    collected_count: int | str
     generation_id: str
     observed_at: str
     expires_at: str
@@ -722,4 +721,3 @@ class PackagePage(WireModel):
     page: Page
     counts: InventoryCounts
     freshness: Freshness
-    mode: Literal["delegated"]

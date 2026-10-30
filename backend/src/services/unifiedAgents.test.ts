@@ -170,7 +170,7 @@ afterEach(async () => {
     expect(inventoryPresentation(await scenario.queries.page(selected.id, identity, { limit: 50 })).value).toHaveLength(2);
     expect(await live.record(scenario.scope, nativeId!)).toEqual(previous);
     await generations.revokePrincipal(scenario.scope.tenantId, scenario.scope.principalId);
-    await expect(live.record(scenario.scope, nativeId!)).rejects.toMatchObject({ code: "agent_not_found" });
+    expect(await live.record(scenario.scope, nativeId!)).toEqual(previous);
   });
 
   it("keeps aged complete inventory, directory counts and people readable without recollection or renewing live authority", async () => {
@@ -196,7 +196,7 @@ afterEach(async () => {
       expect(new Date(source.observation!.expiresAt)).toEqual(expiresAt);
     }
     const users = new UserSourcesRepository(database.runtime, "synthetic-retained-user-snapshot-key");
-    const userSelection = await users.capture(scenario.identity, "delegated");
+    const userSelection = await users.capture(scenario.identity);
     const people = await users.page(userSelection.id, scenario.identity);
     expect(people).toMatchObject({ value: [{ directory: { objectId: ownerA } }],
       sources: { directory: { state: "stale" } }, summary: { checkedUsers: 1, licensedUsers: 0, unknownLicenseUsers: 1 } });

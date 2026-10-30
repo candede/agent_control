@@ -52,7 +52,8 @@ export function userSourceFactsSql(selected = false) {
       WHEN d.plan_count=0 THEN 'no_paid' ELSE 'paid_inactive' END AS entitlement,
     a.identity AS activity_identity,a.report_refresh_date,a.last_activity_date,a.chat_date,a.teams_date,
     a.word_date,a.excel_date,a.powerpoint_date,a.outlook_date,a.onenote_date,a.loop_date,
-    CASE WHEN NOT $3::boolean OR a.last_activity_date IS NULL THEN 'unknown'
+    CASE WHEN a.report_refresh_date IS NULL OR a.last_activity_date IS NULL
+      OR $3::timestamptz >= ((a.report_refresh_date::timestamp+interval '5 days') AT TIME ZONE 'UTC') THEN 'unknown'
       WHEN a.last_activity_date BETWEEN a.report_refresh_date-(CASE a.period WHEN 'D28' THEN 27 ELSE 29 END) AND a.report_refresh_date THEN 'active'
       ELSE 'inactive' END AS activity_state`;
   if (selected) return `${projection} FROM selected_directory d
@@ -90,7 +91,7 @@ export function userSourceFactsSql(selected = false) {
 
 export function userSourceSqlParameters(context: Pick<UserSourceReadContext, "metadata" | "evaluatedAt">): unknown[] {
   return [context.metadata.directory.generationId, context.metadata.app_activity.generationId,
-    context.metadata.app_activity.generationId !== null && isCopilotAppActivityFresh(context.metadata.app_activity.reportRefreshDate, context.evaluatedAt)];
+    context.evaluatedAt];
 }
 
 export class UserSourcesRepository {
@@ -105,43 +106,42 @@ export class UserSourcesRepository {
 
   async validateRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity) {
     if (root.kind !== "user_sources") throw new AppError(400, "invalid_cursor", "Selection endpoint mismatch.");
-    const row = (await client.query(`SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND principal_id=$3
-      AND source='user_sources' AND selector='complete' AND scope_kind='principal' AND epoch=$4
-      AND $5::timestamptz>clock_timestamp()`, [root.scopeId, identity.tenantId, identity.principalId, root.revision, root.expiresAt])).rows[0];
+    const row = (await client.query(`SELECT id FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2
+      AND source='user_sources' AND selector='complete' AND scope_kind='tenant' AND epoch=$3
+      AND $4::timestamptz>clock_timestamp()`, [root.scopeId, identity.tenantId, root.revision, root.expiresAt])).rows[0];
     if (!row) throw new SelectionError("selection_invalidated");
   }
 
-  async ensureScope(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"]) {
+  async ensureScope(identity: SelectionIdentity) {
     if ([identity.tenantId, identity.principalId, identity.authorizationHash].some(value => typeof value !== "string" || !value.trim())) {
       throw new AppError(403, "scope_mismatch", "An authenticated tenant and principal are required.");
     }
-    if (!["delegated", "application"].includes(tokenMode)) throw new SelectionError("selection_invalidated");
     return this.connections.run(async client => {
       await client.query("INSERT INTO data_principal_epochs(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING", [identity.tenantId, identity.principalId]);
       const epoch = (await client.query("SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2 FOR UPDATE",
         [identity.tenantId, identity.principalId])).rows[0].epoch;
       if (epoch !== identity.sessionEpoch) throw new SelectionError("selection_invalidated");
       const inserted = (await client.query(`INSERT INTO data_scope_epochs(id,tenant_id,scope_kind,principal_id,token_mode,source,selector,session_epoch)
-        VALUES($1,$2,'principal',$3,$4,'user_sources','complete',$5)
+        VALUES($1,$2,'tenant',NULL,'tenant','user_sources','complete',0)
         ON CONFLICT(tenant_id,scope_kind,principal_id,token_mode,source,selector) DO NOTHING RETURNING id`,
-      [randomUUID(), identity.tenantId, identity.principalId, tokenMode, epoch])).rows[0];
-      const scope = (inserted ?? (await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-        AND scope_kind='principal' AND token_mode=$3 AND source='user_sources' AND selector='complete'`,
-      [identity.tenantId, identity.principalId, tokenMode])).rows[0])?.id as string | undefined;
+      [randomUUID(), identity.tenantId])).rows[0];
+      const scope = (inserted ?? (await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1
+        AND scope_kind='tenant' AND token_mode='tenant' AND source='user_sources' AND selector='complete'`,
+      [identity.tenantId])).rows[0])?.id as string | undefined;
       if (!scope) throw new SelectionError("selection_invalidated");
       return scope;
     });
   }
 
-  async capture(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"], input: UserSourceFilter = {}) {
+  async capture(identity: SelectionIdentity, input: UserSourceFilter = {}) {
     const query = userSourceFilter(input);
-    const stateId = await this.ensureScope(identity, tokenMode);
+    const stateId = await this.ensureScope(identity);
     return this.selections.captureWith(identity, endpoint, { values: query, allowed: queryFields }, async (client, evaluatedAt) => {
       const state = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [stateId])).rows[0];
-      const scope = { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode };
+      const scope = { tenantId: identity.tenantId };
       const metadata = await this.metadataInRead(client, scope, evaluatedAt);
       const cacheExpiry = (await client.query(`SELECT min(expires_at) AS expires_at FROM agent_people_cache
-        WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>$3`, [identity.tenantId, identity.principalId, evaluatedAt])).rows[0].expires_at as Date | null;
+        WHERE tenant_id=$1 AND expires_at>$2`, [identity.tenantId, evaluatedAt])).rows[0].expires_at as Date | null;
       const expiry = new Date(Math.min(evaluatedAt.getTime() + 30 * 60_000, cacheExpiry?.getTime() ?? Infinity));
       const roots: DependencyRoot[] = [{ kind: "user_sources", scopeId: stateId, revision: state.epoch, expiresAt: expiry }];
       for (const source of Object.values(metadata)) {
@@ -152,20 +152,20 @@ export class UserSourcesRepository {
       const transition = refresh === null ? null : new Date(Date.parse(`${refresh}T23:59:59.999Z`) + 4 * 86_400_000);
       return { roots, ...(transition && transition > evaluatedAt ? { nextTransition: transition } : {}),
         persist: async (connection, selection) => {
-          await connection.query(`INSERT INTO user_source_read_contexts(selection_id,tenant_id,token_mode,metadata)
-            VALUES($1,$2,$3,$4::jsonb)`, [selection.id, identity.tenantId, tokenMode, JSON.stringify(metadata)]);
+          await connection.query(`INSERT INTO user_source_read_contexts(selection_id,tenant_id,metadata)
+            VALUES($1,$2,$3::jsonb)`, [selection.id, identity.tenantId, JSON.stringify(metadata)]);
         } };
     });
   }
 
   async metadataInRead(client: pg.PoolClient, scope: UserSourceScope, evaluatedAt: Date): Promise<UserSourceMetadataSet> {
     const rows = (await client.query(`SELECT requested.source,s.id AS scope_id,h.revision::text,
-      g.id AS generation_id,g.observed_at,g.expires_at,g.row_count,success.report_refresh_date::text,
+      g.id AS generation_id,g.observed_at,g.expires_at,g.row_count,success.report_refresh_date::text,success.retained_count,
       COALESCE(success.report_period,latest.report_period,'D28') AS report_period,
       latest.created_at AS attempted_at,latest.status AS attempt_status,latest.error_code,latest.message
       ,latest.observed_count AS attempt_observed_count
       FROM (VALUES('directory'),('app_activity')) requested(source)
-      LEFT JOIN data_scope_epochs s ON s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode=$3
+      LEFT JOIN data_scope_epochs s ON s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant'
         AND s.source=requested.source AND s.selector='complete'
       LEFT JOIN data_generation_heads h ON h.scope_id=s.id
       LEFT JOIN data_generations g ON g.id=h.generation_id AND g.state='published'
@@ -177,13 +177,13 @@ export class UserSourcesRepository {
         WHERE attempt.scope_id=s.id AND attempt_generation.scope_id=s.id
           AND attempt_generation.scope_epoch=s.epoch AND attempt_generation.session_epoch=s.session_epoch
         ORDER BY attempt_generation.created_at DESC,attempt_generation.id DESC LIMIT 1) latest ON true`,
-    [scope.tenantId, scope.principalId, scope.tokenMode])).rows;
+    [scope.tenantId])).rows;
     const metadata = Object.fromEntries(rows.map(row => {
       const available = row.generation_id !== null;
       const state = !available ? "unavailable"
         : row.expires_at <= evaluatedAt || evaluatedAt.getTime() - row.observed_at.getTime() >= automaticDataSyncIntervalMs
           || row.source === "app_activity" && row.report_refresh_date !== null && !isCopilotAppActivityFresh(row.report_refresh_date, evaluatedAt) ? "stale"
-          : row.source === "app_activity" && row.report_refresh_date === null ? "partial"
+          : row.retained_count>0 || row.source === "app_activity" && row.report_refresh_date === null ? "partial"
           : row.attempt_status === "available" || row.attempt_status === "running" ? "available" : "partial";
       const value: UserSourceMetadata = {
         source: row.source, generationId: row.generation_id, scopeId: row.scope_id,
@@ -213,13 +213,13 @@ export class UserSourcesRepository {
     return metadata;
   }
 
-  refreshStatus(identity: SelectionIdentity, tokenMode: UserSourceScope["tokenMode"]) {
+  refreshStatus(identity: SelectionIdentity) {
     return this.connections.selectedRead(async client => {
       const principal = (await client.query("SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2 FOR SHARE",
         [identity.tenantId, identity.principalId])).rows[0];
       if (principal && principal.epoch !== identity.sessionEpoch) throw new SelectionError("selection_invalidated");
       const evaluatedAt = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
-      const metadata = await this.metadataInRead(client, { ...identity, tokenMode }, evaluatedAt);
+      const metadata = await this.metadataInRead(client, identity, evaluatedAt);
       const sources = Object.values(metadata);
       const complete = sources.every(source => source.generationId !== null && source.attemptStatus === "available");
       const status = complete ? "succeeded" : sources.some(source => source.generationId !== null) ? "partial"
@@ -231,7 +231,7 @@ export class UserSourcesRepository {
 
   async contextInRead(client: pg.PoolClient, identity: SelectionIdentity,
     selected: Awaited<ReturnType<DataSelections["assert"]>>): Promise<UserSourceReadContext> {
-    const row = (await client.query("SELECT token_mode,metadata FROM user_source_read_contexts WHERE selection_id=$1 AND tenant_id=$2",
+    const row = (await client.query("SELECT metadata FROM user_source_read_contexts WHERE selection_id=$1 AND tenant_id=$2",
       [selected.selection.id, identity.tenantId])).rows[0];
     if (!row || !selected.pins.some(pin => pin.root_kind === "user_sources")) throw new SelectionError("selection_invalidated");
     const metadata = row.metadata as UserSourceMetadataSet;
@@ -243,7 +243,7 @@ export class UserSourcesRepository {
     const query = userSourceFilter(selected.selection.query_json);
     if (canonicalQuery(query, queryFields) !== selected.selection.query_hash) throw new SelectionError("invalid_cursor");
     return { metadata, evaluatedAt: selected.selection.evaluated_at,
-      scope: { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: row.token_mode },
+      scope: { tenantId: identity.tenantId },
       selection: { id: selected.selection.id, revision: selected.selection.revision,
         expiresAt: selected.selection.expires_at.toISOString(), evaluatedAt: selected.selection.evaluated_at.toISOString(),
         validatedAt: selected.selection.validated_at.toISOString() },
@@ -423,15 +423,15 @@ export class UserSourcesRepository {
       [identity.tenantId, identity.principalId]);
     await this.connections.run(async client => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
-        [`data-sync:${identity.tenantId}:${identity.principalId}`]);
+        [`data-sync:${identity.tenantId}`]);
       const principal = (await client.query("SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2 FOR UPDATE",
         [identity.tenantId, identity.principalId])).rows[0];
       if (!principal || principal.epoch !== identity.sessionEpoch) throw new SelectionError("selection_invalidated");
-      await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND principal_id=$2
-        AND source='user_sources' ORDER BY id FOR UPDATE`, [identity.tenantId, identity.principalId]);
+      await client.query(`SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND scope_kind='tenant'
+        AND source='user_sources' ORDER BY id FOR UPDATE`, [identity.tenantId]);
       await fence(client);
       const count = exactCount((await client.query(`SELECT count(*)::text AS n FROM agent_people_cache
-        WHERE tenant_id=$1 AND principal_id=$2 AND NOT(object_id=ANY($3::uuid[]))`, [identity.tenantId, identity.principalId, ids])).rows[0].n);
+        WHERE tenant_id=$1 AND NOT(object_id=ANY($2::uuid[]))`, [identity.tenantId, ids])).rows[0].n);
       if (count + ids.length > 100_000) throw new AppError(413, "agent_people_limit", "Saved people exceed 100000 identities.");
       await client.query(`INSERT INTO agent_people_cache(tenant_id,principal_id,object_id,revision,status,
         display_name,user_principal_name,checked_at,resolved_at,expires_at,error_code)
@@ -439,8 +439,9 @@ export class UserSourcesRepository {
           CASE WHEN status='resolved' THEN "checkedAt" ELSE NULL END,
           "checkedAt"+CASE status WHEN 'resolved' THEN interval '7 days' WHEN 'not_found' THEN interval '1 day' ELSE interval '15 minutes' END,"errorCode"
         FROM jsonb_to_recordset($3::jsonb) r("objectId" uuid,revision uuid,status text,"displayName" text,"userPrincipalName" text,"checkedAt" timestamptz,"errorCode" text)
-        ON CONFLICT(tenant_id,principal_id,object_id) DO UPDATE SET revision=EXCLUDED.revision,status=EXCLUDED.status,checked_at=EXCLUDED.checked_at,
-          expires_at=EXCLUDED.expires_at,error_code=EXCLUDED.error_code,
+        ON CONFLICT(tenant_id,object_id) DO UPDATE SET principal_id=EXCLUDED.principal_id,revision=EXCLUDED.revision,status=EXCLUDED.status,checked_at=EXCLUDED.checked_at,
+          expires_at=CASE WHEN EXCLUDED.status='lookup_failed' THEN GREATEST(agent_people_cache.expires_at,EXCLUDED.expires_at)
+            ELSE EXCLUDED.expires_at END,error_code=EXCLUDED.error_code,
           display_name=CASE WHEN EXCLUDED.status='lookup_failed' THEN agent_people_cache.display_name ELSE EXCLUDED.display_name END,
           user_principal_name=CASE WHEN EXCLUDED.status='lookup_failed' THEN agent_people_cache.user_principal_name ELSE EXCLUDED.user_principal_name END,
           resolved_at=CASE WHEN EXCLUDED.status='lookup_failed' THEN CASE WHEN agent_people_cache.status='not_found' THEN agent_people_cache.checked_at
@@ -673,23 +674,26 @@ export async function userSourcePeopleInRead(
   const requested = userSourceObjectIds(ids);
   if (!requested.length) return [];
   const rows = (await client.query(`SELECT requested.id,d.identity AS directory_id,d.display_name,d.upn,
+      (d.residual->>'retainedObservedAt')::timestamptz AS directory_observed_at,
       c.status,c.display_name AS cached_name,c.user_principal_name AS cached_upn,
       c.checked_at,c.resolved_at,c.expires_at,c.error_code
-    FROM unnest($4::text[]) requested(id)
-    LEFT JOIN directory_user_rows d ON d.generation_id=$3 AND d.tenant_id=$1 AND d.identity=requested.id
-      AND EXISTS(SELECT 1 FROM data_scope_epochs s WHERE s.id=d.scope_id AND s.principal_id=$2 AND s.token_mode=$6)
-    LEFT JOIN agent_people_cache c ON c.tenant_id=$1 AND c.principal_id=$2
-      AND c.object_id=requested.id::uuid AND c.expires_at>$5 AND $7::boolean
+    FROM unnest($3::text[]) requested(id)
+    LEFT JOIN directory_user_rows d ON d.generation_id=$2 AND d.tenant_id=$1 AND d.identity=requested.id
+      AND EXISTS(SELECT 1 FROM data_scope_epochs s WHERE s.id=d.scope_id AND s.scope_kind='tenant' AND s.token_mode='tenant')
+    LEFT JOIN agent_people_cache c ON c.tenant_id=$1
+      AND c.object_id=requested.id::uuid AND c.expires_at>$4 AND $5::boolean
     WHERE d.identity IS NOT NULL OR c.object_id IS NOT NULL ORDER BY requested.id COLLATE "C"`,
-  [scope.tenantId, scope.principalId, directory?.generationId ?? null, requested, evaluatedAt, scope.tokenMode, includePeopleCache])).rows;
+  [scope.tenantId, directory?.generationId ?? null, requested, evaluatedAt, includePeopleCache])).rows;
   return rows.map(row => {
+    const observedAt: Date | null = row.directory_id !== null && directory !== null
+      ? row.directory_observed_at ?? directory.observedAt : null;
     const saved = row.directory_id !== null && directory !== null ? {
       objectId: row.id, displayName: row.display_name, userPrincipalName: row.upn,
-      observedAt: directory.observedAt.toISOString(),
+      observedAt: observedAt!.toISOString(),
     } : null;
-    if (!row.status || saved && directory!.observedAt > row.checked_at) return saved!;
+    if (!row.status || saved && observedAt! > row.checked_at) return saved!;
     const conclusive = row.status === "not_found" ? row.checked_at : row.resolved_at;
-    const identity = saved && row.status === "lookup_failed" && (!conclusive || directory!.observedAt > conclusive)
+    const identity = saved && row.status === "lookup_failed" && (!conclusive || observedAt! > conclusive)
       ? saved : { objectId: row.id, displayName: row.cached_name, userPrincipalName: row.cached_upn,
         observedAt: (row.resolved_at ?? row.checked_at).toISOString() };
     return { ...identity, status: row.status, checkedAt: row.checked_at.toISOString(),

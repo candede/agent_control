@@ -6,7 +6,8 @@ import type { OfficialUsageReportKind } from "../src/types/officialReportRecords
 export function generationInput(overrides: Partial<BeginGeneration> = {}): BeginGeneration {
   const now = Date.now();
   return {
-    scope: { tenantId: "synthetic-tenant", kind: "principal", principalId: "synthetic-principal", tokenMode: "delegated", source: "directory", selector: "complete" },
+    scope: { tenantId: selectionIdentity.tenantId, kind: "tenant", principalId: null, tokenMode: "tenant", source: "directory", selector: "complete" },
+    actorPrincipalId: "synthetic-principal",
     schemaVersion: 1, sessionEpoch: "0", jobId: randomUUID(), jobKind: "fixture", observedAt: new Date(now),
     expiresAt: new Date(now + 86_400_000), deadlineAt: new Date(now + 1800_000), reserveBytes: 16 * 1024 ** 2, ...overrides,
   };

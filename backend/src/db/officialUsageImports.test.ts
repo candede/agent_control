@@ -50,7 +50,7 @@ async function operation(identity: SelectionIdentity, setId: string, action: "se
   return imports.confirm(identity, await imports.confirmPreview(identity, setId, action));
 }
 async function agents(identity: SelectionIdentity, setId?: string) {
-  return reports.page((await reports.capture(identity, "delegated", "official_agents", setId ? { setId } : {})).id, identity);
+  return reports.page((await reports.capture(identity, "official_agents", setId ? { setId } : {})).id, identity);
 }
 async function counts(identity: SelectionIdentity) {
   return (await fixture.runtime.query(`SELECT
@@ -248,7 +248,7 @@ describe("native automatic import and semantic reuse", () => {
     expect(await single(identity, duplicate.stages[0])).toEqual(partial);
     expect((await fixture.runtime.query(`SELECT accepted_set_id,accepted_version_id,accepted_result_revision
       FROM official_usage_staging WHERE id=$1`, [duplicate.stages[0].id])).rows).toEqual(receiptBefore);
-    const selected = await reports.capture(identity, "delegated", "history");
+    const selected = await reports.capture(identity, "history");
     expect((await reports.page(selected.id, identity)).counts.total).toBe(1);
     expect((await agents(identity)).reports.setId).toBe(original.setId);
     await releaseSelections(identity); await retainUntilConverged(fixture.operator, { batchSize: 250 });
@@ -319,7 +319,7 @@ describe("native automatic import and semantic reuse", () => {
     expect(results[rejected]).toMatchObject({ reason: { code: "active_revision_mismatch" } });
     for (const preview of drafts[rejected].stages) await imports.discard(identity, preview.id);
     expect(await (await bundle(identity)).accept()).toEqual(accepted.value);
-    const selected = await reports.capture(identity, "delegated", "history");
+    const selected = await reports.capture(identity, "history");
     expect((await reports.page(selected.id, identity)).counts.total).toBe(1);
   });
 

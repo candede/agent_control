@@ -97,6 +97,60 @@ describe("inventory sweep cancellation and retention", () => {
     return source;
   }
 
+  it.each(["inventory_control_pending", "inventory_native_control_pending"] as const)(
+    "defers canonical discovery for another actor's pending %s, but not another tenant's", async table => {
+      const f = fixture();
+      const scope = { tenantId: f.root.tenantId, principalId: "current-reader" };
+      let pendingTenant = scope.tenantId;
+      vi.mocked(f.database.query).mockImplementation(async (sql, parameters) => {
+        const statement = String(sql);
+        const values = parameters as string[];
+        const rows = statement.startsWith("SELECT 1 WHERE")
+          ? statement.includes(table) && values[0] === pendingTenant
+            && (!statement.includes("principal_id=$2") || values[1] === "other-actor") ? [{}] : []
+          : [f.root];
+        return { command: "SELECT", rows, rowCount: rows.length, fields: [], oid: 0 };
+      });
+      vi.spyOn(DataGenerations.prototype, "sessionEpoch").mockResolvedValue("0");
+      const request = vi.spyOn(f.runtime.reconciliation, "request").mockResolvedValue({
+        scopeId: f.scopeId, active: null, pendingSequence: "1",
+      });
+
+      await expect(f.runtime.enqueue(scope, false)).resolves.toBe(false);
+      expect(request).not.toHaveBeenCalled();
+
+      pendingTenant = "another-tenant";
+      await expect(f.runtime.enqueue(scope, false)).resolves.toBe(true);
+      expect(request).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("discovers native receipts owned by an actor other than the current source publisher", async () => {
+    const f = fixture();
+    await retain(f, "source-publisher");
+    const receiptAuthority = await retain(f, "control-actor");
+    vi.mocked(f.database.query).mockImplementation(async sql => {
+      const rows = [
+        { tenant_id: f.root.tenantId, principal_id: "source-publisher", id: "1" },
+        ...(String(sql).includes("FROM inventory_native_control_pending")
+          ? [{ tenant_id: f.root.tenantId, principal_id: "control-actor", id: "2" }] : []),
+      ];
+      return { command: "SELECT", rows, rowCount: rows.length, fields: [], oid: 0 };
+    });
+    vi.spyOn(f.runtime, "publishControls").mockResolvedValue(0);
+    const native = vi.spyOn(f.runtime, "publishNativeControls").mockImplementation(async scope => {
+      if (scope.principalId === "control-actor") expect(currentAuthority()).toBe(receiptAuthority);
+      return 0;
+    });
+    vi.spyOn(f.runtime, "enqueue").mockResolvedValue(false);
+    vi.spyOn(f.runtime, "collect").mockResolvedValue(false);
+
+    await expect(f.runtime.pass()).resolves.toBe(true);
+    expect(native).toHaveBeenCalledWith(
+      { tenantId: f.root.tenantId, principalId: "control-actor" }, expect.any(AbortSignal),
+    );
+  });
+
   it.each(["inventory_input_fenced","inventory_control_changed"] as const)("re-reads bounded publication after a concurrent %s fence",async code=>{
     const f=fixture();
     vi.spyOn(f.runtime,"publishControls").mockResolvedValue(0);
@@ -353,43 +407,48 @@ describe("inventory sweep cancellation and retention", () => {
     expect(f.content).not.toHaveBeenCalled();
   });
 
-  it("recovers orphan package controls without a source scope", async () => {
-    const f = fixture();
-    const scope = { tenantId: f.root.tenantId, principalId: "orphan-principal" };
-    const observationId = randomUUID();
-    let pending = true;
-    const rows = (value: object[]): pg.QueryResult =>
-      ({ command: "SELECT", rows: value, rowCount: value.length, fields: [], oid: 0 });
-    vi.mocked(f.database.query).mockImplementation(async sql => {
-      const statement = String(sql);
-      if (statement.startsWith("SELECT tenant_id,principal_id,min(")) {
-        return rows(pending && statement.includes("inventory_control_pending")
-          ? [{ tenant_id: scope.tenantId, principal_id: scope.principalId, id: observationId }] : []);
-      }
-      if (statement.startsWith("SELECT p.target_id") || statement.startsWith("SELECT p.scope_id")
-        || statement.startsWith("SELECT 1 WHERE") || statement.startsWith("SELECT r.scope_id")) return rows([]);
-      throw new Error("Unexpected orphan recovery query.");
-    });
-    f.query.mockImplementation(async sql => {
-      const statement = String(sql);
-      if (statement.startsWith("DELETE FROM inventory_control_pending")) {
-        pending = false;
-      }
-      return { ...rows([]), command: ["BEGIN", "COMMIT", "ROLLBACK"].includes(statement) ? statement : "SELECT" };
-    });
-    const collect = vi.spyOn(f.runtime, "collect").mockResolvedValue(false);
-    const packageReadback = vi.spyOn(StreamedInventory.prototype, "controlReadback");
-    const nativeReadback = vi.spyOn(StreamedInventory.prototype, "nativeControlReadback");
-    const request = vi.spyOn(f.runtime.reconciliation, "request");
+  it.each((["package", "native"] as const).flatMap(domain =>
+    [false, true].map(otherActor => ({ domain, otherActor }))))(
+    "recovers orphan $domain controls without a source scope (another actor authorized: $otherActor)", async ({ domain, otherActor }) => {
+      const f = fixture();
+      if (otherActor) await retain(f, "other-reader");
+      const scope = { tenantId: f.root.tenantId, principalId: "orphan-principal" };
+      const observationId = randomUUID();
+      const table = domain === "package" ? "inventory_control_pending" : "inventory_native_control_pending";
+      let pending = true;
+      const rows = (value: object[]): pg.QueryResult =>
+        ({ command: "SELECT", rows: value, rowCount: value.length, fields: [], oid: 0 });
+      vi.mocked(f.database.query).mockImplementation(async sql => {
+        const statement = String(sql);
+        if (statement.startsWith("SELECT tenant_id,principal_id,min(")) {
+          return rows(pending && statement.includes(`FROM ${table}`)
+            ? [{ tenant_id: scope.tenantId, principal_id: scope.principalId, id: observationId }] : []);
+        }
+        if (statement.startsWith("SELECT p.target_id") || statement.startsWith("SELECT p.scope_id")
+          || statement.startsWith("SELECT 1 WHERE") || statement.startsWith("SELECT r.scope_id")) return rows([]);
+        throw new Error("Unexpected orphan recovery query.");
+      });
+      f.query.mockImplementation(async (sql, parameters) => {
+        const statement = String(sql);
+        if (statement.startsWith(`DELETE FROM ${table}`) && parameters?.[1] === scope.principalId) {
+          pending = false;
+        }
+        return { ...rows([]), command: ["BEGIN", "COMMIT", "ROLLBACK"].includes(statement) ? statement : "SELECT" };
+      });
+      const collect = vi.spyOn(f.runtime, "collect").mockResolvedValue(false);
+      const packageReadback = vi.spyOn(StreamedInventory.prototype, "controlReadback");
+      const nativeReadback = vi.spyOn(StreamedInventory.prototype, "nativeControlReadback");
+      const request = vi.spyOn(f.runtime.reconciliation, "request");
 
-    await expect(f.runtime.pass()).resolves.toBe(true);
-    expect(pending).toBe(false);
-    expect(packageReadback).not.toHaveBeenCalled();
-    expect(nativeReadback).not.toHaveBeenCalled();
-    expect(request).not.toHaveBeenCalled();
-    expect(collect).toHaveBeenCalledOnce();
-    await expect(f.runtime.pass()).resolves.toBe(false);
-  });
+      await expect(f.runtime.pass()).resolves.toBe(true);
+      expect(pending).toBe(false);
+      expect(packageReadback).not.toHaveBeenCalled();
+      expect(nativeReadback).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+      expect(collect).toHaveBeenCalledOnce();
+      await expect(f.runtime.pass()).resolves.toBe(false);
+    },
+  );
 
   it("does not wait on abandoned canonical work when no current authorized source remains", async () => {
     const f = fixture();

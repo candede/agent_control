@@ -4,14 +4,14 @@ import type { InventoryRoot } from "../types/inventoryRecords.js";
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 
 export async function inventorySelectionRoots(client: pg.PoolClient,
-  scope: { id: string; tenantId: string; tokenMode: "delegated" | "application" }, expiresAt: Date): Promise<DependencyRoot[]> {
+  scope: { id: string; tenantId: string }, expiresAt: Date): Promise<DependencyRoot[]> {
   const root = (await client.query<{
     scope_id: string; baseline_id: string; revision: string; inputs: InventoryRoot[];
   }>(`SELECT r.scope_id,r.baseline_id,r.revision::text,v.inputs
     FROM inventory_roots r JOIN inventory_revisions v ON v.scope_id=r.scope_id AND v.revision=r.revision
     JOIN data_scope_epochs s ON s.id=r.scope_id
-    WHERE r.scope_id=$1 AND r.current AND r.tenant_id=$2 AND s.token_mode=$3`,
-  [scope.id, scope.tenantId, scope.tokenMode])).rows[0];
+    WHERE r.scope_id=$1 AND r.current AND r.tenant_id=$2 AND s.scope_kind='tenant' AND s.token_mode='tenant'`,
+  [scope.id, scope.tenantId])).rows[0];
   if (!root) return [];
   return [{ kind: "inventory_delta", scopeId: root.scope_id, generationId: root.baseline_id, revision: root.revision, expiresAt },
     ...root.inputs.map(input => ({ kind: "inventory_delta" as const, scopeId: input.scopeId,
@@ -24,26 +24,21 @@ export async function inventoryAssociationRevision(client: pg.PoolClient, tenant
 }
 
 export async function validateInventoryRoot(client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity,
-  applicationScope?: Pick<SelectionIdentity, "tenantId" | "principalId">, exportSelectionId?: string) {
+  exportSelectionId?: string) {
   if (root.kind !== "inventory_delta") throw new SelectionError("selection_invalidated");
-  const applicationOwner = applicationScope?.tenantId === identity.tenantId ? applicationScope.principalId : "";
-  const owners = applicationOwner ? [identity.principalId, applicationOwner] : [identity.principalId];
   const revision = await client.query(`SELECT 1 FROM inventory_revisions v JOIN inventory_roots r ON r.baseline_id=v.baseline_id
     JOIN data_generations g ON g.id=v.generation_id JOIN data_scope_epochs s ON s.id=v.scope_id
     JOIN data_generations anchor ON anchor.id=v.baseline_id
     WHERE v.scope_id=$1 AND v.revision=$2 AND v.baseline_id=$3 AND v.tenant_id=$4 AND r.collected_before<=$2
-      AND s.principal_id=ANY($5::text[]) AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
-      AND (s.token_mode<>'application' OR s.source='inventory_packages' AND s.principal_id=$6
-        AND EXISTS(SELECT 1 FROM capability_configuration c WHERE c.tenant_id=s.tenant_id
-          AND c.capability_id='graph.package.read.application' AND c.enabled AND c.shared_data_scope))
+      AND s.scope_kind='tenant' AND s.token_mode='tenant' AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
       AND g.state IN ('published','retired') AND g.validated
       AND anchor.state IN ('published','retired')
       AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(v.inputs) input("scopeId" uuid,"baselineId" uuid,epoch bigint)
         LEFT JOIN data_scope_epochs source ON source.id=input."scopeId"
         LEFT JOIN data_generations generation ON generation.id=input."baselineId"
-        WHERE source.epoch IS DISTINCT FROM input.epoch OR source.tenant_id<>$4 OR NOT(source.principal_id=ANY($5::text[]))
+        WHERE source.epoch IS DISTINCT FROM input.epoch OR source.tenant_id<>$4 OR source.scope_kind<>'tenant'
           OR generation.id IS NULL OR generation.state NOT IN ('published','retired'))`,
-  [root.scopeId, root.revision, root.generationId, identity.tenantId, owners, applicationOwner]);
+  [root.scopeId, root.revision, root.generationId, identity.tenantId]);
   if (revision.rowCount !== 1) throw new SelectionError("selection_invalidated");
   if (exportSelectionId !== undefined) {
     const changed = await client.query(`SELECT 1 FROM inventory_read_contexts c
@@ -73,7 +68,7 @@ export function selectedInventorySourcesSql(tenant: string, principal: string, a
     JOIN unified_agent_memberships member ON member.generation_id=canonical.generation_id AND member.identity=canonical.identity
     JOIN inventory_records source ON source.generation_id=member.source_generation_id AND source.identity=member.source_identity
     WHERE selected.id=${selection}::uuid AND selected.tenant_id=${tenant} AND selected.principal_id=${principal}
-      AND scope.tenant_id=${tenant} AND scope.principal_id=${principal}
-      AND scope.source='inventory_canonical' AND scope.token_mode='delegated'
+      AND scope.tenant_id=${tenant} AND scope.scope_kind='tenant'
+      AND scope.source='inventory_canonical' AND scope.token_mode='tenant'
       AND (${agent}::text IS NULL OR canonical.identity=${agent})`;
 }

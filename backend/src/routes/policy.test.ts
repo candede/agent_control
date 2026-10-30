@@ -37,6 +37,7 @@ describe("route policy declarations", () => {
       "POST /quarantine/canary-approvals", "GET /quarantine/canary-approvals", "POST /quarantine/canary-approvals/:id/execute",
       "GET /copilot-usage/users", "GET /copilot-usage/users/facets", "GET /copilot-usage/users/unresolved-identities",
       "GET /copilot-usage/adoption", "GET /copilot-usage/adoption/facets",
+      "GET /copilot-usage/adoption/summary", "GET /copilot-usage/adoption/departments",
       "GET /copilot-usage/adoption/champions", "GET /copilot-usage/users/resolve", "GET /copilot-usage/users/:objectId/agent-relationships",
       "GET /copilot-usage/users/:objectId", "GET /copilot-usage/users/:objectId/service-plans", "GET /copilot-usage/users/:objectId/agents",
       "GET /official-usage/users/:username", "GET /official-usage/users/:username/directory", "GET /official-usage/users/:username/service-plans",

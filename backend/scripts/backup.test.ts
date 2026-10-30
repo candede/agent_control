@@ -113,11 +113,11 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     return usage.acceptBundle(owner,bundleId,await usage.bundle(owner,bundleId));
   };
   const historicalReports = await acceptBundle();
-  const historicalSelection = await reader.capture(usageScope,"delegated","official_users");
+  const historicalSelection = await reader.capture(usageScope,"official_users");
   const historicalVersionIds = (await reader.page(historicalSelection.id,usageScope)).reports.lineages.map(lineage => lineage.versionId);
   const currentReports = await acceptBundle(historicalReports.setId);
   expect(currentReports.setId).not.toBe(historicalReports.setId);
-  const currentSelection = await reader.capture(usageScope,"delegated","official_users");
+  const currentSelection = await reader.capture(usageScope,"official_users");
   const currentVersionIds = new Set((await reader.page(currentSelection.id,usageScope)).reports.lineages.map(lineage => lineage.versionId));
   const sharedVersionIds = historicalVersionIds.filter(id => currentVersionIds.has(id));
   const historicalOnlyVersionIds = historicalVersionIds.filter(id => !currentVersionIds.has(id));
@@ -188,8 +188,9 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     const restoredInventory = new InventoryQueries(restoredRuntime, "synthetic-inventory-restore-read-secret");
     await expect(restoredInventory.page(inventorySelection.id, inventoryIdentity)).rejects.toMatchObject({ code: "selection_invalidated" });
     const restoredStore = new InventoryGenerations(restoredRuntime);
-    expect((await restoredStore.gcMetadata(inventoryRoot.scopeId, inventoryRoot.tenantId)).exactHeads).toBe(1);
-    expect((await restoredRuntime.query("SELECT identity FROM inventory_exact_heads WHERE scope_id=$1", [inventoryRoot.scopeId])).rows).toEqual([]);
+    expect((await restoredStore.gcMetadata(inventoryRoot.scopeId, inventoryRoot.tenantId)).exactHeads).toBe(0);
+    expect((await restoredRuntime.query("SELECT identity FROM inventory_exact_heads WHERE scope_id=$1", [inventoryRoot.scopeId])).rows)
+      .toEqual([{ identity: "package-000000" }]);
     const state = await restoredRuntime.query("SELECT mode FROM operational_state");
     expect(state.rows).toEqual([{ mode: "maintenance" }]);
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM sessions")).rows[0].count).toBe(0);
@@ -202,20 +203,20 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1",
       [packageRoot.scopeId])).rows[0].count).toBe(1);
     await expect(restoredInventory.capture({ ...usageScope, sessionEpoch: "1" }, packageRoot.scopeId))
-      .rejects.toMatchObject({ code: "selection_invalidated" });
+      .resolves.toMatchObject({ endpoint: "inventory" });
     await expect(restoredInventory.capture({ ...usageScope, principalId: "other", sessionEpoch: "0" }, packageRoot.scopeId))
-      .rejects.toMatchObject({ code: "selection_invalidated" });
-    expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM inventory_live_sources WHERE tenant_id=$1 AND principal_id=$2",
-      [packageScope.tenantId, packageScope.principalId])).rows[0].count).toBe(0);
+      .resolves.toMatchObject({ endpoint: "inventory" });
+    expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM inventory_live_sources WHERE tenant_id=$1",
+      [packageScope.tenantId])).rows[0].count).toBeGreaterThan(0);
     const restoredReader = new LargeTenantUsersReports(restoredRuntime,"synthetic-backup-read-secret-never-production",35);
     const restoredIdentity={...usageScope,sessionEpoch:"1"},restoredCorrectionIdentity={...laterCorrectionScope,sessionEpoch:"1"};
     await expect(restoredReader.page(currentSelection.id,usageScope)).rejects.toMatchObject({code:"selection_invalidated"});
-    const restoredUsers=await restoredReader.capture(restoredIdentity,"delegated","official_users");
+    const restoredUsers=await restoredReader.capture(restoredIdentity,"official_users");
     expect((await restoredReader.page(restoredUsers.id,restoredIdentity)).value).toHaveLength(1);
-    const restoredOverview=await restoredReader.capture(restoredCorrectionIdentity,"delegated","overview");
+    const restoredOverview=await restoredReader.capture(restoredCorrectionIdentity,"overview");
     expect((await restoredReader.page(restoredOverview.id,restoredCorrectionIdentity)).analytics.overview)
       .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
-    await expect(restoredReader.capture(restoredCorrectionIdentity,"delegated","official_users",{setId:laterCorrectedOriginal.setId}))
+    await expect(restoredReader.capture(restoredCorrectionIdentity,"official_users",{setId:laterCorrectedOriginal.setId}))
       .rejects.toMatchObject({ code: "selection_invalidated" });
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
       historicalOnlyVersionIds])).rows[0].count).toBe(0);
@@ -236,7 +237,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect(await reopenRestoredDatabase(fixture.operator,target)).toEqual({mode:"normal",providerWorkEnabled:true});
     expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0]).toEqual({mode:"normal"});
     await expect(restoredReader.page(restoredUsers.id,restoredIdentity)).rejects.toMatchObject({code:"selection_invalidated"});
-    const reopenedUsers=await restoredReader.capture(restoredIdentity,"delegated","official_users");
+    const reopenedUsers=await restoredReader.capture(restoredIdentity,"official_users");
     expect((await restoredReader.page(reopenedUsers.id,restoredIdentity)).value).toEqual([]);
     expect(await restoredHunting.getJob(huntingScope,currentHunt.jobId)).toBeUndefined();
     await expect(restoredHunting.listRows(huntingScope,currentHunt.jobId)).rejects.toThrow("not found");

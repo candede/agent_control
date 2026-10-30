@@ -297,9 +297,7 @@ export class PowerPlatformInventoryService {
     try {
       assertCurrent();
       const queryTypes = inventoryQueryTypes(current.roleScope, current.requestedTypes);
-      const input = await inventoryJobInput(this.repository.database, scope, "power_platform", id, {
-        environmentId: current.environmentScope ?? undefined, resourceTypes: queryTypes,
-      });
+      const input = await inventoryJobInput(this.repository.database, scope, "power_platform", id);
       deadlineAt = input.deadlineAt.getTime();
       execution = createRefreshExecutionSignal(signal, Math.max(0, Math.min(refreshExecutionDeadlineMs, deadlineAt - Date.now())));
       signal = execution.signal;

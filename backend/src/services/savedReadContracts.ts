@@ -40,7 +40,7 @@ export class SavedReadContracts {
 
   private async compound(client: pg.PoolClient, context: ReportReadContext, inventoryId: string) {
     const { context: selected, selection } = await this.inventory.contextInRead(client, inventoryId, context.identity);
-    if (context.tokenMode !== "delegated" || selected.source !== "inventory_canonical" || selected.tokenMode !== "delegated") throw new SelectionError("invalid_cursor");
+    if (selected.source !== "inventory_canonical") throw new SelectionError("invalid_cursor");
     if (selected.data.metadata.directory.generationId !== context.metadata.directory.generationId
       || selected.data.report.historyRevision !== context.report.historyRevision || selected.data.report.historyEpoch !== context.report.historyEpoch) {
       throw new AppError(409, "selection_invalidated", "Report, directory and inventory join selections no longer share the same saved dependencies.");

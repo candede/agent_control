@@ -84,7 +84,6 @@ const record: UnifiedAgentRecord = {
       observedAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       current: true,
-      tokenMode: "delegated",
       scopeKind: "broad",
       observedCount: 2,
       totalRecords: 2,

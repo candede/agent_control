@@ -15,7 +15,7 @@ function savedInventory(): UnifiedAgentInventoryPage {
     identityCollection: { checkedPackages: 2, pendingPackages: 0 },
     sources: {
       graphPackages: { state: "available", error: null, observation: {
-        id: "graph", snapshotId: "graph", current: true, tokenMode: "delegated", scopeKind: "broad",
+        id: "graph", snapshotId: "graph", current: true, scopeKind: "broad",
         observedAt, expiresAt, observedCount: 2, totalRecords: 2,
       } },
       powerPlatform: { state: "available", error: null, observation: {

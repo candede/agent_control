@@ -21,10 +21,10 @@ export async function readAutomaticInventoryRevisions(scope: { tenantId: string;
       FROM data_scope_epochs s LEFT JOIN data_generation_heads h ON h.scope_id=s.id
       LEFT JOIN data_generations g ON g.id=h.generation_id
       LEFT JOIN inventory_roots r ON r.scope_id=s.id AND r.current
-      WHERE s.tenant_id=$1 AND s.principal_id=$2 AND s.token_mode='delegated'
+      WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant'
         AND (h.generation_id IS NOT NULL OR s.epoch>0)
         AND (s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical') OR s.source IN ('directory','app_activity') AND s.selector='complete')
-      UNION ALL SELECT 'agent_people',coalesce((SELECT revision FROM inventory_people_revisions WHERE tenant_id=$1 AND principal_id=$2),0)::text
+      UNION ALL SELECT 'agent_people',coalesce((SELECT revision FROM inventory_people_revisions WHERE tenant_id=$1),0)::text
       UNION ALL SELECT 'agent_usage',coalesce((SELECT revision FROM agent_usage_state WHERE tenant_id=$1),0)::text
       UNION ALL SELECT 'authorization',coalesce((SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2),0)::text
       UNION ALL SELECT 'reports',jsonb_build_array(coalesce(h.revision,0),coalesce(h.invalidation_epoch,0),coalesce(s.revision,1),s.active_set_id)::text

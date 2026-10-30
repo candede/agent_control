@@ -48,7 +48,7 @@ function source(source: UserSourceMetadata["source"]): UserSourceMetadata {
 }
 function context(endpoint: ReportEndpoint, input: ReportQuery = {}): ReportReadContext {
   const query = reportQuery(endpoint, input);
-  return { identity, tokenMode: "delegated", endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
+  return { identity, endpoint, query, queryHash: canonicalQuery(query, reportQueryFields),
     evaluatedAt: new Date("2026-10-01T00:00:00Z"),
     selection: { id: selectionId, revision: "1", evaluatedAt: "2026-10-01T00:00:00Z", expiresAt: "2026-10-01T00:10:00Z",
       validatedAt: "2026-10-01T00:00:00Z", publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
@@ -78,7 +78,7 @@ beforeAll(async () => {
       username: "reader@example.invalid", displayName: "Reader", roles };
     next();
   });
-  app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity: identified, tokenMode: "delegated" }),
+  app.use("/api", createOfficialReportDataRouter({ reports, identity: async () => ({ identity: identified }),
     enqueueExport: async () => { throw new Error("Unexpected export dispatch"); } }));
   app.use(errorHandler);
   server = await new Promise<Server>(resolve => {
@@ -92,7 +92,7 @@ beforeEach(() => {
   vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected database query"));
   vi.spyOn(client, "query").mockRejectedValue(new Error("Unexpected client query"));
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Unexpected provider request")));
-  vi.spyOn(reports, "capture").mockImplementation(async (_identity, _tokenMode, endpoint, query) => {
+  vi.spyOn(reports, "capture").mockImplementation(async (_identity, endpoint, query) => {
     saved = context(endpoint, query);
     return { ...saved.selection, endpoint: saved.endpoint, queryHash: saved.queryHash,
       evaluatedAt: saved.evaluatedAt, expiresAt: new Date(saved.selection.expiresAt) };
@@ -148,7 +148,7 @@ describe("department adoption HTTP contract", () => {
       selection: context("adoption_departments").selection, reports: context("adoption_departments").report,
     });
     expect(await request("GET", "/copilot-usage/adoption/departments?company=~string%3AContoso&limit=8")).toMatchObject({ status: 200 });
-    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "adoption_departments",
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "adoption_departments",
       reportQuery("adoption_departments", { company: "Contoso" }));
     expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, expect.objectContaining({ endpoint: "adoption_departments",
       query: expect.objectContaining({ sort: "adoptionRate", order: "desc" }) }), { limit: 8 });
@@ -212,7 +212,7 @@ describe("retained adoption history HTTP contract", () => {
     expect(await request("GET", "/official-usage/history/adoption?limit=100")).toMatchObject({
       status: 200, body: { value: [], counts: { total: 0, filtered: 0 }, page: { limit: 100 } },
     });
-    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", "adoption_history", {});
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "adoption_history", {});
     expect(read).toHaveBeenCalledExactlyOnceWith(client, reports, saved, { limit: 100 });
   });
   it.each([
@@ -344,7 +344,7 @@ describe("report query HTTP contracts", () => {
     "round-trips a literal empty creator type through %s", async path => {
       allowPage();
       expect(await request("GET", `/${path}${reportQueryString({ creatorType: "" })}`)).toMatchObject({ status: 200 });
-      expect(reports.capture).toHaveBeenCalledWith(identity, "delegated", expect.any(String),
+      expect(reports.capture).toHaveBeenCalledWith(identity, expect.any(String),
         expect.objectContaining({ creatorType: "" }));
     },
   );
@@ -359,7 +359,7 @@ describe("report query HTTP contracts", () => {
     allowPage();
     for (const creatorType of ["~null", "~string:", "x".repeat(256)]) {
       expect(await request("GET", `/official-usage/aggregate${reportQueryString({ creatorType })}`)).toMatchObject({ status: 200 });
-      expect(reports.capture).toHaveBeenLastCalledWith(identity, "delegated", "official_agents",
+      expect(reports.capture).toHaveBeenLastCalledWith(identity, "official_agents",
         reportQuery("official_agents", { creatorType }));
     }
   });
@@ -374,7 +374,7 @@ describe("report query HTTP contracts", () => {
       ] as const) {
         expect(await request("GET", `/${path}${reportQueryString({ creatorType })}`))
           .toMatchObject({ status: 200 });
-        expect(reports.capture).toHaveBeenLastCalledWith(identity, "delegated", endpoint,
+        expect(reports.capture).toHaveBeenLastCalledWith(identity, endpoint,
           expect.objectContaining({ creatorType }));
         expect(await request("GET", `/${path}${reportQueryString({ selectionId, creatorType })}`))
           .toMatchObject({ status: 200 });
@@ -395,7 +395,7 @@ describe("report query HTTP contracts", () => {
     const response = await request("GET", "/official-usage/history/options");
     expect(response).toMatchObject({ status: 200, body: { value: [], selection: { id: selectionId } } });
     expect(Object.keys(response.body).sort()).toEqual(["counts", "page", "reports", "selection", "value"]);
-    expect(reports.capture).toHaveBeenCalledWith(identity, "delegated", "history", reportQuery("history"));
+    expect(reports.capture).toHaveBeenCalledWith(identity, "history", reportQuery("history"));
     expect(reports.pageInRead).not.toHaveBeenCalled();
     expect(reports.summaryInRead).not.toHaveBeenCalled();
   });
@@ -413,7 +413,7 @@ describe.each([
   it("captures the requested historical set without applying child filters to the parent", async () => {
     expect(await request("GET", `${path}${reportQueryString({ setId, search: "Child", sort: "creatorType" })}`))
       .toMatchObject({ status: 200 });
-    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", endpoint, reportQuery(endpoint, { setId }));
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, endpoint, reportQuery(endpoint, { setId }));
     const options = endpoint === "copilot_users" ? vi.mocked(reports.pageInRead).mock.calls[0][2] : vi.mocked(reports.page).mock.calls[0][2];
     expect(options?.childQuery).toEqual(reportQuery("relationships", { search: "Child", sort: "creatorType" }));
   });
@@ -439,7 +439,7 @@ describe.each([
     vi.mocked(reports.capture).mockRejectedValue(new SelectionError("selection_invalidated"));
     expect(await request("GET", `${path}${reportQueryString({ setId })}`))
       .toMatchObject({ status: 409, body: { code: "selection_invalidated" } });
-    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, "delegated", endpoint, reportQuery(endpoint, { setId }));
+    expect(reports.capture).toHaveBeenCalledExactlyOnceWith(identity, endpoint, reportQuery(endpoint, { setId }));
     expect(reports.exactInRead).not.toHaveBeenCalled();
     expect(reports.pageInRead).not.toHaveBeenCalled();
   });

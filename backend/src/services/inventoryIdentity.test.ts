@@ -4,6 +4,7 @@ import { inventoryEnvironmentPattern, inventoryGuidPattern, normalizeEnvironment
 import { InventoryIdentityQueries } from "../db/inventoryIdentityQueries.js";
 import { LiveInventory } from "../db/liveInventory.js";
 import { normalizeEnvironmentIdentitySql, normalizeInventoryIdentifierSql, normalizeNativeIdentitySql } from "../db/inventoryIdentityNormalization.js";
+import { inventoryNativeRootChoicesSql } from "../db/inventoryInputScopes.js";
 
 vi.mock("../db/pool.js", () => ({
   pool: {},
@@ -71,6 +72,25 @@ describe("exact inventory identity resolution", () => {
       expect(sql).toContain("fact.generation_id=n.generation_id AND fact.identity=n.identity");
       expect(sql).toContain(normalizeInventoryIdentifierSql("requested.kind", "fact.value"));
       expect(sql).toContain("ORDER BY resource_type,normalized_environment_id,normalized_native_id,kind,native_id,environment_id");
+      expect(database.connect).not.toHaveBeenCalled();
+    });
+
+    it("includes retained resource types in both exact matches and unresolved evidence after a narrowed refresh", async () => {
+      const { database, client, query } = fixture();
+      query.mockResolvedValueOnce(rows([])).mockResolvedValueOnce(rows([{ present: true, blueprint: false }]));
+      await expect(new InventoryIdentityQueries(database).resolve(client, scope, types, identity()))
+        .resolves.toEqual({ status: "unresolved", reason: "no_documented_exact_identifier" });
+      for (const [sql] of query.mock.calls) {
+        expect(sql).toContain(inventoryNativeRootChoicesSql("roots"));
+        expect(sql).toContain("kind=ANY($3::text[])");
+        expect(sql).toContain("member.valid_from_revision<=captured.revision");
+        expect(sql).toContain("member.valid_to_revision>captured.revision");
+        expect(sql).toContain("record.resource_type=kind");
+        expect(sql).toContain("root.current AND root.domain='power_platform' AND root.tenant_id=$1");
+        expect(sql).toContain("scope.scope_kind='tenant' AND scope.token_mode='tenant'");
+        expect(sql).toContain("generation.state='published' AND generation.validated");
+        expect(sql).not.toContain("CROSS JOIN LATERAL unnest(attempt.resource_types)");
+      }
       expect(database.connect).not.toHaveBeenCalled();
     });
 

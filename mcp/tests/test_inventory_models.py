@@ -3,9 +3,9 @@ import json
 import httpx2
 import pytest
 from pydantic import ValidationError
-from test_tools import GUID, RECORD, response_for
+from test_tools import GUID, RECORD, SOURCE, response_for
 
-from agent_control_mcp.inventory_models import ProviderUsage, QuarantineIdentity
+from agent_control_mcp.inventory_models import FreshnessSource, ProviderUsage, QuarantineIdentity
 from agent_control_mcp.tools import operation_named
 
 PROVENANCE = {
@@ -14,6 +14,64 @@ PROVENANCE = {
     "maturity": "preview",
 }
 METRICS = ["totalRunTimeInHours", "exceptionRate"]
+
+
+@pytest.fixture(params=["inventory_packages", "inventory_power_platform"])
+def freshness_source(request):
+    native = request.param == "inventory_power_platform"
+    # InventoryQueries.summaries projects saved membership and latest collection counts separately.
+    return {
+        "scope_id": SOURCE,
+        "source": request.param,
+        "selector": "complete",
+        "row_count": "2",
+        "collected_count": "1",
+        "generation_id": GUID,
+        "observed_at": "2026-10-16T00:00:00Z",
+        "expires_at": "2026-10-16T00:10:00Z",
+        "channel": "catalog",
+        "environment_id": None,
+        "resource_types": ["microsoft.copilotstudio/agents"] if native else [],
+        "baseline_id": GUID,
+        "role_scope": "unknown" if native else None,
+        "agent_count": 2 if native else 0,
+        "expected_count": "1",
+        "page_count": 1,
+        "unknown_field_count": 0,
+        "wire_count": "1",
+        "complete": True,
+        "catalog_scope_complete": True,
+        "catalog_complete": True,
+        "catalog_observed_at": "2026-10-16T00:00:00Z",
+        "catalog_expires_at": "2026-10-16T00:10:00Z",
+        "captured_revision": "1",
+        "current": True,
+    }
+
+
+@pytest.mark.parametrize("count_type", [int, str], ids=["integer", "postgres-bigint"])
+def test_freshness_source_preserves_current_saved_projection(freshness_source, count_type):
+    body = {
+        **freshness_source,
+        "row_count": count_type(2),
+        "collected_count": count_type(1),
+    }
+    parsed = FreshnessSource.model_validate_json(json.dumps(body))
+    assert json.loads(parsed.model_dump_json(exclude_unset=True)) == body
+
+
+@pytest.mark.parametrize("extra_field", ["token_mode", "unexpected"])
+def test_freshness_source_rejects_fields_outside_current_projection(freshness_source, extra_field):
+    with pytest.raises(ValidationError):
+        FreshnessSource.model_validate_json(
+            json.dumps({**freshness_source, extra_field: "delegated"})
+        )
+
+
+def test_freshness_source_requires_collection_count(freshness_source):
+    del freshness_source["collected_count"]
+    with pytest.raises(ValidationError):
+        FreshnessSource.model_validate_json(json.dumps(freshness_source))
 
 
 @pytest.mark.parametrize("provenance", [None, PROVENANCE], ids=["unknown", "observed"])
@@ -183,6 +241,23 @@ async def test_sdk_preserves_first_run_inventory_state(state, rpc, entra):
     body = {"state": state, "message": "Saved inventory is not available yet."}
     entra.api_responses.append(httpx2.Response(200, json=body))
     result = await rpc("get_inventory_health")
+    assert not result.get("isError"), result
+    assert result["structuredContent"] == body
+    assert len(entra.api_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "name", ["get_inventory_health", "list_agents", "get_inventory_summary", "list_packages"]
+)
+async def test_sdk_preserves_nonempty_inventory_freshness(
+    name, freshness_source, rpc, entra, source_fixtures
+):
+    operation = operation_named(name)
+    body = response_for(operation, source_fixtures["complete"])
+    body["freshness"]["sources"] = [freshness_source]
+    entra.api_responses.append(httpx2.Response(200, json=body))
+    request = {} if name == "get_inventory_health" else {"selectionId": GUID}
+    result = await rpc(name, request)
     assert not result.get("isError"), result
     assert result["structuredContent"] == body
     assert len(entra.api_calls) == 1

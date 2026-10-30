@@ -199,12 +199,12 @@ describe("history-only dashboard capture", () => {
       return { ...context().selection, endpoint, queryHash: context().queryHash,
         evaluatedAt: at, validatedAt: at, expiresAt: new Date(context().selection.expiresAt) };
     });
-    await reports.capture(identity, "delegated", "adoption_history");
+    await reports.capture(identity, "adoption_history");
     expect(sourceRead).not.toHaveBeenCalled();
     const saved = query.mock.calls.find(([sql]) => sql.startsWith("INSERT INTO official_usage_read_contexts"))![1]!;
-    expect(saved[5]).toBeNull();
-    expect(JSON.parse(saved[4] as string)).toMatchObject({ setId: null, historyRevision: "5", lineages: [] });
-    expect(JSON.parse(saved[3] as string)).toMatchObject({
+    expect(saved[4]).toBeNull();
+    expect(JSON.parse(saved[3] as string)).toMatchObject({ setId: null, historyRevision: "5", lineages: [] });
+    expect(JSON.parse(saved[2] as string)).toMatchObject({
       directory: { generationId: null }, app_activity: { generationId: null },
     });
   });

@@ -199,7 +199,7 @@ describe("users/report route-to-client boundary", () => {
       const result = await response.json() as AdoptionPage;
       expect(result.selection.id).toBeTruthy();
       expect(result.page).toMatchObject({ number: 1, offset: 0 });
-      expect(capture).toHaveBeenCalledWith(identity, "delegated", "adoption", expect.not.objectContaining({ anchor: expect.anything() }));
+      expect(capture).toHaveBeenCalledWith(identity, "adoption", expect.not.objectContaining({ anchor: expect.anything() }));
       const pinned = await api(`/copilot-usage/adoption?selectionId=${result.selection.id}&anchor=${"a".repeat(64)}&limit=2`);
       expect(pinned.status, await pinned.clone().text()).toBe(200);
       expect((await pinned.json() as AdoptionPage).selection.id).toBe(result.selection.id);
@@ -462,7 +462,7 @@ describe("users/report route-to-client boundary", () => {
     }
     expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM audit_events WHERE tenant_id=$1
       AND action IN ('export-official-usage-users','export-official-usage-aggregate') AND status='succeeded'`, [identity.tenantId])).rows[0].n).toBeGreaterThanOrEqual(6);
-    const current = await reports.page((await reports.capture(identity, "delegated", "history")).id, identity);
+    const current = await reports.page((await reports.capture(identity, "history")).id, identity);
     expect(current.reports).toMatchObject({ activeSetId: history.reports.activeSetId, activeRevision: history.reports.activeRevision });
     expect(current.counts.total).toBe(history.counts.total + (operation === "correction" ? 1 : -1));
   }, 30000);

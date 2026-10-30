@@ -18,7 +18,7 @@ function fixture() {
   const query = vi.spyOn(client, "query").mockImplementation(async (statement: unknown, parameters?: unknown[]) => {
     if (typeof statement !== "string") throw new Error("Expected SQL");
     if (statement.includes("AS filtered")) return result([{ total: "2", filtered: "2", invalid: "0" }]);
-    if (statement.includes("FROM unnest($4::text[])")) return result((parameters?.[3] as string[]).map(id => ({
+    if (statement.includes("FROM unnest($3::text[])")) return result((parameters?.[2] as string[]).map(id => ({
       id, directory_id: id, display_name: "J\u030c", upn: null, status: null,
     })));
     return result([objectId, otherId].map(id => ({ id, roles: ["owner"], bytes: 100, candidate_count: 2, agent_count: "1" })));
@@ -84,16 +84,16 @@ it("captures inventory exact-person requests before selected acquisition yields"
     const sql = String(statement);
     if (sql.startsWith("SELECT set_config")) return result([]);
     if (sql.includes("FROM inventory_read_contexts")) return result([{
-      source: "inventory_canonical", token_mode: "delegated", root_scope_id: "scope",
+      source: "inventory_canonical", token_mode: "tenant", root_scope_id: "scope",
       association_revision: "0", report_context: data, query_values: {},
     }]);
     if (sql.includes("inventory_association_revision")) return result([{ revision: "0" }]);
-    if (sql.includes("FROM unnest($4::text[])")) return result((parameters?.[3] as string[]).map(id => ({
+    if (sql.includes("FROM unnest($3::text[])")) return result((parameters?.[2] as string[]).map(id => ({
       id, directory_id: id, display_name: "Saved person", upn: null, status: null,
     })));
     throw new Error("Unexpected inventory query");
   });
   expect((await inventory.people("selection", identity, ids))[0].objectId).toBe(objectId);
-  expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($4::text[])"),
-    [identity.tenantId, identity.principalId, "directory", [objectId], at, "delegated", false]);
+  expect(query).toHaveBeenCalledWith(expect.stringContaining("FROM unnest($3::text[])"),
+    [identity.tenantId, "directory", [objectId], at, false]);
 });

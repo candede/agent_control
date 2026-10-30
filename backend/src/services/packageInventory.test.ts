@@ -178,6 +178,21 @@ describe("streamed package refresh service", () => {
     expect(f.repository.claimDueDetails).not.toHaveBeenCalled();
     expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
   });
+  it("queues provider-free saved derivation even when the caller cannot authorize provider detail work", async () => {
+    const f = fixture({ autoDetails: true }), enqueue = vi.fn(async () => false);
+    vi.mocked(inventoryRuntime).mockReturnValueOnce({ enqueue } as never);
+    f.repository.claimDueDetails.mockResolvedValueOnce(f.job);
+    f.dependencies.requireAvailable.mockRejectedValueOnce(new AppError(403, "missing_permission", "Provider permission denied."));
+    await f.service.refreshDueDetails(f.owner);
+    expect(enqueue).toHaveBeenCalledWith(
+      { tenantId: f.owner.tenantId, principalId: f.owner.homeAccountId }, true, undefined);
+    expect(f.dependencies.requireAvailable).toHaveBeenCalledOnce();
+    expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "missing_permission",
+      expect.any(String), f.job.resultRevision);
+    expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(f.streams.graphCatalog).not.toHaveBeenCalled();
+    expect(f.streams.exactJob).not.toHaveBeenCalled();
+  });
 
   it.each([false, true])("does not let an unrelated automatic check resume a cancelled batch while its collector is stopping (signal=%s)", async withSignal => {
     const f = fixture({ autoDetails: true }), polling = deferred<void>();
@@ -275,8 +290,8 @@ describe("streamed package refresh service", () => {
     if (application) {
       expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
       expect(f.dependencies.requireApplicationDataScope).toHaveBeenCalledTimes(3);
-      expect(inventoryRuntime).not.toHaveBeenCalled();
-    } else expect(inventoryRuntime).toHaveBeenCalledOnce();
+    }
+    expect(inventoryRuntime).toHaveBeenCalledOnce();
   });
 
   it.each([false, true])("persists scalar progress and retry notices without source arrays (exact=%s)", async exact => {
@@ -382,8 +397,9 @@ describe("streamed package refresh service", () => {
     const f = fixture(), pending = deferred<AuthenticatedUser>();
     f.dependencies.revalidateUser.mockResolvedValueOnce(f.owner).mockReturnValueOnce(pending.promise);
     vi.mocked(inventoryJobInput).mockResolvedValueOnce({
-      scope: { tenantId: f.owner.tenantId!, principalId: f.owner.homeAccountId, kind: "principal",
-        tokenMode: "delegated", source: "inventory_packages", selector: "complete" },
+      scope: { tenantId: f.owner.tenantId!, principalId: null, kind: "tenant",
+        tokenMode: "tenant", source: "inventory_packages", selector: "complete" },
+      actorPrincipalId: f.owner.homeAccountId,
       schemaVersion: 1, sessionEpoch: "0", jobId: f.job.id, jobKind: "package_refresh",
       observedAt: new Date(), expiresAt: new Date(Date.now() + 60_000),
       deadlineAt: new Date(Date.now() + 1000), reserveBytes: 1024,
