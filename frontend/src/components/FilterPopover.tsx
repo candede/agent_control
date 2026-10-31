@@ -96,7 +96,7 @@ export function FilterPopover({ label, activeCount, description, triggerRef, chi
       aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? id : undefined}
       onClick={() => setOpen(value => !value)}>
       <SlidersHorizontal size={16} aria-hidden="true" /> Filters
-      {activeCount ? <span className="filter-count" aria-hidden="true">{activeCount}</span> : null}
+      <span className={`filter-count${activeCount ? "" : " is-empty"}`} aria-hidden="true">{activeCount}</span>
     </button>
     {open ? <div ref={popover} id={id} className="agent-filter-popover" role="dialog" aria-label={label}>
       <header>

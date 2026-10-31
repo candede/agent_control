@@ -67,6 +67,43 @@ function fixture(beforeRead?: () => void) {
 }
 
 describe("selected inventory request snapshots", () => {
+  it.each([{ batches: [0] }, { batches: [4, 1, 0] }])(
+    "expires report history batches $batches before capturing and persisting the explicit report ID as inventory query context", async ({ batches }) => {
+    const setId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+    const { inventory, readQuery, client, data } = fixture();
+    data.report = { ...data.report, setId, activeSetId: "11111111-1111-4111-8111-111111111111" };
+    vi.spyOn(inventory.reports.sources, "ensureScope").mockResolvedValue("source-scope");
+    vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("history-scope");
+    const expire = vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
+    for (const count of batches) expire.mockResolvedValueOnce(count);
+    vi.spyOn(inventory.reports.history, "root").mockResolvedValue({
+      kind: "tenant_history", scopeId: "history-scope", revision: "1", expiresAt: new Date(at.getTime() + 600_000),
+    });
+    const report = vi.spyOn(inventory.reports, "currentInventoryData").mockResolvedValue(data);
+    readQuery.mockImplementation(sql => {
+      if (sql.startsWith("SELECT r.scope_id,r.baseline_id")) return result([{
+        scope_id: "scope", baseline_id: "baseline", revision: "1", inputs: [],
+      }]);
+      if (sql.startsWith("INSERT INTO inventory_read_contexts")) return result();
+      throw new Error(`Unexpected capture SQL: ${sql}`);
+    });
+    vi.spyOn(inventory.selections, "captureWith").mockImplementation(async (who, endpoint, filters, prepare) => {
+      expect(expire.mock.calls).toEqual(batches.map(() => [identity.tenantId]));
+      expect(filters.values).toEqual({ inventoryQuery: digest(JSON.stringify({ setId })) });
+      const prepared = await prepare(client, at);
+      const selection = { id: "selection", revision: "1", endpoint, queryHash: "a".repeat(64),
+        evaluatedAt: at, validatedAt: at, expiresAt: new Date(at.getTime() + 600_000) };
+      await prepared.persist!(client, selection);
+      expect(who).toEqual(identity);
+      return selection;
+    });
+    await inventory.capture(identity, "scope", { setId: setId.toUpperCase() });
+    expect(report).toHaveBeenCalledWith(client, identity, at, setId);
+    const insert = readQuery.mock.calls.find(([sql]) => sql.startsWith("INSERT INTO inventory_read_contexts"))!;
+    expect(JSON.parse(String(insert[1]![2])).report).toMatchObject({ setId, activeSetId: data.report.activeSetId });
+    expect(JSON.parse(String(insert[1]![5]))).toEqual({ setId });
+  });
+
   it.each(["exact", "usage"] as const)("retains the bounded %s IDs while acquiring the selection", async method => {
     const ids = ["original"];
     const { inventory, readQuery } = fixture(() => {
@@ -140,6 +177,62 @@ describe("selected inventory request snapshots", () => {
 });
 
 describe("saved package detail reconstruction", () => {
+  it.each([
+    {},
+    { supportedHosts: [], elementTypes: [], categories: [] },
+    { supportedHosts: ["Teams"], elementTypes: ["DeclarativeCopilots"], categories: ["Productivity"] },
+  ])("restores package-source page previews without exposing detail-only categories: %j", async collections => {
+    const { inventory, readQuery, client, data } = fixture();
+    const record = packageInventoryRecord(allowlistedPackage({ id: "package", displayName: "Package", isBlocked: false, ...collections }));
+    const observedCollections = Object.fromEntries(record.facts.filter(fact => fact.kind === "collection"
+      && ["supportedHosts", "elementTypes"].includes(fact.value)).map(collection => [
+      collection.value, record.facts.filter(fact => fact.kind === collection.value).map(fact => fact.value),
+    ]));
+    const context: Parameters<InventoryQueries["pageInRead"]>[1] = {
+      data, selectionId: "selection", expiresAt: at.getTime() + 60_000, scopeId: "scope",
+      baselineId: "baseline", revision: "1", source: "inventory_packages", query: { sortBy: "createdAt" },
+    };
+    const counts = { total: 1, linked: 0, graphOnly: 1, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
+    readQuery.mockImplementation(sql => {
+      if (sql.includes("candidates AS MATERIALIZED")) return result([{
+        identity: record.identity, native_id: record.native_id, domain: "packages", resource_type: null,
+        source_residual: sql.includes("'scopeId',f.scope_id,'identity',f.identity")
+          ? { ...record.residual, ...observedCollections, savedSource: { scopeId: "scope", identity: record.identity } }
+          : record.residual,
+        display_name: record.display_name, environment_id: null, presence: record.presence, link_state: record.link_state,
+        availability: record.availability, management: record.management, identity_info: {}, members: [], columns: {},
+        responses: null, active_users: null, last_activity: null, association_count: 0, candidate_count: 1, bytes: 100,
+      }]);
+      if (sql.includes("summary_facts AS MATERIALIZED")) return result([{
+        summary: counts, scopeSummary: counts, filteredSummary: counts, mutationTargets: { packages: 1 },
+        inventoryOverview: { availableToUsers: 0, organizationCreated: 0, teamsAvailable: 0, createdOrAvailable: 0 },
+      }]);
+      if (sql.startsWith("SELECT r.baseline_id")) return result([{ baseline_id: "baseline", revision: "1", status: "idle" }]);
+      if (sql.startsWith("WITH roots AS")) return result();
+      if (sql.startsWith("SELECT EXISTS")) return result([{ expired: false }]);
+      if (sql.startsWith("SELECT count(*) FILTER(WHERE r.domain='packages')")) return result([{}]);
+      if (sql.startsWith("SELECT m.identity,r.observed_at") || sql.startsWith("WITH inputs AS")) return result();
+      throw new Error("Unexpected package-source page query.");
+    });
+
+    const page = await inventory.pageInRead(client, context, {
+      revision: "revision", query_hash: "query", evaluated_at: at, validated_at: at,
+      expires_at: new Date(at.getTime() + 60_000),
+    }, "selection", identity, { limit: 1 });
+
+    expect(page.value[0].residual).toMatchObject({
+      ...observedCollections, savedSource: { scopeId: "scope", identity: record.identity },
+    });
+    for (const field of ["supportedHosts", "elementTypes"] as const) {
+      expect(Object.hasOwn(page.value[0].residual, field)).toBe(Object.hasOwn(collections, field));
+    }
+    expect(page.value[0].residual).not.toHaveProperty("categories");
+    const sql = readQuery.mock.calls.find(([sql]) => sql.includes("candidates AS MATERIALIZED"))![0];
+    expect(sql).toContain("item.generation_id=f.generation_id AND item.identity=f.identity");
+    expect(sql).toContain("collection.value IN ('supportedHosts','elementTypes')");
+    expect(sql).toContain("jsonb_agg(item.value ORDER BY item.ordinal)");
+  });
+
   it.each([
     {},
     { supportedHosts: [], elementTypes: [], categories: [] },

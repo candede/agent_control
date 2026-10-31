@@ -1,6 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
-import type { DataSyncRun, DataSyncSourceId } from "../src/api/client";
+import type { DataSyncRun, DataSyncSourceId, PackageDetailSyncState } from "../src/api/client";
 import { completedState, initial, mockSync } from "./dataSyncFixtures";
 
 function primarySync(page: Page) {
@@ -65,6 +65,28 @@ async function expectAccessibleSyncPage(page: Page) {
   const accessibility = await new AxeBuilder({ page })
     .include(".data-sync-reports").include(".data-sync-panel").include(".sync-inventory-tools").include(".jobs-view").analyze();
   expect(accessibility.violations).toEqual([]);
+}
+
+async function measureSyncLayout(page: Page) {
+  return page.locator(".data-sync-workspace, .data-sync-source, .sync-history").evaluateAll(elements => elements.map(element => {
+    const bounds = element.getBoundingClientRect();
+    return { name: element.getAttribute("aria-label") ?? element.className, top: bounds.top + window.scrollY, height: bounds.height };
+  }));
+}
+
+async function expectUnchangedSyncLayout(page: Page, before: Awaited<ReturnType<typeof measureSyncLayout>>) {
+  expect(before).toHaveLength(6);
+  await expect.poll(async () => {
+    const after = await measureSyncLayout(page);
+    return after.map((bounds, index) => {
+      const previous = before[index];
+      if (!previous) throw new Error(`Unexpected sync layout element: ${bounds.name}`);
+      const top = bounds.top - previous.top;
+      const height = bounds.height - previous.height;
+      return { name: bounds.name, top: Math.abs(top) < 1 ? 0 : top, height: Math.abs(height) < 1 ? 0 : height };
+    });
+  }, { message: "Sync progress does not move or resize the workspace, its four rows, or history" })
+    .toEqual(before.map(({ name }) => ({ name, top: 0, height: 0 })));
 }
 
 test.afterEach(async ({ page }) => {
@@ -337,7 +359,7 @@ test("Sync status, run details and history remain live beyond thirty minutes wit
   historyRun = fixture.finish(await page.evaluate(() => new Date().toISOString()));
   await page.clock.runFor(2_100);
   await expect(dialog.getByText("Sync complete", { exact: true })).toBeVisible();
-  await expect(page.locator(".data-sync-last-run")).toContainText("Sync complete");
+  await expect(page.locator(".data-sync-workspace-run")).toContainText("Sync complete");
   await expect(page.getByRole("table", { name: "Sync history", includeHidden: true })).toContainText("Complete");
   await expect(page.locator(".data-sync-panel")).toHaveAttribute("aria-busy", "false");
   await expect(page.locator(".sync-history")).toHaveAttribute("aria-busy", "false");
@@ -391,10 +413,10 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   await expect(page.getByRole("heading", { name: "Sync history" })).toBeVisible();
   await page.screenshot({ path: info.outputPath("sync-setup.png") });
   await expect(panel.getByText("Syncing graph packages, power platform", { exact: true })).toBeVisible();
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("max", "3");
-  await expect(panel.getByText("650", { exact: true })).toBeVisible();
-  await expect(panel.getByText("2,451", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("progressbar", { name: "Completed sync sources" })).toHaveCount(0);
+  await expect(panel.getByText("1 of 4 sync steps complete", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("article", { name: "Graph packages" }).getByText("650 processed in this stage", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("article", { name: "Power Platform" }).getByText("2,451 processed in this stage", { exact: true })).toBeVisible();
   await expect(panel.getByText("Reading the next page of Graph packages.")).toBeVisible();
   await expect(panel.getByText(/Sync continues when you switch tabs/)).toBeVisible();
   expect(fixture.starts).toEqual([]);
@@ -471,7 +493,7 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   expect(errors).toEqual([]);
 });
 
-test("current sync has an aligned, keyboard-accessible cancellation footer with pending feedback", async ({ page }, info) => {
+test("inline sync has an aligned, keyboard-accessible workspace footer with pending cancellation feedback", async ({ page }, info) => {
   const state = completedState();
   const users = state.sources.find(source => source.source === "users");
   if (!state.run || !users) throw new Error("Expected a saved Users source and run.");
@@ -491,7 +513,7 @@ test("current sync has an aligned, keyboard-accessible cancellation footer with 
   });
   await page.goto("/sync");
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
-  const footer = panel.getByRole("group", { name: "Current sync actions" });
+  const footer = panel.getByRole("group", { name: "Workspace sync actions" });
   const details = footer.getByRole("button", { name: "View run details" });
   const cancel = footer.getByRole("button", { name: "Cancel run" });
   await expect(cancel).toBeVisible();
@@ -530,7 +552,9 @@ test("current sync has an aligned, keyboard-accessible cancellation footer with 
   }
   await expect(panel.getByText("Sync cancelled", { exact: true })).toBeVisible();
   await expect(panel.getByText("4 of 4 sync steps complete", { exact: true })).toBeVisible();
-  await expect(footer).toHaveCount(0);
+  await expect(footer).toBeVisible();
+  await expect(footer.getByRole("button", { name: "Cancel run" })).toHaveCount(0);
+  await expect(footer.getByRole("button", { name: "Reset saved data..." })).toBeEnabled();
   expect(requests).toBe(1);
   expect(fixture.unexpected).toEqual([]);
 });
@@ -594,7 +618,8 @@ for (const attempts of ["completed", "mixed"] as const) {
         "dl > div:first-child > dt",
         "dl > div:first-child > dd:first-of-type",
         "dl > div:nth-child(2) > dt",
-        "dl > div:nth-child(2) > dd",
+        "dl > div:nth-child(2) > dd:first-of-type",
+        "dl > div:nth-child(2) > .data-sync-attempt-count",
         ".data-sync-source-attempt > span:first-child",
         ".data-sync-source-attempt > .status-badge",
         ...(width > 1000 ? [".data-sync-source-actions button"] : []),
@@ -620,6 +645,104 @@ for (const attempts of ["completed", "mixed"] as const) {
     expect(fixture.unexpected).toEqual([]);
   });
 }
+
+for (const { id, label, count } of [
+  { id: "users", label: "Users", count: 17 },
+  { id: "graph_packages", label: "Graph packages", count: 650 },
+  { id: "power_platform", label: "Power Platform", count: 2_451 },
+] as const) {
+  test(`inline ${label} progress preserves the four-row layout through start and completion`, async ({ page }, info) => {
+    const fixture = await mockSync(page, completedState());
+    await page.goto("/sync");
+    const panel = page.getByRole("region", { name: "Data sync", exact: true });
+    const row = panel.getByRole("article", { name: label, exact: true });
+    await expect(panel.getByText("4 of 4 sync steps complete", { exact: true })).toBeVisible();
+    const before = await measureSyncLayout(page);
+
+    await row.getByRole("button", { name: `Sync ${label.toLowerCase()}`, exact: true }).click();
+    await expect(row.getByText(`${count.toLocaleString()} processed in this stage`, { exact: true })).toBeVisible();
+    await expect(row.getByText("42", { exact: true })).toBeVisible();
+    await expect(row.locator(".status-badge")).toHaveText("Syncing");
+    await expect(panel.getByRole("region", { name: "Current sync", exact: true })).toHaveCount(0);
+    await expect(panel.getByRole("progressbar", { name: "Completed sync sources" })).toHaveCount(0);
+    await expect(panel.locator(".data-sync-details > section")).toHaveCount(1);
+    await expectUnchangedSyncLayout(page, before);
+    await expectAccessibleSyncPage(page);
+    await panel.screenshot({ path: info.outputPath(`inline-${id}-progress.png`) });
+
+    fixture.finish();
+    await expect(panel.getByText("Sync complete", { exact: true })).toBeVisible();
+    await expect(row.locator(".status-badge")).toHaveText("Complete");
+    await expectUnchangedSyncLayout(page, before);
+    expect(fixture.starts).toEqual([{ mode: "incremental", sources: [id] }]);
+    expect(fixture.unexpected).toEqual([]);
+  });
+}
+
+test("inline Graph package details progress keeps the same layout and action slot through completion", async ({ page }, info) => {
+  const fixture = await mockSync(page, completedState());
+  let details: PackageDetailSyncState = {
+    status: "ready", total: 42, fresh: 22, pending: 20, eligible: 20,
+    message: "Exact package details are pending.", job: null,
+  };
+  let starts = 0;
+  let finishStart!: () => void;
+  const startResponse = new Promise<void>(resolve => { finishStart = resolve; });
+  await page.route("**/api/data-sync/package-details", route => {
+    expect(route.request().method()).toBe("GET");
+    return route.fulfill({ json: details });
+  });
+  await page.route("**/api/data-sync/package-details/start", async route => {
+    expect(route.request().method()).toBe("POST");
+    starts += 1;
+    details = {
+      ...details, status: "running", eligible: 0, message: "Collecting exact package details.",
+      job: { id: "detail-batch", status: "running", targetCount: 20, observedCount: 0, updatedAt: "2026-09-15T10:02:00Z" },
+    };
+    await startResponse;
+    return route.fulfill({ status: 202, json: details });
+  });
+  await page.goto("/sync");
+  const panel = page.getByRole("region", { name: "Data sync", exact: true });
+  const row = panel.getByRole("article", { name: "Graph package details", exact: true });
+  await expect(row.getByText("22 / 42", { exact: true })).toBeVisible();
+  const before = await measureSyncLayout(page);
+
+  await row.getByRole("button", { name: "Sync package details", exact: true }).click();
+  try {
+    await expect(row.getByRole("button", { name: "Starting package details", exact: true })).toBeDisabled();
+    await expectUnchangedSyncLayout(page, before);
+  } finally {
+    finishStart();
+  }
+  await expect(row.getByRole("button", { name: "Cancel detail collection", exact: true })).toBeEnabled();
+  await expect(row.getByRole("button")).toHaveCount(1);
+  await expect(row.getByText("0 of 20 targets checked", { exact: true })).toBeVisible();
+  await expectUnchangedSyncLayout(page, before);
+
+  const batch = details.job;
+  if (!batch) throw new Error("Expected the current package detail batch.");
+  details = { ...details, job: { ...batch, observedCount: 7 } };
+  await expect(row.getByText("7 of 20 targets checked", { exact: true })).toBeVisible();
+  await expect(row.getByRole("progressbar", { name: "Package detail coverage" })).toHaveAttribute("value", "22");
+  await expectUnchangedSyncLayout(page, before);
+  await expectAccessibleSyncPage(page);
+  await panel.screenshot({ path: info.outputPath("inline-package-details-progress.png") });
+
+  details = {
+    ...details, status: "complete", fresh: 42, pending: 0, eligible: 0, message: "Exact package details are collected.",
+    job: { ...batch, status: "succeeded", observedCount: 20 },
+  };
+  await expect(row.getByText("42 / 42", { exact: true })).toBeVisible();
+  await expect(row.getByRole("button", { name: "Sync package details", exact: true })).toBeDisabled();
+  await expect(row.getByRole("button")).toHaveCount(1);
+  await expect(row.getByRole("progressbar")).toHaveCount(0);
+  await expect(panel.getByText("Sync complete", { exact: true })).toBeVisible();
+  await expectUnchangedSyncLayout(page, before);
+  expect(starts).toBe(1);
+  expect(fixture.starts).toEqual([]);
+  expect(fixture.unexpected).toEqual([]);
+});
 
 test("clean resync is separate from refresh and requires an informed confirmation", async ({ page }, info) => {
   const fixture = await mockSync(page, {
@@ -666,15 +789,14 @@ for (const status of ["completed", "cancelled", "running", "partial"] as const) 
     const heading = inventory.getByRole("heading", { name: "Inventory health", exact: true });
     const diagnostics = inventory.getByRole("button", { name: "View diagnostics", exact: true });
     const panel = page.getByRole("region", { name: "Data sync", exact: true });
-    const terminal = status === "completed" || status === "cancelled";
-    const summary = terminal ? panel.locator(".data-sync-last-run") : panel.getByRole("region", { name: "Current sync", exact: true });
+    const summary = panel.locator(".data-sync-workspace-footer");
     const detailsButton = summary.getByRole("button", { name: "View run details", exact: true });
     for (const width of [360, 600, 601, 738, 760, 761, 1024, 1440]) {
       await test.step(`${width}px viewport`, async () => {
         await page.setViewportSize({ width, height: 900 });
         await expect(heading).toBeVisible();
         await expect(diagnostics).toBeEnabled();
-        for (const label of terminal ? [heading, summary.locator("strong")] : [heading]) {
+        for (const label of [heading, summary.locator(".data-sync-workspace-run > span").first()]) {
           const lines = await label.evaluate(element => {
             const range = element.ownerDocument.createRange();
             range.selectNodeContents(element);
@@ -684,8 +806,7 @@ for (const status of ["completed", "cancelled", "running", "partial"] as const) 
         }
         expect(await inventory.locator(".sync-inventory-summary > div").evaluate(element => element.getBoundingClientRect().width))
           .toBeGreaterThan(200);
-        const runText = terminal ? summary.locator(":scope > div")
-          : summary.getByRole("group", { name: "Current sync actions", exact: true }).locator(".data-sync-run-meta");
+        const runText = summary.locator(":scope > p");
         expect(await runText.evaluate(element => element.getBoundingClientRect().width)).toBeGreaterThan(200);
         for (const region of [inventory, summary]) {
           expect(await region.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
@@ -770,14 +891,14 @@ test("a running sync survives back, forward, and reload without starting another
   await expectFirstSyncModal(page);
   await page.goto("/sync");
   const panel = page.getByRole("region", { name: "Data sync", exact: true });
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
+  await expect(panel.getByRole("article", { name: "Graph packages" })).toContainText("650 processed in this stage");
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Users", exact: true }).click();
   await expect(page).toHaveURL(/\/users$/);
   await expect(panel).toHaveCount(0);
   await expectFirstSyncModal(page);
   await page.goBack();
   await expect(page).toHaveURL(/\/sync$/);
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
+  await expect(panel.getByRole("article", { name: "Graph packages" })).toContainText("650 processed in this stage");
   await expect(primarySync(page)).toHaveAttribute("aria-current", "page");
   await page.goForward();
   await expect(page).toHaveURL(/\/users$/);
@@ -788,12 +909,12 @@ test("a running sync survives back, forward, and reload without starting another
   await expect(page).toHaveURL(/\/users$/);
   await expect(panel).toHaveCount(0);
   await expect(notice).toBeVisible();
-  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(notice.getByRole("button", { name: "Continue to workspace", exact: true })).toBeEnabled();
   await expectFirstSyncModal(page);
   await page.goto("/sync");
   await page.reload();
   await expect(page).toHaveURL(/\/sync$/);
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("value", "1");
+  await expect(panel.getByRole("article", { name: "Graph packages" })).toContainText("650 processed in this stage");
   await expect(panel.getByText("Reading the next page of Graph packages.")).toBeVisible();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(await page.evaluate(() => document.body.style.overflow)).not.toBe("hidden");
@@ -819,7 +940,8 @@ test("Users navigation stays read-only and Sync retains the explicit users-only 
   await expect(panel.getByRole("article", { name: "Graph packages" }).getByText("42", { exact: true })).toBeVisible();
   await expect(panel.getByRole("article", { name: "Power Platform" })).toBeVisible();
   await expect(panel.getByText("4 of 4 sync steps complete")).toBeVisible();
-  await expect(panel.getByRole("progressbar")).toHaveAttribute("max", "1");
+  await expect(panel.getByRole("article", { name: "Users" })).toContainText("17 processed in this stage");
+  await expect(panel.getByRole("progressbar", { name: "Completed sync sources" })).toHaveCount(0);
   await expect(page.getByRole("dialog")).toHaveCount(0);
   expect(fixture.starts).toEqual([{ mode: "incremental", sources: ["users"] }]);
   fixture.finish();

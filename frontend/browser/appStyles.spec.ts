@@ -20,6 +20,64 @@ async function renderStyles(page: Page, content: string) {
   await page.setContent(`<style>${styles}</style>${content}`);
 }
 
+test("app footer shares theme tokens and keeps attribution and creator links readable at narrow widths", async ({ page }, info) => {
+  for (const shell of ["app-shell", "signed-out"]) {
+    await renderStyles(page, `<main class="${shell}"><footer class="app-footer">
+      <div class="app-footer-meta">
+        <p class="app-footer-credit"><svg width="16" height="16" aria-hidden="true"></svg><span>
+          Developed by <strong class="app-footer-email">candede@microsoft.com</strong> with GitHub Copilot</span></p>
+        <p class="app-footer-disclaimer">Provided as-is, without warranty of any kind. Use at your own discretion.</p>
+      </div>
+      <nav class="app-footer-links" aria-label="Creator links">
+        <a class="app-footer-link" href="https://candede.com" target="_blank" rel="noreferrer noopener" aria-label="Open candede.com">
+          <svg width="15" height="15" aria-hidden="true"></svg>candede.com</a>
+        <a class="app-footer-link" href="https://www.linkedin.com/in/candede/" target="_blank" rel="noreferrer noopener" aria-label="Open LinkedIn profile">
+          <svg width="15" height="15" aria-hidden="true"></svg>LinkedIn</a>
+      </nav>
+    </footer></main>`);
+    const footer = page.locator(".app-footer");
+    const credit = footer.locator(".app-footer-credit");
+    const email = footer.locator(".app-footer-email");
+    const links = footer.getByRole("link");
+    await expect(credit).toHaveCSS("color", "rgb(52, 64, 84)");
+    await expect(credit.locator("svg")).toHaveCSS("color", "rgb(81, 70, 199)");
+    await expect(email).toHaveCSS("font-style", "normal");
+    await expect(email).toHaveCSS("font-weight", "600");
+    for (const fontSize of [16, 32]) {
+      await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, fontSize);
+      for (const width of [320, 360, 760, 1440]) {
+        await page.setViewportSize({ width, height: 780 });
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+        for (const element of [footer, credit, email, footer.locator(".app-footer-disclaimer")]) {
+          expect(await element.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+        }
+        for (const link of await links.all()) {
+          await link.scrollIntoViewIfNeeded();
+          await expect(link).toBeInViewport({ ratio: 1 });
+          await link.click({ trial: true });
+          expect((await link.boundingBox())!.height).toBeGreaterThanOrEqual(36);
+        }
+        if (fontSize === 16 && (width === 360 || width === 1440)) {
+          await footer.screenshot({ path: info.outputPath(`footer-${shell}-${width}.png`) });
+        }
+      }
+    }
+    await links.first().focus();
+    await page.keyboard.press("Tab");
+    await expect(links.last()).toBeFocused();
+    expect(await links.last().evaluate(el => el.matches(":focus-visible") && getComputedStyle(el).outlineStyle !== "none")).toBe(true);
+    for (const colorScheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme, forcedColors: "active" });
+      for (const link of await links.all()) {
+        expect(await link.evaluate(el => getComputedStyle(el).color !== getComputedStyle(el).backgroundColor)).toBe(true);
+      }
+      await expect(links.last()).toBeFocused();
+      expect(await links.last().evaluate(el => getComputedStyle(el).outlineStyle !== "none")).toBe(true);
+    }
+    await page.emulateMedia({ forcedColors: "none" });
+  }
+});
+
 test("global recovery errors reflow without pushing diagnostics or retry outside the page", async ({ page }) => {
   const reference = "saved_inventory_request_reference_".repeat(24);
   await renderStyles(page, `<main class="app-shell"><div class="error-banner" role="alert">
@@ -638,8 +696,10 @@ test("official usage dialogs keep import and management recovery reachable in sh
         </div><footer class="usage-import-footer"><button class="secondary" disabled>Cancel import</button><button>Refresh bundle validation</button></footer>
       </section>` : `<section class="usage-manage-reports" aria-label="Manage saved reports" tabindex="0">
         <section class="official-usage-history-panel"><div class="error-banner" role="alert">${reference}<button>Retry saved data</button></div>
-          <div class="table-shell usage-history-table" role="region" aria-label="Saved report history" aria-busy="true" tabindex="0"><table><thead><tr><th>Imported</th><th>Activity dates</th><th>Status</th><th>Actions</th></tr></thead>
-            <tbody><tr><td><span class="usage-mobile-label" aria-hidden="true">Imported</span>10/7/2026</td><td><span class="usage-mobile-label" aria-hidden="true">Activity dates</span>No activity dates</td>
+          <div class="table-shell usage-history-table" role="region" aria-label="Saved report history" aria-busy="true" tabindex="0"><table><thead><tr><th>Activity dates</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody><tr><td><span class="usage-mobile-label" aria-hidden="true">Activity dates</span>
+              <dl class="usage-history-dates"><div><dt>Start</dt><dd><time datetime="2026-10-01">Oct 1, 2026</time></dd></div>
+                <div><dt>End</dt><dd><time datetime="2026-10-30">Oct 30, 2026</time></dd></div></dl></td>
             <td><span class="usage-mobile-label" aria-hidden="true">Status</span><span class="usage-report-badge">Saved</span></td>
             <td><div class="table-actions"><button class="secondary" disabled>View report</button><button class="icon-button danger" aria-label="Delete report set" disabled>X</button></div></td></tr></tbody></table></div>
         </section></section>`}</div></dialog>`);
@@ -849,24 +909,25 @@ test("data sync workspace and saved-status recovery fit narrow screens and enlar
         <div><h2>Data sync</h2><p>Keep workspace data up to date.</p></div>
         <div class="data-sync-toolbar"><button disabled>Sync all sources</button><button class="secondary">Retry status check</button></div></header>
       <div class="data-sync-details"><div class="error-banner" role="alert">${reference} Showing the last reported workspace status.</div>
-        <section class="data-sync-activity"><section class="data-sync-progress">
-          <div class="data-sync-progress-heading"><div><strong>Last reported: Syncing power platform</strong><p>1 of 3 automatic sources complete</p></div></div>
-          <progress value="1" max="3" aria-label="Completed sync sources"></progress>
-          <ol class="data-sync-live-sources"><li class="data-sync-live-source source-permission-required">
-            <span class="status-badge status-permission-required">Permission required</span>
-            <div><strong>Power Platform</strong><p>${reference}</p><button class="secondary">Review permissions</button></div>
-            <div class="data-sync-live-count"><strong>1,234,567,890</strong><span>reported, not a saved total</span></div>
-          </li></ol></section>
-          <div class="data-sync-activity-footer"><p class="data-sync-run-meta">Sync continues when you switch tabs.
-            <button class="sync-text-button">View run details</button></p>
-            <div class="data-sync-run-actions"><button class="secondary data-sync-cancel">Cancel run</button></div></div></section>
-        <section class="data-sync-workspace"><div class="section-heading"><h3>Workspace data</h3><span class="data-sync-state state-attention">1 of 3 sources synced</span></div>
-          <div class="data-sync-sources"><article class="data-sync-source">
+        <section class="data-sync-workspace"><div class="section-heading"><h3>Workspace data</h3><span class="data-sync-state state-attention">1 of 4 sync steps complete</span></div>
+          <div class="data-sync-sources"><article class="data-sync-source" aria-label="Power Platform">
             <div class="data-sync-source-name"><strong>Power Platform</strong><p>Agents and environment metadata</p></div>
-            <dl><div><dt>Last saved count</dt><dd>1,234,567,890</dd></div><div><dt>Last successful sync</dt><dd>10/7/2026, 12:30 PM</dd></div></dl>
+            <dl><div><dt>Last saved count</dt><dd>1,000,000,000</dd><dd class="data-sync-count-unit">resources</dd></div>
+              <div><dt>Last successful sync</dt><dd>10/7/2026, 12:30 PM</dd>
+                <dd class="data-sync-count-unit data-sync-attempt-count">1,234,567,890 reported, not a saved total</dd></div></dl>
             <div class="data-sync-source-actions"><div class="data-sync-source-attempt"><span>Last reported attempt</span>
-              <span class="status-badge status-permission-required">Permission required</span></div><button class="secondary" disabled>Sync power platform</button></div>
-          </article></div></section></div>
+              <span class="status-badge status-permission-required">Permission required</span></div>
+              <div class="data-sync-source-controls"><button class="secondary" disabled>Sync power platform</button></div></div>
+            <div class="data-sync-source-note"><p role="status">Last reported: ${reference}
+              <button class="sync-text-button">Review permissions</button></p></div>
+          </article></div>
+          <div class="data-sync-workspace-footer"><p><strong class="data-sync-workspace-run" role="status"><span>Last reported: Sync needs attention</span></strong>
+            Sync keeps previous successful data until a replacement is ready. Sync continues when you switch tabs.</p>
+            <div class="data-sync-workspace-footer-actions" role="group" aria-label="Workspace sync actions">
+              <button class="sync-text-button">View run details</button>
+              <div class="data-sync-run-actions"><button class="secondary data-sync-cancel">Cancel run</button></div>
+            </div></div>
+        </section></div>
     </section>
     <section class="data-sync-reports"><header class="data-sync-page-header"><div class="data-sync-page-icon">C</div>
       <div><h2>CSV usage reports</h2><p>Import Microsoft 365 usage exports to see agent activity.</p></div>
@@ -887,7 +948,7 @@ test("data sync workspace and saved-status recovery fit narrow screens and enlar
     await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, fontSize);
     for (const width of [320, 360, 600, 601, 760, 1000, 1001, 1280]) {
       await page.setViewportSize({ width, height: 1000 });
-      for (const selector of [".data-sync-panel", ".data-sync-live-source", ".data-sync-reports", ".sync-inventory-tools", ".sync-history", ".sync-history-filter"]) {
+      for (const selector of [".data-sync-panel", ".data-sync-source", ".data-sync-workspace-footer", ".data-sync-reports", ".sync-inventory-tools", ".sync-history", ".sync-history-filter"]) {
         expect(await page.locator(selector).evaluate(element => element.scrollWidth <= element.clientWidth + 1),
           `${selector} must fit at ${width}px with ${fontSize}px text`).toBe(true);
       }
@@ -1050,12 +1111,11 @@ test("inventory controls and recovery messages fit with bulk selection on narrow
             <p role="alert">${reference} <button type="button">Retry options</button></p>
           </div>
           <div class="agent-query-summary"><span class="agent-match-count" role="status">
-            <strong>Updating...</strong><span>matching agents</span></span>
-            <button class="clear-filters-button">Clear filters</button></div>
+            <strong>Updating...</strong><span>matching agents</span></span></div>
           <div class="agent-filter-picker"><button class="secondary agent-filter-trigger">
             <svg width="16" height="16" aria-hidden="true"></svg>Filters
             <span class="filter-count" aria-hidden="true">3</span></button></div>
-        </div></section>
+        </div><div class="agent-filter-chips"><button class="agent-filter-chip">Clear filters</button></div></section>
         <button class="secondary agent-match-select" disabled>Select all 50,000</button>
         <div class="agent-column-picker"><button class="secondary"><svg width="16" height="16" aria-hidden="true"></svg>Columns</button></div>
       </div></div>
@@ -1228,9 +1288,10 @@ test("Users recovery messages and retained filters fit narrow screens", async ({
       <section class="catalog-controls user-activity-controls agent-grid-toolbar" aria-label="User filters">
         <div class="agent-query-bar">
           <label class="agent-search-field">Search<input type="search" value="retained filter"></label>
-          <div class="agent-query-summary"><span role="status">Updating...</span><button>Clear filters</button></div>
+          <div class="agent-query-summary"><span role="status">Updating...</span></div>
           <div class="agent-filter-picker"><button class="secondary">Filter users</button></div>
         </div>
+        <div class="agent-filter-chips"><button class="agent-filter-chip">Clear filters</button></div>
       </section>
       <div class="copilot-users-table-shell" role="region" aria-label="M365 Copilot license status" tabindex="0">
         <table class="copilot-users-table reported-users-table"><thead><tr><th><button class="table-sort-heading">User</button></th></tr></thead><tbody></tbody></table>
@@ -1268,15 +1329,15 @@ for (const state of ["idle", "preparing", "ready", "error"] as const) {
             <div class="agent-query-bar">
               <label class="agent-search-field"><svg width="17" height="17" aria-hidden="true"></svg>
                 <span class="sr-only">Search reported users or agents</span><input type="search" value="retained user search"></label>
-              <div class="agent-query-summary"><span class="agent-match-count" role="status"><strong>Updating...</strong><span>matching users</span></span>
-                <button class="clear-filters-button">Clear filters</button></div>
+              <div class="agent-query-summary"><span class="agent-match-count" role="status"><strong>Updating...</strong><span>matching users</span></span></div>
               <div class="agent-filter-picker"><button class="secondary agent-filter-trigger" aria-label="Filters, 2 active">
                 <svg width="16" height="16" aria-hidden="true"></svg>Filters<span class="filter-count" aria-hidden="true">2</span></button></div>
               <div class="report-export">${exportContent}</div>
             </div>
             <p role="alert">Enter a whole-number threshold between 1 and 100,000,000.</p>
             <div class="agent-filter-chips"><button class="agent-filter-chip" aria-label="Remove company filter">
-              <span>Company: <strong>${reference}</strong></span><svg width="13" height="13" aria-hidden="true"></svg></button></div>
+              <span>Company: <strong>${reference}</strong></span><svg width="13" height="13" aria-hidden="true"></svg></button>
+              <button class="agent-filter-chip">Clear filters</button></div>
           </section>
           <div class="table-shell copilot-users-table-shell" role="region" aria-label="Reported user activity" tabindex="0">
             <table class="agent-table copilot-users-table reported-users-table"><thead><tr>

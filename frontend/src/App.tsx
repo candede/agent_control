@@ -266,6 +266,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setPowerPlatformJobSelection({ id, initialJob });
   }, []);
   const [usersRoute, setUsersRoute] = useState(() => parseUsersRoute(readViewSearch("users")));
+  const [personalReportSetId, setPersonalReportSetId] = useState(() => {
+    const view = parseWorkbenchView(window.location.pathname);
+    return view === "agents" ? initialAgentRoute.reportSetId : view === "users" ? usersRoute.reportSetId : undefined;
+  });
+  const observedReportDefault = useRef<{ owner: string; id: string | null; revision: string; viewRevision: number } | undefined>(undefined);
   const [dashboardRoute, setDashboardRoute] = useState(() => parseDashboardRoute(readViewSearch("dashboard")));
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
@@ -411,6 +416,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const currentUnifiedAgentQuery = useCallback((): UnifiedAgentInventoryQuery => {
     const operationIdPrefix = parseBulkRefSearch(deferredQuery);
     return {
+      ...(personalReportSetId ? { setId: personalReportSetId } : {}),
       ...(packageType !== undefined ? { type: packageType } : {}),
       ...(endUserAccess !== "all" ? { endUserAccess } : {}),
       ...(reportedUsage !== "all" ? { reportedUsage } : {}),
@@ -427,7 +433,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       inventoryScope: agentInventoryScope, sortBy: agentSortBy, sortDirection: agentSortDirection,
     };
   }, [agentEnvironmentFilter, agentInventoryScope, agentManagement, agentRelevance, agentSortBy, agentSortDirection,
-    availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, packageType, platformFilter, publisherFilter, reportedUsage, statusFilter]);
+    availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, packageType, personalReportSetId, platformFilter, publisherFilter, reportedUsage, statusFilter]);
   const agentSearchPending = deferredQuery !== normalizedQuery;
   const agentDetailRequestId = useRef(0);
   const agentDetailAbortController = useRef<AbortController | undefined>(undefined);
@@ -678,7 +684,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
       const view = parseWorkbenchView(window.location.pathname);
       const agentRoute = view === "agents" ? parseAgentRoute(window.location.search) : undefined;
-      const retainDetail = agentRoute?.detailId !== undefined && agentRoute.detailId === requestedAgentDetailId
+      const retainDetail = agentRoute?.detailId !== undefined && agentRoute.detailId === requestedAgentDetailId && agentRoute.reportSetId === personalReportSetId
         && !busyAgentId && !preparingBulkAction && !bulkConfirmation && !singleAccessAgentDetail && !bulkAccessAgentIds;
       if (!retainDetail) {
         cancelAgentDetailRequest();
@@ -699,6 +705,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       setActiveView(view);
       if (agentRoute) {
         const route = agentRoute;
+        setPersonalReportSetId(route.reportSetId);
+        setUsersRoute(current => ({ ...current, reportSetId: route.reportSetId, page: 0 }));
         setQuery(route.search);
         setAgentInventoryScope(route.inventoryScope);
         setPackageType(route.packageType);
@@ -737,7 +745,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         setRequestedQuarantineJobId(route.quarantineJobId);
         setRequestedInventorySnapshotId(route.inventorySnapshotId);
       } else if (view === "users") {
-        setUsersRoute(parseUsersRoute(window.location.search));
+        const route = parseUsersRoute(window.location.search);
+        setPersonalReportSetId(route.reportSetId);
+        setUsersRoute(route);
       } else if (view === "dashboard") {
         setDashboardRoute(parseDashboardRoute(window.location.search));
       } else if (view === "sync") {
@@ -843,6 +853,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       inventorySnapshotId: requestedInventorySnapshotId,
       selectedPowerPlatformIds: [...new Set([...pendingPowerPlatformIds, ...selectedPowerPlatformTargets.keys()])],
       quarantineJobId: requestedQuarantineJobId,
+      reportSetId: personalReportSetId,
     });
     const selectionStored = search.get("selectionState") === "session";
     const selectionSaved = selectionStored && user
@@ -862,7 +873,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           : `The selection remains active, but could not be preserved in browser session storage. It will not survive reload; no IDs were silently truncated.`,
       }));
     }
-  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, currentUnifiedAgentQuery, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, query, replaceRoute, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user, groupPackageSelection, groupTargetCount, principalKey, serverPackageSelection, unifiedAgentPage]);
+  }, [activeView, agentDetail?.id, agentDetailTab, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, currentUnifiedAgentQuery, endUserAccess, hostFilter, pendingPowerPlatformIds, pendingStoredAgentSelectionCount, personalReportSetId, platformFilter, publisherFilter, query, replaceRoute, reportedUsage, requestedAgentDetailId, requestedInventorySnapshotId, requestedPackageControlJobId, requestedPackageRefreshJobId, requestedPackageRefreshMode, requestedQuarantineJobId, selectedAgentIds, selectedPowerPlatformTargets, selectedUnifiedAgent?.id, statusFilter, user, groupPackageSelection, groupTargetCount, principalKey, serverPackageSelection, unifiedAgentPage]);
 
   useEffect(() => {
     if (!user || activeView !== "sync") return;
@@ -1250,7 +1261,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const forceCurrentSnapshot = forceCurrentAgentReload.current;
     forceCurrentAgentReload.current = false;
     loadSavedAgents(forceCurrentSnapshot);
-  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, platformFilter, publisherFilter, reportedUsage, statusFilter, user, userAgentOverlay]);
+  }, [activeView, agentEnvironmentFilter, agentInventoryScope, agentManagement, agentPageIndex, agentRelevance, agentReloadRevision, agentSearchPending, agentSortBy, agentSortDirection, packageType, availableToFilter, createdWithinDays, deferredQuery, endUserAccess, hostFilter, pendingStoredAgentSelectionCount, personalReportSetId, platformFilter, publisherFilter, reportedUsage, statusFilter, user, userAgentOverlay]);
 
   useEffect(() => {
     if (!inventoryUnavailable || loadingAgents || !hasRole(user, "AgentControl.Viewer")
@@ -1421,6 +1432,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setActiveView(view);
     const savedSearch = savedViewSearches.current.get(view) ?? "";
     const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
+    if (view === "agents" || view === "users") {
+      if (personalReportSetId) search.set("snapshot", personalReportSetId);
+      else search.delete("snapshot");
+    }
     if (view === "sync") {
       const route = parseDataSyncRoute(search.toString());
       selectPowerPlatformJob(route.powerPlatformJobId);
@@ -1445,6 +1460,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   function handleUsersRouteChange(route: UsersRouteState, replace = false) {
     if (!ownsAgentScope(principalKey)) return;
+    route = { ...route, reportSetId: personalReportSetId };
     const search = usersRouteSearch(route);
     const next = workbenchUrl("users", search);
     savedViewSearches.current.set("users", search.toString());
@@ -1489,18 +1505,28 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     void dataSyncPanelRef.current?.refresh();
   }
 
-  function resetUserReportFilters() {
-    const next = { ...usersRoute, reportSetId: undefined, agentId: undefined, search: "", page: 0 };
-    if (activeView === "users") handleUsersRouteChange(next, true);
-    else {
-      savedViewSearches.current.set("users", usersRouteSearch(next).toString());
-      setUsersRoute(next);
-    }
+  function handlePersonalReportSelected(id: string | undefined) {
+    if (!ownsAgentScope(principalKey) || id === personalReportSetId) return;
+    setPersonalReportSetId(id);
+    const nextUsers = { ...usersRoute, reportSetId: id, page: 0 };
+    setUsersRoute(nextUsers);
+    savedViewSearches.current.set("users", usersRouteSearch(nextUsers).toString());
+    const search = activeView === "users" ? usersRouteSearch(nextUsers)
+      : agentRouteSearch({ ...parseAgentRoute(window.location.search), reportSetId: id, page: 0 });
+    savedViewSearches.current.set(activeView, search.toString());
+    window.history.pushState(routeHistoryState(activeView), "", workbenchUrl(activeView, search));
   }
 
-  function handleReportSetSelected(selectionChanged: boolean) {
-    if (selectionChanged) resetUserReportFilters();
-    handleOfficialUsageChanged();
+  function handleLatestReportObserved(id: string | null, revision: string) {
+    if (!ownsAgentScope(principalKey)) return;
+    const previous = observedReportDefault.current;
+    observedReportDefault.current = { owner: principalKey, id, revision, viewRevision: officialUsageDashboardRevision };
+    const inventoryReports = unifiedAgentPage?.usageContext.reports;
+    const changed = previous?.owner === principalKey
+      ? previous.viewRevision === officialUsageDashboardRevision && (previous.id !== id || previous.revision !== revision)
+      : !personalReportSetId && inventoryReports
+        && (inventoryReports.setId !== id || inventoryReports.activeRevision !== revision);
+    if (changed) handleOfficialUsageChanged();
   }
 
   function openUsageImport(view: "import" | "manage" = "import") {
@@ -1705,6 +1731,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }
 
   function clearPrivateRoute() {
+    setPersonalReportSetId(undefined);
+    observedReportDefault.current = undefined;
     setRequestedDataSyncRunId(undefined);
     setSyncReportRoute(undefined);
     selectPowerPlatformJob(undefined);
@@ -3003,6 +3031,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setSelectionRouteNotice(undefined);
     setExportChoiceOpen(false);
     const cached = agentInventoryQueries.getCached(principalKey, {
+      ...(personalReportSetId ? { setId: personalReportSetId } : {}),
       inventoryScope: scope, sortBy: agentSortBy, sortDirection: agentSortDirection, limit: agentDisplayPageSize,
     }, true);
     setUnifiedAgentPage(cached);
@@ -3575,11 +3604,17 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
           {canReadSensitiveUsage ? <AgentInventoryOverview key={principalKey}
             inventory={unifiedAgentReadError ? undefined : visibleUnifiedAgentPage} revision={inventoryReportRevision}
-            reportPending={inventoryReportRevision !== officialUsageDashboardRevision}
+            reportPending={inventoryReportRevision !== officialUsageDashboardRevision
+              || Boolean(visibleUnifiedAgentPage && visibleUnifiedAgentPage.usageContext.reports.setId
+                !== (personalReportSetId ?? visibleUnifiedAgentPage.usageContext.reports.activeSetId))
+              || Boolean(!personalReportSetId && observedReportDefault.current?.owner === principalKey
+                && visibleUnifiedAgentPage && (visibleUnifiedAgentPage.usageContext.reports.setId !== observedReportDefault.current.id
+                  || visibleUnifiedAgentPage.usageContext.reports.activeRevision !== observedReportDefault.current.revision))}
             loadingInventory={agentInventoryPending}
             inventoryScope={agentInventoryScope}
-            reportSelector={canOperate ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
-              principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
+            reportSelector={<OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
+              principalKey={principalKey} revision={officialUsageDashboardRevision} selectedId={personalReportSetId}
+              onSelect={handlePersonalReportSelected} onLatestReportObserved={handleLatestReportObserved} />}
             allSelected={!hasActiveAgentFilters} onClearFilters={handleClearAgentFilters}
             endUserAccess={endUserAccess} reportedUsage={reportedUsage}
             onAccessChange={endUserAccess => handleAgentFilterChange({ endUserAccess })}
@@ -3756,8 +3791,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           dataRevision={copilotUsersDataRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
-          reportSelector={canOperate ? <OfficialUsageReportSelector key={`user-reports:${principalKey}`}
-            principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
+          reportSelector={<OfficialUsageReportSelector key={`user-reports:${principalKey}`}
+            principalKey={principalKey} revision={officialUsageDashboardRevision} selectedId={personalReportSetId}
+            onSelect={handlePersonalReportSelected} onLatestReportObserved={handleLatestReportObserved} />}
           onOpenAgent={id => {
             if (!ownsAgentScope(principalKey)) return;
             agentDetailReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -4068,42 +4104,41 @@ function ExportIcon() {
 function AppFooter() {
   return (
     <footer className="app-footer">
-      <span>
-        Provided as-is, without warranty of any kind. Use at your own
-        discretion.
-      </span>
       <div className="app-footer-meta">
-        <span className="app-footer-credit">
-          <Bot size={15} strokeWidth={2.2} aria-hidden="true" />
-          Developed by{" "}
-          <strong className="app-footer-email">
-            <em>candede@microsoft.com</em>
-          </strong>{" "}
-          on GitHub Copilot
-        </span>
-        <nav className="app-footer-links" aria-label="Creator links">
-          <a
-            className="app-footer-link"
-            href="https://candede.com"
-            target="_blank"
-            rel="noreferrer noopener"
-            aria-label="Open candede.com"
-          >
-            <Globe2 size={15} strokeWidth={2.2} aria-hidden="true" />
-            candede.com
-          </a>
-          <a
-            className="app-footer-link"
-            href="https://www.linkedin.com/in/candede/"
-            target="_blank"
-            rel="noreferrer noopener"
-            aria-label="Open LinkedIn profile"
-          >
-            <ExternalLink size={15} strokeWidth={2.2} aria-hidden="true" />
-            LinkedIn
-          </a>
-        </nav>
+        <p className="app-footer-credit">
+          <Bot size={16} aria-hidden="true" />
+          <span>
+            Developed by{" "}
+            <strong className="app-footer-email">candede@microsoft.com</strong>{" "}
+            with GitHub Copilot
+          </span>
+        </p>
+        <p className="app-footer-disclaimer">
+          Provided as-is, without warranty of any kind. Use at your own discretion.
+        </p>
       </div>
+      <nav className="app-footer-links" aria-label="Creator links">
+        <a
+          className="app-footer-link"
+          href="https://candede.com"
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="Open candede.com"
+        >
+          <Globe2 size={15} aria-hidden="true" />
+          candede.com
+        </a>
+        <a
+          className="app-footer-link"
+          href="https://www.linkedin.com/in/candede/"
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="Open LinkedIn profile"
+        >
+          <ExternalLink size={15} aria-hidden="true" />
+          LinkedIn
+        </a>
+      </nav>
     </footer>
   );
 }

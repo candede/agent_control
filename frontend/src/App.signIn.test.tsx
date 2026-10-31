@@ -64,6 +64,26 @@ describe("username-first sign-in", () => {
     expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(["/api/auth/status", "/api/me"]);
   });
 
+  it("credits development with GitHub Copilot in the footer", async () => {
+    loginTransport();
+    render(<App />);
+    await screen.findByRole("textbox", { name: "Work or school username" });
+    const footer = screen.getByRole("contentinfo");
+    expect(footer.querySelector(".app-footer-credit")).toHaveTextContent("Developed by candede@microsoft.com with GitHub Copilot");
+    expect(footer.querySelector(".app-footer-email")).not.toContainHTML("<em>");
+    expect(footer.querySelector(".app-footer-disclaimer")).toHaveTextContent("Provided as-is, without warranty of any kind. Use at your own discretion.");
+    expect(screen.getByRole("navigation", { name: "Creator links" })).toBeInTheDocument();
+    for (const [name, href] of [
+      ["Open candede.com", "https://candede.com"],
+      ["Open LinkedIn profile", "https://www.linkedin.com/in/candede/"],
+    ]) {
+      const link = screen.getByRole("link", { name });
+      expect(link).toHaveAttribute("href", href);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noreferrer noopener");
+    }
+  });
+
   it.each([
     "", "username", "name@", "name@@example.com", "name@organization.",
     "name@example..com", "name@-organization.com", "name@organization-.com",

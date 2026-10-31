@@ -50,7 +50,9 @@ Agent Control has three app roles:
 | --- | --- |
 | `AgentControl.Viewer` | View tenant data and request read-only synchronization |
 | `AgentControl.UsageReportUploader` | Viewer access plus new report-set uploads, validation, publication and own unaccepted-draft cleanup |
-| `AgentControl.Admin` | Viewer/Uploader access plus published-report corrections/selection/deletion, supported controls, configuration and local Audit read/export |
+| `AgentControl.Admin` | Viewer/Uploader access plus published-report corrections/deletion, supported controls, configuration and local Audit read/export |
+
+Personal report-set selection is read-only and available to every Viewer-capable role.
 
 Set **Assignment required?** to **Yes** on the Enterprise application. Assign
 each approved user or group one role.

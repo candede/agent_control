@@ -100,6 +100,8 @@ contracts are not ordinary Permissions prerequisites.
 Saved workspace status and exact-run details refresh independently. Background
 workspace updates preserve pending exact-run reads and their polling schedule.
 Check status retries both saved-status reads without starting provider collection.
+Exact package-detail coverage is rechecked when the saved Graph catalog changes;
+late control results from an earlier catalog cannot overwrite current status.
 
 Sync inventory health checks read saved data independently of the Agents browsing
 selection and pause while hidden or offline. Each check has a 30-second deadline.
@@ -126,6 +128,8 @@ Sync history keeps its Outcome filter beside Refresh history. During automatic
 or manual history reads, the refresh icon animates without adding a visible
 loading message or shifting the table. Loading status remains available to
 screen readers; reduced-motion preferences disable the animation.
+Reduced-motion preferences also disable run-detail progress width transitions,
+including when waiting or stale results are not marked as actively running.
 
 Users opens the unchanged **Users** view by default. **Adoption** shows
 always-visible Company / Department sections with independent people and agent

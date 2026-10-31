@@ -558,7 +558,7 @@
 .filter-count {
   display: inline-grid;
   place-items: center;
-  min-width: 19px;
+  min-width: calc(2ch + 10px);
   height: 19px;
   padding: 0 5px;
   border-radius: 5px;
@@ -566,6 +566,10 @@
   color: var(--ink);
   font-size: 11px;
   font-weight: 700;
+}
+
+.filter-count.is-empty {
+  visibility: hidden;
 }
 
 .agent-filter-popover {
@@ -671,6 +675,7 @@
 .agent-match-count {
   display: flex;
   flex-direction: column;
+  min-width: 14ch;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
@@ -706,7 +711,6 @@
   flex-shrink: 0;
 }
 
-.agent-workspace .clear-filters-button,
 .user-activity-controls .clear-filters-button {
   min-height: 36px;
   padding: 3px 6px;
@@ -717,7 +721,6 @@
   white-space: nowrap;
 }
 
-.agent-workspace .clear-filters-button:hover,
 .user-activity-controls .clear-filters-button:hover {
   color: var(--ink);
   text-decoration: underline;

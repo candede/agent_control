@@ -46,8 +46,8 @@ async function bundle(identity: SelectionIdentity, options: Parameters<typeof st
 }
 const single = (identity: SelectionIdentity, preview: Awaited<ReturnType<typeof stage>>) =>
   imports.accept(identity, { stagingId: preview.id, revision: preview.revision, contentHash: preview.contentHash, expectedActiveRevision: preview.activeRevision });
-async function operation(identity: SelectionIdentity, setId: string, action: "select" | "delete") {
-  return imports.confirm(identity, await imports.confirmPreview(identity, setId, action));
+async function remove(identity: SelectionIdentity, setId: string) {
+  return imports.confirmDeletion(identity, await imports.previewDeletion(identity, setId));
 }
 async function agents(identity: SelectionIdentity, setId?: string) {
   return reports.page((await reports.capture(identity, "official_agents", setId ? { setId } : {})).id, identity);
@@ -79,11 +79,11 @@ async function releaseSelections(identity: SelectionIdentity) {
 }
 
 describe("native automatic import and semantic reuse", () => {
-  it.each([false, true])("selects the first complete wizard report once (previous partial acceptance=%s)", async partial => {
+  it.each([false, true])("automatically uses complete reports and preserves replay receipts (previous partial acceptance=%s)", async partial => {
     const identity = owner(), draft = await bundle(identity);
     if (partial) expect(await single(identity, draft.stages[0])).toMatchObject({ complete: false, activeRevision: "1" });
     expect((await agents(identity)).reports.activeSetId).toBeNull();
-    const input = { ...await imports.bundle(identity, draft.bundleId), preserveSelection: true };
+    const input = await imports.bundle(identity, draft.bundleId);
     const accepted = await imports.acceptBundle(identity, draft.bundleId, input);
     expect(accepted).toMatchObject({ complete: true, activeRevision: "2" });
     expect((await agents(identity)).reports).toMatchObject({ setId: accepted.setId, activeSetId: accepted.setId });
@@ -91,17 +91,16 @@ describe("native automatic import and semantic reuse", () => {
     expect((await agents(identity)).reports.activeRevision).toBe("2");
 
     const next = await bundle(identity, { responses: 9 });
-    const saved = await imports.acceptBundle(identity, next.bundleId, { ...next.preview, preserveSelection: true });
-    expect((await agents(identity)).reports.setId).toBe(accepted.setId);
-    const selected = await operation(identity, saved.setId, "select");
+    const saved = await next.accept();
+    expect(saved.activeRevision).toBe("3");
     expect(await imports.acceptBundle(identity, draft.bundleId, input)).toEqual(accepted);
     expect((await agents(identity)).reports).toMatchObject({
-      setId: saved.setId, activeSetId: saved.setId, activeRevision: selected.activeRevision,
+      setId: saved.setId, activeSetId: saved.setId, activeRevision: saved.activeRevision,
     });
   });
 
   it.each(["new", "duplicate", "correction"] as const)(
-    "saves a wizard %s import without changing selection, including receipt retries", async scenario => {
+    "automatically publishes a wizard %s import without changing replay receipts", async scenario => {
       const identity = owner();
       const previous = await (await bundle(identity)).accept();
       const draft = await bundle(identity, {
@@ -110,26 +109,26 @@ describe("native automatic import and semantic reuse", () => {
       });
       const state = async () => (await fixture.runtime.query(
         "SELECT active_set_id,revision::text,updated_at FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows;
-      const before = await state(), input = { ...draft.preview, preserveSelection: true };
+      const before = await state(), input = draft.preview;
       const accepted = await imports.acceptBundle(identity, draft.bundleId, input);
-      expect(accepted).toMatchObject({ complete: true, activeRevision: draft.preview.expectedActiveRevision });
-      expect(await state()).toEqual(before);
-      expect((await agents(identity, accepted.setId)).reports).toMatchObject({
-        setId: accepted.setId, activeSetId: previous?.setId ?? null,
-      });
+      expect(accepted).toMatchObject({ complete: true,
+        activeRevision: scenario === "duplicate" ? previous.activeRevision : String(BigInt(previous.activeRevision) + 1n) });
+      const after = await state();
+      if (scenario === "duplicate") expect(after).toEqual(before);
+      else expect(after).not.toEqual(before);
+      expect((await agents(identity, previous.setId)).reports).toMatchObject({ setId: previous.setId, activeSetId: accepted.setId });
       expect(await imports.acceptBundle(identity, draft.bundleId, input)).toEqual(accepted);
-      expect(await state()).toEqual(before);
+      expect(await state()).toEqual(after);
       if (scenario === "duplicate") expect(accepted.setId).toBe(previous?.setId);
       else expect(accepted.setId).not.toBe(previous?.setId);
-      await operation(identity, accepted.setId, "select");
       expect((await agents(identity)).reports.activeSetId).toBe(accepted.setId);
     });
 
-  it("selects only one racing first import and preserves it when the competing import is retried", async () => {
+  it("accepts one racing first import and automatically advances after a freshly reviewed same-period retry", async () => {
     const identity = owner();
     const drafts = [await bundle(identity), await bundle(identity, { responses: 9 })];
     const outcomes = await Promise.allSettled(drafts.map(draft =>
-      imports.acceptBundle(identity, draft.bundleId, { ...draft.preview, preserveSelection: true })));
+      imports.acceptBundle(identity, draft.bundleId, draft.preview)));
     const accepted = outcomes.find(outcome => outcome.status === "fulfilled");
     expect(accepted?.status).toBe("fulfilled");
     expect(outcomes.filter(outcome => outcome.status === "fulfilled")).toHaveLength(1);
@@ -139,12 +138,10 @@ describe("native automatic import and semantic reuse", () => {
     } });
     if (accepted?.status !== "fulfilled") throw new Error("Expected one accepted first report.");
     const retry = drafts[rejectedIndex];
-    const saved = await imports.acceptBundle(identity, retry.bundleId, {
-      ...await imports.bundle(identity, retry.bundleId), preserveSelection: true,
-    });
+    const saved = await imports.acceptBundle(identity, retry.bundleId, await imports.bundle(identity, retry.bundleId));
     expect(saved.setId).not.toBe(accepted.value.setId);
-    expect(saved.activeRevision).toBe(accepted.value.activeRevision);
-    expect((await agents(identity)).reports.setId).toBe(accepted.value.setId);
+    expect(saved.activeRevision).toBe(String(BigInt(accepted.value.activeRevision) + 1n));
+    expect((await agents(identity)).reports.setId).toBe(saved.setId);
   });
 
   it("returns the durable acceptance after cleanup fails and resumes its indexed bounded deletion",async () => {
@@ -230,7 +227,7 @@ describe("native automatic import and semantic reuse", () => {
     expect(await counts(identity)).toEqual(before);
     await expireSyntheticUploads(identity); await retainUntilConverged(fixture.operator, { batchSize: 250 });
     expect(await duplicate.accept()).toEqual(accepted);
-    await operation(identity, original.setId, "delete");
+    await remove(identity, original.setId);
     await expect(duplicate.accept()).rejects.toMatchObject({ code: "deleted_report_duplicate" });
   });
 
@@ -253,16 +250,13 @@ describe("native automatic import and semantic reuse", () => {
     expect((await agents(identity)).reports.setId).toBe(original.setId);
     await releaseSelections(identity); await retainUntilConverged(fixture.operator, { batchSize: 250 });
     expect(await single(identity, duplicate.stages[0])).toEqual(partial);
-    await operation(identity, original.setId, "delete");
+    await remove(identity, original.setId);
     await expect(single(identity, duplicate.stages[0])).rejects.toMatchObject({ status: 409 });
   });
 
-  it.each([
-    { purged: false, preserveSelection: false }, { purged: true, preserveSelection: false },
-    { purged: false, preserveSelection: true }, { purged: true, preserveSelection: true },
-  ])("reimports deleted bytes without reviving old receipts (purged=$purged, preserveSelection=$preserveSelection)", async ({ purged, preserveSelection }) => {
+  it.each([false, true])("reimports deleted bytes without reviving old receipts (purged=%s)", async purged => {
     const identity = owner(), original = await bundle(identity), removed = await original.accept(), originalPage = await agents(identity);
-    const deletion = await operation(identity, removed.setId, "delete");
+    const deletion = await remove(identity, removed.setId);
     if (purged) {
       await expireSyntheticUploads(identity); await releaseSelections(identity);
       await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [identity.tenantId]);
@@ -272,19 +266,19 @@ describe("native automatic import and semantic reuse", () => {
     await expect(original.accept()).rejects.toMatchObject({ code: purged ? "bundle_fence_mismatch" : "deleted_report_duplicate" });
     const reimportIdentity = { ...identity, principalId: "reimport-administrator" };
     const reimported = await bundle(reimportIdentity, { reformatted: purged });
-    const accept = () => imports.acceptBundle(reimportIdentity, reimported.bundleId, { ...reimported.preview, preserveSelection });
+    const accept = () => reimported.accept();
     const [accepted, retried] = await Promise.all([accept(), accept()]);
     expect(retried).toEqual(accepted);
     expect(accepted).toMatchObject({ complete: true,
-      activeRevision: preserveSelection ? deletion.activeRevision : String(BigInt(deletion.activeRevision) + 1n) });
+      activeRevision: String(BigInt(deletion.activeRevision) + 1n) });
     expect(accepted.setId).not.toBe(removed.setId);
     const current = await agents(identity, accepted.setId);
     expect(current.value).toEqual(originalPage.value); expect(current.reports.acceptedAt).not.toBe(originalPage.reports.acceptedAt);
     expect(current.reports.setId).toBe(accepted.setId);
-    expect((await agents(identity)).reports.activeSetId).toBe(preserveSelection ? null : accepted.setId);
+    expect((await agents(identity)).reports.activeSetId).toBe(accepted.setId);
     expect((await fixture.runtime.query("SELECT bundle_id,deleted_at FROM official_usage_sets WHERE id=$1", [removed.setId])).rows)
       .toEqual(purged ? [] : [{ bundle_id: original.bundleId, deleted_at: expect.any(Date) }]);
-    await expect(agents(identity, removed.setId)).rejects.toMatchObject({ status: 409 });
+    await expect(agents(identity, removed.setId)).rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
     await releaseSelections(identity); await retainUntilConverged(fixture.operator, { batchSize: 250 });
     const expected = { sets: purged ? 1 : 2, versions: purged ? 3 : 6, facts: 3, rows: 3, memberships: purged ? 3 : 6 };
     expect(await counts(identity)).toEqual(expected);
@@ -297,7 +291,7 @@ describe("native automatic import and semantic reuse", () => {
     const identity = owner(), original = await (await bundle(identity)).accept(), bundleId = randomUUID();
     for (const kind of kinds) await stage(identity, bundleId, kind, { responses: kind === "agents" ? 7 : 4 });
     const other = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId)), otherPage = await agents(identity);
-    await operation(identity, original.setId, "delete");
+    await remove(identity, original.setId);
     expect((await agents(identity)).reports.setId).toBe(other.setId);
     const accepted = await (await bundle(identity)).accept();
     expect([original.setId, other.setId]).not.toContain(accepted.setId);
@@ -309,7 +303,7 @@ describe("native automatic import and semantic reuse", () => {
 
   it("fences different simultaneous reuploads and deduplicates a fresh retry", async () => {
     const identity = owner(), original = await (await bundle(identity)).accept();
-    await operation(identity, original.setId, "delete");
+    await remove(identity, original.setId);
     const drafts = [await bundle(identity), await bundle(identity)];
     const results = await Promise.allSettled(drafts.map(draft => draft.accept()));
     expect(results.map(result => result.status).sort()).toEqual(["fulfilled", "rejected"]);
@@ -325,12 +319,12 @@ describe("native automatic import and semantic reuse", () => {
 
   it.each([false, true])("reuses version content while preserving a new correction's lineage (partial=%s)", async partial => {
     const identity = owner(), original = await (await bundle(identity)).accept(), unrelated = await (await bundle(identity, { responses: 7 })).accept();
-    const unrelatedPage = await agents(identity), selected = await operation(identity, original.setId, "select");
+    const unrelatedPage = await agents(identity);
     const correction = await bundle(identity, { responses: 7, correctionOfSetId: original.setId });
-    if (partial) expect(await single(identity, correction.stages[0])).toMatchObject({ complete: false, activeRevision: selected.activeRevision });
+    if (partial) expect(await single(identity, correction.stages[0])).toMatchObject({ complete: false, activeRevision: unrelated.activeRevision });
     const preview = await imports.bundle(identity, correction.bundleId);
     const accepted = await imports.acceptBundle(identity, correction.bundleId, preview);
-    expect(accepted.activeRevision).toBe(String(BigInt(selected.activeRevision) + 1n));
+    expect(accepted.activeRevision).toBe(String(BigInt(unrelated.activeRevision) + 1n));
     expect([original.setId, unrelated.setId]).not.toContain(accepted.setId);
     expect((await agents(identity)).value).toEqual(unrelatedPage.value);
     expect((await fixture.runtime.query("SELECT supersedes_set_id FROM official_usage_sets WHERE id=$1", [accepted.setId])).rows)
@@ -338,7 +332,7 @@ describe("native automatic import and semantic reuse", () => {
     expect(await counts(identity)).toEqual({ sets: 3, versions: 6, facts: 6, rows: 6, memberships: 9 });
     expect(await imports.acceptBundle(identity, correction.bundleId, preview)).toEqual(accepted);
     expect(await (await bundle(identity, { responses: 7, correctionOfSetId: original.setId })).accept()).toEqual(accepted);
-    await operation(identity, unrelated.setId, "delete");
+    await remove(identity, unrelated.setId);
     expect((await agents(identity)).value).toEqual(unrelatedPage.value);
   });
 
@@ -364,11 +358,11 @@ describe("native automatic import and semantic reuse", () => {
 
   it("permits deleted content in a new correction but never an unavailable correction target", async () => {
     const identity = owner(), original = await (await bundle(identity)).accept(), removed = await (await bundle(identity, { responses: 7 })).accept();
-    await operation(identity, removed.setId, "delete"); await operation(identity, original.setId, "select");
+    await remove(identity, removed.setId);
     const correction = await (await bundle(identity, { responses: 7, correctionOfSetId: original.setId })).accept();
     expect([removed.setId, original.setId]).not.toContain(correction.setId);
     expect((await agents(identity)).reports.setId).toBe(correction.setId);
-    await operation(identity, original.setId, "delete");
+    await remove(identity, original.setId);
     await expect(bundle(identity, { correctionOfSetId: original.setId })).rejects.toMatchObject({ code: "invalid_correction" });
   });
 

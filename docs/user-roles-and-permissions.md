@@ -23,9 +23,9 @@ signed in, or an approval/enable step is not required.
 
 | App role | Allowed tasks |
 | --- | --- |
-| `AgentControl.Viewer` | Read shared agents, users, reports and saved sync results; run read-only sync. |
+| `AgentControl.Viewer` | Read shared agents, users, reports and saved sync results; choose a personal report context; run read-only sync. |
 | `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish new CSV sets; discard own unaccepted drafts. |
-| `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/selection/deletion, configuration and local Audit read/export. |
+| `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/deletion, configuration and local Audit read/export. |
 
 Assign roles through **Enterprise applications > Agent Control > Users and
 groups**. Enable **Assignment required?** on the enterprise application. Each
@@ -39,6 +39,10 @@ Only Admin can see the **Audit** tab/page or read/export local administrative
 audit logs. Viewer and Usage Report Uploader cannot access them through direct
 URLs or API requests either. Audit recording is unchanged. This local Audit
 history is distinct from Microsoft Purview Audit Search.
+
+Only Admin can see the **Manage** tab in agent details. Viewer and Usage Report
+Uploader see **Overview**, **Usage**, and **Users**; a direct Manage link opens
+Overview instead. Provider permission checks still apply to Admin changes.
 
 Graph read sync uses the configured application grants, not the signed-in user's
 Microsoft reader roles. Power Platform sync additionally needs that user's
@@ -175,7 +179,7 @@ not used.
 ## CSV downloads and report import
 
 Local import uses no Microsoft token. New imports require Usage Report Uploader
-or Admin; published-report corrections, selection and deletion require Admin.
+or Admin; published-report corrections and deletion require Admin. All three roles can choose a personal report; the tenant default automatically follows the latest report content.
 
 Downloading the original user-level CSV reports from Microsoft 365 requires
 **Reports Reader** or **AI Administrator**. **Usage Summary Reports Reader** does

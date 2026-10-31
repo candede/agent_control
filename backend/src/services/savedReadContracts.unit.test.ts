@@ -193,9 +193,58 @@ describe("saved relationship page bounds", () => {
     expect(page).toMatchObject({ value: [], relationshipState: "available", missingReasons: [],
       counts: { total: 0, distinctAgents: 0, returned: 0 } });
   });
+
+  it.each(["copilot_users", "adoption"] as const)(
+    "accepts an all-inventory selection with an explicit report context for %s relationships", async endpoint => {
+      const { saved, selected, query, assert } = fixture(endpoint);
+      const setId = "44444444-4444-4444-8444-444444444444";
+      saved.report.setId = setId;
+      saved.report.lineages = [usageLineage];
+      selected.context.query = { ...selected.context.query, setId };
+
+      const page = endpoint === "copilot_users"
+        ? await reads.relationships(saved.selection.id, saved.identity, inventoryId, objectId, "used", { limit: 50 })
+        : await reads.champions(saved.selection.id, saved.identity, inventoryId, { limit: 50 });
+
+      expect(page).toMatchObject({ value: [], inventorySelection: { id: inventoryId },
+        relationshipState: "available", counts: { total: 0, distinctAgents: 0, returned: 0 } });
+      expect(query.mock.calls.filter(([sql]) => sql.includes("FROM requested")).every(([, values]) => values?.[4] === setId))
+        .toBe(true);
+      expect(assert).toHaveBeenCalledWith(expect.anything(), inventoryId, saved.identity);
+
+      selected.context.query.view = "copilot_studio";
+      await expect(endpoint === "copilot_users"
+        ? reads.relationships(saved.selection.id, saved.identity, inventoryId, objectId, "used", { limit: 50 })
+        : reads.champions(saved.selection.id, saved.identity, inventoryId, { limit: 50 }))
+        .rejects.toMatchObject({ status: 400, code: "relationship_inventory_scope" });
+    },
+  );
 });
 
 describe("saved user resolution", () => {
+  it.each([
+    { username: " person@example.invalid ", matches: "2", state: "ambiguous", reason: "a case-different ambiguous UPN" },
+    { username: "person@example.invalid", matches: "1", state: "resolved", reason: "a conflicting object-ID alias" },
+  ])("checks captured directory aliases for ambiguity from $reason", async ({ username, matches, state }) => {
+    const { saved, query } = fixture();
+    saved.metadata.directory.generationId = "directory";
+    query.mockImplementationOnce(async sql => {
+      const projection = sql.slice(sql.lastIndexOf("SELECT (SELECT count(*)::text"));
+      expect(projection.replace(/\s+/g, " ")).toContain(
+        "m.username=$7 OR m.directory_identity_key IN ( SELECT identity_key FROM directory_keys WHERE identity=(",
+      );
+      expect(projection).toContain('upn_key=lower(btrim($7) COLLATE "default") COLLATE "C"');
+      expect(projection).toContain("m.match_count>1 OR m.user_rows>1 OR m.alias_ambiguous");
+      expect(projection).not.toContain("NFKC");
+      return result([{ matches, object_id: objectId, exact_report: null,
+        reported_username: null, ambiguous_report: true }]);
+    });
+    const resolution = await reads.resolve(saved.selection.id, saved.identity, username);
+    expect(resolution).toMatchObject({ username, state, objectId: matches === "1" ? objectId : null, directoryMatches: Number(matches),
+      reportIdentityState: "ambiguous", reportedUsername: null, concealment: "unknown" });
+    expect(query.mock.calls[0][1]?.at(-1)).toBe(username);
+  });
+
   it.each([
     { matches: "0", exact_report: null, reported_username: null, ambiguous_report: false, state: "directory_missing", reportIdentityState: "missing" },
     { matches: "0", exact_report: "concealed", reported_username: null, ambiguous_report: false, state: "directory_missing", reportIdentityState: "unresolved" },

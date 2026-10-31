@@ -1,5 +1,6 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { adoptionSnapshotLabel } from "../src/adoptionTrends";
 import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportPage, reportSelection } from "../src/test/reportDataFixture";
 import { mockLayoutApi } from "./layoutFixtures";
 
@@ -104,13 +105,20 @@ test("Dashboard shows historical adoption, preserves baseline and company naviga
   } }));
   await page.goto("/dashboard");
   await expect(page.getByRole("button", { name: "Dashboard", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(page.getByRole("heading", { name: "Understand adoption. Empower your people." })).toBeVisible();
+  await expect(page.getByRole("link", { name: "View saved reports", exact: true })).toHaveCount(0);
   const users = page.getByRole("region", { name: "Active users", exact: true });
   await expect(users.getByText("306", { exact: true })).toBeVisible();
   await expect(users.getByText("+6 (+2%)", { exact: true })).toBeVisible();
   await expect(users.getByText("-38 (-11%)", { exact: true })).toBeVisible();
   await expect(page.getByRole("img", { name: "Active users over saved reports" })).toBeVisible();
   await expect(page.getByRole("img", { name: "Active agents over saved reports" })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Report snapshots and comparisons", exact: true }).getByRole("row")).toHaveCount(4);
+  const snapshots = page.getByRole("region", { name: "Report snapshots and comparisons", exact: true });
+  await expect(snapshots.getByRole("row")).toHaveCount(4);
+  await expect(snapshots.getByRole("rowheader")).toHaveText([
+    adoptionSnapshotLabel(latest), adoptionSnapshotLabel(second), adoptionSnapshotLabel(first),
+  ]);
+  await expect(snapshots.getByText("Observed activity", { exact: true })).toHaveCount(0);
   const departmentPanel = page.getByRole("region", { name: "Adoption by department" });
   await expect(departmentPanel.getByText("75%", { exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "People and engagement" }).getByText("40,000", { exact: true })).toBeVisible();

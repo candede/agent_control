@@ -31,15 +31,18 @@ export function OfficialUsageHistoryPanel({ revision, onSelect, admin, freshCapt
     {data ? <>
       {data.counts.total > 0 ? <p className="usage-history-count">{data.counts.total.toLocaleString()} saved report {data.counts.total === 1 ? "set" : "sets"}</p> : null}
       {data.counts.filtered > 0 ? <div className="table-shell usage-history-table" role="region" aria-label="Saved report history" aria-busy={read.loading} tabIndex={0}><table><thead><tr>
-        <th scope="col">Imported</th><th scope="col">Activity dates</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
+        <th scope="col">Activity dates</th><th scope="col">Status</th><th scope="col"><span className="sr-only">Actions</span></th>
       </tr></thead><tbody>
-        {data.value.map(set => <tr key={set.id}><td><span className="usage-mobile-label" aria-hidden="true">Imported</span>{usageDate(set.acceptedAt)}</td><td>
+        {data.value.map(set => <tr key={set.id}><td>
           <span className="usage-mobile-label" aria-hidden="true">Activity dates</span>
-          {set.reportingStart || set.reportingEnd ? <>
-            {set.reportingStart ? <time dateTime={set.reportingStart}>{usageDate(set.reportingStart)}</time> : "Not reported"} to{" "}
-            {set.reportingEnd ? <time dateTime={set.reportingEnd}>{usageDate(set.reportingEnd)}</time> : "Not reported"}
-          </> : "No activity dates"}
-          <small>{set.periodProvenance === "activity_range" ? "Observed activity" : "Reporting period"}</small></td>
+          {set.reportingStart || set.reportingEnd ? <dl className="usage-history-dates">
+            <div><dt>Start</dt><dd>
+              {set.reportingStart ? <time dateTime={set.reportingStart}>{usageDate(set.reportingStart)}</time> : "Not reported"}
+            </dd></div>
+            <div><dt>End</dt><dd>
+              {set.reportingEnd ? <time dateTime={set.reportingEnd}>{usageDate(set.reportingEnd)}</time> : "Not reported"}
+            </dd></div>
+          </dl> : "No activity dates"}</td>
           <td><span className="usage-mobile-label" aria-hidden="true">Status</span>
             <span className={`usage-report-badge${set.active ? " is-current" : ""}`}>{set.active ? "Current" : set.visibility === "superseded" ? "Superseded" : "Saved"}</span>
           </td><td><div className="table-actions">

@@ -24,7 +24,7 @@ type SavedSet = { row: ReportHistorySet; files: SelectedCsvFixture[] };
 type Captured = { path: string; metadata: ReportMetadata; query: ReportQuery; files: SelectedCsvFixture[]; historyIds: string[] };
 export type SelectedImportOptions = {
   role?: "Admin" | "Viewer"; active?: boolean; historical?: boolean; staged?: boolean; additionalSavedSets?: number;
-  selectedSetId?: string; reusedExistingSet?: boolean; loseAcceptanceResponse?: boolean; stageResponseGate?: Promise<void>;
+  reusedExistingSet?: boolean; loseAcceptanceResponse?: boolean; stageResponseGate?: Promise<void>;
 };
 
 const normalized = (value: string) => value.trim().normalize("NFKC").toLowerCase();
@@ -67,8 +67,9 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   const exports = new Map<string, { selected: Captured; rows: ReportAgent[]; bytes: Buffer; status: OfficialReportExportStatus }>();
   const exportIntents = new Map<string, { id: string; selectionId: string }>();
   const exportSubmissions: OfficialReportExportRequest[] = [], exportStatusBytes: number[] = [], exportDownloads: boolean[] = [];
-  let activeRevision = options.active ? 2 : 1, historyRevision = 1, historyEpoch = 1;
-  let selectedSetId = options.selectedSetId ?? (options.active ? importedSetId : null);
+  let activeRevision = 1, historyRevision = 1, historyEpoch = 1;
+  let latestSetId: string | null = null;
+  let publicationSequence = 0;
   let hasHistory = Boolean(options.active || options.historical);
   let usedImportedSetId = Boolean(options.active);
   function save(id: string, bundleId: string, files: SelectedCsvFixture[], acceptedAt = importInstant, supersedesSetId: string | null = null) {
@@ -86,7 +87,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     });
     sets.set(id, { row: historySet(1, { id, bundleId, acceptedAt, reportingStart: period.startDate, reportingEnd: period.endDate,
       periodProvenance: period.provenance, contentHash: setHash(files), supersedesSetId,
-      active: id === selectedSetId }), files });
+      active: id === latestSetId }), files });
   }
   function deleteSet(id: string) {
     const removed = sets.get(id);
@@ -94,7 +95,15 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     for (const file of removed?.files ?? []) {
       if (![...sets.values()].some(set => set.files.some(row => row.versionId === file.versionId))) versions.delete(file.contentHash);
     }
-    if (selectedSetId === id) { selectedSetId = null; activeRevision++; }
+    refreshLatest();
+  }
+  function publicationTime() { return new Date(Date.parse(importInstant) + ++publicationSequence).toISOString(); }
+  function refreshLatest() {
+    const latest = [...sets.values()].filter(set => set.row.visibility === "retained" && new Set(set.files.map(file => file.kind)).size === 3)
+      .sort((a, b) => compare(b.row.reportingEnd ?? "", a.row.reportingEnd ?? "")
+        || compare(b.row.reportingStart ?? "", a.row.reportingStart ?? "")
+        || compare(b.row.acceptedAt, a.row.acceptedAt) || compare(b.row.id, a.row.id))[0]?.row.id ?? null;
+    if (latest !== latestSetId) { latestSetId = latest; activeRevision++; }
   }
   if (options.historical) {
     const rows = [
@@ -113,10 +122,11 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     save(`aaaaaaaa-aaaa-4aaa-8aaa-${String(index + 1).padStart(12, "0")}`, randomUUID(), seeded, "2026-06-02T10:00:00.000Z");
   }
   if (options.active) save(importedSetId, initialBundle, seeded);
-  function metadata(id: string | null = selectedSetId): ReportMetadata {
+  refreshLatest();
+  function metadata(id: string | null = latestSetId): ReportMetadata {
     const saved = id ? sets.get(id) : undefined;
     const result = selectedImportMetadata(saved?.files ?? [], {
-      setId: saved?.row.id ?? null, activeSetId: selectedSetId, activeRevision: String(activeRevision),
+      setId: saved?.row.id ?? null, activeSetId: latestSetId, activeRevision: String(activeRevision),
       historyRevision: String(historyRevision), historyEpoch: String(historyEpoch),
       acceptedAt: saved?.row.acceptedAt ?? null, expiresAt: saved ? "2027-03-11T14:45:00.000Z" : null, evaluatedAt: importInstant,
     });
@@ -165,8 +175,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       return { selected: prior, selectionId: selectionId! };
     }
     if (selections.size >= 250) throw new Error("Synthetic selection fixture exceeded its bound");
-    if (query.setId && !sets.has(query.setId)) throw new AppError(404, "official_usage_set_not_found", "The exact synthetic report set is unavailable.");
-    const reports = metadata(query.setId ?? selectedSetId);
+    if (query.setId && !sets.has(query.setId)) throw new AppError(404, "usage_report_unavailable", "The exact report set is no longer available.");
+    const reports = metadata(query.setId ?? latestSetId);
     const selected: Captured = { path: root, metadata: reports, query, files: reports.setId ? sets.get(reports.setId)!.files : [], historyIds: [...sets.keys()] };
     const id = randomUUID(); selections.set(id, selected); return { selected, selectionId: id };
   }
@@ -269,8 +279,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
         }
       }
       const body: OfficialReportBundleAcceptance = request.postDataJSON(); acceptRequests.push({ bundleId: bundle[1], ...body });
-      if (body.preserveSelection !== undefined && typeof body.preserveSelection !== "boolean") {
-        return respond({ code: "invalid_import_intent", detail: "Preserving the report selection must be a boolean." }, 400);
+      if (!body || typeof body !== "object" || Object.keys(body).some(key => !["bundleHash", "expectedActiveRevision"].includes(key))) {
+        return respond({ code: "invalid_import_intent", detail: "Review the current complete bundle before accepting." }, 400);
       }
       const receiptKey = JSON.stringify([bundle[1], body.bundleHash, body.expectedActiveRevision]);
       const receipt = receipts.get(receiptKey);
@@ -307,18 +317,13 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       const setId = existing?.row.id ?? (usedImportedSetId ? randomUUID() : importedSetId);
       for (const stage of current) stages[stages.indexOf(stage)] = { ...stage, status: "accepted" };
       if (!existing) {
-        const active = selectedSetId ? sets.get(selectedSetId)?.row : undefined;
-        const backfill = active?.reportingEnd && (!period.endDate
-          || `${period.endDate}/${period.startDate ?? ""}` < `${active.reportingEnd}/${active.reportingStart ?? ""}`);
-        if (!body.preserveSelection && (!selectedSetId || correctionOfSetId === selectedSetId || !correctionOfSetId && !backfill)) {
-          selectedSetId = setId; activeRevision++;
-        }
         usedImportedSetId = true; historyRevision++;
         if (correctionOfSetId && target) {
           historyEpoch++;
           sets.set(correctionOfSetId, { ...target, row: { ...target.row, visibility: "superseded" } });
         }
-        save(setId, bundle[1], files, importInstant, correctionOfSetId);
+        save(setId, bundle[1], files, publicationTime(), correctionOfSetId);
+        refreshLatest();
       }
       hasHistory = true;
       const result: OfficialReportAccepted = { setId, activeRevision: String(activeRevision), complete: true };
@@ -330,9 +335,9 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     if (preview) {
       if (method !== "POST") return notFound();
       const operation: OfficialReportConfirmation["operation"] = request.postDataJSON()?.operation;
-      if (operation !== "select" && operation !== "delete") return respond({ code: "invalid_operation", detail: "Unsupported operation." }, 400);
+      if (operation !== "delete") return respond({ code: "invalid_operation", detail: "Unsupported operation." }, 400);
       const target = sets.get(preview[1]);
-      if (!target || operation === "select" && target.row.visibility !== "retained") {
+      if (!target) {
         return respond({ code: "staging_unavailable", detail: "The exact report is unavailable for this operation." }, 409);
       }
       const intent = { id: randomUUID(), setId: preview[1], operation, activeRevision: String(activeRevision),
@@ -345,6 +350,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
     if (confirmationPath) {
       if (method !== "POST") return notFound();
       const confirmation: OfficialReportConfirmation = request.postDataJSON();
+      if (confirmation?.operation !== "delete") return respond({ code: "invalid_operation", detail: "Unsupported operation." }, 400);
       if (confirmation?.id !== confirmationPath[1]) return respond({ code: "invalid_identifier", detail: "Confirmation ID mismatch." }, 400);
       const reviewed = confirmationReceipts.get(confirmation.id);
       if (!reviewed || Object.keys(reviewed).some(key => reviewed[key as keyof OfficialReportConfirmation] !== confirmation[key as keyof OfficialReportConfirmation])
@@ -354,9 +360,8 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       }
       confirmationReceipts.delete(confirmation.id);
       confirmations.push(structuredClone(confirmation));
-      if (confirmation.operation === "select") { selectedSetId = confirmation.setId; activeRevision++; }
-      else deleteSet(confirmation.setId);
-      return respond({ activeSetId: selectedSetId, activeRevision: String(activeRevision) });
+      deleteSet(confirmation.setId);
+      return respond({ activeSetId: latestSetId, activeRevision: String(activeRevision) });
     }
     if (path === "/api/data-exports") {
       if (method !== "POST") return notFound();
@@ -568,8 +573,16 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
   await page.context().route(url => /^\/api\/data-exports\/[^/]+\/download$/.test(url.pathname), handle);
   return { unexpected, uploadBodies, uploadIntents, stages, stageReads, discardedStages, bundlePreviews, acceptRequests,
     setPreviews, confirmations, metadataReads, agentRequests, userRequests, historyRequests, apiRequests, commands,
-    exportRequests, exportSubmissions, exportStatusBytes, exportDownloads, selectedSetId: () => selectedSetId,
-    selectReport(id: string) { expect(sets.has(id)).toBe(true); selectedSetId = id; activeRevision++; },
+    exportRequests, exportSubmissions, exportStatusBytes, exportDownloads, latestSetId: () => latestSetId,
+    async publishNewReport() {
+      const id = randomUUID();
+      const files = await Promise.all(csvFiles.map(file => parseSelectedCsv(Buffer.from(
+        file.content.replaceAll("@", `+new${publicationSequence + 1}@`).replaceAll("Alpha", "New Alpha")))));
+      save(id, randomUUID(), files, publicationTime());
+      historyRevision++;
+      refreshLatest();
+      return id;
+    },
     deleteImportedReport() { deleteSet(importedSetId); },
   };
 }

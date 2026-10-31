@@ -1852,7 +1852,7 @@ describe.sequential("packaged API/session contracts", () => {
 
     const confirmationResponse = await request(`/api/official-usage/sets/${activeSetId}/preview`, {
       method: "POST", headers: { Cookie: administratorCookie, "Content-Type": "application/json" },
-      body: JSON.stringify({ operation: "select" }),
+      body: JSON.stringify({ operation: "delete" }),
     });
     expect(confirmationResponse.status).toBe(200);
     const confirmation = await confirmationResponse.json();

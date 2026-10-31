@@ -310,7 +310,9 @@ describe("live selected users and reports", () => {
     expect((await reports.facets(selected.id, identity, { field: "company" })).value).toEqual([{ value: "Company", count: 4 }, { value: null, count: 3 }]);
     for (const [search, count] of [["USER1@EXAMPLE.INVALID", 1], ["cOmPaNy", 4], ["DEPARTMENT", 5]] as const) {
       const searched = await reports.capture(identity, "copilot_users", { search });
-      expect((await reports.page(searched.id, identity)).counts).toEqual({ total: 7, filtered: count });
+      const searchedPage = await reports.page(searched.id, identity);
+      expect(searchedPage.counts).toEqual({ total: 7, filtered: count });
+      expect(searchedPage.summary).toEqual(page.summary);
     }
     expect((await reports.page(selected.id, identity, { endpoint: "plans", child: users[0].identity.objectId })).value).toHaveLength(1);
     const official = await reports.capture(identity, "official_users");
@@ -337,13 +339,17 @@ describe("live selected users and reports", () => {
     for (const [filters, count] of [
       [{ username: "user1@example.invalid" }, 1], [{ company: null }, 3], [{ department: null }, 2],
       [{ cohort: "zero" }, 1], [{ cohort: "low", lowResponseThreshold: 3 }, 0],
+      [{ cohort: "licensed" }, 3], [{ cohort: "needs_attention" }, 3],
       [{ cohort: "using_agents" }, 2], [{ cohort: "no_agent_activity" }, 1],
       [{ reportActivity: "recent", inactiveDays: 1 }, 6], [{ reportActivity: "no-activity" }, 1],
       [{ agentId: "agent", responsesOnly: true }, 6], [{ creatorType: "Other" }, 0], [{ serviceState: "unknown" }, 1],
       [{ entitlement: "paid_active" }, 3], [{ appActivity: "unknown" }, 7], [{ startDate: today, endDate: today }, 6],
     ] as const) {
       const filtered = await reports.capture(identity, "copilot_users", filters);
-      expect((await reports.page(filtered.id, identity)).counts.filtered, JSON.stringify(filters)).toBe(count);
+      const filteredPage = await reports.page(filtered.id, identity);
+      expect(filteredPage.counts.filtered, JSON.stringify(filters)).toBe(count);
+      expect(filteredPage.summary).toMatchObject({ licensedUsers: 3, usingAgentsUsers: 2, noAgentActivityUsers: 1,
+        needsAttentionUsers: "lowResponseThreshold" in filters ? 2 : 3 });
     }
     const exports = new OfficialReportExports(reports, usageAudit(identity).actor);
     for (const kind of ["copilot_users", "official_users", "official_agents"] as const) {

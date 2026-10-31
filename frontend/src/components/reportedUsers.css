@@ -9,7 +9,6 @@
 .user-activity-controls .agent-filter-fields input,
 .user-activity-controls .agent-filter-fields select { width: 100%; min-width: 0; }
 .reported-users-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
-.reported-users-snapshot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; margin: 0; }
 .reported-users-empty { padding: 24px 16px; border: 1px solid var(--border); border-radius: 8px; text-align: center; }
 .reported-users-empty h3,
 .reported-users-empty h4 { margin: 0 0 8px; }

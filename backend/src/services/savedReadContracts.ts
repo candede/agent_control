@@ -23,7 +23,10 @@ export class SavedReadContracts {
           (SELECT username FROM report_users WHERE username=$7 LIMIT 1) AS exact_report,
           (SELECT reported_username FROM combined WHERE identity=(
             SELECT min(identity) FROM directory WHERE upn_key=lower(btrim($7) COLLATE "default") COLLATE "C")) AS reported_username,
-          EXISTS(SELECT 1 FROM matches WHERE username=$7 AND (match_count>1 OR user_rows>1 OR alias_ambiguous))
+          EXISTS(SELECT 1 FROM matches m WHERE (m.username=$7 OR m.directory_identity_key IN (
+            SELECT identity_key FROM directory_keys WHERE identity=(
+              SELECT min(identity) FROM directory WHERE upn_key=lower(btrim($7) COLLATE "default") COLLATE "C")))
+            AND (m.match_count>1 OR m.user_rows>1 OR m.alias_ambiguous))
             OR EXISTS(SELECT 1 FROM resolved WHERE identity_count>1 AND identity=(
               SELECT min(identity) FROM directory WHERE upn_key=lower(btrim($7) COLLATE "default") COLLATE "C")) AS ambiguous_report`,
       [...this.reports.parameters(context), username])).rows[0];
@@ -46,7 +49,7 @@ export class SavedReadContracts {
       throw new AppError(409, "selection_invalidated", "Report, directory and inventory join selections no longer share the same saved dependencies.");
     }
     // Full person/cohort relationships must not accidentally inherit a category UI filter.
-    if (Object.entries(selected.query).some(([key, value]) => !["sortBy", "sortDirection"].includes(key)
+    if (Object.entries(selected.query).some(([key, value]) => !["setId", "sortBy", "sortDirection"].includes(key)
       && !(["inventoryScope", "view", "source"].includes(key) && value === "all"))) {
       throw new AppError(400, "relationship_inventory_scope", "Capture an all-inventory selection for complete person relationships.");
     }

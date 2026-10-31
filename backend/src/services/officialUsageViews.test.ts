@@ -217,13 +217,13 @@ describe("native report row semantics and exact children", () => {
       expect((await reports.page(first.selection.id, identity, { limit: 2, cursor: next.page.previousCursor! })).value).toEqual(first.value);
     }
   });
-  it("distinguishes absent selection, incomplete imports, unselected retained sets, deletion and stale evidence", async () => {
+  it("distinguishes never-imported, incomplete, deleted and stale evidence with automatic deletion fallback", async () => {
     const identity = owner();
     expect((await users(identity)).reports.availability).toBe("never_imported");
     const draft = await stage(identity, "users", ["person,Person,1,1,"], randomUUID());
     const partial = await imports.accept(identity, { stagingId: draft.id, revision: draft.revision, contentHash: draft.contentHash, expectedActiveRevision: draft.activeRevision });
     expect((await users(identity)).reports.availability).toBe("incomplete");
-    await imports.confirm(identity, await imports.confirmPreview(identity, partial.setId, "delete"));
+    await imports.confirmDeletion(identity, await imports.previewDeletion(identity, partial.setId));
     const first = await publish(identity, { agents: [], userAgents: [], users: ["person,Person,1,1,"] });
     const active = await users(identity);
     expect(active.reports).toMatchObject({ availability: "active", periodAgeDays: null, acceptedAgeDays: 0,
@@ -231,9 +231,9 @@ describe("native report row semantics and exact children", () => {
     await fixture.operator.query("UPDATE official_usage_sets SET accepted_at=clock_timestamp()-interval '40 days' WHERE id=$1", [first.setId]);
     expect((await users(identity)).reports).toMatchObject({ availability: "stale", acceptedAgeDays: 40 });
     const second = await publish(identity, { agents: [], userAgents: [], users: ["person,Person,1,2,"] });
-    await imports.confirm(identity, await imports.confirmPreview(identity, second.setId, "delete"));
-    expect((await users(identity)).reports.availability).toBe("not_selected");
-    await imports.confirm(identity, await imports.confirmPreview(identity, first.setId, "delete"));
+    await imports.confirmDeletion(identity, await imports.previewDeletion(identity, second.setId));
+    expect((await users(identity)).reports).toMatchObject({ setId: first.setId, availability: "stale" });
+    await imports.confirmDeletion(identity, await imports.previewDeletion(identity, first.setId));
     expect((await users(identity)).reports.availability).toBe("deleted");
   });
   it("does not replace missing Users observations or missing relationship evidence with inferred zero", async () => {

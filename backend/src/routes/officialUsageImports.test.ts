@@ -20,6 +20,12 @@ describe("native official report import HTTP contracts", () => {
   afterAll(async () => { await fixture?.close(); });
   afterEach(async () => {
     if (!fixture) return;
+    // Rejected responses can precede cleanup; admission remains reserved until that work settles.
+    await expect.poll(async () => (await fixture.database.runtime.query(`SELECT count(*)::int AS pending
+      FROM official_usage_ingestions WHERE tenant_id=$1 AND principal_id=$2
+        AND (state IN ('streaming','validating','accepting') OR state IN ('cancelled','failed') AND stored_bytes>0)`,
+    [fixture.identity.tenantId, fixture.identity.principalId])).rows[0].pending,
+    { timeout: 5000, interval: 25 }).toBe(0);
     const drafts = await fixture.database.runtime.query(`SELECT id FROM official_usage_staging
       WHERE tenant_id=$1 AND actor_principal_id=$2 AND status='active' LIMIT 250`, [fixture.identity.tenantId, fixture.identity.principalId]);
     for (const draft of drafts.rows) expect((await fixture.api(`/official-usage/staging/${draft.id}`, { method: "DELETE" })).status).toBe(204);
@@ -37,7 +43,7 @@ describe("native official report import HTTP contracts", () => {
     return (await fixture.database.runtime.query("SELECT count(*)::int AS n FROM official_usage_ingestions WHERE tenant_id=$1 AND principal_id=$2",
       [fixture.identity.tenantId, fixture.identity.principalId])).rows[0].n as number;
   }
-  async function completeBundle(marker: string, preserveSelection?: boolean) {
+  async function completeBundle(marker: string) {
     const bundleId = randomUUID();
     for (const kind of ["agents", "userAgents", "users"] as const) {
       const row = kind === "agents" ? `${marker},Assistant,Your org,1,0,4,2026-07-06`
@@ -51,26 +57,26 @@ describe("native official report import HTTP contracts", () => {
     const preview = await previewResponse.json() as OfficialReportBundlePreview;
     expect(preview.complete).toBe(true); expect(preview.stages).toHaveLength(3);
     const response = await fixture.api(`/official-usage/bundles/${bundleId}/accept`, { method: "POST",
-      body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection }) });
+      body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }) });
     expect(response.status, await response.clone().text()).toBe(200);
     return await response.json() as OfficialReportAccepted;
   }
 
-  it("selects the first wizard report through HTTP and preserves it for later imports", async () => {
-    const selected = await completeBundle(randomUUID(), true);
+  it("automatically advances the default through HTTP while explicit saved reads remain personal", async () => {
+    const selected = await completeBundle(randomUUID());
     for (const path of ["/official-usage/aggregate?limit=1", "/official-usage/users?limit=1"]) {
       const response = await fixture.api(path);
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ reports: { setId: selected.setId, activeSetId: selected.setId } });
     }
-    const saved = await completeBundle(randomUUID(), true);
+    const saved = await completeBundle(randomUUID());
     expect(saved.setId).not.toBe(selected.setId);
-    expect(saved.activeRevision).toBe(selected.activeRevision);
-    const response = await fixture.api(`/official-usage/aggregate?setId=${saved.setId}&limit=1`);
+    expect(saved.activeRevision).toBe(String(BigInt(selected.activeRevision) + 1n));
+    const response = await fixture.api(`/official-usage/aggregate?setId=${selected.setId}&limit=1`);
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ reports: { setId: saved.setId, activeSetId: selected.setId } });
+    expect(await response.json()).toMatchObject({ reports: { setId: selected.setId, activeSetId: saved.setId } });
   });
-  it.each(["true", "false", 0, null])("rejects non-boolean preserveSelection %j before acceptance", async preserveSelection => {
+  it.each([true, false, "true", "false", 0, null])("rejects the removed preserveSelection field %j before acceptance", async preserveSelection => {
     const response = await fixture.api(`/official-usage/bundles/${randomUUID()}/accept`, { method: "POST",
       body: JSON.stringify({ bundleHash: "a".repeat(64), expectedActiveRevision: "1", preserveSelection }) });
     expect(response.status).toBe(400);

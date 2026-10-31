@@ -208,12 +208,15 @@ export class LargeTenantUsersReports {
   }
 
   async reportForSelection(client: pg.PoolClient, context: ReportReadContext, setId?: string): Promise<ReportMetadata> {
-    if (!setId || setId === context.report.setId) return context.report;
+    if (!setId) return context.report;
+    setId = reportUuid(setId);
+    const report = await this.metadata(client, context.identity.tenantId, setId, context.evaluatedAt);
     const member = await client.query(`SELECT 1 FROM (${readableHistorySql}) history
-      WHERE history.id=$3::uuid AND history.visibility='retained'`,
+      WHERE history.id=$3::uuid`,
     [context.identity.tenantId, context.report.historyRevision, setId]);
     if (!member.rowCount) throw new SelectionError("selection_invalidated");
-    const report = await this.metadata(client, context.identity.tenantId, setId, context.evaluatedAt);
+    // Mutation hashes must retain the immutable metadata, including its stored JSONB key order.
+    if (setId === context.report.setId) return context.report;
     return { ...report, activeSetId: context.report.activeSetId, activeRevision: context.report.activeRevision,
       historyRevision: context.report.historyRevision, historyEpoch: context.report.historyEpoch };
   }
@@ -221,7 +224,8 @@ export class LargeTenantUsersReports {
   private async metadata(client: pg.PoolClient, tenant: string, setId: string | undefined, now: Date, historyOnly = false): Promise<ReportMetadata> {
     const state = (await client.query(`SELECT h.revision::text AS history_revision,h.invalidation_epoch::text,
       s.active_set_id,s.revision::text AS active_revision,
-      (SELECT count(*) FROM official_usage_history_memberships m WHERE m.tenant_id=h.tenant_id AND m.valid_to_revision IS NULL)::int AS retained,
+      (SELECT count(*) FROM official_usage_history_memberships m WHERE m.tenant_id=h.tenant_id
+        AND m.valid_to_revision IS NULL AND m.visibility='retained')::int AS retained,
       (SELECT count(*) FROM official_usage_sets t WHERE t.tenant_id=h.tenant_id AND NOT t.complete AND t.deleted_at IS NULL)::int AS incomplete
       FROM official_usage_history_state h LEFT JOIN official_usage_state s ON s.tenant_id=h.tenant_id WHERE h.tenant_id=$1`, [tenant])).rows[0]
       ?? { history_revision: "0", invalidation_epoch: "0", active_set_id: null, active_revision: "1", retained: 0, incomplete: 0 };
@@ -229,16 +233,19 @@ export class LargeTenantUsersReports {
     const set = chosen ? (await client.query(`SELECT s.id,s.reporting_start::text,s.reporting_end::text,s.period_provenance,s.accepted_at,s.expires_at
       FROM official_usage_sets s JOIN official_usage_history_memberships m ON m.set_id=s.id AND m.tenant_id=s.tenant_id
       WHERE s.id=$1 AND s.tenant_id=$2 AND s.deleted_at IS NULL AND s.complete AND m.valid_to_revision IS NULL
-        AND (s.expires_at IS NULL OR s.expires_at>$3)`, [chosen, tenant, now])).rows[0] : null;
-    if (setId && !set) throw new SelectionError("selection_invalidated");
+        AND (s.expires_at IS NULL OR s.expires_at>GREATEST($3::timestamptz,clock_timestamp()))`, [chosen, tenant, now])).rows[0] : null;
+    if (setId && !set) throw new AppError(404, "usage_report_unavailable", "This published report is no longer available.");
     const versions = set ? (await client.query(`SELECT v.id,v.kind,v.content_hash,v.row_count,v.source_as_of,v.source_as_of_provenance,
       v.source_freshness,v.period_provenance,v.expires_at,a.expires_at AS artifact_expiry,
+      (LEAST(v.expires_at,a.expires_at) IS NULL OR LEAST(v.expires_at,a.expires_at)>GREATEST($3::timestamptz,clock_timestamp())) AS alive,
       ${readableReportVersionSql("v.id","v.tenant_id","v.kind","v.row_count")} AS complete
       FROM official_usage_set_versions m JOIN official_usage_versions v ON v.id=m.version_id AND v.tenant_id=m.tenant_id AND v.kind=m.kind
       JOIN official_usage_artifacts a ON a.id=v.artifact_id AND a.tenant_id=v.tenant_id
-      WHERE m.set_id=$1 AND m.tenant_id=$2 AND v.deleted_at IS NULL ORDER BY v.kind`, [set.id, tenant])).rows : [];
-    if (set && (versions.length !== 3 || versions.some(row => row.complete !== true
-      || row.expires_at && row.expires_at <= now || row.artifact_expiry && row.artifact_expiry <= now))) throw new SelectionError("selection_invalidated");
+      WHERE m.set_id=$1 AND m.tenant_id=$2 AND v.deleted_at IS NULL ORDER BY v.kind`, [set.id, tenant, now])).rows : [];
+    if (set && (versions.length !== 3 || versions.some(row => row.complete !== true || row.alive !== true))) {
+      if (setId) throw new AppError(404, "usage_report_unavailable", "This published report is no longer available.");
+      throw new SelectionError("selection_invalidated");
+    }
     const age = (date: number | null) => date === null ? null : Math.max(0, Math.floor((now.getTime() - date) / 86400000));
     const periodAgeDays = age(set?.reporting_end ? Date.parse(`${set.reporting_end}T23:59:59.999Z`) : null);
     const acceptedAgeDays = age(set?.accepted_at?.getTime() ?? null);
@@ -284,7 +291,8 @@ export class LargeTenantUsersReports {
       return result;
     });
   }
-  async currentInventoryData(client: pg.PoolClient, scope: Pick<SelectionIdentity, "tenantId" | "principalId">, at?: Date): Promise<ReportCurrentData> {
+  async currentInventoryData(client: pg.PoolClient, scope: Pick<SelectionIdentity, "tenantId" | "principalId">, at?: Date, setId?: string): Promise<ReportCurrentData> {
+    if (setId !== undefined) setId = reportUuid(setId);
     const state = (await client.query("SELECT current_setting('transaction_isolation') AS isolation,clock_timestamp() AS now")).rows[0];
     if (state.isolation !== "repeatable read") throw new Error("inventory_report_repeatable_read_required");
     const evaluatedAt = at ?? state.now as Date;
@@ -294,10 +302,10 @@ export class LargeTenantUsersReports {
       expiresAt: null, observedAt: null, attemptedAt: null, attemptStatus: null, attemptObservedCount: null,
       errorCode: null, message: "App activity is not captured for agent inventory.", rowCount: null, state: "unavailable",
       reportRefreshDate: null, period: null, reportVersion: null };
-    return { identity: scope, evaluatedAt, query: { lowResponseThreshold: 5 },
+    return { identity: scope, evaluatedAt, query: { lowResponseThreshold: 5, ...(setId ? { setId } : {}) },
       publicationRevisions: await readAutomaticInventoryRevisions(scope, client),
       metadata,
-      report: await this.metadata(client, scope.tenantId, undefined, evaluatedAt) };
+      report: await this.metadata(client, scope.tenantId, setId, evaluatedAt) };
   }
   parameters(context: Omit<ReportCurrentData, "publicationRevisions">) {
     return [...userSourceSqlParameters(context), context.identity.tenantId, context.report.setId, context.query.lowResponseThreshold];
@@ -697,9 +705,8 @@ export class LargeTenantUsersReports {
   }
 
   private summaryQuery(context: ReportReadContext): ReportSql {
-    const combined = this.dataset(context, "copilot_users"), params = combined.values;
+    const combined = this.dataset(context, "copilot_users");
     const directoryCurrent = context.metadata.directory.generationId !== null;
-    const where = directoryCurrent && ["copilot_users", "official_users"].includes(context.endpoint) ? this.filter(context, "copilot_users", params) : "true";
     const counts = `SELECT count(*)::text AS checked,
       count(*) FILTER(WHERE entitlement='paid_active')::text AS licensed,
       count(*) FILTER(WHERE entitlement='paid_active' AND agent_activity_state='active')::text AS using_agents,
@@ -707,8 +714,8 @@ export class LargeTenantUsersReports {
       count(*) FILTER(WHERE entitlement='paid_active' AND (agent_activity_state='active' OR activity_state='active'))::text AS measured,
       count(*) FILTER(WHERE entitlement='paid_active' AND (agent_activity_state='none' OR agent_activity_state='active' AND review_cohort='low' OR activity_state='inactive' OR service_state<>'enabled'))::text AS attention,
       count(*) FILTER(WHERE entitlement='paid_active' AND (agent_activity_state='unknown' OR activity_state='unknown'))::text AS unknown
-      FROM summary_directory dataset WHERE ${where}`;
-    return { values: params, sql: `WITH summary_directory AS (${combined.sql.slice(reportRelationsSql.length)}) SELECT
+      FROM summary_directory`;
+    return { values: combined.values, sql: `WITH summary_directory AS (${combined.sql.slice(reportRelationsSql.length)}) SELECT
       ${directoryCurrent ? `(SELECT to_jsonb(counted) FROM (${counts}) counted)` : "NULL::jsonb"} AS directory_counts,
       (SELECT count(*) FROM report_users r WHERE NOT EXISTS(SELECT 1 FROM resolved ok WHERE ok.username=r.username AND ok.identity_count=1))::text AS unresolved,
       (SELECT count(*) FROM official_users WHERE has_activity AND entitlement IN ('paid_inactive','no_paid'))::text AS unpaid,

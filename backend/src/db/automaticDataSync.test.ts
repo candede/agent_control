@@ -23,7 +23,6 @@ import { PackageRefreshJobs } from "./packageRefreshJobs.js";
 import { PowerPlatformRefreshJobs } from "./powerPlatformRefreshJobs.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord } from "../services/inventoryRecordProjection.js";
 import { seedReportSet } from "../../scripts/officialReportFixtures.js";
-import { OfficialReportImports } from "./officialReportImports.js";
 import { OfficialReportHistory } from "./officialReportHistory.js";
 import { inventoryPresentation } from "../services/inventoryPresentation.js";
 
@@ -179,27 +178,35 @@ describe("session-driven automatic sync admission", () => {
   }
 
   it.each(["failed", "permission_required", "waiting_authorization"] as const)(
-    "refreshes licenses after selecting a saved report but retains the %s retry cooldown", async status => {
-      const scope = owner(), principal = identity(scope), imports = new OfficialReportImports(fixture.runtime);
+    "refreshes licenses after the automatic report head advances but retains the %s retry cooldown", async status => {
+      const scope = owner(), principal = identity(scope);
       const saved = await seedReportSet(fixture.runtime, scope.tenantId, 1);
       const other = await seedReportSet(fixture.runtime, scope.tenantId, 2);
       const history = new OfficialReportHistory(fixture.runtime);
       await history.ensure(scope.tenantId);
-      for (const report of [saved, other]) {
-        await history.connections.run(client => history.accepted(client, scope.tenantId, report.id));
-      }
+      await history.connections.run(async client => {
+        await history.accepted(client, scope.tenantId, saved.id);
+        await history.reconcileHead(client, scope.tenantId);
+      });
       const first = await repository.submitDue(scope);
       await publishFixtureDirectory(fixture.runtime, principal, []);
       await complete(scope, first.run!);
       expect((await repository.submitDue(scope)).created).toBe(false);
-      await imports.confirm(principal, await imports.confirmPreview(principal, saved.id, "select"));
+      await history.connections.run(async client => {
+        await history.accepted(client, scope.tenantId, other.id);
+        await history.reconcileHead(client, scope.tenantId);
+      });
       const refresh = await repository.submitDue(scope);
       expect(refresh).toMatchObject({ created: true, run: { automatic: true, sources: [{ source: "users" }] } });
       await repository.updateSource(scope, refresh.run!.id, "users", {
         status, count: null, message: "Fixture directory collection did not finish.", canRetry: true,
       });
       await repository.finishRun(scope, refresh.run!.id);
-      await imports.confirm(principal, await imports.confirmPreview(principal, other.id, "select"));
+      const latest = await seedReportSet(fixture.runtime, scope.tenantId, 3);
+      await history.connections.run(async client => {
+        await history.accepted(client, scope.tenantId, latest.id);
+        await history.reconcileHead(client, scope.tenantId);
+      });
       expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: refresh.run!.id } });
     },
   );

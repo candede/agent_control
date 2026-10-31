@@ -18,10 +18,10 @@ export type OfficialReportBundlePreview = {
   stages: Array<{ stagingId: string; kind: OfficialUsageReportKind; revision: number; contentHash: string; rowCount: number;
     reconciliation: OfficialReportPreview["reconciliation"] }>;
 };
-export type OfficialReportBundleAcceptance = { bundleHash: string; expectedActiveRevision: string; preserveSelection?: boolean };
+export type OfficialReportBundleAcceptance = { bundleHash: string; expectedActiveRevision: string };
 export type OfficialReportBundleInspection = { forDiscard?: boolean };
 export type OfficialReportAccepted = { setId: string; activeRevision: string; complete: boolean };
-export type OfficialReportConfirmation = { id: string; setId: string; operation: "select" | "delete";
+export type OfficialReportConfirmation = { id: string; setId: string; operation: "delete";
   activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };
 export type OfficialReportConfirmed = { activeSetId: string | null; activeRevision: string };
 export type OfficialReportFacetPage = {

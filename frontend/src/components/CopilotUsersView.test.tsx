@@ -1,6 +1,6 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render as renderComponent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, getAgentResponsibility } from "../api/client";
 import * as api from "../api/reportData";
@@ -14,6 +14,10 @@ import { CopilotUsersView } from "./CopilotUsersView";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 import { responsibilityFixture, responsibilityOwnerId } from "../test/agentResponsibilityFixture";
 import { PublicationContext } from "../publicationContext";
+
+function render(ui: ReactNode) {
+  return renderComponent(ui, { wrapper: SavedQueryProvider });
+}
 
 vi.mock("../api/client", async original => ({
   ...await original<typeof import("../api/client")>(), getAgentResponsibility: vi.fn(),
@@ -202,8 +206,8 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(within(surface).getByRole("searchbox", { name: "Search users or agents" })).toBeVisible();
     expect(within(surface).getByRole("button", { name: "Export users CSV" })).toBeVisible();
     expect(within(surface).getByRole("navigation", { name: "users pages" })).toBeVisible();
-    await userEvent.click(within(summary).getByRole("button", { name: "Use current reports" }));
-    expect(onRouteChange).toHaveBeenLastCalledWith(expect.objectContaining({ reportSetId: undefined, page: 0 }), false);
+    expect(screen.queryByRole("button", { name: "Use current reports" })).not.toBeInTheDocument();
+    expect(onRouteChange).not.toHaveBeenCalled();
   });
   it("keeps report selection available for both cohorts and removes the responsibility option", async () => {
     render(<CopilotUsersView reportSelector={<select aria-label="Report set"><option>Selected report</option></select>} />);
@@ -279,7 +283,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       `copilot-usage/users/${ada.directory.objectId}`, undefined, expect.any(AbortSignal), next.reports.setId);
     expect(modal.queryByRole("group", { name: "User summary" })).not.toBeInTheDocument();
     await act(async () => pending.resolve({ value: next.value[0], reports: next.reports, sources: next.sources, selection: next.selection }));
-    expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("8");
+    await waitFor(() => expect(modal.getByText("Agent responses").parentElement).toHaveTextContent("8"));
     detail(next.value[0], next);
     view.rerender(<CopilotUsersView route={{ ...route, reportSetId: next.reports.setId! }} dataRevision={1} />);
     await waitFor(() => expect(api.readReportDetail).toHaveBeenCalledTimes(3));
@@ -433,21 +437,123 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
   it.each([
-    ["Using agents", "using_agents", "usingAgentsUsers", 2],
-    ["Needs attention", "needs_attention", "needsAttentionUsers", 2],
-    ["No reported agent activity", "no_agent_activity", "noAgentActivityUsers", 1],
-    ["Active M365 Copilot licensed users", "licensed", "licensedUsers", 4],
-  ] as const)("preserves server-authoritative %s counts and cohort membership", async (label, cohort, metric, count) => {
+    ["Using agents", "using_agents", [ada, ben]],
+    ["Needs attention", "needs_attention", [ben, cleo]],
+    ["No reported agent activity", "no_agent_activity", [cleo]],
+    ["Active M365 Copilot licensed users", "licensed", [ada, ben, cleo, drew]],
+  ] as const)("filters %s rows without changing any overall card counts", async (label, cohort, selectedUsers) => {
     render(<CopilotUsersView />); await screen.findByRole("button", { name: "Ada" });
-    const card = screen.getByRole("button", { name: label });
-    expect(card.querySelector("strong")).toHaveTextContent(String(count));
-    expect(page().summary[metric]).toBe(count);
-    vi.mocked(api.readReportPage).mockResolvedValue(page([ben]));
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    const card = within(summary).getByRole("button", { name: label });
+    expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["4", "2", "2", "1"]);
+    vi.mocked(api.readReportPage).mockResolvedValue(page([...selectedUsers], { counts: { total: 100000, filtered: selectedUsers.length } }));
     await userEvent.click(card);
     await waitFor(() => assertQuery({ cohort }));
     expect(card).toHaveAttribute("aria-pressed", "true");
-    if (cohort !== "licensed") await waitFor(() => expect(rows()).toHaveLength(1));
-    expect(within(screen.getByRole("group", { name: "M365 Copilot license summary" })).getAllByRole("button", { pressed: true })).toHaveLength(1);
+    await waitFor(() => expect(rows()).toHaveLength(selectedUsers.length));
+    rows().forEach((row, index) => expect(within(row).getByRole("button")).toHaveTextContent(selectedUsers[index].directory.displayName!));
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent(`${selectedUsers.length} matching ${selectedUsers.length === 1 ? "user" : "users"}`);
+    expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["4", "2", "2", "1"]);
+    expect(within(summary).getAllByRole("button", { pressed: true })).toHaveLength(1);
+  });
+  it.each([
+    ["Using agents", "using_agents", [ada, ben]],
+    ["Needs attention", "needs_attention", [ben, cleo]],
+    ["No reported agent activity", "no_agent_activity", [cleo]],
+  ] as const)("keeps overall cards visible while %s table results are loading", async (label, cohort, selectedUsers) => {
+    render(<CopilotUsersView />); await screen.findByRole("button", { name: "Ada" });
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    const pending = deferred<ReportPage<CombinedUser>>();
+    vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
+    await userEvent.click(within(summary).getByRole("button", { name: label }));
+    await waitFor(() => assertQuery({ cohort }));
+    expect(summary).toHaveAttribute("aria-busy", "false");
+    expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["4", "2", "2", "1"]);
+    expect(document.querySelector(".user-directory-table")).toHaveAttribute("aria-busy", "true");
+    await act(async () => pending.resolve(page([...selectedUsers], { counts: { total: 100000, filtered: selectedUsers.length } })));
+    await waitFor(() => expect(rows()).toHaveLength(selectedUsers.length));
+    expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["4", "2", "2", "1"]);
+    await userEvent.click(within(summary).getByRole("button", { name: label }));
+    await waitFor(() => expect(rows()).toHaveLength(4));
+    expect(within(summary).getByRole("button", { name: "Active M365 Copilot licensed users" })).toHaveAttribute("aria-pressed", "true");
+    expect(api.readReportPage).toHaveBeenCalledTimes(2);
+  });
+  it.each([false, true])("refreshes overall cards independently of filtered rows after a data revision (failure=%s)", async failure => {
+    const view = render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    vi.mocked(api.readReportPage).mockResolvedValue(page([ada, ben], { counts: { total: 100000, filtered: 2 } }));
+    await userEvent.click(screen.getByRole("button", { name: "Using agents" }));
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    const active = [ada, ben, named(5, "Eden")];
+    const updated = page([...active, cleo, named(6, "Finn", 0), named(7, "Gail", 0)], {
+      counts: { total: 6, filtered: 6 },
+      summary: { ...page().summary, licensedUsers: 6, usingAgentsUsers: 3, needsAttentionUsers: 4, noAgentActivityUsers: 3 },
+    });
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      if (query?.cohort === "licensed") {
+        if (failure) throw new ApiError(503, "data_read_conflict", "Summary read unavailable");
+        return updated;
+      }
+      return { ...updated, value: active, counts: { total: 6, filtered: 3 } };
+    });
+    view.rerender(<CopilotUsersView dataRevision={1} />);
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    if (failure) {
+      expect(await screen.findByRole("alert")).toHaveTextContent("Summary read unavailable");
+      vi.mocked(api.readReportPage).mockResolvedValue(updated);
+      await userEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    }
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    await waitFor(() => expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["6", "3", "4", "3"]));
+    expect(within(summary).getByRole("button", { name: "Using agents" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("status", { name: "Matching users" })).toHaveTextContent("3 matching users");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+  it("withdraws overall cards when the filtered read denies access", async () => {
+    render(<CopilotUsersView />);
+    await screen.findByRole("button", { name: "Ada" });
+    vi.mocked(api.readReportPage).mockRejectedValue(new ApiError(403, "forbidden", "Current Viewer access is required"));
+    await userEvent.click(screen.getByRole("button", { name: "Using agents" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Current Viewer access is required");
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["Unknown", "Unknown", "Unknown", "Unknown"]);
+    expect(screen.queryByRole("button", { name: "Ada" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+  });
+  it.each(["retry", "restart"] as const)("allows summary %s while the filtered table read is unavailable", async recovery => {
+    const tableError = new ApiError(503, "data_read_conflict", "Filtered users unavailable");
+    const summaryError = recovery === "retry"
+      ? new ApiError(503, "data_read_conflict", "Summary read unavailable")
+      : new ApiError(409, "selection_invalidated", "Summary selection changed");
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      throw query?.search ? tableError : summaryError;
+    });
+    render(<CopilotUsersView route={{ view: "licenses", search: "Ada", page: 0 }} />);
+    await screen.findByText(tableError.message);
+    const summaryStatus = await screen.findByText(recovery === "retry" ? summaryError.message : /This selection changed or expired/);
+    const updated = page([ada], {
+      summary: { ...page().summary, licensedUsers: 6, usingAgentsUsers: 3, needsAttentionUsers: 4, noAgentActivityUsers: 3 },
+    });
+    vi.mocked(api.readReportPage).mockImplementation(async (_path, query) => {
+      if (query?.search) throw tableError;
+      return updated;
+    });
+    await userEvent.click(within(summaryStatus.closest<HTMLElement>('[role="alert"]')!).getByRole("button", {
+      name: recovery === "retry" ? "Retry saved data" : "Restart selection",
+    }));
+    const summary = screen.getByRole("group", { name: "M365 Copilot license summary" });
+    await waitFor(() => expect(Array.from(summary.querySelectorAll("strong"), element => element.textContent)).toEqual(["6", "3", "4", "3"]));
+    expect(screen.getByRole("alert")).toHaveTextContent(tableError.message);
+    expect(api.readReportPage).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.readReportPage).mock.calls.filter(([, query]) => query?.search)).toHaveLength(1);
+    expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("search");
+    expect(screen.getByRole("searchbox", { name: "Search users or agents" })).toHaveValue("Ada");
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
+    vi.mocked(api.readReportPage).mockResolvedValue(updated);
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled();
   });
   it.each([0, null, 42000])("does not infer licensed count %s from the displayed page", async licensedUsers => {
     const data = page(); data.summary.licensedUsers = licensedUsers;
@@ -688,10 +794,12 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       });
       vi.mocked(api.createReportExport).mockReturnValue(exportRead.promise);
       const route = { view: viewName, search: "Ada", page: 0, reportSetId: reportId };
+      const initialReads = viewName === "licenses" ? 2 : 1;
+      const focusReads = viewName === "licenses" ? 2 : 1;
       const view = render(<SavedQueryProvider><CopilotUsersView route={route} /></SavedQueryProvider>);
       await screen.findByRole("button", { name: "Ada" });
       fireEvent.click(screen.getByRole("button", { name: "Next users" }));
-      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(initialReads + 1));
       await waitFor(() => expect(screen.getByRole("button", { name: "Export users CSV" })).toBeEnabled());
       fireEvent.click(screen.getByRole("button", { name: "Export users CSV" }));
       const exportSignal = vi.mocked(api.createReportExport).mock.calls[0][1]!;
@@ -704,11 +812,11 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
         expect(screen.getByRole("dialog", { name: "Ada" })).toBeVisible();
         expect(screen.getByRole("button", { name: "Cancel export" })).toBeEnabled();
         expect(exportSignal.aborted).toBe(false);
-        expect(api.readReportPage).toHaveBeenCalledTimes(2);
+        expect(api.readReportPage).toHaveBeenCalledTimes(initialReads + 1);
         expect(api.readReportDetail).toHaveBeenCalledOnce();
       }
       fireEvent.focus(window);
-      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(3));
+      await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(initialReads + 1 + focusReads));
       expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).toMatchObject({
         search: "ada", setId: reportId, selectionId: saved.selection.id, cursor: "next-users",
       });
@@ -718,7 +826,7 @@ describe("record-backed paid M365 Copilot license dashboard", () => {
       expect(screen.queryByRole("dialog", { name: "Ada" })).not.toBeInTheDocument();
       expect(exportSignal.aborted).toBe(true);
       expect(screen.getByRole("button", { name: "Export users CSV" })).toBeDisabled();
-      expect(api.readReportPage).toHaveBeenCalledTimes(4);
+      expect(api.readReportPage).toHaveBeenCalledTimes(initialReads + 2 + focusReads);
       expect(vi.mocked(api.readReportPage).mock.lastCall?.[1]).not.toHaveProperty("cursor");
       await act(async () => exportRead.resolve({ id: "retired-export" }));
       expect(api.reportExportStatus).not.toHaveBeenCalled();

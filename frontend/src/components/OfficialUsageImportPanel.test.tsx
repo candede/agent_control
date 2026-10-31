@@ -17,7 +17,7 @@ import { OfficialUsageImportPanel, type OfficialUsageImportHandle } from "./Offi
 vi.mock("../api/reportData", async original => {
   const actual = await original<typeof import("../api/reportData")>();
   return { ...actual, stageReport: vi.fn(), readReportStage: vi.fn(), discardReportStage: vi.fn(), previewReportBundle: vi.fn(), acceptReportBundle: vi.fn(),
-    previewReportOperation: vi.fn(), confirmReportOperation: vi.fn(),
+    previewReportDeletion: vi.fn(), confirmReportDeletion: vi.fn(),
     reportPages: { ...actual.reportPages, agents: vi.fn() } };
 });
 mockNativeDialogs();
@@ -70,7 +70,9 @@ beforeEach(() => {
     }
     let result = acceptedBundles.get(id);
     if (!result) {
-      if (!input.preserveSelection && current.some(stage => stage.status !== "accepted")) activeRevision = String(BigInt(activeRevision) + 1n);
+      if (current.some(stage => stage.status !== "accepted") && ![...acceptedBundles.values()].some(saved => saved.setId === reportSetId)) {
+        activeRevision = String(BigInt(activeRevision) + 1n);
+      }
       result = { setId: reportSetId, activeRevision, complete: true };
       acceptedBundles.set(id, result);
       stages = stages.map(stage => stage.bundleId === id ? { ...stage, status: "accepted" } : stage);
@@ -84,9 +86,6 @@ beforeEach(() => {
     if (stages.some(stage => stage.id === id && stage.status === "accepted")) throw new ApiError(409, "staging_unavailable", "Cannot discard an accepted stage");
     stages = stages.filter(stage => stage.id !== id);
   });
-  vi.mocked(api.previewReportOperation).mockResolvedValue({ id: "selection-confirmation", setId: reportSetId, operation: "select",
-    activeRevision: reports.activeRevision, historyRevision: reports.historyRevision, historyEpoch: reports.historyEpoch, hash: "c".repeat(64) });
-  vi.mocked(api.confirmReportOperation).mockResolvedValue({ activeSetId: reportSetId, activeRevision: "5" });
 });
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
@@ -104,8 +103,8 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
     expect(vi.mocked(api.stageReport).mock.calls.every(([, intent]) => intent.correctionOfSetId === undefined)).toBe(true);
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
 
   it("denies correction imports to a standalone UsageReportUploader before reading or uploading files", () => {
@@ -157,7 +156,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(screen.queryByText(/activity_range|Resume staging ID|bounded staging|tenant-visible/)).not.toBeInTheDocument();
     expect(api.acceptReportBundle).not.toHaveBeenCalled();
   });
-  it("streams three companions, saves without selecting, verifies exact data and finishes only on Close", async () => {
+  it("streams three companions, advances the automatic default, verifies exact data and finishes only on Close", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose();
     const confirm = await ready();
@@ -174,8 +173,8 @@ describe("streamed complete-set import confirmation", () => {
     fireEvent.click(confirm);
     await imported();
     expect(api.acceptReportBundle).toHaveBeenCalledExactlyOnceWith(id,
-      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection: true }, expect.any(AbortSignal));
-    expect(activeRevision).toBe("4");
+      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }, expect.any(AbortSignal));
+    expect(activeRevision).toBe("5");
     expect(api.reportPages.agents).toHaveBeenCalledWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(callbacks.onDone).not.toHaveBeenCalled();
@@ -183,8 +182,8 @@ describe("streamed complete-set import confirmation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith();
     expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it.each([0, 1000000, null])("uses exact full-CSV lineage counts and responses %s instead of the one-row preview or overlapping license categories", async responses => {
     const data = reportPage([reportAgent()]);
@@ -207,7 +206,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onDone).toHaveBeenCalledExactlyOnceWith();
     expect(callbacks.onCancel).not.toHaveBeenCalled();
     expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
   });
   it("keeps validated companions and shows only missing report kinds without automatic publication", async () => {
@@ -452,14 +451,14 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
     expect(api.reportPages.agents).toHaveBeenCalledExactlyOnceWith({ setId: reportSetId, limit: 1 }, expect.any(AbortSignal));
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.discardReportStage).not.toHaveBeenCalled();
     expect(stages).toEqual(acceptedStages);
     expect(saved.reports.activeSetId).toBe("another-active-set");
     expect(saved.reports.activeRevision).toBe(reports.activeRevision);
   });
-  it("adds another report set in a fresh wizard without discarding saved reports or selecting either import", async () => {
+  it("starts another wizard without discarding saved reports or manually changing the default", async () => {
     function Host() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
       return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0} onChanged={callbacks.onChanged} />;
@@ -477,9 +476,9 @@ describe("streamed complete-set import confirmation", () => {
     expect(stages.every(stage => stage.status === "accepted")).toBe(true);
     expect(callbacks.onChanged).toHaveBeenCalledTimes(2);
     expect(api.discardReportStage).not.toHaveBeenCalled();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(activeRevision).toBe("4");
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
+    expect(activeRevision).toBe("5");
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
@@ -865,7 +864,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(callbacks.onCancel).not.toHaveBeenCalled();
     expect(callbacks.onDone).not.toHaveBeenCalled();
     expect(api.discardReportStage).not.toHaveBeenCalled();
-    expect(activeRevision).toBe("4");
+    expect(activeRevision).toBe("5");
     expect(stages.every(stage => stage.status === "accepted")).toBe(true);
     expect(callbacks.onChanged).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Verify acceptance" }));
@@ -874,7 +873,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(calls[1][1]).toBe(calls[0][1]);
     expect(api.previewReportBundle).toHaveBeenCalledOnce();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
-    expect(activeRevision).toBe("4");
+    expect(activeRevision).toBe("5");
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
   });
   it("requires explicit validation refresh and another acceptance after a definite revision conflict", async () => {
@@ -1018,7 +1017,7 @@ describe("streamed complete-set import confirmation", () => {
     await waitFor(() => expect(callbacks.onDone).toHaveBeenCalledOnce());
     expect(callbacks.onChanged).toHaveBeenCalledOnce();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
   });
   it("does not substitute another report for exact accepted verification", async () => {
@@ -1029,7 +1028,7 @@ describe("streamed complete-set import confirmation", () => {
     expect(screen.queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
     expect(callbacks.onDone).not.toHaveBeenCalled();
   });
-  it.each([null, "other", reportSetId])("shows the same summary with selected report %s and never offers selection", async activeSetId => {
+  it.each([null, "other", reportSetId])("verifies the accepted report independently of latest head %s and never offers a tenant override", async activeSetId => {
     vi.mocked(api.reportPages.agents).mockResolvedValue(reportPage([reportAgent()], { reports: { ...reports, activeSetId } }));
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose(); await accept(); await imported();
@@ -1039,9 +1038,9 @@ describe("streamed complete-set import confirmation", () => {
     expect(screen.queryByText(/another report is currently selected|keep the current selection/i)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(callbacks.onDone).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
-    expect(activeRevision).toBe("4");
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
+    expect(activeRevision).toBe("5");
   });
   it("cannot close a replacement session through a retired saved-import handle", async () => {
     const ref = createRef<OfficialUsageImportHandle>();
@@ -1064,8 +1063,8 @@ describe("streamed complete-set import confirmation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(callbacks.onDone).toHaveBeenCalledOnce();
     expect(api.reportPages.agents).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
   });
   it("closes without navigating to or rechecking a report deleted after the summary", async () => {
@@ -1206,7 +1205,7 @@ describe("streamed complete-set import confirmation", () => {
       expect(callbacks.onCancel).not.toHaveBeenCalled();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
       expect(screen.queryByRole("list", { name: "Selected CSV files" })).not.toBeInTheDocument();
-      expect(api.confirmReportOperation).not.toHaveBeenCalled();
+      expect(api.confirmReportDeletion).not.toHaveBeenCalled();
       if (phase === "discard") expect(api.discardReportStage).toHaveBeenCalledOnce();
     });
   it("keeps staged work through unchanged-role capability revalidation without duplicate reads", async () => {
@@ -1265,7 +1264,7 @@ describe("streamed complete-set import confirmation", () => {
     await act(async () => acceptance.resolve({ setId: reportSetId, activeRevision: "5", complete: true }));
     await imported();
     expect(api.acceptReportBundle).toHaveBeenCalledExactlyOnceWith(bundleId,
-      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision, preserveSelection: true }, expect.any(AbortSignal));
+      { bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }, expect.any(AbortSignal));
     expect(api.stageReport).not.toHaveBeenCalled();
     expect(api.discardReportStage).not.toHaveBeenCalled();
   });

@@ -51,6 +51,7 @@ export class OfficialReportHistory {
       [tenantId])).rows[0])?.id as string | undefined;
       if (!scope) throw new Error("official_history_scope_missing");
       await client.query(`INSERT INTO official_usage_history_state(tenant_id,scope_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [tenantId, scope]);
+      await this.reconcileHead(client, tenantId);
       return scope;
     });
   }
@@ -89,6 +90,28 @@ export class OfficialReportHistory {
     if (!row) throw new Error("official_history_not_initialized");
     await lockDataScope(client, row.scope_id, tenantId);
     return row.scope_id as string;
+  }
+
+  async lockHead(client: pg.PoolClient, tenantId: string) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`official-usage:${tenantId}`]);
+    await client.query("INSERT INTO official_usage_state(tenant_id) VALUES($1) ON CONFLICT DO NOTHING", [tenantId]);
+    return (await client.query<{ active_set_id: string | null; revision: string }>(
+      "SELECT active_set_id,revision::text FROM official_usage_state WHERE tenant_id=$1 FOR UPDATE", [tenantId])).rows[0];
+  }
+
+  async reconcileHead(client: pg.PoolClient, tenantId: string) {
+    await this.lock(client, tenantId);
+    const state = await this.lockHead(client, tenantId);
+    await this.prepareRead(client, tenantId);
+    const head = (await client.query<{ id: string }>(`${historyIntegritySql}
+      SELECT s.id FROM (${readableHistorySql}) s WHERE s.visibility='retained'
+        AND NOT EXISTS(SELECT 1 FROM invalid_sets invalid WHERE invalid.id=s.id)
+      ORDER BY s.reporting_end DESC NULLS LAST,s.reporting_start DESC NULLS LAST,s.accepted_at DESC,s.id DESC LIMIT 1`,
+    [tenantId, null])).rows[0]?.id ?? null;
+    if (head === state.active_set_id) return state;
+    return (await client.query<{ active_set_id: string | null; revision: string }>(`UPDATE official_usage_state
+      SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1
+      RETURNING active_set_id,revision::text`, [tenantId, head])).rows[0];
   }
 
   async accepted(client: pg.PoolClient, tenantId: string, setId: string, correctionOf?: string | null) {
@@ -133,15 +156,14 @@ export class OfficialReportHistory {
       await this.prepareRead(client, tenantId);
       if (!(await client.query(`${historyIntegritySql} SELECT 1 FROM invalid_sets LIMIT 1`, [tenantId, null])).rowCount) return 0;
       await this.lock(client, tenantId);
-      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`official-usage:${tenantId}`]);
+      await this.lockHead(client, tenantId);
       const rows = (await client.query(`${historyIntegritySql} SELECT id FROM invalid_sets ORDER BY id LIMIT $3`, [tenantId, null, limit])).rows;
       for (const row of rows) {
         await this.invalidate(client, tenantId, row.id, true);
         await client.query("UPDATE official_usage_sets SET deleted_at=COALESCE(deleted_at,clock_timestamp()) WHERE id=$1", [row.id]);
         await retireUnreferencedReportVersions(client, tenantId, row.id);
-        await client.query(`UPDATE official_usage_state SET active_set_id=NULL,revision=revision+1,updated_at=clock_timestamp()
-          WHERE tenant_id=$1 AND active_set_id=$2`, [tenantId, row.id]);
       }
+      await this.reconcileHead(client, tenantId);
       return rows.length;
   }
 
@@ -165,5 +187,5 @@ export class OfficialReportHistory {
 
 export const readableHistorySql = `SELECT s.*,m.visibility FROM official_usage_history_memberships m
   JOIN official_usage_sets s ON s.id=m.set_id AND s.tenant_id=m.tenant_id
-  WHERE m.tenant_id=$1 AND m.valid_from_revision<=$2::bigint
-    AND (m.valid_to_revision IS NULL OR m.valid_to_revision>$2::bigint)`;
+  WHERE m.tenant_id=$1 AND (($2::bigint IS NULL AND m.valid_to_revision IS NULL)
+    OR (m.valid_from_revision<=$2::bigint AND (m.valid_to_revision IS NULL OR m.valid_to_revision>$2::bigint)))`;

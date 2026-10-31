@@ -41,8 +41,8 @@ describe("official retained adoption history", () => {
     const id = selectionId ?? (await reports.capture(identity, "adoption_history")).id;
     return reports.read(id, identity, (client, context) => readAdoptionHistory(client, reports, context, { limit: 1, cursor }));
   }
-  const remove = (identity: SelectionIdentity, setId: string) => imports.confirmPreview(identity, setId, "delete")
-    .then(preview => imports.confirm(identity, preview));
+  const remove = (identity: SelectionIdentity, setId: string) => imports.previewDeletion(identity, setId)
+    .then(preview => imports.confirmDeletion(identity, preview));
 
   it("counts exact case-sensitive per-set unions, deduplicates relationship repetitions and keeps source totals independent", async () => {
     const identity = owner(), accepted = await bundle(identity, rows);

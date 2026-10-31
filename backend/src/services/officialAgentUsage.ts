@@ -270,17 +270,24 @@ export class OfficialAgentUsage {
     const event = await audit.startEvent({ operationId: `agent-usage:${randomUUID()}`, scope: "single",
       action: input.target ? "associate-agent-usage" : "remove-agent-usage-association", agentId: recordId, actor,
       requestPath: `/api/agent-inventory/${encodeURIComponent(recordId)}/usage-associations`, metadata });
+    let reportExpiresAt = Infinity;
+    const assertReportAvailable = () => {
+      if (reportExpiresAt <= Date.now()) throw new AppError(404, "usage_report_unavailable", "This published report is no longer available.");
+    };
     // Ordinary writer transaction; all source locks precede the selected read fences.
-    try { return await this.reports.history.connections.run(async client => {
+    try { const result = await this.reports.history.connections.run(async client => {
       await lockInventorySelection(client, identity, input.selectionId);
       await this.selections.assert(client, input.selectionId, identity);
       const selected = await this.contextInRead(client, identity, input.selectionId);
+      await this.reports.history.lock(client, identity.tenantId);
+      await this.reports.history.lockHead(client, identity.tenantId);
       // A saved read is not proof that a management target is still current.
-      const context: UsageReadContext = { ...selected, inventorySelectionId: undefined };
       const now = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
-      const active = (await client.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1 FOR UPDATE", [identity.tenantId])).rows[0];
+      const context: UsageReadContext = { ...selected, inventorySelectionId: undefined,
+        report: await this.reports.reportForSelection(client, selected, input.reportSetId) };
+      reportExpiresAt = context.report.expiresAt ? Date.parse(context.report.expiresAt) : Infinity;
       const target = await this.target(client, { ...context, evaluatedAt: now }, recordId);
-      if (active?.active_set_id !== input.reportSetId || context.report.setId !== input.reportSetId || target.context.usageRevision !== input.usageRevision) throw new AppError(409, "agent_usage_changed", "Report or associations changed.");
+      if (context.report.setId !== input.reportSetId || target.context.usageRevision !== input.usageRevision) throw new AppError(409, "agent_usage_changed", "Report or associations changed.");
       if (target.context.inventoryRevision !== input.inventoryRevision) throw new AppError(409, "inventory_changed", "Exact inventory source references changed.");
       const report = await client.query(`${reportRelationsSql} SELECT identity FROM official_agents WHERE agent_id=$7 AND response_source='agents'`,
         [...this.reports.parameters(context), input.reportAgentId]);
@@ -317,7 +324,10 @@ export class OfficialAgentUsage {
         metadata: { ...metadata, changed, revision: resulting.context.usageRevision, targetSelectionHash } });
       await this.selections.assert(client, input.selectionId, identity);
       return (await this.target(client, { ...context, evaluatedAt: now }, recordId)).context;
-    }); } catch (error) {
+    }, false, undefined, undefined, assertReportAvailable);
+      assertReportAvailable();
+      return result;
+    } catch (error) {
       try {
         if ((await audit.getEvent(event.id))?.status !== "succeeded") await audit.completeEvent(event.id, {
           status: "failed", errorCode: error instanceof AppError || error instanceof SelectionError ? error.code : "agent_usage_association_failed",

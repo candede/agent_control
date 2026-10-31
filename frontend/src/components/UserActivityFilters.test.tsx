@@ -48,6 +48,26 @@ beforeEach(() => { vi.mocked(api.readReportFacet).mockResolvedValue(facetPage())
 afterEach(() => { vi.resetAllMocks(); });
 
 describe("user activity filter controls", () => {
+  it.each([
+    { initialSearch: "Ada" },
+    { initialValues: { ...defaults, company: "Contoso" } },
+    { initialValues: { ...defaults, department: null } },
+    { initialValues: { ...defaults, cohort: "low" as const } },
+    { initialValues: { ...defaults, lowResponseThreshold: "10" } },
+  ])("keeps bulk clearing in the active-filter row: %j", async initial => {
+    const user = userEvent.setup();
+    render(<Filters {...initial} />);
+    const clear = screen.getByRole("button", { name: "Clear filters" });
+    expect(clear).toHaveClass("agent-filter-chip");
+    expect(clear.closest(".agent-query-bar")).toBeNull();
+    expect(clear.closest(".agent-filter-chips")).not.toBeNull();
+    await user.click(clear);
+    expect(screen.getByRole("searchbox")).toHaveValue("");
+    expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+    expect(document.querySelector(".agent-filter-chips")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Filters" })).toHaveFocus();
+  });
+
   it.each([false, true])("clears an unfocused search without changing filters while loading=%s", async loading => {
     const user = userEvent.setup();
     render(<><Filters selection={selectionId} loading={loading} initialSearch="Ada"

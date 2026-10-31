@@ -1,7 +1,7 @@
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReportHistorySet, ReportMetadata } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportConfirmation } from "../../../backend/src/types/officialReportApi";
-import { confirmReportOperation, previewReportOperation } from "../api/reportData";
+import { confirmReportDeletion, previewReportDeletion } from "../api/reportData";
 import { ApiError } from "../api/client";
 import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
@@ -75,7 +75,7 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     const abort = new AbortController(); operation.current = { controller: abort, kind: "preview" };
     setTarget(nextTarget); setConfirmation(undefined); setBusy("preview"); setError(undefined); setRecovery(undefined); setNotice(undefined);
     try {
-      const next = await previewReportOperation(nextTarget.report.id, "delete", abort.signal);
+      const next = await previewReportDeletion(nextTarget.report.id, abort.signal);
       if (abort.signal.aborted) return;
       if (!nextTarget.canAct()) { dismiss(); return; }
       const evidence = nextTarget.evidence;
@@ -99,7 +99,7 @@ function ManageReports({ revision, canManage, onChanged, onViewSnapshot, onCorre
     const abort = new AbortController(); operation.current = { controller: abort, kind: "confirm" };
     setBusy("confirm"); setError(undefined);
     try {
-      await confirmReportOperation(confirmation, abort.signal);
+      await confirmReportDeletion(confirmation, abort.signal);
       if (!abort.signal.aborted) {
         setTarget(undefined); setConfirmation(undefined); setRecovery(undefined); setReload(value => ({ sequence: value.sequence + 1, revision }));
         setNotice("Report set deleted."); onChanged?.();
@@ -148,7 +148,8 @@ function DeleteReportDialog({ report, active, ready, busy, error, recovery, onCa
     onCancel={event => { event.preventDefault(); if (busy !== "confirm") onCancel(); }}>
     <h2 id="usage-delete-title">Delete report set?</h2><p>{report.reportingStart ?? "Unknown start"} to {report.reportingEnd ?? "Unknown end"}</p>
     <p id="usage-delete-description">This removes report {report.id}. History pages, overview and exports will be invalidated.
-      {active ? " No report will be selected until you choose another set." : " The active report selection stays unchanged."}</p>
+      {active ? " Latest will automatically use the next newest available reporting period." : " The latest report stays unchanged."}
+      {" "}Anyone viewing this report will return to Latest.</p>
     {busy ? <p role="status">{busy === "confirm" ? "Deleting saved report..." : "Checking report operation..."}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
     <button type="button" className="secondary" autoFocus disabled={busy === "confirm"} onClick={onCancel}>Cancel</button>

@@ -100,7 +100,7 @@ const PrincipalPackageDetailsSyncPanel = forwardRef<PackageDetailsSyncPanelHandl
       if (controller.signal.aborted) return;
       observe(next);
     } catch (reason) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && activeRevision.current === revision) {
         callbacks.current.onStateChanged(undefined);
         if (reason instanceof ApiError && [401, 403].includes(reason.status)) setState(undefined);
         setError(reason instanceof Error ? reason.message : "Package detail collection could not be updated.");
@@ -122,34 +122,37 @@ const PrincipalPackageDetailsSyncPanel = forwardRef<PackageDetailsSyncPanelHandl
       <div>
         <dt>Fresh details / catalog total</dt>
         <dd>{verified ? `${verified.fresh.toLocaleString()} / ${verified.total.toLocaleString()}` : "Not checked"}</dd>
-        {verified ? <dd className="data-sync-count-unit">packages fresh; {verified.pending.toLocaleString()} pending</dd> : null}
-        {verified && verified.total > 0 && verified.pending > 0 ? <dd><progress className="data-sync-source-progress" aria-label="Package detail coverage"
-          value={verified.fresh} max={verified.total} /></dd> : null}
+        <dd className="data-sync-count-unit">{verified
+          ? `packages fresh; ${verified.pending.toLocaleString()} pending` : "Coverage not checked"}</dd>
+        <dd className="data-sync-source-progress-slot">
+          {verified && verified.total > 0 && verified.pending > 0 ? <progress className="data-sync-source-progress" aria-label="Package detail coverage"
+            value={verified.fresh} max={verified.total} /> : null}
+        </dd>
       </div>
       <div>
         <dt>Latest batch update</dt>
         <dd>{verified?.job ? formatSyncInstant(verified.job.updatedAt) : "No batch recorded"}</dd>
-        {verified?.job ? <dd className="data-sync-count-unit">{verified.job.observedCount} of {verified.job.targetCount} targets checked</dd> : null}
+        <dd className="data-sync-count-unit data-sync-attempt-count">{verified?.job
+          ? `${verified.job.observedCount} of ${verified.job.targetCount} targets checked` : "Batch count not reported"}</dd>
       </div>
     </>}
     actions={<>
-      <WorkbenchActionGate actionId="data-sync.start" compact><button type="button" className="secondary"
-        disabled={!available || Boolean(busy) || Boolean(error) || !state || ["running", "complete", "not_collected"].includes(state.status)}
-        title={verified?.status === "complete" ? "No pending or stale package details to collect." : undefined}
-        onClick={() => void control("start")}>{busy === "start" ? "Starting details..." : "Sync package details"}</button></WorkbenchActionGate>
       {state?.status === "running" ? <WorkbenchActionGate actionId="data-sync.cancel" compact><button type="button" className="secondary data-sync-cancel"
         disabled={!available || Boolean(busy) || Boolean(error)} aria-busy={busy === "cancel"}
         aria-label={busy === "cancel" ? "Cancelling detail collection" : "Cancel detail collection"} onClick={() => void control("cancel")}>
         {busy === "cancel" ? <LoaderCircle size={16} className="data-sync-spinning" aria-hidden="true" /> : <CircleStop size={16} aria-hidden="true" />}
         {busy === "cancel" ? "Cancelling..." : "Cancel details"}
-      </button></WorkbenchActionGate> : null}
+      </button></WorkbenchActionGate> : <WorkbenchActionGate actionId="data-sync.start" compact><button type="button" className="secondary"
+        disabled={!available || Boolean(busy) || Boolean(error) || !state || ["complete", "not_collected"].includes(state.status)}
+        aria-label={busy === "start" ? "Starting package details" : "Sync package details"} aria-busy={busy === "start"}
+        title={verified?.status === "complete" ? "No pending or stale package details to collect." : undefined}
+        onClick={() => void control("start")}>{busy === "start" ? "Starting..." : "Sync details"}</button></WorkbenchActionGate>}
     </>}>
     {error ? <div className="error-banner" role="alert">{error}</div> : null}
     <p role="status">{verified ? verified.message : error
       ? "Detail coverage has not been reverified. Use Check status before starting another collection."
       : "Checking exact package-detail coverage."}</p>
-    <p className="data-sync-run-meta">{verified?.status === "complete"
-      ? "Nothing pending. This control collects missing or stale details; it does not force a reread of fresh details."
-      : "Runs in paced 20-package batches while authorization remains valid, even when this page is hidden."}</p>
+    <p className="data-sync-run-meta">Collects missing or stale details in paced 20-package batches while authorization remains valid,
+      even when this page is hidden. It does not force a reread of fresh details.</p>
   </SyncSourceRow>;
 });

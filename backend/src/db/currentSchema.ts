@@ -3,6 +3,7 @@ import { inventoryLimits } from "../types/inventoryRecords.js";
 import { auditOriginIntegritySql, auditOriginValidationSql } from "./auditOriginSchema.js";
 import { agentControlReceiptsSql } from "./agentControlReceiptsSchema.js";
 import { unknownOrigin } from "../types/actionOrigin.js";
+import { readableReportVersionSql } from "./reportCapacitySchema.js";
 
 const schemaBaseSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
@@ -1019,8 +1020,7 @@ CREATE TABLE official_usage_confirmations (
                                                                         AND length(actor_principal_id) <= 256)
   , CONSTRAINT official_usage_confirmations_confirmation_hash_check CHECK (confirmation_hash ~ CAST('^[a-f0-9]{64}$' AS text))
   , CONSTRAINT official_usage_confirmations_expected_revision_check CHECK (expected_revision > 0)
-  , CONSTRAINT official_usage_confirmations_operation_check CHECK (operation = ANY(ARRAY[CAST('select' AS text)
-                                                                                       , CAST('delete' AS text)]))
+  , CONSTRAINT official_usage_confirmations_operation_check CHECK (operation = CAST('delete' AS text))
   , CONSTRAINT official_usage_confirmations_tenant_id_check CHECK (length(tenant_id) >= 1
                                                                AND length(tenant_id) <= 128)
   , CONSTRAINT official_usage_confirmations_pkey PRIMARY KEY (id)
@@ -1039,7 +1039,7 @@ CREATE TABLE official_usage_audit (
   , error_code text
   , observed_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL
   , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('90 days' AS interval) NOT NULL
-  , CONSTRAINT official_usage_audit_action_check CHECK (action IN ('staged', 'accepted', 'selected', 'deleted', 'discarded'))
+  , CONSTRAINT official_usage_audit_action_check CHECK (action IN ('staged', 'accepted', 'deleted', 'discarded'))
   , CONSTRAINT official_usage_audit_actor_principal_id_check CHECK (length(actor_principal_id) >= 1
                                                                 AND length(actor_principal_id) <= 256)
   , CONSTRAINT official_usage_audit_error_code_check CHECK (error_code IS NULL
@@ -3935,8 +3935,9 @@ BEGIN
   PERFORM pg_advisory_xact_lock(hashtextextended('data-sync:'||NEW.tenant_id,0));
   IF TG_OP='UPDATE' THEN RAISE EXCEPTION 'reviewed usage associations are immutable; remove before reassignment'; END IF;
   IF NOT EXISTS (
-    SELECT 1 FROM public.official_usage_state state
-    JOIN public.official_usage_sets report_set ON report_set.id=state.active_set_id AND report_set.tenant_id=state.tenant_id
+    SELECT 1 FROM public.official_usage_sets report_set
+    JOIN public.official_usage_history_memberships history ON history.set_id=report_set.id
+      AND history.tenant_id=report_set.tenant_id AND history.valid_to_revision IS NULL
     JOIN public.official_usage_set_versions membership ON membership.set_id=report_set.id
       AND membership.tenant_id=report_set.tenant_id AND membership.kind='agents'
     JOIN public.official_usage_versions version ON version.id=membership.version_id
@@ -3947,13 +3948,19 @@ BEGIN
       AND row.tenant_id=version.tenant_id AND row.kind=version.kind
     JOIN public.official_usage_row_facts fact ON fact.tenant_id=row.tenant_id
       AND fact.kind=row.kind AND fact.payload_hash=row.payload_hash
-    WHERE state.tenant_id=NEW.tenant_id AND report_set.id=NEW.report_set_id
+    WHERE report_set.tenant_id=NEW.tenant_id AND report_set.id=NEW.report_set_id
       AND report_set.complete AND report_set.deleted_at IS NULL
       AND (report_set.expires_at IS NULL OR report_set.expires_at>clock_timestamp())
       AND version.deleted_at IS NULL AND (version.expires_at IS NULL OR version.expires_at>clock_timestamp())
       AND (artifact.expires_at IS NULL OR artifact.expires_at>clock_timestamp())
+      AND 3=(SELECT count(*) FROM public.official_usage_set_versions member
+        JOIN public.official_usage_versions v ON v.id=member.version_id AND v.tenant_id=member.tenant_id AND v.kind=member.kind
+        JOIN public.official_usage_artifacts a ON a.id=v.artifact_id AND a.tenant_id=v.tenant_id
+        WHERE member.set_id=report_set.id AND member.tenant_id=report_set.tenant_id AND v.deleted_at IS NULL
+          AND (LEAST(v.expires_at,a.expires_at) IS NULL OR LEAST(v.expires_at,a.expires_at)>clock_timestamp())
+          AND ${readableReportVersionSql("v.id","v.tenant_id","v.kind","v.row_count")})
       AND fact.row_data->>'agentId'=NEW.report_agent_id
-  ) THEN RAISE EXCEPTION 'usage association requires an agent in the active accepted Agents export'; END IF;
+  ) THEN RAISE EXCEPTION 'usage association requires an agent in a readable published Agents export'; END IF;
 
   IF NOT EXISTS (
     SELECT 1 FROM public.inventory_live_sources source

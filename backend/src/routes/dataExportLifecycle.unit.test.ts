@@ -109,9 +109,9 @@ describe("durable export HTTP publication", () => {
     const confirmationId = "abcdefab-1234-4567-89ab-abcdefabcdef", setId = "fedcbafe-1234-4567-89ab-fedcbafedcba";
     const { request, response, next, run } = transport("post", "/official-usage/confirmations/:id");
     request.params.id = confirmationId.toUpperCase();
-    request.body = { id: confirmationId, setId, operation: "select", activeRevision: "4",
+    request.body = { id: confirmationId, setId, operation: "delete", activeRevision: "4",
       historyRevision: "9", historyEpoch: "2", hash: "a".repeat(64) };
-    const confirm = vi.spyOn(OfficialReportImports.prototype, "confirm").mockResolvedValue({ activeSetId: setId, activeRevision: "5" });
+    const confirm = vi.spyOn(OfficialReportImports.prototype, "confirmDeletion").mockResolvedValue({ activeSetId: setId, activeRevision: "5" });
     await run();
     expect(confirm).toHaveBeenCalledWith(identity, request.body);
     expect(response.json).toHaveBeenCalledWith({ activeSetId: setId, activeRevision: "5" });

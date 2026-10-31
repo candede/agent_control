@@ -814,7 +814,7 @@ exact IDs from `capabilityRegistry`; where dynamic, the service rechecks them.
 Tool names are the finite server allowlist. Phase06 read/collection/investigation
 and phase07 exact-control tools below are registered now.
 No allowlisted tool may invoke a route omitted here. Application-mode options,
-canaries, import/shared-selection writes, binary downloads and browser automation
+canaries, import/deletion writes, binary downloads and browser automation
 are deliberately omitted. The SDK rejects direct calls to unregistered/omitted tools,
 not merely hide `tools/list` results.
 
@@ -897,7 +897,7 @@ it does not make the endpoint browser-only (`—`).
 | `GET /api/official-usage/users/:username/directory` | R(official_users) ->exact uniquely linked directory detail or404 | reported-user license follow-up | get_report_user_directory | V |
 | `GET /api/official-usage/users/:username/service-plans` | R(official_users) ->linked plans or404 | reported-user plans | list_report_user_service_plans | V |
 | `GET /api/official-usage/history` | R(history) ->sets,whole-history summary | reportPages.history/Manage reports | list_report_history | V |
-| `GET /api/official-usage/history/options` | R(history) ->options page, same ordering | shared report dropdown/latest period | list_report_options | V |
+| `GET /api/official-usage/history/options` | R(history),setId? ->options page, same ordering | personal report dropdown/latest period | list_report_options | V |
 | `GET /api/official-usage/history/:setId/observations` | R(history) ->exact set observations page | inspector source details | list_report_observations | V |
 | `GET /api/official-usage/overview` | R(overview),scope default history ->history locator/no summed responses | overview cards/API retained locator | get_report_overview | V |
 | `GET /api/agent-inventory/:recordId/usage` | U ->source-backed CandidateAgentUsageSummary | readAgentReportSummary/modal metrics | get_agent_usage | V |
@@ -908,13 +908,18 @@ it does not make the endpoint browser-only (`—`).
 | `POST /api/agent-inventory/:recordId/usage-associations` | confirmed association fields below with exact source target ->updated context | mutateAgentReportAssociation/explicit repair API | — | A |
 | `DELETE /api/agent-inventory/:recordId/usage-associations` | same fields without target; matching inventorySelectionId? ->context | mutateAgentReportAssociation/remove reviewed link | — | A |
 
+Person relationships and adoption champions accept an otherwise unfiltered
+all-inventory selection containing `setId`: it selects inventory report metrics,
+not inventory membership. Compound reads use the paired report selection for
+usage and still require matching saved directory and history dependencies.
+
 Association body: exact `selectionId,reportSetId,reportAgentId,inventoryRevision,
 usageRevision,confirmed:true`; POST target `{source:graph_packages,packageId}`
 or `{source:power_platform,nativeId,environmentId:string|null}`. DELETE omits
-target. Preserve active report/current membership fences and transactional
+target. Preserve the captured readable report/current membership fences and transactional
 audit. These tenant shared repair writes are browser-only, not reasoning tools.
 
-### CSV import, shared report selection and export
+### CSV import, personal report viewing, deletion and export
 
 The actual streaming server upload is **256MiB per file**, maximum100000 Users,
 200000 Agents or1000000 User-Agent rows. Multipart accepts one file and six
@@ -930,9 +935,9 @@ limits and bounded SQL stream batches; no MCP file/blob/download tool.
 | `DELETE /api/official-usage/staging/:id` | exact UUID ->204 | discardReportStage/confirmed cleanup | — | U; own unaccepted new drafts; corrections A |
 | `POST /api/official-usage/staging/:id/accept` | OfficialReport acceptance intent/hash/revision ->accepted | retained single-stage API; ordinary browser uses bundle | — | U; own new imports; corrections A |
 | `POST /api/official-usage/bundles/:id/preview` | `{forDiscard?:boolean}` ->OfficialReportBundlePreview | previewReportBundle/validate or cleanup | — | U; own new imports; corrections A |
-| `POST /api/official-usage/bundles/:id/accept` | `{contentHash,expectedActiveRevision,acknowledgeCorrection?}` ->OfficialReportAccepted | acceptReportBundle/import/replay verification | — | U; own new imports; corrections A |
-| `POST /api/official-usage/sets/:id/preview` | `{operation:select\|delete}` ->OfficialReportConfirmation | previewReportOperation/dropdown/delete | — | A |
-| `POST /api/official-usage/confirmations/:id` | exact full server confirmation,body id=path ->confirmed | confirmReportOperation/shared selection/deletion | — | A |
+| `POST /api/official-usage/bundles/:id/accept` | `{bundleHash,expectedActiveRevision}` ->OfficialReportAccepted | acceptReportBundle/import/replay verification | — | U; own new imports; corrections A |
+| `POST /api/official-usage/sets/:id/preview` | `{operation:delete}` ->OfficialReportConfirmation | previewReportDeletion/confirmed deletion | — | A |
+| `POST /api/official-usage/confirmations/:id` | exact full delete confirmation,body id=path ->confirmed | confirmReportDeletion/confirmed deletion | — | A |
 | `POST /api/data-exports` | OfficialReportExportRequest `{selectionId,kind,ids?,idempotencyKey}` ->202 `{id}` | createReportExport/all filtered inventory/users/report CSV | — | V |
 | `GET /api/data-exports/:id` | exact UUID ->status/bytes/expiry | reportExportStatus/download polling | — | V |
 | `DELETE /api/data-exports/:id` | exact UUID ->204 | cancelReportExport | — | V |
@@ -942,7 +947,9 @@ Exact import/confirmation/export members are frozen by
 `types/officialReportApi.ts` and `db/officialReportImports.ts`; no dates are
 guessed. `kind=copilot_users|official_agents|official_users|graph_packages|
 power_platform_agents|unified_agents`. Duplicates reuse immutable receipts;
-first import selection/later shared-selection semantics stay API-owned.
+the server automatically maintains Latest by report content period, including
+first publication, corrections, deletion and expiry. All Viewer-capable readers
+can supply a personal `setId`; this is a saved read, not a tenant-selection write.
 Unknown/uncertain acceptance is verified, not reuploaded. CSV keeps whole
 matching selected datasets, source metric meanings and spreadsheet escaping.
 Local browser storage is not an API data source.
@@ -1187,7 +1194,10 @@ page and use the same optional comparison fields and errors.
   `oid.tid`, or report usernames as private keys. `objectId` is null unless one
   directory object matches. `reportIdentityState=matched|ambiguous|unresolved|
   missing`, `reportedUsername`, `directoryMatches`, directory/reports and selection
-  metadata remain explicit. The saved schemas do **not** retain the tenant's
+  metadata remain explicit. Report ambiguity follows the matched directory
+  object's saved UPN/object-ID aliases even when the requested UPN spelling
+  differs; compatibility-folded report keys are not directory aliases.
+  The saved schemas do **not** retain the tenant's
   concealment setting: `concealment:"unknown"` and `concealed_or_unresolved`
   deliberately do not claim known concealment. No Graph settings enrichment.
   A supplied selection must be `copilot_users`; setId and selectionId cannot be
@@ -1407,12 +1417,12 @@ admission bounds. Import success is verified before closing the current
 `Close` control back to Sync. Saved tenant data remains readable for Viewer
 during a permission-check outage; local Audit remains Admin-only.
 
-CSV acceptance preserves the current report choice, including no active set
-after earlier history. The first-ever accepted set becomes active; an empty
-history page after prior deletions is not a new first publication. A rejected
-correction must leave the captured active choice unchanged. The Admin may
-explicitly choose its exact set; the Viewer sees read-only selected-report
-context, not an editable Admin selector. Available-but-empty directory
+CSV acceptance automatically maintains the newest content-period default,
+including after earlier deletion. Older backfills cannot override newer periods,
+and a rejected correction leaves the default unchanged. Admin, Uploader and
+Viewer have the same read-only personal picker on Users and Agents. Latest
+follows publication; explicit report IDs remain pinned without tenant writes.
+Unavailable personal reports return to Latest with a notice. Available-but-empty directory
 evidence is distinct from unavailable evidence: unknown-license report users
 remain excluded and counted as unknown, rather than becoming non-paid users
 or an invented synchronization error.
@@ -1436,7 +1446,7 @@ Loading skeletons are decorative under the existing busy-state semantics.
 | Usage, report identity association/repair and retained-window comparisons | inventory usage/usage-history/usage-associations/usage-candidates; D reads, C association writes | AgentUsagePanel/reportData/OfficialUsageHistoryPanel -> officialReportData, officialAgentUsage/History | agentUsageHistory/mcpReadContracts/officialUsageHistorySelection; AgentUsagePanel; agentUsageHistory/agentActivity.spec.ts. Keep exact report set; compare overlap/unknown/unequal windows without invented growth; association repair requires confirmation/current revision. |
 | Report snapshot inspector/aggregates/bridge/overview/observations | official-usage aggregate/facets, agents/users children, agent-users, history/options, overview, observations; D | ReportingView/reportPages/OfficialUsageReportSelector -> officialReportData/LargeTenantUsersReports | dataPages/officialReportReads/officialUsageViews; OfficialUsageSnapshot/OfficialUsageViews; officialUsage/cumulativeUsage.spec.ts. Switch retained set explicitly, preserve source-specific totals and discrepancy, read complete pages. Bridge remains API-only, no new page. |
 | `sync`: CSV upload/diagnostics/drafts/bundle acceptance/correction | official-usage staging/diagnostics/bundles; C | OfficialUsageImportPanel/stageReport/previewReportBundle/acceptReportBundle -> officialReportData/officialReportImports | officialUsageCsv/officialUsageImports/officialReportStream; OfficialUsageImportModal; csvUsageReports/reportSets.spec.ts. In isolated approved data only: upload supported CSV, inspect warnings, cancel/discard, verify uncertain acceptance without duplicate upload. Production defaults read-only absent separate approval. |
-| Report management/shared selection/deletion | sets preview/confirmations/history; C writes, D history | OfficialUsageManageReports/previewReportOperation/confirmReportOperation -> officialReportImports | officialUsageImports/officialUsageHistorySelection; OfficialUsageManageReports; reportSets.spec.ts. Select/delete only exact approved synthetic data; source revision invalidates old selections. No customer write implied. |
+| Personal report viewing and report management/deletion | history/options and personal setId saved reads; C deletion, D history | OfficialUsageReportSelector; OfficialUsageManageReports/previewReportDeletion/confirmReportDeletion -> officialReportImports | officialReportDefaults/officialUsageHistorySelection; OfficialUsageManageReports; reportSets.spec.ts. Verify all-role personal isolation and content-period Latest without tenant writes; delete only exact approved synthetic data with confirmation. |
 | Selected CSV export, polling/cancel/authorization-wait/expiry/native download | data-exports POST/GET/DELETE/download; C | ReportExportButton/reportData -> dataExports/inventoryExports/reportExportDispatcher/reportExportAudit | dataExports/inventoryExports/reportExportAudit; ReportExportLifecycle; savedReadLifecycle.spec.ts. Export pinned all-matching/explicit references, full About child rows, native download (no Blob), cancel/reauthorize with same intent; no partial CSV success. |
 | Sync initial/incremental/full/confirmed clear saved data/history | data-sync state/runs/retry/cancel; D, explicit C browser automation | DataSyncPanel/SyncHistoryView/getDataSyncState/startDataSync -> dataSync route/service | automaticRefreshIntegration/dataSyncPersistence; DataSyncPanel/SyncHistoryView; dataSync/savedBackendLifecycle.spec.ts. Ordinary saved read does not refresh; explicit refresh preserves accepted reports. Full clear is isolated-only manual write. |
 | Existing visibility/due-check browser automation | data-sync/auto-refresh; C | useAutomaticRefresh/checkAutomaticRefresh -> existing dataSync scheduler admission | automaticRefreshIntegration/automaticRevisions; useAutomaticRefresh; automaticRefresh.spec.ts. Preserve existing due behavior without adding automatic refresh to saved handlers or exposing it as a tool. |
@@ -1504,7 +1514,7 @@ denial/challenge/refresh/revocation/reconnect, not live vendor controls. Actual
 tool traces measure complete-page calls/bytes/time; client/server descriptions
 are not consent proof. Current API HTTP/SQL parity remains authoritative.
 No production fixture-auth route, synthetic
-import into customer reports, latest/shared selection change, broad sync, real
+import into customer reports, published-report deletion, broad sync, real
 bulk canary or production reset.
 
 Commands from repository root:

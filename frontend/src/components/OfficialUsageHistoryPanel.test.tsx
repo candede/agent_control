@@ -8,6 +8,7 @@ import { SavedQueryProvider } from "./SavedQueryProvider";
 import { historySet, reportPage, selectionId } from "../test/reportDataFixture";
 import { selectedHistoryPage } from "../test/selectedUsageFixture";
 import { deferred } from "../test/deferred";
+import { usageDate } from "../usageInsights";
 
 type HistoryPage = ReportPage<ReportHistorySet>;
 
@@ -172,21 +173,46 @@ describe("saved report history", () => {
     expect(onDelete).not.toHaveBeenCalled();
   });
 
-  it("distinguishes observed dates, explicit reporting periods, and undated reports", async () => {
+  it("emphasizes labeled activity bounds without import dates or provenance labels", async () => {
     const data = history(0, 3);
+    data.value[0].reportingStart = "2026-10-01";
+    data.value[0].reportingEnd = "2026-10-30";
     data.value[1].periodProvenance = "operator_asserted";
     data.value[2].reportingStart = data.value[2].reportingEnd = null;
+    for (const set of data.value) set.acceptedAt = "2026-10-31T12:00:00Z";
     api.history.mockResolvedValue(data);
     render(<OfficialUsageHistoryPanel revision={0} onSelect={vi.fn()} />);
-    await screen.findByRole("table");
-    expect(screen.getAllByText("Observed activity")).toHaveLength(2);
-    expect(screen.getByText("Reporting period")).toBeVisible();
+    const table = await screen.findByRole("table");
+    expect(within(table).getAllByRole("columnheader").map(header => header.textContent)).toEqual(["Activity dates", "Status", "Actions"]);
+    expect(within(table).getAllByRole("cell")).toHaveLength(9);
+    expect(within(table).queryByText(/Imported|Observed activity|Reporting period/)).not.toBeInTheDocument();
+    expect(within(table).queryByText(usageDate(data.value[0].acceptedAt))).not.toBeInTheDocument();
+    expect(within(table).getAllByText("Start", { exact: true })).toHaveLength(2);
+    expect(within(table).getAllByText("End", { exact: true })).toHaveLength(2);
     expect(screen.getByText("No activity dates")).toBeVisible();
     expect(screen.queryByText(/Activity dates do not imply continuous coverage/)).not.toBeInTheDocument();
-    const dates = screen.getByRole("table").querySelectorAll("time");
+    const dates = table.querySelectorAll("time");
     expect(dates).toHaveLength(4);
     expect(dates[0]).toHaveAttribute("datetime", data.value[0].reportingStart);
+    expect(dates[0]).toHaveTextContent(usageDate(data.value[0].reportingStart));
     expect(dates[1]).toHaveAttribute("datetime", data.value[0].reportingEnd);
+    expect(dates[1]).toHaveTextContent(usageDate(data.value[0].reportingEnd));
+  });
+
+  it.each([
+    { start: null, end: "2026-10-30" },
+    { start: "2026-10-01", end: null },
+    { start: "2026-10-30", end: "2026-10-30" },
+  ])("preserves missing and same-day activity bounds: $start to $end", async ({ start, end }) => {
+    api.history.mockResolvedValue(reportPage([historySet(1, { reportingStart: start, reportingEnd: end })]));
+    render(<OfficialUsageHistoryPanel revision={0} />);
+    const table = await screen.findByRole("table");
+    const values = table.querySelectorAll(".usage-history-dates dd");
+    expect(values).toHaveLength(2);
+    expect(values[0]).toHaveTextContent(usageDate(start));
+    expect(values[1]).toHaveTextContent(usageDate(end));
+    expect(table.querySelectorAll("time")).toHaveLength(Number(Boolean(start)) + Number(Boolean(end)));
+    expect(within(table).queryByText("No activity dates")).not.toBeInTheDocument();
   });
 
   it("reloads on returning to the window and offers Retry only if that read fails", async () => {

@@ -218,7 +218,7 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
   function accept() {
     if (operation.current || busy || denied || cancelRequested.current || !bundle?.complete && !attempt) return;
     const admitted = attempt ?? { bundleId: bundle!.bundleId,
-      input: Object.freeze({ bundleHash: bundle!.bundleHash, expectedActiveRevision: bundle!.expectedActiveRevision, preserveSelection: true }) };
+      input: Object.freeze({ bundleHash: bundle!.bundleHash, expectedActiveRevision: bundle!.expectedActiveRevision }) };
     setAttempt(admitted); setRecovery(undefined);
     return begin("accepting", async signal => {
       const receipt = await acceptReportBundle(admitted.bundleId, admitted.input, signal); signal.throwIfAborted();

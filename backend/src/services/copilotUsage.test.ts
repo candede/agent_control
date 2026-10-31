@@ -193,7 +193,7 @@ describe("live Users orchestration and publication boundary", () => {
     expect(h.fetcher).not.toHaveBeenCalled(); expect(h.requireAvailable).not.toHaveBeenCalled();
   });
   it.each([false, true])("acknowledges a changed report with one necessary directory collection, including another change during collection: %s", async changesDuringCollection => {
-    const h = await harness(), history = new OfficialReportHistory(fixture.runtime), imports = new OfficialReportImports(fixture.runtime);
+    const h = await harness(), history = new OfficialReportHistory(fixture.runtime);
     await h.seed("directory");
     await h.seed("app_activity");
     const before = await h.status();
@@ -201,7 +201,7 @@ describe("live Users orchestration and publication boundary", () => {
     const activateReport = async (revision: number) => {
       const report = await seedReportSet(fixture.runtime, h.identity.tenantId, revision);
       await history.connections.run(client => history.accepted(client, h.identity.tenantId, report.id));
-      await imports.confirm(h.identity, await imports.confirmPreview(h.identity, report.id, "select"));
+      await history.connections.run(client => history.reconcileHead(client, h.identity.tenantId));
     };
     await activateReport(1);
     expect(await directoryNeedsReportRefresh(fixture.runtime, h.identity)).toBe(true);

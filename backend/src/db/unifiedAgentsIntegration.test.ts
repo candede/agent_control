@@ -297,10 +297,10 @@ describe("typed unified inventory integration", () => {
     expect((await read(scope, { view: "used" })).page.counts.filtered).toBe(0);
     expect((await exportRows(filtered)).filter(row => row.recordType === "agent")).toMatchObject([{ responses: "10" }]);
     await expect(usage.mutate(await usageIdentity(fixture.runtime, scope), filtered.page.value[0].id, reviewed, usageAudit(scope).actor))
-      .rejects.toMatchObject({ code: "agent_usage_changed" });
+      .resolves.toMatchObject({ reportSetId: reviewed.reportSetId });
     const replaced = await read(scope);
     await deleteUsageSet(fixture.runtime, scope, replacement.setId);
-    expect((await read(scope)).page.usageContext).toMatchObject({ reports: { setId: null, availability: "not_selected" } });
+    expect((await read(scope)).page.usageContext).toMatchObject({ reports: { setId: reviewed.reportSetId } });
     await expect(replaced.queries.page(replaced.selection.id, replaced.identity)).rejects.toMatchObject({ code: "selection_invalidated" });
   });
 

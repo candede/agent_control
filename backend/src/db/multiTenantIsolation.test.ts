@@ -275,14 +275,14 @@ describe("multi-tenant repositories with overlapping provider and principal iden
       .not.toBe(second.reports.lineages.find(lineage => lineage.kind === "agents")?.versionId);
     expect((await read(otherAccount)).value).toEqual(first.value);
     await expect(reports.capture(saved[0].identity, "official_agents", { setId: accepted[1].setId }))
-      .rejects.toMatchObject({ code: "selection_invalidated" });
-    await expect(repository.confirmPreview(saved[0].identity, accepted[1].setId, "select")).rejects.toMatchObject({ code: "staging_unavailable" });
+      .rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
+    await expect(repository.previewDeletion(saved[0].identity, accepted[1].setId)).rejects.toMatchObject({ code: "staging_unavailable" });
     await expect(repository.stage(saved[0].identity, { bundleId: randomUUID(), correctionOfSetId: accepted[1].setId },
       (async function* () { yield Buffer.from(csvs[0]); })()))
       .rejects.toMatchObject({ code: "invalid_correction" });
-    const confirmation = await repository.confirmPreview(saved[0].identity, accepted[0].setId, "delete");
-    await expect(async () => repository.confirm(saved[1].identity, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });
-    await repository.confirm(saved[0].identity, confirmation);
+    const confirmation = await repository.previewDeletion(saved[0].identity, accepted[0].setId);
+    await expect(async () => repository.confirmDeletion(saved[1].identity, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });
+    await repository.confirmDeletion(saved[0].identity, confirmation);
     expect((await read(owner)).reports.activeSetId).toBeNull();
     expect((await read(otherTenant)).reports.activeSetId).toBe(accepted[1].setId);
     expect(await repository.acceptBundle(saved[1].identity, bundleId, saved[1].preview)).toMatchObject({ setId: accepted[1].setId });

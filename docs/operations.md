@@ -77,7 +77,11 @@ Permissions is recovery guidance after a genuine permission failure, not a
 prerequisite visit.
 
 Sync shows current-attempt observations separately from last saved counts and
-last successful publication. A running count is not a provider total or ETA.
+last successful publication, inline in the Users, Graph packages, Power Platform
+and Graph package details rows. Starting or finishing a sync does not add or
+remove a separate progress panel. Run details and cancellation remain available
+in the workspace footer; package-detail cancellation stays in its row. A running
+count is not a provider total or ETA and may restart for a new collection stage.
 Failed/partial attempts do not replace a complete saved source.
 
 Retained package refresh jobs report deadline-expired waiting/running work as

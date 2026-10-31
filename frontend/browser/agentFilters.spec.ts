@@ -133,7 +133,7 @@ test.describe("touch search clearing", () => {
   });
 });
 
-test("filtered results keep Clear filters inline and show the matching total without a duplicate report row", async ({ page }, info) => {
+test("filtered results keep Clear filters below stable query controls and show the matching total", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.route("**/api/agent-inventory?*", route => {
     const query = inventoryFixtureQuery(route);
@@ -162,20 +162,29 @@ test("filtered results keep Clear filters inline and show the matching total wit
     await expect(toolbar.locator(".inventory-facet-compact details")).toHaveCount(0);
     await expect(toolbar.getByLabel("Search and page show agents options")).toHaveCount(0);
     const initialHeight = (await toolbar.boundingBox())!.height;
+    const mainControls = [search, category, toolbar.getByRole("button", { name: /^Filters/ }),
+      ...(viewport.width > 900 ? [toolbar.getByRole("button", { name: "Columns", exact: true })] : [])];
+    // Catalog counts can reflow the heading above the toolbar on mobile.
+    const mainControlBounds = async () => {
+      const origin = (await toolbar.boundingBox())!;
+      return Promise.all(mainControls.map(async control => {
+        const bounds = (await control.boundingBox())!;
+        return { ...bounds, x: bounds.x - origin.x, y: bounds.y - origin.y };
+      }));
+    };
+    const initialControls = await mainControlBounds();
     for (const type of ["firstParty", "thirdParty", "shared"]) {
       await category.selectOption(encodeInventoryFacet(type));
-      await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
+      await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
+      await expect(toolbar.locator(".agent-filter-chips").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
       await expect(count).toHaveText("1 matching agent");
-      await expect(toolbar.locator(".agent-filter-chips")).toHaveCount(0);
+      await expect(toolbar.locator(".agent-filter-chips").getByRole("button", { name: /^Remove / })).toHaveCount(0);
       await expect(toolbar.locator(".agent-report-note")).toHaveCount(0);
-      expect((await toolbar.boundingBox())!.height, "Selecting a category adds no toolbar row").toBeCloseTo(initialHeight, 1);
-      if (viewport.width >= 768) {
-        const controls = await Promise.all([search, category, clear, toolbar.getByRole("button", { name: "Filters", exact: true }),
-          ...(viewport.width > 900 ? [toolbar.getByRole("button", { name: "Columns", exact: true })] : [])].map(control => control.boundingBox()));
-        expect(Math.max(...controls.map(box => box!.y)) - Math.min(...controls.map(box => box!.y)),
-          "Clear filters shares the main control row").toBeLessThanOrEqual(1);
-        expect((await toolbar.boundingBox())!.height).toBeLessThanOrEqual(viewport.width > 900 ? 64 : 110);
-      }
+      expect((await toolbar.boundingBox())!.height, "Clear filters adds a separate chip row").toBeGreaterThan(initialHeight);
+      expect(await mainControlBounds(),
+        "Selecting a category does not move or resize the main controls").toEqual(initialControls);
+      const queryBounds = (await toolbar.locator(".agent-query-bar").boundingBox())!;
+      expect((await clear.boundingBox())!.y).toBeGreaterThanOrEqual(queryBounds.y + queryBounds.height);
     }
     await expect(page.getByRole("combobox", { name: "Report set", exact: true })).toBeVisible();
     await page.screenshot({ path: info.outputPath(`filtered-toolbar-${viewport.width}.png`), fullPage: true });
@@ -194,7 +203,10 @@ test("filtered results keep Clear filters inline and show the matching total wit
     await page.keyboard.press("Escape");
     await expect(count).toHaveText("1 matching agent");
     await expect(toolbar.getByRole("button", { name: "Remove publisher filter" })).toBeVisible();
-    await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
+    await expect(toolbar.locator(".agent-query-bar").getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
+    await expect(toolbar.locator(".agent-filter-chips").getByRole("button", { name: "Clear filters", exact: true })).toBeVisible();
+    expect(await mainControlBounds(),
+      "Adding a detailed filter does not move or resize the main controls").toEqual(initialControls);
     await clear.click();
     await expect(count).toHaveText("3 matching agents");
     await expect(toolbar.locator(".agent-filter-chips")).toHaveCount(0);
@@ -483,10 +495,12 @@ test("filter dismissal supports the close button, Escape, outside click and nonm
   await expect(trigger).toBeFocused();
   await expect(dialog).toBeVisible();
   await page.keyboard.press("Shift+Tab");
-  await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toBeFocused();
-  await expect(dialog).toHaveCount(0);
-  await page.keyboard.press("Shift+Tab");
   await expect(page.getByRole("combobox", { name: "Show agents", exact: true })).toBeFocused();
+  await expect(dialog).toHaveCount(0);
+  await page.getByRole("button", { name: "Clear filters", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(trigger).toBeFocused();
+  await expect(page.getByRole("button", { name: "Clear filters", exact: true })).toHaveCount(0);
   expect(unexpected).toEqual([]);
 });
 

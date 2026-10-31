@@ -9,6 +9,7 @@ import { parseUnifiedAgentRecordId, unifiedAgentSortKeys, type UnifiedAgentInven
   type SavedAgentEnvironment, type SavedAgentPerson } from "../types/unifiedAgents.js";
 import { normalizePackageAuthoringTool, packageStatusAliases, type CopilotPackageDetail } from "../types/copilotPackage.js";
 import { AppError } from "../errors.js";
+import { reportUuid } from "./officialReportImports.js";
 import { readInventoryResponsibility } from "./inventoryResponsibility.js";
 import type { AgentResponsibilityQuery } from "../types/agentResponsibility.js";
 import { currentInventorySourcesSql, lockInventorySelection } from "./inventoryAuthority.js";
@@ -24,13 +25,13 @@ import { isPublicationRevisions } from "../types/dataSelection.js";
 import type { AgentAboutPage } from "../types/savedReadContracts.js";
 
 export type InventoryQuery = Omit<UnifiedAgentInventoryQuery, "limit" | "selectionId" | "cursor">;
-const queryFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
+const queryFields = ["setId", "inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
   "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher", "availableTo", "host", "platform",
   "createdWithinDays", "sortBy", "sortDirection"] as const;
 const numericSorts = new Set(["createdAt", "lastModifiedAt", "lastPublishedAt", "observedAt", "responses", "activeUsers", "lastActivity"]);
 const needsPeopleCache = (query: InventoryQuery) => Boolean(query.search?.trim()) || ["owner", "createdBy"].includes(query.sortBy ?? "");
 const unfilteredOrdering = (query: InventoryQuery, source: string) => Object.entries(query).every(([key,value]) =>
-  ["sortBy","sortDirection"].includes(key)
+  ["setId","sortBy","sortDirection"].includes(key)
   || ["inventoryScope","view","source"].includes(key) && value==="all"
   || key==="inventoryScope" && (source==="inventory_packages" && value==="catalog"
     || source==="inventory_power_platform" && value==="power_platform_only"));
@@ -59,7 +60,7 @@ type Context = { data: ReportCurrentData; selectionId: string;expiresAt: number;
 type PageOptions = { limit?: number; cursor?: string; recordId?: string; expectedQuery?: InventoryQuery; explicitExportId?: string;
   exportKind?: "unified_agents" | "graph_packages" | "power_platform_agents" };
 
-export function inventoryPackageResidualSql(alias: "member" | "r" | "selected",
+export function inventoryPackageResidualSql(alias: "member" | "r" | "selected" | "f",
   collections: readonly ("supportedHosts" | "elementTypes" | "categories")[] = ["supportedHosts", "elementTypes"]) {
   return `CASE WHEN ${alias}.domain='packages' THEN ${alias}.residual
     ||jsonb_build_object('savedSource',jsonb_build_object('scopeId',${alias}.scope_id,'identity',${alias}.identity))||coalesce((
@@ -125,6 +126,7 @@ export class InventoryQueries {
   async capture(identity: SelectionIdentity, scopeId: string, query: InventoryQuery = {}) {
     identity = { ...identity };
     query = { ...query };
+    if (query.setId !== undefined) query.setId = reportUuid(query.setId);
     if (query.sortBy && !unifiedAgentSortKeys.includes(query.sortBy) || query.sortDirection && !["asc", "desc"].includes(query.sortDirection)
       || query.createdWithinDays !== undefined && (!Number.isInteger(query.createdWithinDays) || query.createdWithinDays < 0)) throw new SelectionError("invalid_cursor");
     const criteria = inventoryCriteria(query.availableTo === undefined ? query : { ...query, availableTo: encodeInventoryFacet(query.availableTo) });
@@ -132,11 +134,12 @@ export class InventoryQueries {
       ...criteria.operationIdPrefix === undefined ? {} : { operationIdPrefix: criteria.operationIdPrefix } };
     const sourceScope = await this.reports.sources.ensureScope(identity);
     await this.reports.history.ensure(identity.tenantId);
+    while (await this.reports.history.expire(identity.tenantId) > 0) { /* bounded maintenance transactions */ }
     return this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
       const pinUntil = new Date(at.getTime() + 30 * 60_000);
       const roots = await inventorySelectionRoots(client, { id: scopeId, tenantId: identity.tenantId }, pinUntil);
       if (!roots.length) throw new SelectionError("selection_invalidated");
-      const data = await this.reports.currentInventoryData(client, identity, at);
+      const data = await this.reports.currentInventoryData(client, identity, at, query.setId);
       roots.push(await this.reports.history.root(client, identity.tenantId, at));
       if (needsPeopleCache(query)) {
         const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
@@ -567,7 +570,7 @@ export class InventoryQueries {
           jsonb_build_object('state',f.link_state,'reason',f.residual->'identity'->'reason',
             'warnings',f.residual->'identity'->'warnings',
             'invalidMetadata',f.residual->'identity'->'invalidMetadata') AS identity_info,
-          CASE WHEN f.domain<>'canonical' THEN f.residual END AS source_residual,
+          CASE WHEN f.domain<>'canonical' THEN ${inventoryPackageResidualSql("f")} END AS source_residual,
           coalesce((SELECT jsonb_agg(to_jsonb(member_row) ORDER BY member_row.domain)
             FROM (${primaryMembersSql}) member_row),'[]'::jsonb) AS members,
           coalesce((SELECT max(octet_length(environment.residual::text))+2048

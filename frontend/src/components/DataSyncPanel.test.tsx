@@ -1104,7 +1104,7 @@ describe("DataSyncPanel", () => {
 
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
 
-      const progress = screen.getByRole("region", { name: "Sync status" });
+      const progress = screen.getByRole("region", { name: target === "state" ? "Workspace data" : "Sync status" });
       expect(within(progress).getByText("Last reported: Syncing users")).toBeVisible();
       expect(progress.querySelector(".data-sync-spinning")).toBeNull();
       expect(screen.getByRole("alert")).toHaveTextContent("last reported");
@@ -1281,7 +1281,7 @@ describe("DataSyncPanel", () => {
     renderPanel();
     expect(await screen.findByText(message)).toBeVisible();
     expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
-    const progress = within(screen.getByRole("region", { name: "Sync status" }));
+    const progress = within(screen.getByRole("article", { name: "Graph packages" }));
     if (status === "failed") {
       expect(screen.getByRole("button", { name: "Sync all sources" })).toBeEnabled();
       expect(progress.getByText("Failed", { exact: true })).toBeVisible();
@@ -1300,7 +1300,7 @@ describe("DataSyncPanel", () => {
     }
   });
 
-  it("groups run details and cancellation in the footer and shows the pending cancellation state", async () => {
+  it("keeps run details and cancellation inline in the workspace footer through pending cancellation", async () => {
     const sources = sourceIds.map(id => source(id, "succeeded", { count: 42 }));
     const active = run("running", [source("users", "running", { count: 1_500 })], { mode: "incremental" });
     const cancelled = run("cancelled", [source("users", "cancelled", { count: 1_500 })], { mode: "incremental" });
@@ -1310,8 +1310,8 @@ describe("DataSyncPanel", () => {
     const onRequestedRunChange = vi.fn();
     renderPanel({ onRequestedRunChange });
 
-    const footer = await screen.findByRole("group", { name: "Current sync actions" });
-    expect(footer).toHaveTextContent("Sync continues when you switch tabs.");
+    const footer = await screen.findByRole("group", { name: "Workspace sync actions" });
+    expect(screen.getByRole("region", { name: "Workspace data" })).toHaveTextContent("Sync continues when you switch tabs.");
     await userEvent.click(within(footer).getByRole("button", { name: "View run details" }));
     expect(onRequestedRunChange).toHaveBeenCalledWith(active.id);
     expect(api.cancel).not.toHaveBeenCalled();
@@ -1324,9 +1324,9 @@ describe("DataSyncPanel", () => {
     expect(pending).toBeDisabled();
     expect(pending).toHaveAttribute("aria-busy", "true");
     expect(pending.querySelector("svg")).toHaveClass("data-sync-spinning");
-    const progress = screen.getByRole("region", { name: "Sync status" });
+    const progress = screen.getByRole("region", { name: "Workspace data" });
     expect(progress).toHaveTextContent("Last reported: Syncing users");
-    expect(progress.querySelector(".data-sync-spinning")).toBeNull();
+    expect(progress.querySelector(".data-sync-sources .data-sync-spinning")).toBeNull();
     const users = screen.getByRole("article", { name: "Users" });
     expect(users).toHaveTextContent("Last reported attempt");
     expect(users.querySelector(".data-sync-spinning")).toBeNull();
@@ -1336,7 +1336,9 @@ describe("DataSyncPanel", () => {
     api.getState.mockResolvedValue(syncState({ run: cancelled, sources }));
     await act(async () => resolveCancellation(cancelled));
     expect(await screen.findByText("Sync cancelled")).toBeVisible();
-    expect(screen.queryByRole("group", { name: "Current sync actions" })).not.toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Workspace sync actions" })).toBe(footer);
+    expect(within(footer).queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument();
+    expect(within(footer).getByRole("button", { name: "Reset saved data..." })).toBeEnabled();
     expect(screen.getByText("4 of 4 sync steps complete")).toBeVisible();
   });
 
@@ -1413,7 +1415,11 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("button", { name: /retry|resume/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start initial sync" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Sync users" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Reset saved data..." })).toBeDisabled();
+    if (currentStatus === "running" || currentStatus === "waiting") {
+      expect(screen.queryByRole("button", { name: "Reset saved data..." })).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByRole("button", { name: "Reset saved data..." })).toBeDisabled();
+    }
     await act(async () => { await panelRef.current?.start("incremental", ["users"]); });
     expect(api.start).not.toHaveBeenCalled();
 
@@ -1491,7 +1497,8 @@ describe("DataSyncPanel", () => {
     api.getState.mockResolvedValue({ ...completed, run: nextRun });
     await userEvent.click(page.getByRole("button", { name: "Sync all sources" }));
     expect(api.start).toHaveBeenCalledWith({ mode: "incremental" }, expect.anything());
-    expect(page.getByRole("progressbar")).toBeVisible();
+    expect(page.queryByRole("progressbar", { name: "Completed sync sources" })).not.toBeInTheDocument();
+    expect(within(page.getByRole("article", { name: "Users" })).getByText("Syncing", { selector: ".status-badge" })).toBeVisible();
     expect(page.getByRole("article", { name: "Users" })).toBeVisible();
     expect(within(page.getByRole("article", { name: "Graph packages" })).getByText("42")).toBeVisible();
     expect(page.queryByText("Sync complete")).not.toBeInTheDocument();
@@ -1925,7 +1932,7 @@ describe("DataSyncPanel", () => {
     expect(await screen.findByText("Sync needs attention")).toBeVisible();
     expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
     expect(screen.queryByText("Sync cancelled")).not.toBeInTheDocument();
-    expect(screen.getByText("reported, not a saved total")).toBeVisible();
+    expect(screen.getByRole("article", { name: "Users" })).toHaveTextContent("3 reported, not a saved total");
   });
 
   it.each([
@@ -1998,13 +2005,12 @@ describe("DataSyncPanel", () => {
     api.getState.mockResolvedValue(syncState({ run: run("partial", sources), sources: saved }));
     renderPanel();
 
-    await screen.findByText("4,173");
+    await screen.findByText("4,173 reported, not a saved total");
     const powerPlatform = within(screen.getByRole("article", { name: "Power Platform" }));
     expect(powerPlatform.getByText("Last saved count")).toBeVisible();
     expect(powerPlatform.getByText("4,000")).toBeVisible();
     expect(powerPlatform.queryByText("4,173")).not.toBeInTheDocument();
-    const attempt = screen.getByText("4,173").closest("li")!;
-    expect(within(attempt).getByText("reported, not a saved total")).toBeVisible();
+    expect(powerPlatform.getByText("4,173 reported, not a saved total")).toBeVisible();
     const packages = within(screen.getByRole("article", { name: "Graph packages" }));
     expect(packages.getByText("Last saved count")).toBeVisible();
     expect(packages.getByText("1,005")).toBeVisible();
@@ -2030,14 +2036,13 @@ describe("DataSyncPanel", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Sync users" }));
     expect(screen.getByText("Last reported: Syncing users")).toBeVisible();
-    expect(screen.getByRole("region", { name: "Sync status" }).querySelector(".data-sync-spinning")).toBeNull();
-    expect(screen.getByText("17")).toBeVisible();
-    expect(screen.getByText("processed in this stage")).toBeVisible();
+    expect(screen.getByRole("article", { name: "Users" }).querySelector(".data-sync-spinning")).toBeNull();
+    expect(screen.getByText("17 processed in this stage")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Users" })).getByText("42")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Graph packages" })).getByText("1,005")).toBeVisible();
     expect(within(screen.getByRole("article", { name: "Power Platform" })).getByText("4,178")).toBeVisible();
     expect(screen.getByText("4 of 4 sync steps complete")).toBeVisible();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("max", "1");
+    expect(screen.queryByRole("progressbar", { name: "Completed sync sources" })).not.toBeInTheDocument();
 
     const completedUsers = source("users", "succeeded", { count: 43, lastSuccessAt: "2026-09-16T10:00:00.000Z" });
     const completed = syncState({
@@ -2095,10 +2100,66 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByText("4 of 4 sync steps complete")).not.toBeInTheDocument();
     const details = within(rows[3]!);
     expect(details.getByText("Syncing", { exact: true })).toBeVisible();
-    expect(details.getByRole("button", { name: "Sync package details" })).toBeDisabled();
+    expect(details.queryByRole("button", { name: "Sync package details" })).not.toBeInTheDocument();
     expect(details.getByRole("button", { name: "Cancel detail collection" })).toBeEnabled();
+    expect(details.getAllByRole("button")).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "Check detail status" })).not.toBeInTheDocument();
   });
+
+  it("shows all four targets' live observations in their rows without a separate progress section", async () => {
+    const saved = automaticSources();
+    const counts = [700, 650, 2_451];
+    const attempts = saved.map((value, index) => source(value.source, "running", {
+      count: counts[index], message: `Reading ${value.source} from Microsoft.`,
+    }));
+    api.getState.mockResolvedValue(syncState({
+      onboardingRequired: false, sources: saved, run: run("running", attempts, { automatic: true }),
+    }));
+    api.getDetails.mockResolvedValue(pendingDetails("running"));
+    renderPanel();
+    const workspace = await screen.findByRole("region", { name: "Workspace data" });
+    await screen.findByText("520 / 1,216");
+
+    const rows = within(workspace).getAllByRole("article");
+    expect(rows).toHaveLength(4);
+    for (const [index, row] of rows.slice(0, 3).entries()) {
+      expect(within(row).getByText(`${counts[index]!.toLocaleString()} processed in this stage`)).toBeVisible();
+      expect(within(row).getByText(saved[index]!.count!.toLocaleString())).toBeVisible();
+      expect(within(row).getByRole("status")).toHaveTextContent(attempts[index]!.message);
+      expect(row.querySelector(".status-badge")).toHaveTextContent("Syncing");
+    }
+    expect(within(rows[3]!).getByText("1 of 20 targets checked")).toBeVisible();
+    expect(within(rows[3]!).getByRole("status")).toHaveTextContent("Collecting exact package details.");
+    expect(screen.queryByRole("region", { name: "Current sync" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Sync status" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Progress by source" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("progressbar", { name: "Completed sync sources" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it.each(["users", "graph_packages", "power_platform"] as const)(
+    "keeps %s counts truthful inline through queued work, stage resets and missing provider counts", async id => {
+      const saved = automaticSources();
+      const ref = createRef<DataSyncPanelHandle>();
+      const state = syncState({
+        onboardingRequired: false, sources: saved, run: run("running", [source(id, "queued", { count: 900 })]),
+      });
+      api.getState.mockResolvedValue(state);
+      renderPanel({ ref });
+      await screen.findByRole("region", { name: "Workspace data" });
+      const row = screen.getAllByRole("article")[saved.findIndex(value => value.source === id)]!;
+      expect(within(row).getByText("Collection queued")).toBeVisible();
+      expect(row).not.toHaveTextContent("900");
+
+      for (const count of [700, 20, 0, null]) {
+        api.getState.mockResolvedValue({ ...state, run: run("running", [source(id, "running", { count })]) });
+        await act(async () => { await ref.current!.refresh(); });
+        expect(within(row).getByText(count === null ? "Count not reported" : `${count} processed in this stage`)).toBeVisible();
+        expect(within(row).getByText(saved.find(value => value.source === id)!.count!.toLocaleString())).toBeVisible();
+      }
+    },
+  );
 
   it("rechecks detail coverage through both global Check status and imperative refresh", async () => {
     api.getState.mockResolvedValue(syncState({ onboardingRequired: false, sources: automaticSources() }));
@@ -2314,9 +2375,9 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByText("Sync in progress")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Check progress" })).not.toBeInTheDocument();
     expect(screen.getByText("Reading package page 2.")).toBeVisible();
-    expect(screen.getByRole("progressbar", { name: "Completed sync sources" })).toHaveAttribute("value", "1");
-    expect(screen.getByRole("progressbar")).toHaveAttribute("max", "3");
-    expect(screen.getByText(/1 of 3 automatic sources complete/)).toBeVisible();
+    expect(screen.queryByRole("progressbar", { name: "Completed sync sources" })).not.toBeInTheDocument();
+    expect(screen.getByText("1 of 4 sync steps complete")).toBeVisible();
+    expect(screen.getByRole("article", { name: "Graph packages" })).toHaveTextContent("Count not reported");
     expect(screen.queryByText("Sync complete")).not.toBeInTheDocument();
     expect(onSetupStatusChange).toHaveBeenLastCalledWith("required");
     await act(async () => { view.rerenderPanel({ active: false }); });

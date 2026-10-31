@@ -66,13 +66,11 @@ describe("exact agent report history", () => {
     expect((await fixture.runtime.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].active_set_id).toBe(second.setId);
   });
 
-  it("identifies the newest report independently of an older shared selection and reads its details consistently", async () => {
+  it("identifies the newest report independently of an older personal selection and reads its details consistently", async () => {
     const scope = newUsageScope(), [record] = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
     const older = await publishUsageReports(fixture.runtime, scope, 442, dates("2026-09-11"));
     const latest = await publishUsageReports(fixture.runtime, scope, 499, dates("2026-10-05"));
-    const imports = new OfficialReportImports(fixture.runtime), identity = await usageIdentity(fixture.runtime, scope);
-    await imports.confirm(identity, await imports.confirmPreview(identity, older.setId, "select"));
-    const selected = await inventorySelectionFixture(fixture.runtime, scope), usage = new OfficialAgentUsage(reports, selected.queries);
+    const selected = await inventorySelectionFixture(fixture.runtime, scope, { setId: older.setId }), usage = new OfficialAgentUsage(reports, selected.queries);
     const history = await usage.history(selected.selection.id, selected.identity, record.id);
     expect(history.context.reportSetId).toBe(older.setId);
     expect(history.latestReportSetId).toBe(latest.setId);
@@ -83,7 +81,7 @@ describe("exact agent report history", () => {
     expect((await usage.associations(selected.selection.id, selected.identity, record.id, { setId: latest.setId })).context).toEqual(summary.context);
     expect((await usage.summaries(selected.selection.id, selected.identity, [record.id]))[0])
       .toMatchObject({ responses: 442, lastActivityDateUtc: "2026-09-11T00:00:00.000Z" });
-    expect((await fixture.runtime.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].active_set_id).toBe(older.setId);
+    expect((await fixture.runtime.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].active_set_id).toBe(latest.setId);
   });
 
   it("uses upload time only when every retained report lacks date metadata", async () => {

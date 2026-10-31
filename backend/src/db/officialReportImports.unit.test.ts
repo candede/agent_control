@@ -6,6 +6,7 @@ import { CursorCodec, type SelectionIdentity } from "../services/dataSelections.
 import { AppError } from "../errors.js";
 import { operationalLog } from "../services/telemetry.js";
 import { currentSchemaSql } from "./currentSchema.js";
+import { unknownOrigin } from "../types/actionOrigin.js";
 
 vi.mock("../services/telemetry.js", async original => ({
   ...await original<typeof import("../services/telemetry.js")>(), operationalLog: vi.fn(),
@@ -136,6 +137,24 @@ describe("stored report correction authorization", () => {
       .rejects.toMatchObject(denied);
   });
 
+  it("rechecks an exact actor-bound receipt when concurrent publication advances the preview head", async () => {
+    const { imports, stages, query } = fixture(), original = query.getMockImplementation()!;
+    for (const stage of stages) stage.source_as_of = stages[0].source_as_of;
+    const reviewed = await imports.bundle(identity, bundleId);
+    let reads = 0;
+    query.mockImplementation(async (text, values) => {
+      if (!String(text).includes("FROM official_usage_bundle_receipts")) return original(text, values);
+      expect(values).toEqual([identity.tenantId, identity.principalId, bundleId, reviewed.bundleHash, reviewed.expectedActiveRevision]);
+      const rows = ++reads === 1 ? [] : [{ result_set_id: bundleId, result_active_revision: "5",
+        deleted_at: null, correction_of_set_id: null }];
+      return { command: "", oid: 0, fields: [], rowCount: rows.length, rows };
+    });
+    vi.spyOn(imports, "bundle").mockResolvedValue({ ...reviewed, expectedActiveRevision: "5", bundleHash: "f".repeat(64) });
+    await expect(imports.acceptBundle(identity, bundleId, reviewed))
+      .resolves.toEqual({ setId: bundleId, activeRevision: "5", complete: true });
+    expect(reads).toBe(2);
+  });
+
   it("blocks correction diagnostics after downgrade before querying companion reports", async () => {
     const { imports, stages, query } = fixture(false), original = query.getMockImplementation()!;
     query.mockImplementation(async (text, values) => {
@@ -233,6 +252,97 @@ describe("semantic-duplicate acceptance receipt authorization without a database
   });
 });
 
+describe("acceptance publication fences without a database", () => {
+  function publication(options: {
+    deletedDuringCopy?: boolean; base?: Record<string, unknown>; companion?: Record<string, unknown>;
+  } = {}) {
+    const { imports, stages, query } = fixture();
+    const stage = { ...stages[0], ...options.base, bundle_id: bundleId, ingestion_id: stages[0].id, owner: bundleId,
+      initiating_origin: unknownOrigin, ingestion_state: "ready", status: "active", pending_version: null };
+    const set = { id: bundleId, actor_principal_id: identity.principalId, supersedes_set_id: null,
+      complete: false, deleted_at: null };
+    vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
+    vi.spyOn(imports.history, "lock").mockResolvedValue("scope");
+    vi.spyOn(imports.history, "lockHead").mockResolvedValue({ active_set_id: null, revision: "4" });
+    vi.spyOn(imports, "cleanupIngestion").mockResolvedValue(0);
+    const original = query.getMockImplementation()!;
+    const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
+    let copied = false;
+    query.mockImplementation(async (text, values) => {
+      const sql = String(text);
+      if (sql.startsWith("SELECT pg_advisory_xact_lock")) return result([]);
+      if (sql.startsWith("SELECT s.*,i.id AS ingestion_id")) return result([stage]);
+      if (sql.startsWith("SELECT count(*)::int AS active")) return result([{ active: 0, tenant: 0 }]);
+      if (sql.startsWith("SELECT * FROM official_usage_sets WHERE tenant_id=")) return result([set]);
+      if (sql.startsWith("SELECT v.* FROM official_usage_set_versions")) return result([]);
+      if (sql.startsWith("SELECT\n        (SELECT count(*)")) return result([{ sets: "1", versions: "0", rows: "0" }]);
+      if (sql.startsWith("SELECT v.id FROM official_usage_versions")) return result([]);
+      if (sql.startsWith("INSERT INTO official_usage_artifacts")) return result([{ id: bundleId }]);
+      if (sql.startsWith("INSERT INTO official_usage_versions")) return result([]);
+      if (sql.startsWith("SELECT * FROM official_usage_ingestions")) return result([{}]);
+      if (sql.startsWith("INSERT INTO official_usage_row_facts")) return result([]);
+      if (sql.startsWith("INSERT INTO official_usage_version_rows")) { copied = true; return result([]); }
+      if (sql.startsWith("SELECT 1 FROM official_usage_sets")) {
+        expect(copied).toBe(true);
+        expect(values).toEqual([set.id, identity.tenantId, identity.principalId]);
+        expect(sql).toContain("NOT complete AND deleted_at IS NULL");
+        expect(sql).toContain("expires_at>clock_timestamp()");
+        expect(sql).toContain("FOR UPDATE");
+        return result(options.deletedDuringCopy ? [] : [{}]);
+      }
+      if (sql.startsWith("SELECT set_config")) return result([]);
+      if (sql.startsWith("SELECT (") && sql.endsWith(" AS complete")) return result([{ complete: true }]);
+      if (sql.startsWith("INSERT INTO official_usage_set_versions")) return result([]);
+      if (sql.startsWith("SELECT m.kind,v.content_hash")) {
+        expect(copied).toBe(true);
+        return result([stage, ...(options.companion ? [{ ...stages[1], ...options.base, ...options.companion }] : [])]);
+      }
+      if (sql.startsWith("UPDATE official_usage_ingestions") || sql.startsWith("UPDATE official_usage_staging")
+        || sql.startsWith("INSERT INTO official_usage_audit")) return result([]);
+      return original(text, values);
+    });
+    const input = { stagingId: stage.id, revision: stage.revision, contentHash: stage.content_hash, expectedActiveRevision: "4" };
+    return { imports, query, input, stage };
+  }
+
+  it("cannot publish into a draft deleted while its rows were being copied", async () => {
+    const { imports, query, input } = publication({ deletedDuringCopy: true });
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ code: "staging_unavailable" });
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("INSERT INTO official_usage_set_versions"))).toBe(false);
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("UPDATE official_usage_staging SET status='accepted'"))).toBe(false);
+    expect(query.mock.calls.map(([text]) => text)).toContain("ROLLBACK");
+  });
+
+  it.each([
+    { source_as_of: new Date("2026-02-02T00:00:00Z") },
+    { source_as_of: new Date("2026-02-01T00:00:00Z"), source_as_of_provenance: "source_metadata", source_freshness: "known" },
+    { source_as_of: new Date("2026-02-01T00:00:00Z"), period_provenance: "operator_asserted",
+      reporting_start: "2026-01-26", reporting_end: "2026-02-01" },
+  ])("rechecks a companion accepted during copying against its observation base: %j", async companion => {
+    const { imports, query, input } = publication({ companion });
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ code: "incompatible_bundle" });
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("UPDATE official_usage_staging SET status='accepted'"))).toBe(false);
+    expect(query.mock.calls.map(([text]) => text)).toContain("ROLLBACK");
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("UPDATE official_usage_ingestions SET state='ready'"))).toBe(true);
+  });
+
+  it("still accepts a compatible companion published while the rows were being copied", async () => {
+    const { imports, input } = publication({ companion: { source_as_of: new Date("2026-02-01T00:00:00Z"),
+      reporting_start: "2026-01-26", reporting_end: "2026-02-01" } });
+    await expect(imports.accept(identity, input)).resolves.toEqual({ setId: bundleId, activeRevision: "4", complete: false });
+  });
+
+  it("also rejects a concurrent companion with a different asserted reporting window", async () => {
+    const { imports, query, input } = publication({
+      base: { period_provenance: "operator_asserted", reporting_start: "2026-01-26", reporting_end: "2026-02-01" },
+      companion: { source_as_of: new Date("2026-02-01T00:00:00Z"),
+        reporting_start: "2026-01-25", reporting_end: "2026-01-31" },
+    });
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ code: "incompatible_bundle" });
+    expect(query.mock.calls.map(([text]) => text)).toContain("ROLLBACK");
+  });
+});
+
 describe("bundle validation and cleanup inspection without a database", () => {
   it("preserves normal validation of incompatible observation metadata", async () => {
     const { imports } = fixture();
@@ -247,6 +357,10 @@ describe("bundle validation and cleanup inspection without a database", () => {
       vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
       vi.spyOn(imports.history, "lock").mockResolvedValue("scope");
       const invalidate = vi.spyOn(imports.history, "invalidate").mockResolvedValue(undefined);
+      vi.spyOn(imports.history, "reconcileHead").mockImplementation(async () => {
+        active = null;
+        return { active_set_id: null, revision: "5" };
+      });
       const original = query.getMockImplementation()!;
       const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
       const confirmations: unknown[][] = [];
@@ -306,14 +420,14 @@ describe("bundle validation and cleanup inspection without a database", () => {
 
     it("canonicalizes a confirmed deletion before comparing the active report pointer", async () => {
       const { imports, invalidate } = canonicalIntent();
-      const preview = await imports.confirmPreview(identity, id.toUpperCase(), "delete");
-      expect(await imports.confirm(identity, preview)).toMatchObject({ activeSetId: null });
+      const preview = await imports.previewDeletion(identity, id.toUpperCase());
+      expect(await imports.confirmDeletion(identity, preview)).toMatchObject({ activeSetId: null });
       expect(preview.setId).toBe(id);
       expect(invalidate).toHaveBeenCalledWith(expect.any(pg.Client), identity.tenantId, id, true);
     });
 
     it("freezes confirmation intent before asynchronous authority checks", async () => {
-      const { imports, query, invalidate } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "delete");
+      const { imports, query, invalidate } = canonicalIntent(), input = await imports.previewDeletion(identity, id);
       const original = query.getMockImplementation()!;
       query.mockImplementation(async (text, values) => {
         const value = await original(text, values);
@@ -322,30 +436,42 @@ describe("bundle validation and cleanup inspection without a database", () => {
         }
         return value;
       });
-      expect(await imports.confirm(identity, input)).toMatchObject({ activeSetId: null });
+      expect(await imports.confirmDeletion(identity, input)).toMatchObject({ activeSetId: null });
       expect(invalidate).toHaveBeenCalledWith(expect.any(pg.Client), identity.tenantId, id, true);
     });
 
     it("rejects inherited or accessor confirmation identity without reading it", async () => {
-      const { imports, query } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "select");
+      const { imports, query } = canonicalIntent(), input = await imports.previewDeletion(identity, id);
       query.mockClear();
       const getter = vi.fn(() => id);
       const accessor = { ...input };
       Object.defineProperty(accessor, "setId", { enumerable: true, get: getter });
       for (const value of [Object.create(input), accessor]) {
-        await expect(async () => imports.confirm(identity, value as ReportConfirmation)).rejects.toMatchObject({ status: 400 });
+        await expect(async () => imports.confirmDeletion(identity, value as ReportConfirmation)).rejects.toMatchObject({ status: 400 });
       }
       expect(getter).not.toHaveBeenCalled();
       expect(query).not.toHaveBeenCalled();
     });
 
     it.each(["9223372036854775808", "9999999999999999999", "01"])("rejects an unrepresentable or noncanonical revision %s before persistence", async value => {
-      const { imports, query } = canonicalIntent(), input = await imports.confirmPreview(identity, id, "select");
+      const { imports, query } = canonicalIntent(), input = await imports.previewDeletion(identity, id);
       query.mockClear();
-      await expect(async () => imports.confirm(identity, { ...input, historyRevision: value }))
+      await expect(async () => imports.confirmDeletion(identity, { ...input, historyRevision: value }))
         .rejects.toMatchObject({ status: 400, code: "invalid_import_confirmation" });
       await expect(async () => imports.acceptBundle(identity, id, { bundleHash: "a".repeat(64), expectedActiveRevision: value }))
         .rejects.toMatchObject({ status: 400, code: "invalid_import_confirmation" });
+      expect(query).not.toHaveBeenCalled();
+    });
+    it("does not accept the removed tenant selection or bundle preservation contracts", async () => {
+      const { imports, query } = canonicalIntent(), input = await imports.previewDeletion(identity, id);
+      query.mockClear();
+      await expect(async () => imports.confirmDeletion(identity, { ...input, operation: "select" } as unknown as ReportConfirmation))
+        .rejects.toMatchObject({ status: 400, code: "invalid_operation" });
+      for (const preserveSelection of [true, false, undefined, null]) {
+        await expect(async () => imports.acceptBundle(identity, id, {
+          bundleHash: "a".repeat(64), expectedActiveRevision: "4", preserveSelection,
+        })).rejects.toMatchObject({ status: 400, code: "invalid_import_intent" });
+      }
       expect(query).not.toHaveBeenCalled();
     });
   });

@@ -46,6 +46,7 @@ export type AgentRouteState = {
   inventorySnapshotId?: string;
   selectedPowerPlatformIds: string[];
   quarantineJobId?: string;
+  reportSetId?: string;
 };
 
 export type AuditRouteState = {
@@ -213,6 +214,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     inventorySnapshotId: durableRouteId(params.get("inventorySnapshot"), 64),
     selectedPowerPlatformIds: [...new Set(params.getAll("selectedResource").map(agentRecordId).filter(value => value !== undefined))].slice(0, 25),
     quarantineJobId: durableRouteId(params.get("quarantineJob")),
+    reportSetId: durableRouteId(params.get("snapshot")),
   };
 }
 
@@ -260,6 +262,7 @@ export function agentRouteSearch(state: AgentRouteState) {
   setDurableRouteId(params, "inventorySnapshot", state.inventorySnapshotId, 64);
   for (const id of [...new Set(state.selectedPowerPlatformIds.map(agentRecordId).filter(value => value !== undefined))].slice(0, 25)) params.append("selectedResource", id);
   setDurableRouteId(params, "quarantineJob", state.quarantineJobId);
+  setDurableRouteId(params, "snapshot", state.reportSetId);
   if (state.selectionStorage === "session" && boundedSelectionCount(String(state.selectionCount)) !== undefined) {
     params.set("selectionState", "session");
     params.set("selectionCount", String(state.selectionCount));

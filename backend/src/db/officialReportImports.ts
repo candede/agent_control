@@ -24,7 +24,7 @@ import { operationalLog } from "../services/telemetry.js";
 type Lease = { id: string; owner: string; identity: SelectionIdentity; origin: import("../types/actionOrigin.js").AuditOriginV1 };
 export type ReportImportIntent = { bundleId: string; correctionOfSetId?: string; rejectDuplicateKind?: boolean };
 export type ReportAcceptance = { stagingId: string; revision: number; contentHash: string; expectedActiveRevision: string };
-export type ReportConfirmation = { id: string; setId: string; operation: "select" | "delete"; activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };
+export type ReportConfirmation = { id: string; setId: string; operation: "delete"; activeRevision: string; historyRevision: string; historyEpoch: string; hash: string };
 const unavailable = () => new AppError(409, "staging_unavailable", "The report preview is unavailable or its lease was fenced.");
 class AcceptancePending extends Error {
   constructor(readonly deadline: number) { super("official_report_acceptance_pending"); }
@@ -113,11 +113,6 @@ export class OfficialReportImports {
     if (!row) throw unavailable();
     return row;
   }
-  private async tenant(client: pg.PoolClient, tenantId: string) {
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`official-usage:${tenantId}`]);
-    await client.query("INSERT INTO official_usage_state(tenant_id) VALUES($1) ON CONFLICT DO NOTHING", [tenantId]);
-    return (await client.query("SELECT active_set_id,revision::text FROM official_usage_state WHERE tenant_id=$1 FOR UPDATE", [tenantId])).rows[0];
-  }
   private async quotas(client: pg.PoolClient, identity: SelectionIdentity, bundleId: string, extra: number) {
     const row = (await client.query(`SELECT COALESCE(sum(stored_bytes),0)::text AS tenant,
       COALESCE(sum(stored_bytes) FILTER(WHERE principal_id=$2),0)::text AS actor,
@@ -142,7 +137,7 @@ export class OfficialReportImports {
     await this.connections.run(async client => {
       await this.authorize(client, identity);
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
-      await this.tenant(client, identity.tenantId);
+      await this.history.lockHead(client, identity.tenantId);
       const counts = (await client.query(`SELECT count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END)::int AS n,
         count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END) FILTER(WHERE tenant_id=$1)::int AS tenant
         FROM official_usage_ingestions WHERE state IN ('streaming','validating','accepting') AND lease_until>clock_timestamp()`,
@@ -210,7 +205,7 @@ export class OfficialReportImports {
           const finalized = await this.finalize(lease, result, metadata, heartbeat.signal);
           await heartbeat.pause();
           const replaced = await this.connections.run(async client => {
-            await this.tenant(client, identity.tenantId);
+            await this.history.lockHead(client, identity.tenantId);
             await this.fence(client, lease);
             const previous = (await client.query(`SELECT id,staging_id FROM official_usage_ingestions WHERE tenant_id=$1 AND bundle_id=$2
               AND kind=$3 AND id<>$4 AND state='ready' AND expires_at>clock_timestamp() FOR UPDATE`,
@@ -242,7 +237,7 @@ export class OfficialReportImports {
 
   private append(lease: Lease, kind: OfficialUsageReportKind, rows: readonly OfficialRow[], wireBytes: number, signal: AbortSignal) {
     return this.connections.run(async client => {
-      await this.tenant(client, lease.identity.tenantId);
+      await this.history.lockHead(client, lease.identity.tenantId);
       const current = await this.fence(client, lease);
       if (current.kind && current.kind !== kind) throw unavailable();
       const previous = (await client.query(`SELECT id,state,staging_id FROM official_usage_ingestions WHERE tenant_id=$1 AND bundle_id=$2 AND kind=$3 AND id<>$4
@@ -298,7 +293,7 @@ export class OfficialReportImports {
     }
     const contentHash = hash.digest("hex"), id = randomUUID();
     const preview = await this.connections.run(async client => {
-      const state = await this.tenant(client, lease.identity.tenantId);
+      const state = await this.history.lockHead(client, lease.identity.tenantId);
       const upload = await this.fence(client, lease);
       const sums = (await client.query(`SELECT count(*)::text AS rows,
         sum(COALESCE((row_data->>'responsesSentToUsers')::numeric,(row_data->>'agentResponsesReceived')::numeric,0))::text AS responses,
@@ -389,37 +384,43 @@ export class OfficialReportImports {
 
   acceptBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     bundleId = reportUuid(bundleId);
-    const supplied = ownIntent(input, ["bundleHash", "expectedActiveRevision"], ["preserveSelection"]);
-    if (supplied.preserveSelection !== undefined && typeof supplied.preserveSelection !== "boolean") {
-      throw new AppError(400, "invalid_import_intent", "Preserving the report selection must be a boolean.");
+    const supplied = ownIntent(input, ["bundleHash", "expectedActiveRevision"]);
+    if (Reflect.ownKeys(input).some(key => typeof key !== "string"
+      || !["bundleHash", "expectedActiveRevision", "bundleId", "stages", "complete"].includes(key))) {
+      throw new AppError(400, "invalid_import_intent", "Unsupported bundle acceptance field.");
     }
     input = {
       bundleHash: confirmationHash(supplied.bundleHash),
       expectedActiveRevision: revision(supplied.expectedActiveRevision),
-      ...(supplied.preserveSelection === undefined ? {} : { preserveSelection: supplied.preserveSelection }),
     };
     return settleAcceptance(() => this.acceptReviewedBundle(identity, bundleId, input, signal), signal);
   }
   private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
-    const receipt = await this.connections.selectedRead(async client => {
-      await this.authorize(client, identity);
-      return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at,r.correction_of_set_id FROM official_usage_bundle_receipts r
-        JOIN official_usage_sets s ON s.id=r.result_set_id AND s.tenant_id=r.tenant_id
-        WHERE r.tenant_id=$1 AND r.actor_principal_id=$2 AND r.bundle_id=$3 AND r.bundle_hash=$4
-          AND r.expected_active_revision=$5 AND r.expires_at>clock_timestamp()`,
-      [identity.tenantId, identity.principalId, reportUuid(bundleId), input.bundleHash, input.expectedActiveRevision])).rows[0];
-    });
-    if (receipt) {
+    const acceptedReceipt = async () => {
+      const receipt = await this.connections.selectedRead(async client => {
+        await this.authorize(client, identity);
+        return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at,r.correction_of_set_id FROM official_usage_bundle_receipts r
+          JOIN official_usage_sets s ON s.id=r.result_set_id AND s.tenant_id=r.tenant_id
+          WHERE r.tenant_id=$1 AND r.actor_principal_id=$2 AND r.bundle_id=$3 AND r.bundle_hash=$4
+            AND r.expected_active_revision=$5 AND r.expires_at>clock_timestamp()`,
+        [identity.tenantId, identity.principalId, reportUuid(bundleId), input.bundleHash, input.expectedActiveRevision])).rows[0];
+      });
+      if (!receipt) return null;
       this.requireCorrectionAccess(receipt.correction_of_set_id);
       if (receipt.deleted_at) throw new AppError(409, "deleted_report_duplicate", "This accepted report was deleted.");
       return { setId: receipt.result_set_id as string, activeRevision: receipt.result_active_revision as string, complete: true };
-    }
+    };
+    const receipt = await acceptedReceipt();
+    if (receipt) return receipt;
     const preview = await this.bundle(identity, bundleId);
     if (!preview.complete || preview.bundleHash !== input.bundleHash || preview.expectedActiveRevision !== input.expectedActiveRevision) {
+      // Publication may have advanced the head between the receipt and preview snapshots.
+      const committed = await acceptedReceipt();
+      if (committed) return committed;
       throw new AppError(409, "bundle_fence_mismatch", "Review the current complete bundle before accepting.");
     }
     return this.acceptStages(identity, preview.stages.map(stage => ({ ...stage, expectedActiveRevision: input.expectedActiveRevision })), signal,
-      { bundleId, hash: input.bundleHash, preserveSelection: input.preserveSelection });
+      { bundleId, hash: input.bundleHash });
   }
   accept(identity: SelectionIdentity, input: ReportAcceptance, signal?: AbortSignal) {
     const supplied = ownIntent(input, ["contentHash", "stagingId", "revision", "expectedActiveRevision"]);
@@ -458,14 +459,14 @@ export class OfficialReportImports {
       stages.at(-1)!.version, result.activeRevision, result.complete, stages[0].correction_of_set_id]);
   }
 
-  private async acceptStages(identity: SelectionIdentity, inputs: readonly ReportAcceptance[], parent?: AbortSignal, bundle?: { bundleId: string; hash: string; preserveSelection?: boolean }) {
+  private async acceptStages(identity: SelectionIdentity, inputs: readonly ReportAcceptance[], parent?: AbortSignal, bundle?: { bundleId: string; hash: string }) {
     if (!inputs.length || inputs.length > 3) throw unavailable();
     await this.history.ensure(identity.tenantId);
     const prepared = await this.connections.run(async client => {
       await this.authorize(client, identity);
       await client.query("SELECT pg_advisory_xact_lock(3650147)");
       await this.history.lock(client, identity.tenantId);
-      const state = await this.tenant(client, identity.tenantId);
+      const state = await this.history.lockHead(client, identity.tenantId);
       const stages: pg.QueryResultRow[] = [];
       let acceptedBundle: string | undefined;
       let receipt: { setId: string; activeRevision: string; complete: boolean } | undefined;
@@ -638,8 +639,11 @@ export class OfficialReportImports {
       const result = await measurePublication(publicationKind,() => this.connections.run(async client => {
         await this.authorize(client, identity);
         await this.history.lock(client, identity.tenantId);
-        const state = await this.tenant(client, identity.tenantId);
+        const state = await this.history.lockHead(client, identity.tenantId);
         if (state.revision !== inputs[0].expectedActiveRevision) throw new AppError(409, "active_revision_mismatch", "Active selection changed during validation.");
+        if (!(await client.query(`SELECT 1 FROM official_usage_sets WHERE id=$1 AND tenant_id=$2 AND actor_principal_id=$3
+          AND NOT complete AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp()) FOR UPDATE`,
+        [prepared.setId, identity.tenantId, identity.principalId])).rowCount) throw unavailable();
         if (prepared.correctionOf && !(await client.query(`SELECT 1 FROM official_usage_sets WHERE id=$1 AND tenant_id=$2
           AND complete AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at>clock_timestamp())`,
         [prepared.correctionOf, identity.tenantId])).rowCount) throw new AppError(409, "invalid_correction", "The correction target became unavailable during acceptance.");
@@ -652,8 +656,10 @@ export class OfficialReportImports {
           await client.query("INSERT INTO official_usage_set_versions(set_id,tenant_id,kind,version_id) VALUES($1,$2,$3,$4)",
             [prepared.setId, identity.tenantId, stage.kind, stage.version]);
         }
-        const versions = (await client.query(`SELECT m.kind,v.content_hash,v.reporting_start::text,v.reporting_end::text FROM official_usage_set_versions m
+        const versions = (await client.query(`SELECT m.kind,v.content_hash,v.reporting_start::text,v.reporting_end::text,
+          v.period_provenance,v.source_as_of_provenance,v.source_as_of FROM official_usage_set_versions m
           JOIN official_usage_versions v ON v.id=m.version_id WHERE m.set_id=$1 AND m.tenant_id=$2 ORDER BY m.kind`, [prepared.setId, identity.tenantId])).rows;
+        compatible(versions);
         let setId = prepared.setId!, complete = versions.length === 3;
         let revision = state.revision as string;
         if (complete) {
@@ -667,18 +673,8 @@ export class OfficialReportImports {
             const ends = versions.map(row => row.reporting_end as string | null).filter((value): value is string => value !== null).sort();
             await client.query(`UPDATE official_usage_sets SET complete=true,accepted_at=clock_timestamp(),content_hash=$2,reporting_start=$3,reporting_end=$4
               WHERE id=$1`, [setId, contentHash, starts[0] ?? null, ends.at(-1) ?? null]);
-            const historyRevision = await this.history.accepted(client, identity.tenantId, setId, prepared.correctionOf);
-            // History survives deletion, so later imports cannot reset the first-report exception.
-            const firstReport = historyRevision === "1" && !state.active_set_id;
-            const activePeriod = state.active_set_id && !prepared.correctionOf ? (await client.query(
-              "SELECT reporting_start::text,reporting_end::text FROM official_usage_sets WHERE tenant_id=$1 AND id=$2",
-              [identity.tenantId, state.active_set_id])).rows[0] : undefined;
-            const backfill = activePeriod?.reporting_end && (!ends.length
-              || `${ends.at(-1)}/${starts[0] ?? ""}` < `${activePeriod.reporting_end}/${activePeriod.reporting_start ?? ""}`);
-            if (firstReport || !bundle?.preserveSelection && (!state.active_set_id || prepared.correctionOf === state.active_set_id || !prepared.correctionOf && !backfill)) {
-              revision = (await client.query(`UPDATE official_usage_state SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp()
-                WHERE tenant_id=$1 RETURNING revision::text`, [identity.tenantId, setId])).rows[0].revision;
-            }
+            await this.history.accepted(client, identity.tenantId, setId, prepared.correctionOf);
+            revision = (await this.history.reconcileHead(client, identity.tenantId)).revision;
           }
         }
         const result = { setId, activeRevision: revision, complete };
@@ -695,15 +691,15 @@ export class OfficialReportImports {
     } finally { await heartbeat.stop(); }
   }
 
-  async confirmPreview(identity: SelectionIdentity, setId: string, operation: "select" | "delete"): Promise<ReportConfirmation> {
+  async previewDeletion(identity: SelectionIdentity, setId: string): Promise<ReportConfirmation> {
     setId = reportUuid(setId);
-    if (!["select", "delete"].includes(operation)) throw new AppError(400, "invalid_operation", "Unsupported operation.");
+    const operation = "delete" as const;
     await this.history.ensure(identity.tenantId);
     return this.connections.run(async client => {
       await this.authorize(client, identity);
       await this.history.lock(client, identity.tenantId);
-      const active = await this.tenant(client, identity.tenantId);
-      await this.confirmable(client, identity, setId, operation);
+      const active = await this.history.lockHead(client, identity.tenantId);
+      await this.confirmable(client, identity, setId);
       const history = (await client.query("SELECT revision::text,invalidation_epoch::text FROM official_usage_history_state WHERE tenant_id=$1", [identity.tenantId])).rows[0];
       const result = { id: randomUUID(), setId, operation, activeRevision: active.revision as string,
         historyRevision: history.revision as string, historyEpoch: history.invalidation_epoch as string };
@@ -714,9 +710,9 @@ export class OfficialReportImports {
       return { ...result, hash };
     });
   }
-  confirm(identity: SelectionIdentity, input: ReportConfirmation) {
+  confirmDeletion(identity: SelectionIdentity, input: ReportConfirmation) {
     const supplied = ownIntent(input, ["hash", "id", "setId", "operation", "activeRevision", "historyRevision", "historyEpoch"]);
-    if (supplied.operation !== "select" && supplied.operation !== "delete") throw new AppError(400, "invalid_operation", "Unsupported operation.");
+    if (supplied.operation !== "delete") throw new AppError(400, "invalid_operation", "Unsupported operation.");
     input = { id: reportUuid(supplied.id), setId: reportUuid(supplied.setId), operation: supplied.operation,
       activeRevision: revision(supplied.activeRevision), historyRevision: revision(supplied.historyRevision),
       historyEpoch: revision(supplied.historyEpoch), hash: confirmationHash(supplied.hash) };
@@ -726,37 +722,28 @@ export class OfficialReportImports {
     return this.connections.run(async client => {
       await this.authorize(client, identity);
       await this.history.lock(client, identity.tenantId);
-      const active = await this.tenant(client, identity.tenantId);
+      const active = await this.history.lockHead(client, identity.tenantId);
       const valid = (await client.query(`SELECT c.id FROM official_usage_confirmations c JOIN official_usage_history_state h ON h.tenant_id=c.tenant_id
         WHERE c.id=$1 AND c.tenant_id=$2 AND c.actor_principal_id=$3 AND c.operation=$4 AND c.target_set_id=$5 AND c.expected_revision=$6
           AND c.confirmation_hash=$7 AND c.history_revision=$8 AND c.history_epoch=$9 AND c.history_revision=h.revision
           AND c.history_epoch=h.invalidation_epoch AND c.expires_at>clock_timestamp() AND c.consumed_at IS NULL FOR UPDATE OF c`,
       [input.id, identity.tenantId, identity.principalId, input.operation, input.setId, input.activeRevision, input.hash, input.historyRevision, input.historyEpoch])).rowCount;
       if (!valid || active.revision !== input.activeRevision) throw new AppError(409, "confirmation_mismatch", "Review a new immutable confirmation.");
-      await this.confirmable(client, identity, input.setId, input.operation);
-      if (input.operation === "delete") {
-        await this.history.invalidate(client, identity.tenantId, input.setId, true);
-        await client.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2", [input.setId, identity.tenantId]);
-        await retireUnreferencedReportVersions(client, identity.tenantId, input.setId);
-        await retainDeletedReportRows(client, 250, { tenantId: identity.tenantId, setId: input.setId });
-        if (active.active_set_id === input.setId) await client.query(`UPDATE official_usage_state SET active_set_id=NULL,revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1`, [identity.tenantId]);
-      } else await client.query(`UPDATE official_usage_state SET active_set_id=$2,revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1`, [identity.tenantId, input.setId]);
+      await this.confirmable(client, identity, input.setId);
+      await this.history.invalidate(client, identity.tenantId, input.setId, true);
+      await client.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2", [input.setId, identity.tenantId]);
+      await retireUnreferencedReportVersions(client, identity.tenantId, input.setId);
+      await retainDeletedReportRows(client, 250, { tenantId: identity.tenantId, setId: input.setId });
+      await this.history.reconcileHead(client, identity.tenantId);
       await client.query("UPDATE official_usage_confirmations SET consumed_at=clock_timestamp() WHERE id=$1", [input.id]);
-      await this.audit(client, identity, input.operation === "delete" ? "deleted" : "selected", null, input.setId, null);
+      await this.audit(client, identity, "deleted", null, input.setId, null);
       return (await client.query(`SELECT active_set_id AS "activeSetId",revision::text AS "activeRevision" FROM official_usage_state WHERE tenant_id=$1`, [identity.tenantId])).rows[0];
     });
   }
 
-  private async confirmable(client: pg.PoolClient, identity: SelectionIdentity, setId: string, operation: "select" | "delete") {
-    await client.query("SELECT set_config('jit','off',true)");
-    const valid = await client.query(`SELECT 1 FROM official_usage_sets s WHERE s.id=$1 AND s.tenant_id=$2 AND s.deleted_at IS NULL
-      AND ($3='delete' OR (s.complete AND (s.expires_at IS NULL OR s.expires_at>clock_timestamp())
-        AND EXISTS(SELECT 1 FROM official_usage_history_memberships m WHERE m.tenant_id=s.tenant_id AND m.set_id=s.id AND m.valid_to_revision IS NULL)
-        AND 3=(SELECT count(*) FROM official_usage_set_versions sv JOIN official_usage_versions v ON v.id=sv.version_id AND v.tenant_id=sv.tenant_id
-          JOIN official_usage_artifacts a ON a.id=v.artifact_id AND a.tenant_id=v.tenant_id
-          WHERE sv.set_id=s.id AND sv.tenant_id=s.tenant_id AND v.deleted_at IS NULL
-            AND (LEAST(v.expires_at,a.expires_at) IS NULL OR LEAST(v.expires_at,a.expires_at)>clock_timestamp())
-            AND ${completeReportVersionSql("v.id","v.tenant_id","v.kind","v.row_count")}) ))`, [setId, identity.tenantId, operation]);
+  private async confirmable(client: pg.PoolClient, identity: SelectionIdentity, setId: string) {
+    const valid = await client.query(`SELECT 1 FROM official_usage_sets s
+      WHERE s.id=$1 AND s.tenant_id=$2 AND s.deleted_at IS NULL`, [setId, identity.tenantId]);
     if (!valid.rowCount) throw unavailable();
   }
 
@@ -877,7 +864,7 @@ export class OfficialReportImports {
         return rows + staged;
       });
   }
-  private async audit(client: pg.PoolClient, identity: SelectionIdentity, action: "staged" | "accepted" | "selected" | "deleted" | "discarded", kind: OfficialUsageReportKind | null, id: string, rows: number | null, origin = currentActionOrigin()) {
+  private async audit(client: pg.PoolClient, identity: SelectionIdentity, action: "staged" | "accepted" | "deleted" | "discarded", kind: OfficialUsageReportKind | null, id: string, rows: number | null, origin = currentActionOrigin()) {
     await client.query(`INSERT INTO official_usage_audit(id,tenant_id,actor_principal_id,action,target_kind,target_id,row_count,outcome,origin)
       VALUES($1,$2,$3,$4,$5,$6,$7,'succeeded',$8)`, [randomUUID(), identity.tenantId, identity.principalId, action, kind, id, rows, origin]);
   }

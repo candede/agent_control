@@ -528,6 +528,7 @@ async function verifyInventoryRefreshContractSchema(database: Pick<pg.Pool, "que
 }
 
 async function verifyOfficialReportSchema(database: Pick<pg.Pool, "query">) {
+  const associationGuard = currentSchemaSql.match(/CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?AS \$\$([\s\S]*?)\$\$;/)![1];
   const result = await database.query(`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='official_usage_row_facts'
       AND column_name='responses' AND data_type='bigint')
     AND (SELECT count(*)=6 FROM pg_indexes WHERE schemaname='public' AND indexname IN
@@ -540,10 +541,15 @@ async function verifyOfficialReportSchema(database: Pick<pg.Pool, "query">) {
     AND (SELECT count(*)=5 FROM information_schema.tables WHERE table_schema='public' AND table_name IN(
       'official_usage_history_state','official_usage_history_memberships','official_usage_ingestions','official_usage_ingestion_rows','official_usage_read_contexts'))
     AND (SELECT count(*)=2 FROM pg_constraint WHERE conname IN ('official_usage_typed_fact','official_usage_typed_payload') AND convalidated)
+    AND EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='official_usage_confirmations'::regclass
+      AND conname='official_usage_confirmations_operation_check' AND contype='c' AND convalidated
+      AND pg_get_expr(conbin,conrelid)='(operation = ''delete''::text)')
+    AND EXISTS(SELECT 1 FROM pg_proc WHERE oid='protect_agent_usage_association()'::regprocedure
+      AND prosrc=$1 AND NOT prosecdef AND proconfig=ARRAY['search_path=pg_catalog, public, pg_temp'])
     AND has_table_privilege(current_user,'official_usage_history_memberships','SELECT,INSERT,UPDATE,DELETE')
     AND has_table_privilege(current_user,'official_usage_ingestion_rows','SELECT,INSERT,DELETE')
     AND (current_user<>'agentcontrol_app' OR NOT has_any_column_privilege(current_user,'official_usage_read_contexts','UPDATE'))
-    AS valid`);
+    AS valid`, [associationGuard]);
   if (!result.rows[0]?.valid) throw new Error("Official report schema is invalid.");
 }
 

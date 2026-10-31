@@ -266,6 +266,7 @@ export type UnifiedAgentInventoryHealth = Pick<UnifiedAgentInventoryPage,
   "freshness" | "summary" | "verification" | "identityCollection" | "sources" | "partial" | "errors">;
 
 export type UnifiedAgentInventoryQuery = {
+  setId?: string;
   /** Defaults to all for exact reads and other non-UI consumers. */
   inventoryScope?: UnifiedAgentInventoryScope;
   /** Exact saved Graph package type; no inferred publisher or management classification. */

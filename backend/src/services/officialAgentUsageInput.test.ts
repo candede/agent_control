@@ -146,6 +146,9 @@ describe("exact usage mutation input", () => {
       const lock = vi.spyOn(inventoryAuthority, "lockInventorySelection").mockResolvedValue(undefined);
       vi.spyOn(reports.selections, "assert").mockResolvedValue({ selection: {}, pins: [] });
       vi.spyOn(reports, "contextInRead").mockResolvedValue(context);
+      vi.spyOn(reports.history, "lock").mockResolvedValue("history-scope");
+      vi.spyOn(reports.history, "lockHead").mockResolvedValue({ active_set_id: removal.selectionId, revision: "9" });
+      const readable = vi.spyOn(reports, "reportForSelection").mockResolvedValue(metadata);
       vi.spyOn(reports.history.connections, "run").mockImplementation(work => work(client));
       const start = vi.spyOn(AuditLog.prototype, "startEvent").mockImplementation(async intent =>
         ({ ...intent, id: "review-event", startedAt: now.toISOString(), status: "started" }));
@@ -158,6 +161,7 @@ describe("exact usage mutation input", () => {
         inventoryRevision: digest(JSON.stringify(["inventory-control-v1", identity.tenantId, identity.principalId, agentId, control])), target };
       const result = await new OfficialAgentUsage(reports).mutate(identity, unifiedAgentRecordId(target), input, actor);
       expect(result.reportSetId).toBe(removal.reportSetId);
+      expect(readable).toHaveBeenCalledWith(client, expect.objectContaining({ evaluatedAt: now }), removal.reportSetId);
       expect(result.usageRevision).not.toBe(input.usageRevision);
       expect(lock).toHaveBeenCalledWith(client, identity, removal.selectionId);
       expect(query).toHaveBeenCalledWith(expect.stringContaining("INSERT INTO agent_usage_associations"),

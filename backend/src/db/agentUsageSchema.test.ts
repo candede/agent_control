@@ -96,7 +96,7 @@ describe("usage association schema and runtime boundary", () => {
     ]);
   });
 
-  it("requires exact tenant, active Agents identity and a current tenant source independently of the reviewer", async () => {
+  it("requires exact tenant, published Agents identity and a current tenant source independently of the reviewer", async () => {
     const scope = newUsageScope();
     await saveUsageInventory(fixture.runtime, scope);
     const report = await publishUsageReports(fixture.runtime, scope);
@@ -118,6 +118,22 @@ describe("usage association schema and runtime boundary", () => {
     await fixture.runtime.query("DELETE FROM agent_usage_associations WHERE tenant_id=$1 AND report_set_id=$2 AND report_agent_id='Report-A'", [scope.tenantId, report.setId]);
     await insert();
     expect((await fixture.runtime.query("SELECT revision::text FROM agent_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].revision).toBe("3");
+  });
+  it("permits readable historical report associations but rejects expired report evidence without relying on the default head", async () => {
+    const scope = newUsageScope();
+    await saveUsageInventory(fixture.runtime, scope);
+    const historical = await publishUsageReports(fixture.runtime, scope);
+    const latest = await publishUsageReports(fixture.runtime, scope, 11);
+    const insert = (reportAgentId: string) => fixture.runtime.query(`INSERT INTO agent_usage_associations
+      (tenant_id,report_set_id,report_agent_id,source,native_id,environment_id,reviewed_by)
+      VALUES($1,$2,$3,'graph_packages','Package-A','',$4)`,
+    [scope.tenantId, historical.setId, reportAgentId, scope.principalId]);
+    await insert("Report-A");
+    expect((await fixture.runtime.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1", [scope.tenantId])).rows[0].active_set_id)
+      .toBe(latest.setId);
+    await fixture.operator.query(`UPDATE official_usage_versions SET expires_at=clock_timestamp()-interval '1 second'
+      WHERE id=(SELECT version_id FROM official_usage_set_versions WHERE set_id=$1 AND kind='agents')`, [historical.setId]);
+    await expect(insert("Report-B")).rejects.toThrow("readable published Agents export");
   });
 
   it("rejects association inserts after canonical identity authority expires while publications remain current", async () => {

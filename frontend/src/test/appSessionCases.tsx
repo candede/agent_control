@@ -547,7 +547,8 @@ export function sessionAndNavigationCases() {
       expect(window.location.href).toBe(url);
       expect(window.history.length).toBe(historyLength);
       await waitFor(() => expect(transport.fetchMock.mock.calls.some(([input]) => isPackageDetailRequest(input, agent.id))).toBe(true));
-      await userEvent.click(within(agentDialog).getByRole("tab", { name: "Manage" }));
+      expect(within(agentDialog).queryByRole("tab", { name: "Manage" })).not.toBeInTheDocument();
+      await userEvent.click(within(agentDialog).getByRole("tab", { name: "Usage" }));
       expect(window.location.href).toBe(url);
       await userEvent.click(within(agentDialog).getByRole("button", { name: "Close unified agent details" }));
       await waitFor(() => expect(agentDialog).not.toBeInTheDocument());
@@ -701,7 +702,7 @@ export function sessionAndNavigationCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(0);
   });
 
-  it("reuses recent Users, Agents, report summaries and selector reads across navigation", async () => {
+  it("reuses recent Users, Agents and report summaries while freshly checking Latest on navigation", async () => {
     unifiedPage.usageContext.reports = selectedAgentsPage().reports;
     const roles: SessionUser["roles"] = ["AgentControl.Admin"];
     const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
@@ -713,23 +714,26 @@ export function sessionAndNavigationCases() {
     await userEvent.click(screen.getByRole("button", { name: "Users" }));
     await screen.findByRole("button", { name: "Ada" });
     await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
-    const paths = ["/api/agent-inventory/selections", "/api/agent-inventory", "/api/copilot-usage/users",
-      "/api/official-usage/overview", "/api/official-usage/history/options"];
+    const paths = ["/api/agent-inventory/selections", "/api/agent-inventory", "/api/copilot-usage/users", "/api/official-usage/overview"];
     const reads = () => transport.fetchMock.mock.calls.filter(([input]) => paths.includes(new URL(input, "http://localhost").pathname)).length;
+    const optionsReads = () => transport.fetchMock.mock.calls.filter(([input]) =>
+      new URL(input, "http://localhost").pathname === "/api/official-usage/history/options").length;
     const before = reads();
+    const beforeOptions = optionsReads();
     for (let index = 0; index < 3; index++) {
       fireEvent.click(screen.getByRole("button", { name: "Agents" }));
       expect(screen.getByText(agent.displayName)).toBeVisible();
-      expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled();
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
       expect(screen.queryByText("Loading selected report evidence...")).not.toBeInTheDocument();
       await act(async () => {});
       fireEvent.click(screen.getByRole("button", { name: "Users" }));
       expect(screen.getByRole("button", { name: "Ada" })).toBeVisible();
       expect(screen.getByRole("button", { name: "Active M365 Copilot licensed users" }).querySelector("strong")).toHaveTextContent("4");
-      expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled();
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
       await act(async () => {});
     }
     expect(reads()).toBe(before);
+    expect(optionsReads()).toBe(beforeOptions + 6);
   });
 
   it("applies captured search before paginating the initial catalog transport", async () => {
@@ -793,7 +797,8 @@ export function sessionAndNavigationCases() {
     expect(await screen.findByRole("searchbox", { name: label })).toHaveValue("Ada");
     const reads = () => transport.fetchMock.mock.calls.filter(([input]) =>
       new URL(input, "http://localhost").pathname === (view === "licenses" ? "/api/copilot-usage/users" : "/api/official-usage/users")).length;
-    expect(reads()).toBe(1);
+    const expectedReads = view === "licenses" ? 2 : 1;
+    expect(reads()).toBe(expectedReads);
     expect(new URLSearchParams(window.location.search).has("unsupported")).toBe(false);
     act(() => {
       window.history.pushState({}, "", `/users?view=${view}&unsupported=4&q=Ada`);
@@ -802,7 +807,7 @@ export function sessionAndNavigationCases() {
     await act(async () => {});
     expect(screen.getByRole("searchbox", { name: label })).toHaveValue("Ada");
     expect(new URLSearchParams(window.location.search).has("unsupported")).toBe(false);
-    expect(reads()).toBe(1);
+    expect(reads()).toBe(expectedReads);
   });
 
   it.each(["AgentControl.Admin", "AgentControl.UsageReportUploader"] as const)(
@@ -840,7 +845,7 @@ export function sessionAndNavigationCases() {
         expect(reviewed?.complete).toBe(true);
         expect(url.pathname.split("/")[4]).toBe(reviewed?.bundleId);
         expect(JSON.parse(String(init?.body))).toEqual({
-          bundleHash: reviewed?.bundleHash, expectedActiveRevision: reviewed?.expectedActiveRevision, preserveSelection: true,
+          bundleHash: reviewed?.bundleHash, expectedActiveRevision: reviewed?.expectedActiveRevision,
         });
         expect(stages.every(stage => stage.status === "active")).toBe(true);
         stages.forEach((stage, index) => { stages[index] = { ...stage, status: "accepted" }; });
@@ -878,32 +883,30 @@ export function sessionAndNavigationCases() {
     expect(transport.fetchMock.mock.calls.filter(([input]) => /\/bundles\/[^/]+\/accept$/.test(input))).toHaveLength(1);
   });
 
-  it.each(["different report", "same report", "no report", "failed inventory"] as const)(
-    "waits for replacement inventory before refreshing its selected report overview (%s)", async outcome => {
+  it.each(["different report", "no report", "failed inventory"] as const)(
+    "waits for replacement inventory after observing an automatic latest-report change (%s)", async outcome => {
     unifiedPage.usageContext.reports = selectedAgentsPage().reports;
     const roles: SessionUser["roles"] = ["AgentControl.Admin"];
     const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles });
     const original = transport.fetchMock.getMockImplementation()!, pending = deferredResponse();
-    const nextSet = outcome === "different report" ? "10000000-0000-4000-8000-000000000099"
-      : outcome === "same report" ? unifiedPage.usageContext.reports.setId : null;
+    const nextSet = outcome === "no report" ? null : "10000000-0000-4000-8000-000000000099";
     const history = selectedHistoryPage();
     const alternate = { ...history.value[0], id: "10000000-0000-4000-8000-000000000099", active: false };
-    let optionsAvailable = false, reloading = false, nextInventory: UnifiedAgentInventoryPage | undefined;
+    let optionsAvailable = false, headChanged = false, reloading = false, nextInventory: UnifiedAgentInventoryPage | undefined;
     transport.fetchMock.mockImplementation(async (input, init) => {
       const url = new URL(input, "http://localhost");
       if (url.pathname === "/api/official-usage/history/options") {
-        return optionsAvailable ? Response.json(selectedHistoryPage([...history.value, alternate]))
-          : Response.json({ code: "service_unavailable", detail: "Report options unavailable" }, { status: 503 });
-      }
-      if (url.pathname === `/api/official-usage/sets/${alternate.id}/preview`) {
-        return Response.json({ code: "selection_invalidated", detail: "Report selection changed" }, { status: 409 });
+        if (!optionsAvailable) return Response.json({ code: "service_unavailable", detail: "Report options unavailable" }, { status: 503 });
+        const options = selectedHistoryPage(headChanged && !nextSet ? [] : [...history.value, alternate]);
+        if (headChanged) options.reports = { ...options.reports, setId: nextSet, activeSetId: nextSet, activeRevision: "5" };
+        return Response.json(options);
       }
       const response = await original(input, init);
       if (url.pathname === "/api/agent-inventory" && reloading) {
         const data = await response.json() as UnifiedAgentInventoryPage;
         nextInventory = { ...data, usageContext: { ...data.usageContext,
           reports: { ...data.usageContext.reports, setId: nextSet, activeSetId: nextSet,
-            availability: nextSet ? "active" : "not_selected" } } };
+            activeRevision: "5", availability: nextSet ? "active" : "not_selected" } } };
         return pending.promise;
       }
       return response;
@@ -921,16 +924,16 @@ export function sessionAndNavigationCases() {
     const beforeRetry = inventoryReads();
     const selector = within(screen.getByRole("region", { name: "Report set selection" }));
     optionsAvailable = true;
-    fireEvent.click(selector.getByRole("button", { name: "Retry" }));
+    fireEvent.click(selector.getByRole("button", { name: "Retry saved data" }));
     await waitFor(() => expect(selector.getByRole("combobox")).toBeEnabled());
     expect(inventoryReads()).toBe(beforeRetry);
     expect(overviewReads()).toHaveLength(1);
-    await userEvent.selectOptions(selector.getByRole("combobox"), alternate.id);
-    await selector.findByRole("alert");
-    reloading = true;
-    fireEvent.click(selector.getByRole("button", { name: "Retry" }));
+    headChanged = true; reloading = true;
+    act(() => window.dispatchEvent(new Event("focus")));
     await waitFor(() => expect(nextInventory).toBeDefined());
-    expect(overviewReads()).toHaveLength(1);
+    expect(overviewReads()).toHaveLength(2);
+    expect(overviewReads().every(([input]) =>
+      new URL(input, "http://localhost").searchParams.get("setId") === history.reports.setId)).toBe(true);
     expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeDisabled();
     expect(summary.getByRole("button", { name: "Show reported used agents" })).toHaveTextContent("Waiting for saved inventory");
     expect(summary.queryByText("Loading selected report evidence...")).not.toBeInTheDocument();
@@ -938,12 +941,12 @@ export function sessionAndNavigationCases() {
       ? Response.json({ code: "service_unavailable", detail: "Replacement inventory unavailable" }, { status: 503 })
       : Response.json(nextInventory)));
     await waitFor(() => expect(summary.queryByText("Waiting for saved inventory before reading report evidence...")).not.toBeInTheDocument());
-    if (nextSet) {
-      await waitFor(() => expect(overviewReads()).toHaveLength(2));
-      expect(new URL(overviewReads()[1][0], "http://localhost").searchParams.get("setId")).toBe(nextSet);
+    if (nextSet && outcome !== "failed inventory") {
+      await waitFor(() => expect(overviewReads()).toHaveLength(3));
+      expect(new URL(overviewReads()[2][0], "http://localhost").searchParams.get("setId")).toBe(nextSet);
       await waitFor(() => expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeEnabled());
     } else {
-      expect(overviewReads()).toHaveLength(1);
+      expect(overviewReads()).toHaveLength(2);
       expect(summary.getByRole("button", { name: "Show reported used agents" })).toBeDisabled();
       expect(summary.getByRole("button", { name: "Show reported used agents" })).toHaveTextContent(
         outcome === "failed inventory" ? "Report context unavailable" : "No selected report data");
@@ -951,7 +954,10 @@ export function sessionAndNavigationCases() {
     }
   });
 
-  it("restores recent catalog and additional Power Platform rows synchronously without new captures", async () => {
+  it.each(["latest", "personal"] as const)("restores recent catalog and additional Power Platform rows synchronously without new captures (%s report)", async mode => {
+    const reportId = selectedAgentsPage().reports.setId!;
+    if (mode === "personal") window.history.replaceState({}, "", `/agents?snapshot=${reportId}`);
+    unifiedPage.usageContext.reports = selectedAgentsPage().reports;
     const native = powerPlatformRecord("22222222-2222-4222-8222-222222222222", "Additional native agent");
     const transport = appTransport({ revalidatedRoles: viewer.roles,
       unifiedResponse: unifiedRecordsPage([unifiedPage.value[0], native]), inventoryReadAuthorized: true });
@@ -974,6 +980,105 @@ export function sessionAndNavigationCases() {
       await act(async () => {});
     }
     expect(reads()).toBe(before);
+  });
+
+  it.each(["different report", "first report", "corrected report", "personal pin"] as const)(
+    "replaces a stale Latest inventory on the first report-options observation (%s)", async outcome => {
+      const initialReports = outcome === "first report" ? unifiedPage.usageContext.reports : selectedAgentsPage().reports;
+      unifiedPage.usageContext.reports = initialReports;
+      if (outcome === "personal pin") window.history.replaceState({}, "", `/agents?snapshot=${initialReports.setId}`);
+      const nextReports = { ...selectedAgentsPage().reports,
+        setId: outcome === "corrected report" ? initialReports.setId : "10000000-0000-4000-8000-000000000099",
+        activeSetId: outcome === "corrected report" ? initialReports.setId : "10000000-0000-4000-8000-000000000099",
+        activeRevision: "5" };
+      const nextOptions = selectedHistoryPage();
+      nextOptions.reports = { ...nextReports, setId: outcome === "personal pin" ? initialReports.setId : nextReports.setId };
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const original = transport.fetchMock.getMockImplementation()!, options = deferredResponse();
+      let observed = false;
+      transport.fetchMock.mockImplementation(async (input, init) => {
+        const url = new URL(input, "http://localhost");
+        if (url.pathname === "/api/official-usage/history/options") {
+          return observed ? Response.json(nextOptions) : options.promise;
+        }
+        const response = await original(input, init);
+        if (url.pathname !== "/api/agent-inventory" || !observed) return response;
+        const data = await response.json() as UnifiedAgentInventoryPage;
+        return Response.json({ ...data, usageContext: { ...data.usageContext, reports: nextReports } });
+      });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeDisabled());
+      const before = agentListRequests(transport.fetchMock).length;
+      observed = true;
+      await act(async () => options.resolve(Response.json(nextOptions)));
+      await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+      if (outcome === "personal pin") {
+        expect(agentListRequests(transport.fetchMock)).toHaveLength(before);
+        expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(initialReports.setId);
+        return;
+      }
+      await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(before + 1));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Show reported used agents" })).toBeEnabled());
+      expect(new URLSearchParams(window.location.search).has("snapshot")).toBe(false);
+      expect(transport.fetchMock.mock.calls.some(([input, init]) =>
+        input === "/api/data-sync/runs" && init?.method === "POST")).toBe(false);
+    },
+  );
+
+  it("shares a personal report choice across Users and Agents URLs without tenant writes", async () => {
+    window.history.replaceState({}, "", "/users?q=Ada");
+    const history = selectedHistoryPage();
+    const older = { ...history.value[0], id: "10000000-0000-4000-8000-000000000099", active: false };
+    unifiedPage.usageContext.reports = history.reports;
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const original = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation(async (input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/official-usage/history/options") {
+        const options = selectedHistoryPage([...history.value, older]);
+        options.reports = { ...options.reports, setId: url.searchParams.get("setId") ?? history.reports.setId };
+        return Response.json(options);
+      }
+      const response = await original(input, init);
+      if (url.pathname !== "/api/agent-inventory") return response;
+      const data = await response.json() as UnifiedAgentInventoryPage;
+      return Response.json({ ...data, usageContext: { ...data.usageContext,
+        reports: { ...data.usageContext.reports, setId: selectedInventoryUrl(input).searchParams.get("setId") ?? history.reports.setId } } });
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Ada" });
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Report set" }), older.id);
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(older.id);
+    expect(new URLSearchParams(window.location.search).get("q")).toBe("Ada");
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await screen.findByText(agent.displayName);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "Report set" })).toHaveValue(older.id);
+    expect(selectedInventoryUrl(agentListRequests(transport.fetchMock).at(-1)![0]).searchParams.get("setId")).toBe(older.id);
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Report set" }), "");
+    expect(new URLSearchParams(window.location.search).has("snapshot")).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Ada" });
+    expect(screen.getByRole("searchbox", { name: "Search users or agents" })).toHaveValue("Ada");
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "Report set" })).toHaveValue("");
+    act(() => window.history.back());
+    await waitFor(() => expect(window.location.pathname).toBe("/agents"));
+    act(() => window.history.back());
+    await waitFor(() => expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(older.id));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "Report set" })).toHaveValue(older.id);
+    act(() => window.history.forward());
+    await waitFor(() => expect(new URLSearchParams(window.location.search).has("snapshot")).toBe(false));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "Report set" })).toBeEnabled());
+    expect(screen.getByRole("combobox", { name: "Report set" })).toHaveValue("");
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method && !["GET", "HEAD"].includes(init.method))
+      .filter(([input]) => !["/api/data-sync/auto-refresh", "/api/agent-inventory/selections", "/api/capabilities/check"].includes(input))
+      .map(([input]) => input)).toEqual([]);
   });
 
   it("does not refetch Power Platform job history for inventory filter and sort changes", async () => {
@@ -2359,7 +2464,8 @@ export function sessionAndNavigationCases() {
       if (input === "/api/data-sync/auto-refresh") return Response.json(automaticRefreshResponse({
         revisions: { ...automaticRefreshResponse().revisions, users: (refreshing ? "4" : "3").repeat(64) },
       }));
-      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/users") return refreshing ? pending.promise : Response.json(selectedUsersPage());
+      if (new URL(input, "http://localhost").pathname === "/api/copilot-usage/users") return refreshing
+        ? pending.promise.then(response => response.clone()) : Response.json(selectedUsersPage());
       if (refreshing && new URL(input, "http://localhost").pathname === `/api/copilot-usage/users/${updated.value[1].directory.objectId}`) {
         return Response.json({ value: updated.value[1], reports: updated.reports, sources: updated.sources, selection: updated.selection });
       }
@@ -2388,7 +2494,7 @@ export function sessionAndNavigationCases() {
 
     refreshing = true;
     await act(() => vi.advanceTimersByTimeAsync(60_000));
-    expect(reads()).toBe(before + 1);
+    expect(reads()).toBe(before + 2);
     expect(screen.getByRole("dialog", { name: "Ben" })).toBeVisible();
     expect(detailReads()).toBe(1);
     await act(() => vi.advanceTimersByTimeAsync(500));
@@ -2412,9 +2518,9 @@ export function sessionAndNavigationCases() {
     expect(search).toHaveValue("Ben");
     expect(screen.queryByRole("status", { name: "Background refresh" })).not.toBeInTheDocument();
     await act(() => vi.advanceTimersByTimeAsync(60_000));
-    expect(reads()).toBe(before + 1);
+    expect(reads()).toBe(before + 2);
     expect(screen.getByRole("cell", { name: String(updated.value[1].reportedResponses) })).toBeVisible();
-    expect(reads()).toBe(before + 1);
+    expect(reads()).toBe(before + 2);
     expect(detailReads()).toBe(2);
   });
 
@@ -4244,7 +4350,7 @@ export function sessionAndNavigationCases() {
       ...native, id: "agent:44444444-4444-4444-8444-444444444444", presence: "both",
       packages: [agent, { ...agent, id: "package-alternate" }],
     };
-    const transport = initialCatalogTransport();
+    const transport = initialCatalogTransport({ initialRoles: admin.roles, revalidatedRoles: admin.roles });
     transport.page = packagePage;
     const base = transport.fetchMock.getMockImplementation()!;
     const refresh = deferredResponse();
@@ -13218,7 +13324,14 @@ function appTransport({
         canRetry: false,
       })),
     });
-    if (["/api/official-usage/history", "/api/official-usage/history/options"].includes(new URL(input, "http://localhost").pathname) && reportHistory) return Response.json(reportHistory);
+    const reportPath = new URL(input, "http://localhost").pathname;
+    if (["/api/official-usage/history", "/api/official-usage/history/options"].includes(reportPath) && reportHistory) return Response.json(reportHistory);
+    if (reportPath === "/api/official-usage/history/options") {
+      const reports = unifiedResponse.usageContext.reports;
+      const history = selectedHistoryPage(reports.activeSetId ? undefined : [], reports.activeSetId);
+      return Response.json({ value: history.value, page: history.page, counts: history.counts, selection: history.selection,
+        reports: { ...reports, setId: reports.activeSetId } });
+    }
     const reportData = selectedFixtureRead(input);
     if (reportData) return Response.json(reportData);
     if (input.startsWith("/api/agent-inventory")) {

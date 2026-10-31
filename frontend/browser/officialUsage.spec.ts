@@ -216,7 +216,7 @@ test("explicit acceptance imports all 103/103/104 rows, verifies exact data, pre
   expect(state.acceptRequests).toHaveLength(1);
   const preview = state.bundlePreviews.at(-1)!;
   expect(state.acceptRequests[0]).toEqual({ bundleId: preview.bundleId, bundleHash: preview.bundleHash,
-    expectedActiveRevision: preview.expectedActiveRevision, preserveSelection: true });
+    expectedActiveRevision: preview.expectedActiveRevision });
   const summary = modal(page).getByRole("region", { name: "Imported CSV summary" });
   await expect(summary.locator("dt")).toHaveText(["Agents", "Users", "Responses"]);
   await expect(summary.locator("dd")).toHaveText(["103", "104", "2,061"]);
@@ -226,7 +226,7 @@ test("explicit acceptance imports all 103/103/104 rows, verifies exact data, pre
   for (const body of state.uploadBodies) expect(body).not.toMatch(/name="(?:bundleId|reportingStart|reportingEnd|sourceAsOf|downloadedAt)"/);
   expect(state.uploadIntents.every(query => query.get("rejectDuplicateKind") === "true")).toBe(true);
   await modal(page).getByRole("button", { name: "Close", exact: true }).click(); await expect(page).toHaveURL(/\/sync$/);
-  expect(state.selectedSetId()).toBeNull();
+  expect(state.latestSetId()).toBe(setId);
   expect(state.confirmations).toEqual([]);
   await page.getByRole("button", { name: "Add CSV reports", exact: true }).click();
   expect(await modal(page).getByLabel("CSV report files").evaluate((element: HTMLInputElement) => element.files?.length)).toBe(0);
@@ -354,7 +354,7 @@ test("Escape cannot dismiss acceptance but closes a verified summary without cha
     const before = state.agentRequests.length;
     await page.keyboard.press("Escape"); await expect(page).toHaveURL(/\/sync$/);
     expect(state.agentRequests.length).toBe(before); exactVerification(state);
-    expect(state.selectedSetId()).toBeNull();
+    expect(state.latestSetId()).toBe(setId);
     expect(state.acceptRequests).toHaveLength(1); expect(state.discardedStages).toEqual([]);
   } finally { held.resolve(); }
 });
@@ -368,12 +368,12 @@ test("Close dismisses the verified summary without another request", async ({ pa
   expect(state.uploadBodies).toHaveLength(3); expect(state.acceptRequests).toHaveLength(1); expect(state.bundlePreviews).toHaveLength(previews);
 });
 
-test("Close leaves a report selected elsewhere unchanged without offering selection confirmation", async ({ page }) => {
+test("Close does not replace a newer report published by another operator", async ({ page }) => {
   const state = await mockUsage(page, { historical: true });
   await page.goto("/sync?reports=import"); await completedImport(page);
-  state.selectReport(historicalSetId); await modal(page).getByRole("button", { name: "Close", exact: true }).click();
+  const newer = await state.publishNewReport(); await modal(page).getByRole("button", { name: "Close", exact: true }).click();
   await expect(modal(page)).toBeHidden(); await expect(page).toHaveURL(/\/sync$/);
-  expect(state.selectedSetId()).toBe(historicalSetId); expect(state.confirmations).toEqual([]);
+  expect(state.latestSetId()).toBe(newer); expect(state.confirmations).toEqual([]);
   exactVerification(state); expect(state.uploadBodies).toHaveLength(3); expect(state.acceptRequests).toHaveLength(1);
 });
 
@@ -393,7 +393,7 @@ test("a lost acceptance response retries the identical reviewed operation withou
   await modal(page).getByRole("button", { name: "Verify acceptance" }).click(); await imported(page);
   expect(state.acceptRequests).toHaveLength(2); expect(state.acceptRequests[1]).toEqual(state.acceptRequests[0]);
   expect(state.bundlePreviews).toHaveLength(before); expect(state.uploadBodies).toHaveLength(3);
-  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: null, activeRevision: "1" });
+  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: "2" });
 });
 
 for (const failure of ["transport", "incomplete lineage"] as const) test(`post-accept ${failure} verification retries only exact bounded reads`, async ({ page }) => {
@@ -413,39 +413,39 @@ for (const failure of ["transport", "incomplete lineage"] as const) test(`post-a
   exactVerification(state);
 });
 
-test("duplicate acceptance leaves selection unchanged and finishes with the normal summary", async ({ page }) => {
-  const state = await mockUsage(page, { active: true, historical: true, selectedSetId: historicalSetId, reusedExistingSet: true });
+test("duplicate acceptance leaves the automatic latest head unchanged and finishes with the normal summary", async ({ page }) => {
+  const state = await mockUsage(page, { active: true, historical: true, reusedExistingSet: true });
   await page.goto("/sync?reports=import"); await upload(page); await accept(page);
   await imported(page);
-  expect(state.confirmations).toEqual([]); expect(state.selectedSetId()).toBe(historicalSetId);
+  expect(state.confirmations).toEqual([]); expect(state.latestSetId()).toBe(setId);
   await modal(page).getByRole("button", { name: "Close", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
-  expect(state.setPreviews).toEqual([]); expect(state.selectedSetId()).toBe(historicalSetId);
-  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: historicalSetId, activeRevision: "2" });
+  expect(state.setPreviews).toEqual([]); expect(state.latestSetId()).toBe(setId);
+  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: setId, activeRevision: "2" });
   exactVerification(state); expect(state.acceptRequests).toHaveLength(1);
 });
 
-test("a shared selection changed during readback does not prevent completing an import", async ({ page }) => {
-  const state = await mockUsage(page, { active: true, historical: true, reusedExistingSet: true }); let changed = false;
-  await page.route(url => url.pathname === "/api/official-usage/aggregate", route => {
-    if (state.acceptRequests.length && !changed) { state.selectReport(historicalSetId); changed = true; }
+test("a newer report published during readback does not prevent verifying an older accepted import", async ({ page }) => {
+  const state = await mockUsage(page, { active: true, historical: true, reusedExistingSet: true }); let newer: string | undefined;
+  await page.route(url => url.pathname === "/api/official-usage/aggregate", async route => {
+    if (state.acceptRequests.length && !newer) newer = await state.publishNewReport();
     return route.fallback();
   });
   await page.goto("/sync?reports=import"); await upload(page); await accept(page);
   await imported(page);
-  expect(state.confirmations).toEqual([]); expect(state.selectedSetId()).toBe(historicalSetId);
+  expect(state.confirmations).toEqual([]); expect(state.latestSetId()).toBe(newer);
   await modal(page).getByRole("button", { name: "Close", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
   expect(state.setPreviews).toEqual([]);
-  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: historicalSetId, activeRevision: "3" });
+  expect(state.metadataReads.at(-1)).toMatchObject({ activeSetId: newer, activeRevision: "3" });
   expect(state.acceptRequests).toHaveLength(1); expect(state.uploadBodies).toHaveLength(3); exactVerification(state);
 });
 
-test("Add more reports starts an empty upload while preserving the selected report", async ({ page }) => {
-  const state = await mockUsage(page, { historical: true, selectedSetId: historicalSetId });
+test("Add more reports starts an empty upload without overriding automatic latest or duplicating identical content", async ({ page }) => {
+  const state = await mockUsage(page, { historical: true });
   await page.goto("/sync?reports=import"); await completedImport(page);
   const firstBundle = state.acceptRequests[0].bundleId;
-  expect(state.selectedSetId()).toBe(historicalSetId);
+  expect(state.latestSetId()).toBe(setId);
   await modal(page).getByRole("button", { name: "Add more reports" }).click();
   await expect(modal(page).getByRole("button", { name: "Choose CSV files" })).toBeFocused();
   await expect(modal(page).getByRole("heading", { name: "Reports imported" })).toHaveCount(0);
@@ -453,7 +453,7 @@ test("Add more reports starts an empty upload while preserving the selected repo
   await completedImport(page);
   expect(state.acceptRequests).toHaveLength(2);
   expect(state.acceptRequests[1].bundleId).not.toBe(firstBundle);
-  expect(state.selectedSetId()).toBe(historicalSetId);
+  expect(state.latestSetId()).toBe(setId);
   expect(state.confirmations).toEqual([]); expect(state.discardedStages).toEqual([]);
   await modal(page).getByRole("button", { name: "Close", exact: true }).click();
   await expect(page).toHaveURL(/\/sync$/);
@@ -610,7 +610,7 @@ test("Manage reports retains a 53-set root across compact pages and opens report
   await current.getByRole("button", { name: "View report" }).click(); await snapshotShell(page);
   await expect(agentRows(page).locator("tbody tr")).toHaveCount(50);
   await expect(modal(page).getByRole("button", { name: /Delete report set|Make current/ })).toHaveCount(0);
-  expect(state.commands).toEqual([]); expect(state.selectedSetId()).toBe(setId);
+  expect(state.commands).toEqual([]); expect(state.latestSetId()).toBe(setId);
   await accessible(page); await page.screenshot({ path: info.outputPath("saved-report-inspection.png") });
 });
 
@@ -625,10 +625,10 @@ test("retained-set deletion stays inside an accessible native confirmation and i
   await expect(confirmation).toHaveCount(0);
   await expect(modal(page).getByRole("status").filter({ hasText: "Report set deleted." })).toBeFocused();
   await expect(history(page).getByRole("heading", { name: "No reports yet" })).toBeVisible();
-  expect(state.confirmations).toHaveLength(1); expect(state.selectedSetId()).toBeNull();
+  expect(state.confirmations).toHaveLength(1); expect(state.latestSetId()).toBeNull();
   await modal(page).getByRole("button", { name: "Close reports" }).click();
   await page.goto(`/sync?reports=snapshot&snapshot=${setId}`);
-  await expect(modal(page).getByRole("alert")).toContainText("The exact synthetic report set is unavailable.");
+  await expect(modal(page).getByRole("alert")).toContainText("The exact report set is no longer available.");
   await expect(modal(page).getByRole("button", { name: "Export agent CSV" })).toBeDisabled();
 });
 

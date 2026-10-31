@@ -156,7 +156,8 @@ export function UnifiedAgentDetailModal({
     capabilities?.user?.tenantId, capabilities?.user?.homeAccountId, [...roles].sort(), record.id,
   ]);
   const currentDetail = packageDetailStale ? undefined : selectedDetail;
-  const hasPackageConfirmation = Boolean(packageConfirmation);
+  const canManage = hasAppRole(roles, "AgentControl.Admin");
+  const hasPackageConfirmation = canManage && Boolean(packageConfirmation);
   const inventoryReloadDisabled = packageInventoryPending || packageActionsBusy || hasPackageConfirmation;
   const packageResult = packageResults?.find(result => result.id === selectedPackage?.id);
   const controlError = packageControlError && packageControlError.packageId === selectedPackage?.id ? packageControlError.message : undefined;
@@ -165,11 +166,11 @@ export function UnifiedAgentDetailModal({
     selectedPackage ? record.observations.packageSnapshots[selectedPackage.id]?.snapshotId : undefined,
     record.observations.graphPackages?.snapshotId,
   ]);
-  const selectedTab = tabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
+  const visibleTabs = tabs.filter(tab => tab !== "controls" || canManage);
+  const selectedTab = visibleTabs.find(tab => tab === (activeTab ?? internalTab)) ?? "identities";
   const usesPackageDetails = selectedTab === "identities" || selectedTab === "controls";
   const resource = record.powerPlatformResource;
   const quarantineReason = quarantineTargetReason(resource ?? undefined, record.observations.powerPlatform);
-  const canManage = hasAppRole(roles, "AgentControl.Admin");
   const inspectSelectedPackage = useEffectEvent(() => {
     if (selectedPackage) onInspectPackage(selectedPackage);
   });
@@ -264,11 +265,11 @@ export function UnifiedAgentDetailModal({
         <button ref={closeButton} type="button" className="icon-button" aria-label="Close unified agent details" onClick={close}><X aria-hidden="true" /></button>
       </header>
       <div className="detail-tabs" role="tablist" aria-label="Agent details">
-        {tabs.map(tab => <button key={tab} id={`unified-agent-tab-${tab}`} type="button" role="tab" disabled={hasPackageConfirmation} aria-selected={selectedTab === tab} aria-controls={`unified-agent-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)} onKeyDown={event => {
-          const index = tabs.indexOf(tab);
-          const next = event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length]
-            : event.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length]
-              : event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1] : undefined;
+        {visibleTabs.map(tab => <button key={tab} id={`unified-agent-tab-${tab}`} type="button" role="tab" disabled={hasPackageConfirmation} aria-selected={selectedTab === tab} aria-controls={`unified-agent-panel-${tab}`} tabIndex={selectedTab === tab ? 0 : -1} onClick={() => selectTab(tab)} onKeyDown={event => {
+          const index = visibleTabs.indexOf(tab);
+          const next = event.key === "ArrowRight" ? visibleTabs[(index + 1) % visibleTabs.length]
+            : event.key === "ArrowLeft" ? visibleTabs[(index + visibleTabs.length - 1) % visibleTabs.length]
+              : event.key === "Home" ? visibleTabs[0] : event.key === "End" ? visibleTabs[visibleTabs.length - 1] : undefined;
           if (!next) return;
           event.preventDefault();
           selectTab(next);
@@ -330,15 +331,14 @@ export function UnifiedAgentDetailModal({
           disabled={packageActionsBusy || packageInventoryPending || Boolean(inventoryError)} onChanged={onUsageChanged} /> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage</h3>
-          {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}
-          {canManage && !canEditAccess ? <p className="agent-insight-note">Access settings are read-only until access-management permissions are available.</p> : null}
+          {!canEditAccess ? <p className="agent-insight-note">Access settings are read-only until access-management permissions are available.</p> : null}
           {packageActionsBlockedReason || controlError ? <p className="error-banner" role="alert">{packageActionsBlockedReason ?? controlError}</p> : null}
           {packageResult ? <p className={packageResult.status === "succeeded" ? "notice" : "error-banner"} role={packageResult.status === "succeeded" ? "status" : "alert"}>
             {packageResult.message ?? (packageResult.status === "succeeded" ? "The change completed for this published version." : "The change was not applied to this published version.")}
           </p> : null}
           {packageConfirmation}
         </> : null}
-        {selectedPackage && capabilities ? <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
+        {canManage && selectedPackage && capabilities ? <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
           <AgentAccessManagement key={`${record.id}:${selectedPackage.id}`} revision={packageAccessRevisions?.get(selectedPackage.id) ?? 0}
             agent={selectedPackage} detail={selectedDetail} canManage={canManage} canEditAccess={canEditAccess}
             detailUnavailable={!selectedDetail && Boolean(packageDetailError)}
@@ -352,7 +352,7 @@ export function UnifiedAgentDetailModal({
           {!record.packages.length ? <p>No published version is available for availability or installation settings.</p> : null}
           {!record.packages.length && quarantineReason ? <p className="agent-insight-note">No supported management target is present in the saved inventory. <a href="/sync">Refresh agent inventory</a> and <a href="/permissions">review permissions</a> before choosing a control.</p> : null}
         </> : null}
-        <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
+        {canManage ? <div hidden={selectedTab !== "controls" || hasPackageConfirmation}>
           <div className="agent-management-sections">
             {resource ? <CopilotStudioQuarantineControls
                 key={JSON.stringify([overviewKey, resource.type, quarantineTargetKey(resource)])}
@@ -364,7 +364,7 @@ export function UnifiedAgentDetailModal({
                 onJobChange={onQuarantineJobChange}
               /> : null}
           </div>
-        </div>
+        </div> : null}
       </section>
     </dialog>
   );

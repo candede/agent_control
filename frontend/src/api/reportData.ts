@@ -109,5 +109,5 @@ export const readReportStage = (id: string, signal?: AbortSignal) => request<Off
 export const discardReportStage = (id: string, signal?: AbortSignal) => request<void>(`/api/official-usage/staging/${encodeURIComponent(id)}`, { method: "DELETE", signal });
 export const previewReportBundle = (id: string, signal?: AbortSignal, options: OfficialReportBundleInspection = {}) => post<OfficialReportBundlePreview>(`/api/official-usage/bundles/${encodeURIComponent(id)}/preview`, options, signal);
 export const acceptReportBundle = (id: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) => post<OfficialReportAccepted>(`/api/official-usage/bundles/${encodeURIComponent(id)}/accept`, input, signal);
-export const previewReportOperation = (id: string, operation: "select" | "delete", signal?: AbortSignal) => post<OfficialReportConfirmation>(`/api/official-usage/sets/${encodeURIComponent(id)}/preview`, { operation }, signal);
-export const confirmReportOperation = (input: OfficialReportConfirmation, signal?: AbortSignal) => post<OfficialReportConfirmed>(`/api/official-usage/confirmations/${encodeURIComponent(input.id)}`, input, signal);
+export const previewReportDeletion = (id: string, signal?: AbortSignal) => post<OfficialReportConfirmation>(`/api/official-usage/sets/${encodeURIComponent(id)}/preview`, { operation: "delete" }, signal);
+export const confirmReportDeletion = (input: OfficialReportConfirmation, signal?: AbortSignal) => post<OfficialReportConfirmed>(`/api/official-usage/confirmations/${encodeURIComponent(input.id)}`, input, signal);

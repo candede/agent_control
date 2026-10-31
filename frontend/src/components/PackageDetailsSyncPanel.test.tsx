@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PackageDetailSyncState } from "../api/client";
+import { ApiError, type PackageDetailSyncState } from "../api/client";
 import { PackageDetailsSyncPanel, type PackageDetailsSyncPanelHandle } from "./PackageDetailsSyncPanel";
 
 const api = vi.hoisted(() => ({ read: vi.fn(), start: vi.fn(), cancel: vi.fn() }));
@@ -68,11 +68,15 @@ describe("visible package detail collection", () => {
     expect(callbacks.onPublicationChanged).toHaveBeenCalledOnce();
     expect(screen.getByText(/7 of 20 targets checked/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Cancel detail collection" })).toHaveTextContent("Cancel details");
+    expect(screen.queryByRole("button", { name: "Sync package details" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
     api.read.mockResolvedValue({ ...running, status: "paused", job: { ...running.job!, status: "cancelled" } });
     fireEvent.click(screen.getByRole("button", { name: "Cancel detail collection" }));
     expect(await screen.findByText("Cancelled", { exact: true })).toBeVisible();
     expect(api.cancel).toHaveBeenCalledOnce();
     expect(callbacks.onCancelRequested).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Sync package details" })).toBeEnabled();
+    expect(screen.getAllByRole("button")).toHaveLength(1);
   });
 
   it("does not silently keep a complete claim when status cannot be reverified", async () => {
@@ -100,6 +104,74 @@ describe("visible package detail collection", () => {
     await screen.findByText("5 / 5");
     await act(async () => resolve(initial));
     expect(screen.queryByText("140 / 1,216")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["start", "success"],
+    ["start", "failure"],
+    ["start", "unauthorized"],
+    ["start", "forbidden"],
+    ["cancel", "success"],
+    ["cancel", "failure"],
+    ["cancel", "unauthorized"],
+    ["cancel", "forbidden"],
+  ] as const)("fences an obsolete catalog's late %s %s response", async (kind, result) => {
+    const callbacks = props();
+    const current: PackageDetailSyncState = { ...initial, status: "ready", total: 5, fresh: 3, pending: 2, eligible: 2 };
+    let resolveAction!: (value: PackageDetailSyncState) => void;
+    let rejectAction!: (reason: Error) => void;
+    api[kind].mockReturnValueOnce(new Promise<PackageDetailSyncState>((resolve, reject) => {
+      resolveAction = resolve;
+      rejectAction = reject;
+    }));
+    api.read.mockResolvedValueOnce({ ...initial, status: kind === "start" ? "ready" : "running" });
+    const view = render(<PackageDetailsSyncPanel {...callbacks} />);
+    await screen.findByText("140 / 1,216");
+    fireEvent.click(screen.getByRole("button", { name: kind === "start" ? "Sync package details" : "Cancel detail collection" }));
+    expect(api[kind]).toHaveBeenCalledOnce();
+    const stateNotifications = callbacks.onStateChanged.mock.calls.length;
+    let resolveRead!: (value: PackageDetailSyncState) => void;
+    api.read.mockReturnValueOnce(new Promise<PackageDetailSyncState>(resolve => { resolveRead = resolve; }));
+    view.rerender(<PackageDetailsSyncPanel {...callbacks} revision="catalog-2" />);
+    expect(screen.queryByText("140 / 1,216")).not.toBeInTheDocument();
+    expect(callbacks.onStateChanged).toHaveBeenLastCalledWith(undefined);
+
+    await act(async () => {
+      if (result === "success") {
+        resolveAction({ ...initial, status: "complete", fresh: initial.total, pending: 0, eligible: 0 });
+      } else if (result === "failure") {
+        rejectAction(new Error("Obsolete collection failed."));
+      } else {
+        rejectAction(new ApiError(result === "unauthorized" ? 401 : 403, result, "Obsolete collection access denied."));
+      }
+    });
+    expect(api.read).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText("Checking", { exact: true })).toBeVisible();
+    expect(callbacks.onStateChanged).toHaveBeenCalledTimes(stateNotifications + 1);
+    expect(callbacks.onPublicationChanged).not.toHaveBeenCalled();
+
+    await act(async () => resolveRead(current));
+    expect(screen.getByText("3 / 5")).toBeVisible();
+    expect(callbacks.onStateChanged).toHaveBeenLastCalledWith(current);
+    expect(screen.getByRole("button", { name: "Sync package details" })).toBeEnabled();
+  });
+
+  it.each(["start", "cancel"] as const)("retains a current catalog's %s permission failure", async kind => {
+    const callbacks = props();
+    api[kind].mockRejectedValueOnce(new ApiError(403, "missing_permission", "Current collection access denied."));
+    api.read.mockResolvedValueOnce({ ...initial, status: kind === "start" ? "ready" : "running" })
+      .mockReturnValue(new Promise<PackageDetailSyncState>(() => {}));
+    render(<PackageDetailsSyncPanel {...callbacks} />);
+    await screen.findByText("140 / 1,216");
+    fireEvent.click(screen.getByRole("button", { name: kind === "start" ? "Sync package details" : "Cancel detail collection" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Current collection access denied.");
+    expect(callbacks.onStateChanged).toHaveBeenLastCalledWith(undefined);
+    expect(screen.queryByText("140 / 1,216")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sync package details" })).toBeDisabled();
+    expect(api[kind]).toHaveBeenCalledOnce();
+    expect(api.read).toHaveBeenCalledTimes(2);
   });
 
   it.each([

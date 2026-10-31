@@ -10,7 +10,6 @@ import type { ReportQuery } from "../types/officialReportData.js";
 import {
   awaitUsageInventoryExpiry, deleteUsageSet, newUsageScope, publishUsageReports, saveUsageInventory, usageAudit, usageIdentity, usageIntent, type AgentUsageScope,
 } from "./agentUsageTestSupport.js";
-import { OfficialReportImports } from "./officialReportImports.js";
 import { DataGenerations } from "./dataGenerations.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -27,9 +26,9 @@ async function selected(scope: AgentUsageScope, query: ReportQuery = {}) {
   const identity = await usageIdentity(fixture.runtime, scope);
   return { identity, selection: await reports.capture(identity, "official_agents", query) };
 }
-async function inventory(scope: AgentUsageScope, records: readonly { id: string }[]) {
+async function inventory(scope: AgentUsageScope, records: readonly { id: string }[], setId?: string) {
   return reports.history.connections.selectedRead(async client =>
-    service.inventorySummaries(client, await reports.currentInventoryData(client, scope), records.map(record => record.id)));
+    service.inventorySummaries(client, await reports.currentInventoryData(client, scope, undefined, setId), records.map(record => record.id)));
 }
 async function associate(scope: AgentUsageScope, recordId: string, input: CandidateAgentUsageMutation) {
   return service.mutate(await usageIdentity(fixture.runtime, scope), recordId, input, usageAudit(scope).actor);
@@ -37,10 +36,6 @@ async function associate(scope: AgentUsageScope, recordId: string, input: Candid
 function removal(input: CandidateAgentUsageMutation): CandidateAgentUsageMutation {
   const { target: _target, ...result } = input;
   return result;
-}
-async function selectSet(scope: AgentUsageScope, setId: string) {
-  const imports = new OfficialReportImports(fixture.runtime), identity = await usageIdentity(fixture.runtime, scope);
-  return imports.confirm(identity, await imports.confirmPreview(identity, setId, "select"));
 }
 async function associationCount(tenantId: string) {
   return (await fixture.runtime.query<{ count: number }>("SELECT count(*)::int AS count FROM agent_usage_associations WHERE tenant_id=$1", [tenantId])).rows[0].count;
@@ -79,16 +74,15 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     expect(await sourceRows(scope.tenantId)).toEqual(before);
   });
 
-  it("matches newly selected reports without adding overlapping totals and fences mutations against old selections", async () => {
+  it("matches explicit reports without adding overlapping totals or changing the automatic default", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope, [{ packages: ["Report-A"] }]);
     const first = await publishUsageReports(fixture.runtime, scope, 179), previous = await inventory(scope, records);
     const second = await publishUsageReports(fixture.runtime, scope, 181), current = await inventory(scope, records);
     expect(previous[0]).toMatchObject({ reportSetId: first.setId, responses: 179 });
     expect(current[0]).toMatchObject({ reportSetId: second.setId, responses: 181 });
-    await selectSet(scope, first.setId);
-    expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: first.setId, responses: 179 });
+    expect((await inventory(scope, records, first.setId))[0]).toMatchObject({ reportSetId: first.setId, responses: 179 });
     await deleteUsageSet(fixture.runtime, scope, first.setId);
-    expect((await inventory(scope, records))[0]).toMatchObject({ status: "unavailable", responses: null });
+    expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: second.setId, responses: 181 });
     expect(await associationCount(scope.tenantId)).toBe(0);
   });
 
@@ -291,17 +285,17 @@ describe("persisted reviewed agent usage through exact native contracts", () => 
     expect((await new AuditLog(scope, fixture.runtime).listEvents()).map(row => row.status)).toEqual(["failed"]);
   });
 
-  it("never carries associations into a newly accepted set and fences old mutation revisions", async () => {
+  it("never carries associations into a newly accepted set and allows valid historical-view removal", async () => {
     const scope = newUsageScope(), records = await saveUsageInventory(fixture.runtime, scope);
     const first = await publishUsageReports(fixture.runtime, scope);
     await associate(scope, records[0].id, await usageIntent(fixture.runtime, scope));
     const old = await usageIntent(fixture.runtime, scope), second = await publishUsageReports(fixture.runtime, scope, 11);
     expect(second.setId).not.toBe(first.setId);
     expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: second.setId, status: "unlinked", responses: null });
-    await expect(associate(scope, records[0].id, removal(old))).rejects.toMatchObject({ code: "agent_usage_changed" });
-    expect(await associationCount(scope.tenantId)).toBe(1);
-    await selectSet(scope, first.setId);
-    expect((await inventory(scope, records))[0]).toMatchObject({ status: "linked", responses: 10 });
+    expect((await inventory(scope, records, first.setId))[0]).toMatchObject({ status: "linked", responses: 10 });
+    await expect(associate(scope, records[0].id, removal(old))).resolves.toMatchObject({ reportSetId: first.setId });
+    expect(await associationCount(scope.tenantId)).toBe(0);
+    expect((await inventory(scope, records))[0]).toMatchObject({ reportSetId: second.setId, status: "unlinked", responses: null });
   });
 
   it("immediately cascades deleted associations and invalidates previously captured reads and writes", async () => {

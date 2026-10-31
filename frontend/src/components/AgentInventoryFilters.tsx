@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
 import { agentAccessOptions, agentManagementOptions, agentRelevanceOptions, agentSortOptions, agentUsageOptions } from "../agentColumns";
 import type { AgentRouteState } from "../workbenchRouting";
+import { isExpiredSelection } from "../selectedRead";
 import { FilterPopover } from "./FilterPopover";
 import { InventoryFacetSelect } from "./InventoryFacetSelect";
 import { ApiError, getInventoryFacets, type InventoryFacetField } from "../api/client";
@@ -72,7 +73,8 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
       });
     }).catch(error => {
       if (controller.signal.aborted) return;
-      if (error instanceof ApiError && ["selection_invalidated", "selection_expired", "unauthorized", "forbidden"].includes(error.code)) {
+      if (error instanceof ApiError && !isExpiredSelection(error)
+        && ["selection_invalidated", "inventory_changed", "unauthorized", "forbidden"].includes(error.code)) {
         callbacks.current.onInvalidated?.();
       } else callbacks.current.onError(error instanceof Error ? error.message : "Selected environment label unavailable.", selectionId);
     });
@@ -159,10 +161,6 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
           <strong>{loading ? "Updating..." : matchingCount === undefined ? "Unavailable" : matchingCount.toLocaleString()}</strong>{" "}
           <span>{!loading && matchingCount === 1 ? "matching agent" : "matching agents"}</span>
         </span>
-        {hasFilters ? <button type="button" className="clear-filters-button" onClick={() => {
-          onClear();
-          trigger.current?.focus();
-        }}>Clear filters</button> : null}
       </div>
       <FilterPopover label="Filter agents" activeCount={chips.length} triggerRef={trigger}
         description="Refine this inventory. Changes apply immediately.">
@@ -180,6 +178,9 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
                 className={(field.dynamic ? field.value === undefined : field.value === "all") ? undefined : "active-filter-select"}
                 onChange={event => field.change(event.target.value)}>
                 <option value={field.dynamic ? "" : "all"}>{field.all}</option>
+                {field.dynamic && field.value !== undefined
+                  && !field.options.some(option => encodeInventoryFacet(option.value) === encodeInventoryFacet(field.value!))
+                  ? <option value={encodeInventoryFacet(field.value)}>{inventoryFacetLabel(field.value)}</option> : null}
                 {field.options.map(option => <option key={encodeInventoryFacet(option.value)}
                   value={field.dynamic ? encodeInventoryFacet(option.value) : String(option.value)}>{option.label}</option>)}
               </select>
@@ -250,7 +251,7 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
     </div>
     {values.management !== "all"
       ? <p className="notice" role="note">Management views show confirmed evidence only. Sharing, installation or missing data alone does not establish who manages an agent.</p> : null}
-    {chips.length ? <div className="agent-filter-chips" aria-label="Active filters">
+    {hasFilters ? <div className="agent-filter-chips" aria-label="Active filters">
       {chips.map(chip => <button key={chip.key} type="button" className="agent-filter-chip"
         aria-label={`Remove ${chip.label.toLowerCase()} filter`} title={`${chip.label}: ${chip.value}`}
         onClick={() => {
@@ -259,6 +260,10 @@ export function AgentInventoryFilters({ values, options, loading, matchingCount,
         }}>
         <span>{chip.label}: <strong>{chip.value}</strong></span><X size={13} aria-hidden="true" />
       </button>)}
+      <button type="button" className="agent-filter-chip" onClick={() => {
+        onClear();
+        trigger.current?.focus();
+      }}>Clear filters</button>
     </div> : null}
   </section>;
 }

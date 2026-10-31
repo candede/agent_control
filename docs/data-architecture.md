@@ -138,6 +138,10 @@ retained display data cannot authorize an export or mutation.
 Healthy idle collection checks and inventory health reads run every five minutes.
 First-run and active work use faster status checks; unavailable health retries
 after thirty seconds. Status polling is not provider synchronization.
+Health reads release their temporary selection before responding. If a read
+and its selection cleanup both fail, the read error remains the response and
+the cleanup failure is recorded separately; cleanup failure alone prevents a
+successful response.
 
 ## Inventory and provider evidence
 
@@ -169,7 +173,9 @@ or an inline provenance/byte-count strip.
 
 Package detail reads reconstruct saved hosts, element types and categories from
 child facts, preserving absent versus empty collections and the source reference
-used for complete About text. Detail enrichment preserves catalog-owned summary
+used for complete About text. Package-source pages also reconstruct hosts and
+element types with their saved source reference; categories remain detail-only.
+Detail enrichment preserves catalog-owned summary
 text, including chunked text; incompatible detail reads also retain the prior
 description and sharing collections while marking detail evidence invalidated.
 Inventory and facet searches share Unicode

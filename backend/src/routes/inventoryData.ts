@@ -4,7 +4,7 @@ import type pg from "pg";
 import { config, getTenantConfiguration } from "../config.js";
 import { InventoryQueries, type InventoryQuery } from "../db/inventoryQueries.js";
 import type { SelectionIdentity } from "../services/dataSelections.js";
-import { AppError } from "../errors.js";
+import { AppError, errorTelemetry } from "../errors.js";
 import { reportIdentity } from "../services/reportIdentity.js";
 import { policyRoute } from "./policy.js";
 import { agentResponsibilityQuery, unifiedAgentInventoryQuery } from "./unifiedAgents.js";
@@ -18,6 +18,7 @@ import { requestScope } from "../middleware/auth.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type { UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
 import { hasAppRole } from "../types/capability.js";
+import { operationalLog } from "../services/telemetry.js";
 
 function scalar(value: unknown, name: string, maximum = 4096) {
   if (typeof value !== "string" || !value || value.length > maximum || /[\0\r\n]/.test(value)) {
@@ -48,7 +49,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
   const router = Router();
   const inventory = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays,
     { source: "inventory_canonical" });
-  const filterFields = ["inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
+  const filterFields = ["setId", "inventoryScope", "type", "view", "endUserAccess", "reportedUsage", "management", "relevance", "recordId",
     "operationIdPrefix", "search", "source", "linkState", "environmentId", "blocked", "publisher", "availableTo", "host", "platform",
     "createdWithinDays", "sortBy", "sortDirection"];
   const queryFieldMaximums: Record<string, number> = {
@@ -124,12 +125,20 @@ export function createInventoryDataRouter(database: pg.Pool) {
     response.setHeader("Cache-Control", "no-store");
     if ("state" in selected) { publish(selected); return; }
     let receipt: UnifiedAgentInventoryHealth;
+    let readFailed = false;
     try {
       const { freshness, summary, verification, identityCollection, sources, partial, errors } =
         inventoryPresentation(await inventory.page(selected.id, identity, { limit: 1 }));
       receipt = { freshness, summary, verification, identityCollection, sources, partial, errors };
+    } catch (error) {
+      readFailed = true;
+      throw error;
     } finally {
-      await inventory.selections.invalidate(selected.id, identity);
+      try { await inventory.selections.invalidate(selected.id, identity); }
+      catch (error) {
+        if (!readFailed) throw error;
+        operationalLog("error", "inventory_health_cleanup_failed", errorTelemetry(error));
+      }
     }
     publish(receipt);
   });

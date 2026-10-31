@@ -45,6 +45,14 @@ const enums = {
 };
 
 describe("selected inventory query protocol", () => {
+  it("accepts one canonical personal report ID without treating it as tenant state", () => {
+    const setId = "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF";
+    expect(unifiedAgentInventoryQuery({ setId }).setId).toBe(setId.toLowerCase());
+    expect(unifiedAgentInventoryQuery({}).setId).toBeUndefined();
+    for (const value of ["", "not-a-uuid", ["one", "two"], null, true]) {
+      expect(() => unifiedAgentInventoryQuery({ setId: value })).toThrow();
+    }
+  });
   it.each(inventoryFacetFields)("preserves exact %s literals and tagged unknowns without sentinel collisions", field => {
     for (const literal of ["all", "__unknown__", "__some_or_all__", "available:all", "~null", "~some-or-all", " firstParty ", "公司🌏", null]) {
       const wire = encodeInventoryFacet(literal);

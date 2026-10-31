@@ -18,6 +18,17 @@ import {
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it("round trips personal report selection on Agents and Users without treating Sync management as the same route", () => {
+    const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const agent = parseAgentRoute(`snapshot=${id}&access=available`);
+    const user = parseUsersRoute(`snapshot=${id}&q=Ada`);
+    expect(agent.reportSetId).toBe(id);
+    expect(parseAgentRoute(agentRouteSearch(agent).toString())).toEqual(agent);
+    expect(parseUsersRoute(usersRouteSearch(user).toString())).toEqual(user);
+    expect(parseAgentRoute("access=available").reportSetId).toBeUndefined();
+    expect(parseUsersRoute("").reportSetId).toBeUndefined();
+    expect(parseSyncReportRoute(`reports=snapshot&snapshot=${id}`)?.view).toBe("snapshot");
+  });
   it("round trips exact administrative origin filters without actor or provider authority", () => {
     const route = parseAuditRoute("origin=mcp&integration=app-id&client=Case-sensitive&callingAgent=reported-caller&page=2");
     expect(route).toMatchObject({ originChannel: "mcp", originIntegrationClientId: "app-id", originClientId: "Case-sensitive",

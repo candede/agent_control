@@ -127,6 +127,17 @@ function request(method: "GET" | "POST", path: string, body?: unknown, csrf = tr
 }
 
 describe("endpoint-local inventory searches", () => {
+  it("captures a Viewer's explicit report choice for inventory", async () => {
+    const setId = "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF";
+    const response = await request("POST", "/agent-inventory/selections", { query: { setId } });
+    expect(response.status).toBe(201);
+    expect(InventoryQueries.prototype.capture).toHaveBeenCalledWith(identity, "inventory-scope",
+      expect.objectContaining({ setId: setId.toLowerCase() }));
+  });
+  it.each(["", "not-a-uuid", null, ["one", "two"]])("rejects malformed personal report IDs: %j", async setId => {
+    expect((await request("POST", "/agent-inventory/selections", { query: { setId } })).status).toBe(400);
+    expect(InventoryQueries.prototype.capture).not.toHaveBeenCalled();
+  });
   it.each(["", "   ", "\u3000"])("passes a blank facet search %j to the facet reader", async search => {
     const query = new URLSearchParams({ selectionId, field: "publisher", search });
     const response = await request("GET", `/agent-inventory/facets?${query}`);

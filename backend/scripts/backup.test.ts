@@ -176,8 +176,8 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     } finally { writeFileSync(`${filename}.json`, JSON.stringify(receipt)); }
   }
   const laterCorrection = await acceptBundle(laterCorrectedOriginal.setId, laterCorrectionScope);
-  await usage.confirm(laterCorrectionScope,await usage.confirmPreview(laterCorrectionScope,laterCorrection.setId,"delete"));
-  await usage.confirm(usageScope,await usage.confirmPreview(usageScope,historicalReports.setId,"delete"));
+  await usage.confirmDeletion(laterCorrectionScope,await usage.previewDeletion(laterCorrectionScope,laterCorrection.setId));
+  await usage.confirmDeletion(usageScope,await usage.previewDeletion(usageScope,historicalReports.setId));
   await fixture.operator.query("DELETE FROM defender_hunting_jobs WHERE id=$1",[historicalHunt.jobId]);
   const currentAfterReviewChanges=await fingerprints(fixture.operator);
   expect(await restore(fixture.operator,filename,target)).toEqual(before);
@@ -232,7 +232,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     await expect(reopenRestoredDatabase(unavailableCurrent,target)).rejects.toThrow();
     await unavailableCurrent.end();
     expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0].mode).toBe("maintenance");
-    await usage.confirm(usageScope,await usage.confirmPreview(usageScope,currentReports.setId,"delete"));
+    await usage.confirmDeletion(usageScope,await usage.previewDeletion(usageScope,currentReports.setId));
     await fixture.operator.query("DELETE FROM defender_hunting_jobs WHERE id=$1",[currentHunt.jobId]);
     expect(await reopenRestoredDatabase(fixture.operator,target)).toEqual({mode:"normal",providerWorkEnabled:true});
     expect((await restoredOperator.query("SELECT mode FROM operational_state")).rows[0]).toEqual({mode:"normal"});

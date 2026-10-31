@@ -138,6 +138,17 @@ describe("current schema source contracts", () => {
     expect(schemaFingerprint).toBe(createHash("sha256").update(schemaSql).digest("hex"));
     expect(schemaFingerprint).not.toBe(createHash("sha256").update(schemaSql + "\n").digest("hex"));
   });
+  it("allows destructive confirmations only and guards readable published reports independently of the automatic head", () => {
+    const confirmations = schemaSql.match(/CREATE TABLE official_usage_confirmations \([\s\S]*?\n\);/)![0];
+    expect(confirmations).toContain("official_usage_confirmations_operation_check CHECK (operation = CAST('delete' AS text))");
+    const guard = schemaSql.match(/CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?END\$\$;/)![0];
+    expect(guard).not.toContain("official_usage_state");
+    expect(guard).toContain("history.valid_to_revision IS NULL");
+    expect(guard).toContain("official_usage_membership_counts");
+    expect(guard).toContain("AND 3=(SELECT count(*)");
+    expect(guard).toContain("source.authority_expires_at>clock_timestamp()");
+    expect(guard).toContain("usage association requires an agent in a readable published Agents export");
+  });
   it("rejects a missing schema marker without querying application data", async () => {
     const database = databaseWithResults();
     await expect(schema.verifySchema(database)).rejects.toThrow();
@@ -378,6 +389,16 @@ describe("schema verification without a database", () => {
     const database = databaseWithResults(...previous, [{ valid: false }]);
     await expect(verifySchema(database)).rejects.toThrow("Official report schema is invalid.");
     expect(database.query).toHaveBeenCalledTimes(previous.length + 1);
+  });
+  it("checks the exact current association guard and validated delete-only confirmation constraint", async () => {
+    const previous = resultsBefore("official reports");
+    const database = databaseWithResults(...previous, [{ valid: false }]);
+    await expect(verifySchema(database)).rejects.toThrow("Official report schema is invalid.");
+    const [sql, values] = database.query.mock.calls.at(-1)!;
+    expect(sql).toContain("official_usage_confirmations_operation_check");
+    expect(sql).toContain("pg_get_expr(conbin,conrelid)='(operation = ''delete''::text)'");
+    expect(sql).toContain("AND prosrc=$1 AND NOT prosecdef");
+    expect(values[0]).toBe(schemaSql.match(/CREATE FUNCTION protect_agent_usage_association\(\)[\s\S]*?AS \$\$([\s\S]*?)\$\$;/)![1]);
   });
 
   it.each([[], [{ valid: false }]].map(rows => ({ rows })))(

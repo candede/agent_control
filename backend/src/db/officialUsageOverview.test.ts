@@ -47,8 +47,8 @@ async function accept(identity: SelectionIdentity, input: BundleInput) {
   for (const kind of kinds) await stage(identity, input, kind, bundleId);
   return imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
 }
-const mutate = async (identity: SelectionIdentity, setId: string, operation: "select" | "delete") =>
-  imports.confirm(identity, await imports.confirmPreview(identity, setId, operation));
+const remove = async (identity: SelectionIdentity, setId: string) =>
+  imports.confirmDeletion(identity, await imports.previewDeletion(identity, setId));
 async function overview(identity: SelectionIdentity, query: ReportQuery = {}, limit = 50, authority = reports) {
   const selection = await authority.capture(identity, "overview", query);
   return authority.page(selection.id, identity, { limit }) as Promise<ReportPage<ReportOverviewAgent>>;
@@ -63,27 +63,26 @@ async function historyCount(identity: SelectionIdentity) {
 }
 
 describe("native cumulative overview SQL", () => {
-  it("changes selected-set metrics without merging history or silently falling back after deletion", async () => {
+  it("keeps explicit report metrics local and falls back automatically after latest deletion", async () => {
     const identity = owner(), first = await accept(identity, { agents: [{ id: "older-only", date: day(-44) }, { id: "shared", date: day() }] });
     const second = await accept(identity, { agents: [{ id: "newer-only", date: day() }] });
     expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(3);
     const selected = await overview(identity, { scope: "selected" });
     expect(selected.analytics.overview).toMatchObject({ retainedSets: 1, reportedAgents: 1, usedAgents: 1, active30Days: 1 });
     expect(selected.value).toMatchObject([{ agentId: "newer-only", latestSetId: second.setId }]);
-    await mutate(identity, first.setId, "select");
-    expect((await overview(identity, { scope: "selected" })).analytics.overview)
+    expect((await overview(identity, { scope: "selected", setId: first.setId })).analytics.overview)
       .toMatchObject({ retainedSets: 1, reportedAgents: 2, usedAgents: 2, active30Days: 1 });
-    await mutate(identity, first.setId, "delete");
+    expect((await overview(identity, { scope: "selected" })).reports.setId).toBe(second.setId);
+    await remove(identity, second.setId);
     await expect(reports.page(selected.selection.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
-    expect((await overview(identity, { scope: "selected" })).analytics.overview).toMatchObject({ retainedSets: 0, reportedAgents: 0 });
-    expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(1);
+    expect((await overview(identity, { scope: "selected" })).analytics.overview).toMatchObject({ retainedSets: 1, reportedAgents: 2 });
+    expect((await overview(identity)).analytics.overview?.reportedAgents).toBe(2);
   });
 
   it("permits explicit superseded snapshots without reviving them in cumulative evidence", async () => {
     const identity = owner(), first = await accept(identity, { agents: [{ id: "original", date: day(-14) }] });
     await accept(identity, { agents: [{ id: "corrected", date: day() }], correctionOfSetId: first.setId });
-    await mutate(identity, first.setId, "select");
-    expect((await overview(identity, { scope: "selected" })).value).toMatchObject([{ agentId: "original" }]);
+    expect((await overview(identity, { scope: "selected", setId: first.setId })).value).toMatchObject([{ agentId: "original" }]);
     expect((await overview(identity)).value).toMatchObject([{ agentId: "corrected" }]);
   });
 
@@ -132,7 +131,7 @@ describe("native cumulative overview SQL", () => {
       WHERE tenant_id=$1 GROUP BY kind ORDER BY kind`, [identity.tenantId])).rows).toEqual([
       { kind: "agents", versions: 1 }, { kind: "userAgents", versions: 1 }, { kind: "users", versions: 2 },
     ]);
-    await mutate(identity, second.setId, "delete");
+    await remove(identity, second.setId);
     expect((await overview(identity)).value[0]).toMatchObject({ latestSetId: first.setId, observationCount: 2 });
   });
 
@@ -221,7 +220,7 @@ describe("native cumulative overview SQL", () => {
   it("excludes deleted, partial, foreign, missing-membership and broken-version evidence", async () => {
     const identity = owner(), keep = await accept(identity, { agents: [{ id: "keep", date: day() }] });
     const deleted = await accept(identity, { agents: [{ id: "deleted", date: day() }] });
-    await mutate(identity, deleted.setId, "delete");
+    await remove(identity, deleted.setId);
     const partial = await stage(identity, { agents: [{ id: "incomplete", date: day() }] }, "agents", randomUUID());
     await imports.accept(identity, { stagingId: partial.id, revision: partial.revision, contentHash: partial.contentHash, expectedActiveRevision: partial.activeRevision });
     const broken = await accept(identity, { agents: [{ id: "orphan-fact", date: day() }] });
@@ -246,7 +245,7 @@ describe("native cumulative overview SQL", () => {
     expect((await overview(identity)).value).toMatchObject([{ agentId: "correct", latestSetId: final.setId }]);
     expect((await agents(identity, first.setId)).value).toMatchObject([{ agentId: "incorrect", responses: 999 }]);
     expect(await historyCount(identity)).toBe(3);
-    await mutate(identity, final.setId, "delete");
+    await remove(identity, final.setId);
     expect((await overview(identity)).analytics.overview).toMatchObject({ retainedSets: 0, reportedAgents: 0, usedAgents: 0,
       active30Days: 0, undatedAgents: 0, earliestActivityDateUtc: null, latestActivityDateUtc: null });
     expect(await historyCount(identity)).toBe(2);

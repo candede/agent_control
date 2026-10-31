@@ -59,8 +59,8 @@ async function head(identity: SelectionIdentity) {
     `SELECT active_set_id AS "activeSetId",revision::text AS "activeRevision" FROM official_usage_state WHERE tenant_id=$1`,
     [identity.tenantId])).rows[0];
 }
-async function operation(identity: SelectionIdentity, setId: string, operation: "select" | "delete") {
-  return imports.confirm(identity, await imports.confirmPreview(identity, setId, operation));
+async function remove(identity: SelectionIdentity, setId: string) {
+  return imports.confirmDeletion(identity, await imports.previewDeletion(identity, setId));
 }
 async function ageSyntheticUploads(identity: SelectionIdentity, stagingId?: string) {
   const client = await fixture.operator.connect();
@@ -244,7 +244,7 @@ describe("native immutable official report authority", () => {
       (SELECT count(*)::int FROM official_usage_sets WHERE tenant_id=$1) AS sets,
       (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1) AS versions`, [identity.tenantId])).rows)
       .toEqual([{ receipts: 1, sets: 1, versions: 3 }]);
-    await operation(identity, accepted.setId, "delete");
+    await remove(identity, accepted.setId);
     await expect(imports.acceptBundle(identity, staged.bundleId, reviewed)).rejects.toMatchObject({ code: "deleted_report_duplicate" });
     expect(await head(identity)).toEqual({ activeSetId: null, activeRevision: String(BigInt(accepted.activeRevision) + 1n) });
   });
@@ -305,17 +305,18 @@ describe("native immutable official report authority", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_versions WHERE tenant_id=$1", [identity.tenantId])).rows).toEqual([{ n: 3 }]);
   });
 
-  it("revision-fences concurrent selection and deletion without falling back after active deletion", async () => {
+  it("revision-fences concurrent deletions and falls back automatically after deleting the latest", async () => {
     const identity = owner(), prior = await (await bundle(identity)).accept(), active = await (await bundle(identity, { marker: "2" })).accept();
-    const select = await imports.confirmPreview(identity, prior.setId, "select"), remove = await imports.confirmPreview(identity, active.setId, "delete");
-    const [selected, deleted] = await Promise.allSettled([imports.confirm(identity, select), imports.confirm(identity, remove)]);
-    expect([selected.status, deleted.status].sort()).toEqual(["fulfilled", "rejected"]);
-    if (selected.status === "fulfilled") {
-      expect((await head(identity)).activeSetId).toBe(prior.setId);
-      expect((await operation(identity, prior.setId, "delete")).activeSetId).toBeNull();
-    } else expect((await head(identity)).activeSetId).toBeNull();
-    expect((await page(identity, "official_agents")).value).toEqual([]);
+    const priorDeletion = await imports.previewDeletion(identity, prior.setId), activeDeletion = await imports.previewDeletion(identity, active.setId);
+    const results = await Promise.allSettled([imports.confirmDeletion(identity, priorDeletion), imports.confirmDeletion(identity, activeDeletion)]);
+    expect(results.map(result => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const remaining = results[0].status === "fulfilled" ? active.setId : prior.setId;
+    expect((await head(identity)).activeSetId).toBe(remaining);
+    expect((await page(identity, "official_agents")).reports.setId).toBe(remaining);
     expect((await page(identity, "history")).counts.total).toBe(1);
+    expect((await remove(identity, remaining)).activeSetId).toBeNull();
+    expect((await page(identity, "official_agents")).value).toEqual([]);
+    expect((await page(identity, "history")).counts.total).toBe(0);
   });
 
   it("protects immutable accepted content and reclaims expired pending row copies", async () => {
@@ -342,7 +343,7 @@ describe("native immutable official report authority", () => {
     }
     const accepted = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
     const selected = await reports.capture(identity, "history");
-    await operation(identity, accepted.setId, "delete");
+    await remove(identity, accepted.setId);
     const rows = async () => (await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_version_rows WHERE tenant_id=$1", [identity.tenantId])).rows[0].n;
     expect(await rows()).toBe(251);
     await expect(reports.page(selected.id, identity)).rejects.toMatchObject({ code: "selection_invalidated" });
@@ -373,7 +374,7 @@ describe("native immutable official report authority", () => {
       (SELECT count(*)::int FROM official_usage_versions WHERE tenant_id=$1 AND expires_at IS NOT NULL) AS versions,
       (SELECT count(*)::int FROM official_usage_artifacts WHERE tenant_id=$1 AND expires_at IS NOT NULL) AS artifacts`, [identity.tenantId])).rows)
       .toEqual([{ sets: 0, versions: 0, artifacts: 0 }]);
-    await operation(identity, accepted.setId, "delete");
+    await remove(identity, accepted.setId);
     expect((await page(identity, "official_agents")).value).toEqual([]);
     await fixture.operator.query("UPDATE official_usage_sets SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [identity.tenantId]);
     await fixture.operator.query("UPDATE official_usage_versions SET deleted_at=clock_timestamp()-interval '91 days' WHERE tenant_id=$1", [identity.tenantId]);

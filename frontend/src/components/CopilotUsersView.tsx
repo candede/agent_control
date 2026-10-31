@@ -1,4 +1,5 @@
 import { useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { hashKey } from "@tanstack/react-query";
 import type { CombinedUser, ReportQuery, UnresolvedReportIdentity } from "../../../backend/src/types/officialReportData";
 import { CapabilityContext } from "../capabilityContext";
 import { hasRole } from "../authorization";
@@ -50,9 +51,7 @@ function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInve
   const change = (next: UsersRouteState) => { setInternal(next); onRouteChange?.(next, false); };
   const reportContext = <div className="agent-report-context">
     <span className="agent-context-label">Report context</span>
-    {reportSelector ?? <span>Selected report set</span>}
-    {current.reportSetId ? <p className="reported-users-snapshot">Saved report{" "}
-      <button type="button" className="secondary" onClick={() => change({ ...current, reportSetId: undefined, page: 0 })}>Use current reports</button></p> : null}
+    {reportSelector}
   </div>;
   return <section className="copilot-users" aria-label="Users and adoption" aria-busy={false}>
     <header className="copilot-users-header"><div><h2>Users</h2><p className="sr-only" id={cohortDescriptionId}>{current.section === "adoption"
@@ -97,10 +96,16 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   if (valid && lastThreshold !== Number(threshold)) setLastThreshold(Number(threshold));
   const query = { ...filters, search: normalizeReportSearch(route.search) || undefined, setId: route.reportSetId?.toLowerCase(),
     lowResponseThreshold: valid ? Number(threshold) : lastThreshold };
+  const summaryQuery: ReportQuery = { cohort: "licensed", sort: "responses", order: "desc",
+    setId: query.setId, lowResponseThreshold: query.lowResponseThreshold };
+  const sharesSummary = hashKey([query]) === hashKey([summaryQuery]);
+  const summaryPage = useReportPage<CombinedUser>("copilot-usage/users", summaryQuery, revision, !sharesSummary);
   const read = useReportPage<CombinedUser>("copilot-usage/users", query, revision);
+  const summaryRead = sharesSummary ? read : summaryPage;
   const queryKey = JSON.stringify(query);
   const data = read.data;
-  const directoryProgress = useUserSourceProgress(data?.sources.directory);
+  const summaryData = withdrawsSelectedRead(read.error) ? undefined : summaryRead.data;
+  const directoryProgress = useUserSourceProgress(summaryData?.sources.directory);
   const directoryFailure = useUserSourceFailure(data?.sources.directory);
   const appProgress = useUserSourceProgress(data?.sources.app_activity);
   const [initialReadComplete, setInitialReadComplete] = useState(false);
@@ -122,12 +127,13 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
   }
   return <>
     <ReportReadStatus read={{ ...read, restart: restartSelection }} quietLoading />
-      <div className="agent-overview-metrics" role="group" aria-label="M365 Copilot license summary" aria-busy={read.loading || Boolean(directoryProgress)}>{cohorts.map(([value, label, metric, description]) =>
+    {summaryRead !== read && (summaryRead.error || summaryRead.leaseEnded) ? <ReportReadStatus read={summaryRead} quietLoading /> : null}
+      <div className="agent-overview-metrics" role="group" aria-label="M365 Copilot license summary" aria-busy={summaryRead.loading || Boolean(directoryProgress)}>{cohorts.map(([value, label, metric, description]) =>
         <button key={value} type="button" className="metric agent-overview-filter" aria-label={label} aria-pressed={filters.cohort === value}
-          aria-description={`${read.loading && !data ? "Loading" : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating" : usageCount(data?.summary[metric])}. ${description}`}
-          onClick={() => setFilters({ ...filters, cohort: filters.cohort === value ? "licensed" : value })}><span title={label}>{label}</span><strong>{read.loading && !data
+          aria-description={`${summaryRead.loading && !summaryData ? "Loading" : (directoryProgress || summaryRead.loading) && summaryData?.summary[metric] == null ? "Updating" : usageCount(summaryData?.summary[metric])}. ${description}`}
+          onClick={() => setFilters({ ...filters, cohort: filters.cohort === value ? "licensed" : value })}><span title={label}>{label}</span><strong>{summaryRead.loading && !summaryData
             ? <span className="skeleton-block skeleton-count" aria-hidden="true" />
-            : (directoryProgress || read.loading) && data?.summary[metric] == null ? "Updating..." : usageCount(data?.summary[metric])}</strong>
+            : (directoryProgress || summaryRead.loading) && summaryData?.summary[metric] == null ? "Updating..." : usageCount(summaryData?.summary[metric])}</strong>
           <small title={description}>{description}</small></button>)}{reportContext}</div>
     {directoryProgress ? <p className="reported-users-note" role="status">{directoryProgress}</p>
       : data && !read.loading && data.sources.directory.state !== "available" ? <p className="copilot-users-notice" role="status">{directoryFailure

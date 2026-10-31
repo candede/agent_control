@@ -138,6 +138,36 @@ describe("report licensing reconciliation after failed verification", () => {
   );
 });
 
+describe("tenant-wide paid user summaries", () => {
+  it.each([
+    { cohort: "licensed" },
+    { cohort: "using_agents" },
+    { cohort: "needs_attention" },
+    { cohort: "no_agent_activity" },
+    { search: "no matching user" },
+    { company: "Company", department: null },
+    { entitlement: "no_paid", appActivity: "inactive" },
+    { sort: "name", order: "asc" },
+  ])("keeps tenant totals independent of table filters %j", async filters => {
+    const saved = context("copilot_users"), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    Object.assign(saved.metadata.directory, { state: "available",
+      generationId: "22222222-2222-4222-8222-222222222222", rowCount: 4 });
+    saved.report.availability = "active";
+    const totals = { directory_counts: { checked: "4", licensed: "4", using_agents: "2",
+      no_agents: "2", measured: "2", attention: "3", unknown: "0" },
+      unresolved: "0", unpaid: "0", paid: "2", unknown_license: "0", active_users: "2",
+      responses: null, bridge: null, users: null, licensed: null, unlicensed: null };
+    const query = mockQuery(client);
+    query.mockResolvedValue(result([totals]));
+    const overall = await reports.summaryInRead(client, saved);
+    const filtered = await reports.summaryInRead(client, { ...saved, query: reportQuery("copilot_users", filters) });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[1]).toEqual(query.mock.calls[0]);
+    expect(filtered).toEqual(overall);
+    expect(filtered).toMatchObject({ licensedUsers: 4, usingAgentsUsers: 2, needsAttentionUsers: 3, noAgentActivityUsers: 2 });
+  });
+});
+
 describe("history selection status", () => {
   it.each([null, false, true])("projects SQL active status %j as a boolean", async active => {
     const saved = context("history"), client = Object.assign(new pg.Client(), { release: vi.fn() });

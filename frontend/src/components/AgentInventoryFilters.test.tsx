@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentInventoryFilters, type AgentFilterValues } from "./AgentInventoryFilters";
-import { getInventoryFacets } from "../api/client";
+import { ApiError, getInventoryFacets } from "../api/client";
 import { encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets";
 import { agentRouteSearch, parseAgentRoute } from "../workbenchRouting";
 
@@ -115,12 +115,13 @@ describe("inventory filter toolbar", () => {
   });
 
   it.each<Partial<AgentFilterValues>>([{ packageType: "firstParty" }, { search: "policy" }, { host: "Teams" }])(
-    "keeps Clear filters with the query controls and only renders a chip row for detailed restrictions: %j", initial => {
+    "keeps Clear filters in the chip row, including search-only and package-type filters: %j", initial => {
       setup(initial);
       const clear = screen.getByRole("button", { name: "Clear filters" });
-      expect(clear.closest(".agent-query-bar")).not.toBeNull();
-      expect(clear.closest(".agent-filter-chips")).toBeNull();
-      expect(document.querySelectorAll(".agent-filter-chips")).toHaveLength(initial.host ? 1 : 0);
+      expect(clear).toHaveClass("agent-filter-chip");
+      expect(clear.closest(".agent-query-bar")).toBeNull();
+      expect(clear.closest(".agent-filter-chips")).not.toBeNull();
+      expect(document.querySelectorAll(".agent-filter-chips")).toHaveLength(1);
     },
   );
 
@@ -153,6 +154,7 @@ describe("inventory filter toolbar", () => {
     expect(screen.getAllByRole("combobox")).toHaveLength(1);
     expect(screen.getByRole("searchbox", { name: "Search" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Clear filters" })).not.toBeInTheDocument();
+    expect(document.querySelector(".agent-filter-chips")).not.toBeInTheDocument();
     const trigger = screen.getByRole("button", { name: "Filters" });
     trigger.focus();
     await user.keyboard("{Enter}");
@@ -219,6 +221,63 @@ describe("inventory filter toolbar", () => {
     expect(screen.getByRole("button", { name: "Filters, 1 active" })).toHaveFocus();
     await user.click(screen.getByRole("button", { name: "Remove environment filter" }));
     expect(screen.getByRole("button", { name: "Filters" })).toBeVisible();
+  });
+
+  it.each([
+    { platform: "missing-platform", availability: "missing-assignment", host: "missing-host", publisher: "missing-publisher" },
+    { platform: null, availability: null, host: null, publisher: null },
+    { platform: "studio", availability: { kind: "some-or-all" } as const, host: "Teams", publisher: "Contoso" },
+  ])("retains active facet values while the inventory selection is unavailable: %j", async initial => {
+    const changed = vi.fn(), error = vi.fn();
+    render(<AgentInventoryFilters values={{ ...defaults, ...initial }} options={options} loading
+      onChange={changed} onClear={vi.fn()} onError={error} />);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Filters, 4 active" }));
+    for (const [name, value] of [
+      ["Built with", initial.platform], ["Assigned access", initial.availability],
+      ["Host", initial.host], ["Publisher", initial.publisher],
+    ] as const) {
+      const select = screen.getByRole("combobox", { name });
+      expect(select).toBeDisabled();
+      expect(select).toHaveValue(encodeInventoryFacet(value));
+      expect(within(select).getAllByRole("option").filter(option => option.getAttribute("value") === encodeInventoryFacet(value)))
+        .toHaveLength(1);
+    }
+    expect(changed).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled();
+    expect(getInventoryFacets).not.toHaveBeenCalled();
+  });
+
+  it("keeps retained inventory when the selected environment label read expires", async () => {
+    vi.mocked(getInventoryFacets).mockImplementation(async (_selection, _field, query) => {
+      if (query?.selected) throw new ApiError(409, "selection_invalidated",
+        "Saved label read expired", { details: { reason: "expired" } });
+      return { value: [], total: 0, nextCursor: null };
+    });
+    const invalidated = vi.fn(), error = vi.fn();
+    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: "environment-a" }}
+      options={{ ...options, environments: [] }} loading={false}
+      onChange={vi.fn()} onClear={vi.fn()} onError={error} onInvalidated={invalidated} />);
+    await waitFor(() => expect(error).toHaveBeenCalledWith("Saved label read expired", "selected-fixture"));
+    expect(invalidated).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Remove environment filter" })).toHaveTextContent("environment-a");
+  });
+
+  it.each([
+    new ApiError(409, "selection_invalidated", "Saved label changed", { details: { reason: "changed" } }),
+    new ApiError(409, "inventory_changed", "Saved inventory changed"),
+    new ApiError(401, "unauthorized", "Sign-in required"),
+    new ApiError(403, "forbidden", "Permission denied"),
+  ])("withdraws inventory for a revoked selected environment read: $code", async failure => {
+    vi.mocked(getInventoryFacets).mockImplementation(async (_selection, _field, query) => {
+      if (query?.selected) throw failure;
+      return { value: [], total: 0, nextCursor: null };
+    });
+    const invalidated = vi.fn(), error = vi.fn();
+    render(<AgentInventoryFilters selectionId="selected-fixture" values={{ ...defaults, environmentId: "environment-a" }}
+      options={{ ...options, environments: [] }} loading={false}
+      onChange={vi.fn()} onClear={vi.fn()} onError={error} onInvalidated={invalidated} />);
+    await waitFor(() => expect(invalidated).toHaveBeenCalledOnce());
+    expect(error).not.toHaveBeenCalled();
   });
 
   it("invalidates selected environment labels with the inventory selection and ignores cancelled responses", async () => {

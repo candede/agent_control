@@ -19,7 +19,6 @@ export function AdoptionDashboard({ revision, baselineId, onBaselineChange, comp
       <div><p className="eyebrow"><Sparkles size={15} aria-hidden="true" /> Adoption insights</p>
         <h2 id="adoption-dashboard-title">Understand adoption. Empower your people.</h2>
         <p>See who is getting involved, where to focus, and who is leading the way.</p></div>
-      <a className="secondary dashboard-link" href="/sync?reports=manage">View saved reports</a>
     </header>
     <ReportReadStatus read={history.read} />
     {!snapshots && !history.read.error && !history.read.leaseEnded ? <p role="status">
@@ -171,8 +170,9 @@ function SnapshotTable({ snapshots, heading }: { snapshots: AdoptionSnapshot[]; 
       <table><thead><tr><th scope="col">Report dates</th><th scope="col">Active users</th><th scope="col">Active agents</th>
         <th scope="col">Agent responses</th><th scope="col">Source context</th><th scope="col">Report</th></tr></thead>
       <tbody>{snapshots.map(snapshot => <tr key={snapshot.id}>
-        <th scope="row">{adoptionSnapshotLabel(snapshot)}<small>{snapshot.periodProvenance === "activity_range" ? "Observed activity"
-          : snapshot.periodProvenance === "operator_asserted" ? "Admin-supplied reporting window" : "Reporting window"}</small></th>
+        <th scope="row">{adoptionSnapshotLabel(snapshot)}
+          {snapshot.periodProvenance !== "activity_range" ? <small>{snapshot.periodProvenance === "operator_asserted"
+            ? "Admin-supplied reporting window" : "Reporting window"}</small> : null}</th>
         <td>{usageCount(snapshot.activeUsers)}</td><td>{usageCount(snapshot.activeAgents)}</td><td>{usageCount(snapshot.responses)}</td>
         <td><small>Active users: Users {usageCount(snapshot.userReportActiveUsers)}; Users &amp; agents {usageCount(snapshot.relationshipActiveUsers)}.</small>
           <small>Responses: Agents {usageCount(snapshot.responses)}; Users {usageCount(snapshot.userReportResponses)};

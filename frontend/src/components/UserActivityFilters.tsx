@@ -76,9 +76,6 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
           <strong>{loading ? "Updating..." : matchingCount === undefined ? "Unavailable" : matchingCount.toLocaleString()}</strong>{" "}
           <span>{!loading && matchingCount === 1 ? "matching user" : "matching users"}</span>
         </span>
-        {hasFilters ? <button type="button" className="clear-filters-button" onClick={() => {
-          onClear(); trigger.current?.focus();
-        }}>Clear filters</button> : null}
       </div>
       <FilterPopover label="Filter users" activeCount={chips.length} triggerRef={trigger}>
         <div className="agent-filter-fields">
@@ -104,12 +101,15 @@ export function UserActivityFilters<Cohort extends string>({ values, path, selec
       {exportButton}
     </div>
     {!validThreshold ? <p role="alert">Enter a whole-number threshold between 1 and 100,000,000.</p> : null}
-    {chips.length ? <div className="agent-filter-chips" aria-label="Active filters">
+    {hasFilters ? <div className="agent-filter-chips" aria-label="Active filters">
       {chips.map(chip => <button key={chip.key} type="button" className="agent-filter-chip"
         aria-label={`Remove ${chip.label.toLowerCase()} filter`} title={`${chip.label}: ${chip.value}`}
         onClick={() => { chip.remove(); trigger.current?.focus(); }}>
         <span>{chip.label}: <strong>{chip.value}</strong></span><X size={13} aria-hidden="true" />
       </button>)}
+      <button type="button" className="agent-filter-chip" onClick={() => {
+        onClear(); trigger.current?.focus();
+      }}>Clear filters</button>
     </div> : null}
   </section>;
 }

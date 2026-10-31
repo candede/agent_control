@@ -1445,8 +1445,8 @@ async function reportHistory(database: pg.Pool, telemetry: CapacityTelemetry) {
   const corrected = await imports.acceptBundle(identity, correction, await imports.bundle(identity, correction));
   telemetry.write({ event: "history-nonactive-correction", corrected, pinned: old.id, exportId });
   await assert.rejects(() => reader.page(pin.id, identity));
-  const confirmation = await imports.confirmPreview(identity, accepted[0], "delete");
-  await imports.confirm(identity, confirmation);
+  const confirmation = await imports.previewDeletion(identity, accepted[0]);
+  await imports.confirmDeletion(identity, confirmation);
   await assert.rejects(() => reader.page(pin.id, identity));
   return { sets: 32, corrected, exportId, deletedNonActive: accepted[0], historyPinInvalidated: true };
 }

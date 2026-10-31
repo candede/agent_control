@@ -7,6 +7,44 @@ import { fulfillInventoryPage } from "./selectedInventoryFixture";
 
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
+for (const role of ["AgentControl.Viewer", "AgentControl.UsageReportUploader"] as const) {
+  test(`${role} sees only read-only agent detail tabs, including on a Manage deep link`, async ({ page }) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.clock.setFixedTime(new Date(layoutTime));
+    await page.route(url => url.pathname === "/api/me", route => route.fulfill({ json: {
+      user: {
+        displayName: "Synthetic non-admin", username: "fixture@example.invalid",
+        homeAccountId: "layout-principal", tenantId: "layout-tenant", roles: [role],
+      },
+      csrfToken: "layout-csrf", roleAssignmentRequired: false,
+    } }));
+    const agent = unifiedAgents.value[0];
+    await page.goto("/agents");
+    await page.getByRole("button", { name: `View details for ${agent.displayName}`, exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: agent.displayName });
+    await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage", "Users"]);
+    await expect(dialog.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
+    await expect(dialog.locator(".agent-access-management, .agent-management-sections")).toHaveCount(0);
+
+    await dialog.getByRole("tab", { name: "Overview" }).focus();
+    await page.keyboard.press("End");
+    await expect(dialog.getByRole("tab", { name: "Users" })).toBeFocused();
+    await expect(dialog.getByRole("tab", { name: "Users" })).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("ArrowRight");
+    await expect(dialog.getByRole("tab", { name: "Overview" })).toBeFocused();
+    await page.keyboard.press("ArrowLeft");
+    await expect(dialog.getByRole("tab", { name: "Users" })).toBeFocused();
+    await page.keyboard.press("Home");
+    await expect(dialog.getByRole("tab", { name: "Overview" })).toBeFocused();
+
+    await page.goto(`/agents?detail=${encodeURIComponent(agent.id)}&detailTab=controls`);
+    await expect(dialog.getByRole("tab", { name: "Manage", exact: true })).toHaveCount(0);
+    await expect(dialog.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
+    await expect(dialog.locator(".agent-access-management, .agent-management-sections")).toHaveCount(0);
+    expect(unexpected).toEqual([]);
+  });
+}
+
 test("edits access and installation and reviews blocking inside one agent modal", async ({ page }, info) => {
   test.setTimeout(60_000);
   const unexpected = await mockLayoutApi(page);
@@ -102,6 +140,7 @@ test("edits access and installation and reviews blocking inside one agent modal"
   await page.goto("/agents");
   await page.getByRole("button", { name: `View details for ${agent.displayName}`, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: agent.displayName });
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage", "Users", "Manage"]);
   await dialog.getByRole("tab", { name: "Manage", exact: true }).click();
   const heading = dialog.locator(".agent-access-heading");
   await expect(heading.getByText(`Package ID: ${agent.id}`, { exact: true })).toBeVisible();

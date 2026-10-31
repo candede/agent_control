@@ -80,15 +80,15 @@ describe("live relational official history selection", () => {
     expect((await fixture.operator.query("SELECT count(*)::int AS count FROM official_usage_row_facts WHERE tenant_id=$1", [tenant])).rows[0].count).toBe(0);
   }, 30_000);
 
-  it("allows deleting an incomplete import but never selecting it", async () => {
+  it("allows deleting an incomplete import without making it the automatic default", async () => {
     const identity = { ...selectionIdentity, tenantId: "history-partial-delete" }, imports = new OfficialReportImports(fixture.runtime);
     async function* csv() { yield Buffer.from(`${schemaRegistry.users.headers.join(",")}\nuser,User,1,1,\n`); }
     const stage = await imports.stage(identity, { bundleId: randomUUID() }, csv());
     const partial = await imports.accept(identity, { stagingId: stage.id, revision: stage.revision,
       contentHash: stage.contentHash, expectedActiveRevision: stage.activeRevision });
     expect(partial.complete).toBe(false);
-    await expect(imports.confirmPreview(identity, partial.setId, "select")).rejects.toBeInstanceOf(Error);
-    await imports.confirm(identity, await imports.confirmPreview(identity, partial.setId, "delete"));
+    expect((await fixture.runtime.query("SELECT active_set_id FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0].active_set_id).toBeNull();
+    await imports.confirmDeletion(identity, await imports.previewDeletion(identity, partial.setId));
     expect((await fixture.runtime.query("SELECT deleted_at FROM official_usage_sets WHERE id=$1", [partial.setId])).rows[0].deleted_at).not.toBeNull();
   });
 
@@ -117,7 +117,7 @@ describe("live relational official history selection", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM official_usage_ingestion_rows WHERE ingestion_id=$1", [ingestion])).rows[0].n).toBe(0);
   });
 
-  it("revalidates target expiry when consuming a select confirmation", async () => {
+  it("repairs an expired automatic default on first read without consuming destructive confirmations", async () => {
     const identity = { ...selectionIdentity, tenantId: "history-confirm-expiry" }, imports = new OfficialReportImports(fixture.runtime);
     await imports.history.ensure(identity.tenantId);
     const bundleId = randomUUID();
@@ -126,11 +126,12 @@ describe("live relational official history selection", () => {
       await imports.stage(identity, { bundleId }, csv());
     }
     const set = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
-    expect(await imports.confirm(identity, await imports.confirmPreview(identity, set.setId, "select"))).toMatchObject({ activeSetId: set.setId });
-    const confirmation = await imports.confirmPreview(identity, set.setId, "select");
+    const confirmation = await imports.previewDeletion(identity, set.setId);
     await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [set.setId]);
-    await expect(imports.confirm(identity, confirmation)).rejects.toBeInstanceOf(Error);
-    expect((await fixture.runtime.query("SELECT revision::text FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0].revision).toBe(confirmation.activeRevision);
+    await imports.history.ensure(identity.tenantId);
+    expect((await fixture.runtime.query("SELECT active_set_id,revision::text FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0])
+      .toEqual({ active_set_id: null, revision: String(BigInt(confirmation.activeRevision) + 1n) });
+    await expect(imports.confirmDeletion(identity, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });
     expect((await fixture.runtime.query("SELECT consumed_at FROM official_usage_confirmations WHERE id=$1", [confirmation.id])).rows[0].consumed_at).toBeNull();
   });
 
@@ -140,8 +141,9 @@ describe("live relational official history selection", () => {
     const today = new Date().toISOString().slice(0, 10);
     const publish = async (count: number, correctionOfSetId?: string) => {
       const bundleId = randomUUID();
-      const contents = { users: `user,User,1,${count},${today}`, agents: `agent,Agent,User,1,0,${count},${today}`,
-        userAgents: `agent,Agent,User,user,${count},${today}` };
+      const date = count === 1 || correctionOfSetId ? new Date(Date.now() - 86400000).toISOString().slice(0, 10) : today;
+      const contents = { users: `user,User,1,${count},${date}`, agents: `agent,Agent,User,1,0,${count},${date}`,
+        userAgents: `agent,Agent,User,user,${count},${date}` };
       for (const kind of ["users", "agents", "userAgents"] as const) {
         async function* stream() { yield Buffer.from(`${schemaRegistry[kind].headers.join(",")}\n${contents[kind]}\n`); }
         await imports.stage(identity, { bundleId, correctionOfSetId }, stream());
@@ -160,7 +162,7 @@ describe("live relational official history selection", () => {
     const before = (await fixture.runtime.query("SELECT active_set_id,revision FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0];
     expect(before).toMatchObject({ active_set_id: second.setId });
     if (operation === "correction") await publish(3, first.setId);
-    if (operation === "delete") await imports.confirm(identity, await imports.confirmPreview(identity, first.setId, "delete"));
+    if (operation === "delete") await imports.confirmDeletion(identity, await imports.previewDeletion(identity, first.setId));
     if (operation === "expiry") {
       await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [first.setId]);
       expect(await reports.history.expire(identity.tenantId)).toBe(1);

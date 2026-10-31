@@ -62,7 +62,7 @@ async function selectedAgents(identity: SelectionIdentity, setId?: string, searc
   return reports.page(selected.id, identity, { limit: 1 });
 }
 async function remove(identity: SelectionIdentity, setId: string) {
-  return imports.confirm(identity, await imports.confirmPreview(identity, setId, "delete"));
+  return imports.confirmDeletion(identity, await imports.previewDeletion(identity, setId));
 }
 const one = (changes: Rows = {}): Record<Kind, Rows> => ({ agents: { count: 1, ...changes }, userAgents: { count: 1, ...changes }, users: { count: 1, ...changes } });
 
@@ -172,7 +172,7 @@ describe("native cumulative history and immutable observations", () => {
     expect(after.value.find(row => row.id === prior.setId)?.visibility).toBe("superseded");
     await remove(identity, prior.setId);
     expect((await selectedAgents(identity)).reports.setId).toBe(corrected.setId);
-    await expect(selectedAgents(identity, prior.setId)).rejects.toMatchObject({ status: 409 });
+    await expect(selectedAgents(identity, prior.setId)).rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
   });
 
   it.each([false, true])("reimports expired bytes without reviving an expired set (reformatted: %s)", async reformatted => {
@@ -194,10 +194,10 @@ describe("native cumulative history and immutable observations", () => {
     expect(refreshed.analytics.history?.imports).toBe(2);
     expect(refreshed.value.find(row => row.id === reimported.setId)?.active).toBe(true);
     expect(refreshed.value.some(row => row.id === second.setId)).toBe(false);
-    await expect(selectedAgents(identity, second.setId)).rejects.toMatchObject({ status: 409 });
+    await expect(selectedAgents(identity, second.setId)).rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
     expect((await selectedAgents(identity)).reports.setId).toBe(reimported.setId);
     expect((await history(owner())).analytics.history?.imports).toBe(0);
-    await expect(selectedAgents(owner(), original.setId)).rejects.toMatchObject({ status: 409 });
+    await expect(selectedAgents(owner(), original.setId)).rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
   });
 
   it.each([false, true])("never exposes orphan or partial restored observations (inactive: %s)", async inactive => {
@@ -217,7 +217,7 @@ describe("native cumulative history and immutable observations", () => {
     });
     expect((await selectedAgents(identity)).value).toMatchObject(inactive ? [{ responses: 5 }] : []);
     if (current) expect(historic.reports).toMatchObject({ activeSetId: current.setId, activeRevision: pinned.reports.activeRevision });
-    await expect(selectedAgents(identity, accepted.setId)).rejects.toMatchObject({ status: 409 });
+    await expect(selectedAgents(identity, accepted.setId)).rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
     await retainUntilConverged(fixture.operator, { batchSize: 250 });
   });
 

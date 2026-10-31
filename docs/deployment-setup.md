@@ -445,7 +445,9 @@ these roles manually:
 | --- | --- |
 | `AgentControl.Viewer` | View tenant data and request read-only synchronization |
 | `AgentControl.UsageReportUploader` | Viewer access plus upload, validation and publication of new CSV report sets |
-| `AgentControl.Admin` | Viewer and Uploader access plus published-report corrections/selection/deletion, supported controls, configuration and local Audit read/export |
+| `AgentControl.Admin` | Viewer and Uploader access plus published-report corrections/deletion, supported controls, configuration and local Audit read/export |
+
+Personal report-set selection is read-only and available to every Viewer-capable role.
 
 The roles must be enabled and allow **Users/Groups**. Uploader includes Viewer;
 Admin includes both. Each user or group needs only one role.

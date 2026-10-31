@@ -210,5 +210,5 @@ export async function usageIntent(database: pg.Pool, scope: AgentUsageScope,
 
 export async function deleteUsageSet(database: pg.Pool, scope: AgentUsageScope, setId: string) {
   const repository = new OfficialReportImports(database), identity = await usageIdentity(database, scope);
-  return repository.confirm(identity, await repository.confirmPreview(identity, setId, "delete"));
+  return repository.confirmDeletion(identity, await repository.previewDeletion(identity, setId));
 }

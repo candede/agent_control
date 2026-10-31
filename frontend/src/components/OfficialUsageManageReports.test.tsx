@@ -15,7 +15,7 @@ import { OfficialUsageHistoryPanel } from "./OfficialUsageHistoryPanel";
 import { SavedQueryProvider } from "./SavedQueryProvider";
 
 vi.mock("../api/reportData", async original => ({ ...await original<typeof import("../api/reportData")>(),
-  readReportPage: vi.fn(), previewReportOperation: vi.fn(), confirmReportOperation: vi.fn() }));
+  readReportPage: vi.fn(), previewReportDeletion: vi.fn(), confirmReportDeletion: vi.fn() }));
 mockNativeDialogs();
 const report = historySet(1), older = historySet(2);
 const confirmation: OfficialReportConfirmation = { id: "confirmation", operation: "delete", setId: report.id,
@@ -32,8 +32,8 @@ async function open() {
 }
 beforeEach(() => {
   vi.mocked(api.readReportPage).mockResolvedValue(reportPage([report], { counts: { total: 1, filtered: 1 } }));
-  vi.mocked(api.previewReportOperation).mockImplementation(async id => ({ ...confirmation, setId: id }));
-  vi.mocked(api.confirmReportOperation).mockResolvedValue({ activeSetId: null, activeRevision: "5" });
+  vi.mocked(api.previewReportDeletion).mockImplementation(async id => ({ ...confirmation, setId: id }));
+  vi.mocked(api.confirmReportDeletion).mockResolvedValue({ activeSetId: null, activeRevision: "5" });
 });
 afterEach(() => { cleanup(); vi.resetAllMocks(); vi.restoreAllMocks(); });
 
@@ -50,8 +50,8 @@ describe("record-backed report management", () => {
     }
     vi.spyOn(performance, "now").mockReturnValue(performance.now() + Date.parse(saved.selection.expiresAt) - Date.parse(saved.selection.validatedAt) + 1);
     fireEvent.click(trigger);
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(phase === "confirmation" ? 1 : 0);
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledTimes(phase === "confirmation" ? 1 : 0);
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     fireEvent.focus(window);
     expect(screen.getByRole("table")).toBeVisible();
     expect(screen.getByRole("button", { name: "Delete report set" })).toBeDisabled();
@@ -71,7 +71,7 @@ describe("record-backed report management", () => {
     expect(storage).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "View report" }));
     expect(props.onViewSnapshot).toHaveBeenCalledExactlyOnceWith(report.id);
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
   });
   it.each([true, false])("requires an explicit fenced deletion and accurately describes active=%s before opening a fresh post-mutation history", async active => {
     const target = active ? report : older;
@@ -79,21 +79,21 @@ describe("record-backed report management", () => {
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
-    expect(dialog).toHaveTextContent(active ? "No report will be selected" : "The active report selection stays unchanged");
+    expect(dialog).toHaveTextContent(active ? "Latest will automatically use the next newest" : "The latest report stays unchanged");
     expect(dialog).toHaveTextContent("History pages, overview and exports will be invalidated");
-    expect(api.previewReportOperation).toHaveBeenCalledWith(target.id, "delete", expect.any(AbortSignal));
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledWith(target.id, expect.any(AbortSignal));
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     vi.mocked(api.readReportPage).mockResolvedValue(reportPage([], { counts: { total: 0, filtered: 0 } }));
     fireEvent.click(modal.getByRole("button", { name: "Delete report set" }));
     expect(await screen.findByText("Report set deleted.")).toBeVisible();
     expect(await screen.findByRole("heading", { name: "No reports yet" })).toBeVisible();
-    expect(api.confirmReportOperation).toHaveBeenCalledExactlyOnceWith({ ...confirmation, setId: target.id }, expect.any(AbortSignal));
+    expect(api.confirmReportDeletion).toHaveBeenCalledExactlyOnceWith({ ...confirmation, setId: target.id }, expect.any(AbortSignal));
     expect(props.onChanged).toHaveBeenCalledOnce();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
   it.each(["delete", "reload", "denial"] as const)("captures fresh history after %s even when a peer retains the pre-operation query", async action => {
-    if (action !== "delete") vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new ApiError(action === "denial" ? 403 : 409,
+    if (action !== "delete") vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new ApiError(action === "denial" ? 403 : 409,
       action === "denial" ? "denied" : "selection_invalidated", "History unavailable."));
     render(<SavedQueryProvider>
       <OfficialUsageManageReports {...props} />
@@ -170,22 +170,22 @@ describe("record-backed report management", () => {
     await waitFor(() => expect(modal.getByRole("button", { name: "Cancel" })).toBeEnabled());
     fireEvent(dialog, new Event("cancel", { cancelable: true }));
     expect(trigger).toHaveFocus();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("allows cancellation of a pending preview, aborting late completion rather than reviving the dialog", async () => {
-    const pending = deferred<OfficialReportConfirmation>(); vi.mocked(api.previewReportOperation).mockReturnValue(pending.promise);
+    const pending = deferred<OfficialReportConfirmation>(); vi.mocked(api.previewReportDeletion).mockReturnValue(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     expect(modal.getByRole("button", { name: "Delete report set" })).toBeDisabled();
     fireEvent.click(modal.getByRole("button", { name: "Cancel" }));
-    expect(vi.mocked(api.previewReportOperation).mock.calls[0][2]?.aborted).toBe(true);
+    expect(vi.mocked(api.previewReportDeletion).mock.calls[0][1]?.aborted).toBe(true);
     await act(async () => pending.resolve(confirmation));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it.each(["pending", "prepared"] as const)("retires a %s deletion when history revalidation denies its evidence", async stage => {
     const preview = deferred<OfficialReportConfirmation>();
-    if (stage === "pending") vi.mocked(api.previewReportOperation).mockReturnValueOnce(preview.promise);
+    if (stage === "pending") vi.mocked(api.previewReportDeletion).mockReturnValueOnce(preview.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     if (stage === "prepared") await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
@@ -195,7 +195,7 @@ describe("record-backed report management", () => {
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     if (stage === "pending") {
-      expect(vi.mocked(api.previewReportOperation).mock.calls[0][2]?.aborted).toBe(true);
+      expect(vi.mocked(api.previewReportDeletion).mock.calls[0][1]?.aborted).toBe(true);
       await act(async () => preview.resolve(confirmation));
     }
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -203,8 +203,8 @@ describe("record-backed report management", () => {
     fireEvent.click(screen.getByRole("button", { name: "Retry saved data" }));
     await screen.findByRole("table");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(props.onChanged).not.toHaveBeenCalled();
   });
   it("retires prepared deletion on history invalidation and explicitly replaces it without replaying the preview", async () => {
@@ -225,8 +225,8 @@ describe("record-backed report management", () => {
     await act(async () => current.resolve(reportPage([older])));
     await screen.findByRole("table");
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("keeps a prepared deletion through unchanged background revalidation", async () => {
     render(<OfficialUsageManageReports {...props} />);
@@ -239,11 +239,11 @@ describe("record-backed report management", () => {
     await act(async () => current.resolve(reportPage([report], { counts: { total: 1, filtered: 1 } })));
     expect(screen.getByRole("dialog")).toBe(dialog);
     expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
   });
   it("keeps an admitted deletion locked when history revalidation fails", async () => {
     const pending = deferred<OfficialReportConfirmed>();
-    vi.mocked(api.confirmReportOperation).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.confirmReportDeletion).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -254,14 +254,14 @@ describe("record-backed report management", () => {
     await screen.findByText("History access denied.");
     expect(screen.getByRole("dialog")).toBe(dialog);
     expect(modal.getByRole("button", { name: "Cancel" })).toBeDisabled();
-    expect(vi.mocked(api.confirmReportOperation).mock.calls[0][1]?.aborted).toBe(false);
+    expect(vi.mocked(api.confirmReportDeletion).mock.calls[0][1]?.aborted).toBe(false);
     await act(async () => pending.resolve({ activeSetId: null, activeRevision: "5" }));
     await screen.findByText("Report set deleted.");
     expect(props.onChanged).toHaveBeenCalledOnce();
   });
   it("preserves an uncertain deletion's recovery when a concurrent history read also fails", async () => {
     const deletion = deferred<OfficialReportConfirmed>(), history = deferred<ReportPage<ReportHistorySet>>();
-    vi.mocked(api.confirmReportOperation).mockReturnValueOnce(deletion.promise);
+    vi.mocked(api.confirmReportDeletion).mockReturnValueOnce(deletion.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -278,8 +278,8 @@ describe("record-backed report management", () => {
     expect(remove).toBeDisabled();
     fireEvent.click(modal.getByRole("button", { name: "Reload report history" }));
     await screen.findByRole("table");
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).toHaveBeenCalledOnce();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
     expect(props.onChanged).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
@@ -303,8 +303,8 @@ describe("record-backed report management", () => {
     expect(management.queryByRole("table")).not.toBeInTheDocument();
     expect(management.getByRole("button", { name: "Restart selection" })).toBeEnabled();
     expect(api.readReportPage).toHaveBeenCalledTimes(2);
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("returns focus to management when cancellation cannot focus a revalidating row", async () => {
     render(<OfficialUsageManageReports {...props} />);
@@ -319,7 +319,7 @@ describe("record-backed report management", () => {
     await act(async () => pending.resolve(reportPage([report])));
   });
   it("focuses the denial recovery after its dialog and triggering history are removed", async () => {
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new ApiError(403, "denied", "Management access denied."));
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new ApiError(403, "denied", "Management access denied."));
     render(<OfficialUsageManageReports {...props} />);
     await userEvent.click(await screen.findByRole("button", { name: "Delete report set" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Management access denied.");
@@ -336,33 +336,33 @@ describe("record-backed report management", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Manage saved reports" })).toHaveFocus();
     await screen.findByRole("table");
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("retries failed preparation without silently performing deletion", async () => {
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new Error("Unable to check report"));
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new Error("Unable to check report"));
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     await modal.findByRole("alert");
     fireEvent.click(modal.getByRole("button", { name: "Retry preparation" }));
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(2);
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledTimes(2);
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("admits a single preparation when the same row is activated twice before rerender", async () => {
     const pending = deferred<OfficialReportConfirmation>();
-    vi.mocked(api.previewReportOperation).mockReturnValue(pending.promise);
+    vi.mocked(api.previewReportDeletion).mockReturnValue(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const trigger = await screen.findByRole("button", { name: "Delete report set" });
     act(() => { fireEvent.click(trigger); fireEvent.click(trigger); });
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(vi.mocked(api.previewReportOperation).mock.calls[0][2]?.aborted).toBe(false);
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(vi.mocked(api.previewReportDeletion).mock.calls[0][1]?.aborted).toBe(false);
     await act(async () => pending.resolve(confirmation));
     const dialog = screen.getByRole("dialog", { name: "Delete report set?" });
     expect(within(dialog).getByRole("button", { name: "Delete report set" })).toBeEnabled();
   });
   it("consumes a prepared deletion only once for same-batch confirmation clicks", async () => {
     const pending = deferred<OfficialReportConfirmed>();
-    vi.mocked(api.confirmReportOperation).mockReturnValue(pending.promise);
+    vi.mocked(api.confirmReportDeletion).mockReturnValue(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -371,8 +371,8 @@ describe("record-backed report management", () => {
       fireEvent.click(remove); fireEvent.click(remove);
       fireEvent(dialog, new Event("cancel", { cancelable: true }));
     });
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(vi.mocked(api.confirmReportOperation).mock.calls[0][1]?.aborted).toBe(false);
+    expect(api.confirmReportDeletion).toHaveBeenCalledOnce();
+    expect(vi.mocked(api.confirmReportDeletion).mock.calls[0][1]?.aborted).toBe(false);
     expect(dialog).toBeInTheDocument();
     await act(async () => pending.resolve({ activeSetId: null, activeRevision: "5" }));
     await screen.findByText("Report set deleted.");
@@ -380,7 +380,7 @@ describe("record-backed report management", () => {
   });
   it("does not navigate into a correction when deletion starts before the disabled state renders", async () => {
     const pending = deferred<OfficialReportConfirmed>();
-    vi.mocked(api.confirmReportOperation).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.confirmReportDeletion).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -388,8 +388,8 @@ describe("record-backed report management", () => {
     const correct = modal.getByRole("button", { name: "Import correction instead" });
     act(() => { fireEvent.click(remove); fireEvent.click(correct); });
     expect(props.onCorrect).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(vi.mocked(api.confirmReportOperation).mock.calls[0][1]?.aborted).toBe(false);
+    expect(api.confirmReportDeletion).toHaveBeenCalledOnce();
+    expect(vi.mocked(api.confirmReportDeletion).mock.calls[0][1]?.aborted).toBe(false);
     expect(dialog).toBeInTheDocument();
     await act(async () => pending.resolve({ activeSetId: null, activeRevision: "5" }));
     await screen.findByText("Report set deleted.");
@@ -397,7 +397,7 @@ describe("record-backed report management", () => {
   });
   it.each(["cancel", "escape", "correction"] as const)("retires a prepared deletion synchronously on %s", async action => {
     const pending = deferred<OfficialReportConfirmed>();
-    vi.mocked(api.confirmReportOperation).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.confirmReportDeletion).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -407,14 +407,14 @@ describe("record-backed report management", () => {
       else fireEvent.click(modal.getByRole("button", { name: action === "cancel" ? "Cancel" : "Import correction instead" }));
       fireEvent.click(remove);
     });
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(props.onCorrect).toHaveBeenCalledTimes(action === "correction" ? 1 : 0);
     expect(props.onChanged).not.toHaveBeenCalled();
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
   it("does not revive failed preparation when its retry is activated after cancellation in the same batch", async () => {
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new Error("Unable to check report"));
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new Error("Unable to check report"));
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     const retry = await modal.findByRole("button", { name: "Retry preparation" });
@@ -422,13 +422,13 @@ describe("record-backed report management", () => {
       fireEvent.click(modal.getByRole("button", { name: "Cancel" }));
       fireEvent.click(retry);
     });
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
   it("still allows cancellation immediately after retrying a pending preview", async () => {
     const pending = deferred<OfficialReportConfirmation>();
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new Error("Unable to check report")).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new Error("Unable to check report")).mockReturnValueOnce(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     const retry = await modal.findByRole("button", { name: "Retry preparation" });
@@ -436,15 +436,15 @@ describe("record-backed report management", () => {
       fireEvent.click(retry);
       fireEvent.click(modal.getByRole("button", { name: "Cancel" }));
     });
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(api.previewReportOperation).mock.calls[1][2]?.aborted).toBe(true);
+    expect(api.previewReportDeletion).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.previewReportDeletion).mock.calls[1][1]?.aborted).toBe(true);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await act(async () => pending.resolve(confirmation));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it.each(["reload", "denial", "correction"] as const)("admits only one %s navigation before its dialog unmounts", async action => {
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new ApiError(action === "denial" ? 403 : 409,
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new ApiError(action === "denial" ? 403 : 409,
       action === "denial" ? "denied" : "selection_invalidated", "History unavailable."));
     render(<OfficialUsageManageReports {...props} />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete report set" }));
@@ -453,22 +453,22 @@ describe("record-backed report management", () => {
     act(() => { fireEvent.click(next); fireEvent.click(next); });
     expect(props.onChanged).toHaveBeenCalledTimes(action === "correction" ? 0 : 1);
     expect(props.onCorrect).toHaveBeenCalledTimes(action === "correction" ? 1 : 0);
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
   it.each(["activeRevision", "historyRevision", "historyEpoch"] as const)("refuses a preview whose %s differs from the history the operator chose", async field => {
-    vi.mocked(api.previewReportOperation).mockResolvedValue({ ...confirmation, [field]: "99" });
+    vi.mocked(api.previewReportDeletion).mockResolvedValue({ ...confirmation, [field]: "99" });
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     expect(await modal.findByRole("alert")).toHaveTextContent(/history changed/i);
     expect(modal.getByRole("button", { name: "Delete report set" })).toBeDisabled();
     fireEvent.click(modal.getByRole("button", { name: "Reload report history" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it.each([0, 409])("verifies status %s through fresh history instead of replaying a consumed or stale confirmation", async status => {
-    vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(new ApiError(status, status ? "active_revision_mismatch" : "network_error", "Uncertain deletion"));
+    vi.mocked(api.confirmReportDeletion).mockRejectedValueOnce(new ApiError(status, status ? "active_revision_mismatch" : "network_error", "Uncertain deletion"));
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
@@ -477,12 +477,12 @@ describe("record-backed report management", () => {
     expect(screen.queryByText("Report set deleted.")).not.toBeInTheDocument();
     fireEvent.click(modal.getByRole("button", { name: "Reload report history" }));
     await screen.findByRole("table");
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).toHaveBeenCalledOnce();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
     expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.selectionId).toBeUndefined();
   });
   it("keeps uncertain deletion unverified when its fresh history read fails and retries only that read", async () => {
-    vi.mocked(api.confirmReportOperation).mockRejectedValueOnce(new ApiError(0, "network_error", "Connection lost."));
+    vi.mocked(api.confirmReportDeletion).mockRejectedValueOnce(new ApiError(0, "network_error", "Connection lost."));
     render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     const remove = modal.getByRole("button", { name: "Delete report set" });
@@ -504,12 +504,12 @@ describe("record-backed report management", () => {
     await screen.findByRole("heading", { name: "No reports yet" });
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
     expect(vi.mocked(api.readReportPage).mock.calls.slice(1).every(([, query]) => !query?.selectionId && !query?.cursor)).toBe(true);
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).toHaveBeenCalledOnce();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).toHaveBeenCalledOnce();
     expect(props.onChanged).toHaveBeenCalledOnce();
   });
   it.each([401, 403])("preserves the %s denial explanation across revisions until history is explicitly reloaded", async status => {
-    vi.mocked(api.previewReportOperation).mockRejectedValueOnce(new ApiError(status, "denied", "Report management access denied."));
+    vi.mocked(api.previewReportDeletion).mockRejectedValueOnce(new ApiError(status, "denied", "Report management access denied."));
     const view = render(<OfficialUsageManageReports {...props} />);
     fireEvent.click(await screen.findByRole("button", { name: "Delete report set" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Report management access denied.");
@@ -518,8 +518,8 @@ describe("record-backed report management", () => {
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(api.readReportPage).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Reload report history" }));
     await screen.findByRole("table");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -527,7 +527,7 @@ describe("record-backed report management", () => {
     expect(props.onChanged).toHaveBeenCalledOnce();
   });
   it("prevents cancellation while atomic deletion is committing", async () => {
-    const pending = deferred<OfficialReportConfirmed>(); vi.mocked(api.confirmReportOperation).mockReturnValue(pending.promise);
+    const pending = deferred<OfficialReportConfirmed>(); vi.mocked(api.confirmReportDeletion).mockReturnValue(pending.promise);
     render(<OfficialUsageManageReports {...props} />);
     const { modal, dialog } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
@@ -544,14 +544,14 @@ describe("record-backed report management", () => {
     await waitFor(() => expect(modal.getByRole("button", { name: "Import correction instead" })).toBeEnabled());
     fireEvent.click(modal.getByRole("button", { name: "Import correction instead" }));
     expect(props.onCorrect).toHaveBeenCalledExactlyOnceWith(report.id);
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
   it("never renders mutation or retired browser-migration controls for a Viewer", async () => {
     render(<OfficialUsageManageReports {...props} canManage={false} />);
     await screen.findByRole("table");
     expect(screen.queryByRole("button", { name: /Delete|Remove old|Continue import|Acknowledge/ })).not.toBeInTheDocument();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
   });
   it("retires a prepared deletion on capability revocation even when its caller still requests management", async () => {
     const panel = (roles: NonNullable<typeof admin.user>["roles"]) => <CapabilityContext.Provider value={{ ...admin, user: { ...admin.user!, roles } }}>
@@ -561,7 +561,7 @@ describe("record-backed report management", () => {
     view.rerender(panel(["AgentControl.Viewer"]));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Delete report set" })).not.toBeInTheDocument();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it("preserves prepared deletion across equivalent account and capability metadata updates", async () => {
     const panel = (context: typeof admin) => <CapabilityContext.Provider value={context}>
@@ -574,14 +574,14 @@ describe("record-backed report management", () => {
     expect(screen.getByRole("dialog", { name: "Delete report set?" })).toBe(dialog);
     expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled();
     expect(api.readReportPage).toHaveBeenCalledOnce();
-    expect(api.previewReportOperation).toHaveBeenCalledOnce();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).toHaveBeenCalledOnce();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
   });
   it.each((["account", "tenant"] as const).flatMap(transition => (["preview", "confirm"] as const).map(kind => ({ transition, kind }))))(
     "retires pending $kind across $transition A-B-A changes, including late denial", async ({ transition, kind }) => {
     const preview = deferred<OfficialReportConfirmation>(), confirmed = deferred<OfficialReportConfirmed>();
-    if (kind === "preview") vi.mocked(api.previewReportOperation).mockReturnValueOnce(preview.promise);
-    else vi.mocked(api.confirmReportOperation).mockReturnValueOnce(confirmed.promise);
+    if (kind === "preview") vi.mocked(api.previewReportDeletion).mockReturnValueOnce(preview.promise);
+    else vi.mocked(api.confirmReportDeletion).mockReturnValueOnce(confirmed.promise);
     const panel = (owner: string) => <SavedQueryProvider>
       <CapabilityContext.Provider value={{ ...admin, user: { ...admin.user!,
         ...(transition === "account" ? { homeAccountId: owner } : { tenantId: owner }) } }}>
@@ -595,8 +595,8 @@ describe("record-backed report management", () => {
       await waitFor(() => expect(remove).toBeEnabled());
       fireEvent.click(remove);
     }
-    const signal = kind === "preview" ? vi.mocked(api.previewReportOperation).mock.calls[0][2]
-      : vi.mocked(api.confirmReportOperation).mock.calls[0][1];
+    const signal = kind === "preview" ? vi.mocked(api.previewReportDeletion).mock.calls[0][1]
+      : vi.mocked(api.confirmReportDeletion).mock.calls[0][1];
     view.rerender(panel("account-b"));
     expect(signal?.aborted).toBe(true);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -615,35 +615,35 @@ describe("record-backed report management", () => {
     expect(screen.queryByText("Report set deleted.")).not.toBeInTheDocument();
     expect(props.onChanged).not.toHaveBeenCalled();
     expect(api.readReportPage).toHaveBeenCalledTimes(3);
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(2);
-    expect(api.confirmReportOperation).toHaveBeenCalledTimes(kind === "confirm" ? 1 : 0);
+    expect(api.previewReportDeletion).toHaveBeenCalledTimes(2);
+    expect(api.confirmReportDeletion).toHaveBeenCalledTimes(kind === "confirm" ? 1 : 0);
   });
   it("keeps a replacement preview busy when an earlier cancelled request settles", async () => {
     const earlier = deferred<OfficialReportConfirmation>(), current = deferred<OfficialReportConfirmation>();
-    vi.mocked(api.previewReportOperation).mockReturnValueOnce(earlier.promise).mockReturnValueOnce(current.promise);
+    vi.mocked(api.previewReportDeletion).mockReturnValueOnce(earlier.promise).mockReturnValueOnce(current.promise);
     render(<OfficialUsageManageReports {...props} />);
     const first = await open();
     fireEvent.click(first.modal.getByRole("button", { name: "Cancel" }));
     const second = await open();
-    expect(vi.mocked(api.previewReportOperation).mock.calls[0][2]?.aborted).toBe(true);
-    expect(vi.mocked(api.previewReportOperation).mock.calls[1][2]?.aborted).toBe(false);
+    expect(vi.mocked(api.previewReportDeletion).mock.calls[0][1]?.aborted).toBe(true);
+    expect(vi.mocked(api.previewReportDeletion).mock.calls[1][1]?.aborted).toBe(false);
     await act(async () => earlier.resolve(confirmation));
     expect(second.modal.getByRole("status")).toHaveTextContent("Checking report operation...");
     expect(second.modal.getByRole("button", { name: "Delete report set" })).toBeDisabled();
-    expect(api.previewReportOperation).toHaveBeenCalledTimes(2);
+    expect(api.previewReportDeletion).toHaveBeenCalledTimes(2);
     await act(async () => current.resolve({ ...confirmation, id: "replacement-confirmation" }));
     fireEvent.click(second.modal.getByRole("button", { name: "Delete report set" }));
     await screen.findByText("Report set deleted.");
-    expect(api.confirmReportOperation).toHaveBeenCalledExactlyOnceWith({ ...confirmation, id: "replacement-confirmation" }, expect.any(AbortSignal));
+    expect(api.confirmReportDeletion).toHaveBeenCalledExactlyOnceWith({ ...confirmation, id: "replacement-confirmation" }, expect.any(AbortSignal));
     expect(props.onChanged).toHaveBeenCalledOnce();
   });
   it("aborts obsolete confirmations across revision A-B-A transitions without notifying the replacement view", async () => {
-    const pending = deferred<OfficialReportConfirmed>(); vi.mocked(api.confirmReportOperation).mockReturnValue(pending.promise);
+    const pending = deferred<OfficialReportConfirmed>(); vi.mocked(api.confirmReportDeletion).mockReturnValue(pending.promise);
     const view = render(<OfficialUsageManageReports {...props} />);
     const { modal } = await open();
     await waitFor(() => expect(modal.getByRole("button", { name: "Delete report set" })).toBeEnabled());
     fireEvent.click(modal.getByRole("button", { name: "Delete report set" }));
-    const signal = vi.mocked(api.confirmReportOperation).mock.calls[0][1];
+    const signal = vi.mocked(api.confirmReportDeletion).mock.calls[0][1];
     view.rerender(<OfficialUsageManageReports {...props} revision={1} />);
     view.rerender(<OfficialUsageManageReports {...props} revision={0} />);
     expect(signal?.aborted).toBe(true);

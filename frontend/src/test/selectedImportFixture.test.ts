@@ -59,18 +59,17 @@ async function fixture(options: SelectedImportOptions = { active: true }, csvFil
 }
 
 describe("selected import route contracts", () => {
-  it.each([false, true])("mirrors save-only wizard acceptance with an existing selection=%s", async active => {
+  it.each([false, true])("publishes the automatic latest default with an existing report=%s", async active => {
     const { request, stage, state } = await fixture({ active });
-    const before = state.selectedSetId(), bundleId = "33333333-3333-4333-8333-333333333333";
-    const body = { ...await stage(bundleId, files.map(file => ({ ...file, content: file.content.replaceAll("Alpha", "New Alpha") }))),
-      preserveSelection: true };
+    const bundleId = "33333333-3333-4333-8333-333333333333";
+    const body = await stage(bundleId, files.map(file => ({ ...file, content: file.content.replaceAll("Alpha", "New Alpha") })));
     const saved = await request(`${root}/bundles/${bundleId}/accept`, "POST", body);
     expect(saved.status).toBe(200);
-    expect(state.selectedSetId()).toBe(before);
-    expect(saved.json.activeRevision).toBe(body.expectedActiveRevision);
+    expect(state.latestSetId()).toBe(saved.json.setId);
+    expect(saved.json.activeRevision).toBe(String(BigInt(body.expectedActiveRevision) + 1n));
     expect((await request(`${root}/aggregate?setId=${saved.json.setId}`)).json.value[0].agentName).toBe("New Alpha");
     expect(await request(`${root}/bundles/${bundleId}/accept`, "POST", body)).toEqual(saved);
-    expect(state.selectedSetId()).toBe(before);
+    expect(state.latestSetId()).toBe(saved.json.setId);
   });
 
   it("returns a registered user selection and retains filters, metadata and summaries across pages", async () => {
@@ -81,7 +80,7 @@ describe("selected import route contracts", () => {
       summary: { checkedUsers: null, licensedUsers: null, userReportedResponses: 15 },
       analytics: { rowCount: 1, responses: 5, zeroResponses: 0, unknownResponses: 0 },
     });
-    state.selectReport(importedSetId);
+    await state.publishNewReport();
     const next = await request(`${root}/users?selectionId=${first.json.selection.id}&limit=1`);
     expect(next.json).toEqual(first.json);
     expect((await request(`${root}/users/ada%40example.invalid?selectionId=${first.json.selection.id}`)).status).toBe(404);
@@ -157,10 +156,10 @@ describe("selected import route contracts", () => {
     expect(json.analytics.agents.leastResponses.map((row: { responses: number }) => row.responses)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
-  it("distinguishes retained-but-unselected reports from deleted reports", async () => {
+  it("automatically uses a retained historical report when it is the newest available content", async () => {
     const { request } = await fixture({ historical: true });
     expect((await request(`${root}/aggregate`)).json.reports)
-      .toMatchObject({ availability: "not_selected", setId: null, activeSetId: null });
+      .toMatchObject({ availability: "stale", setId: retainedSetId, activeSetId: retainedSetId });
   });
 
   it("keeps selected and history reporting ranges aligned across all CSV companions", async () => {
@@ -273,14 +272,14 @@ describe("selected import route contracts", () => {
     const bundleId = "33333333-3333-4333-8333-333333333333", original = await stage(bundleId);
     const result = await request(`${root}/bundles/${bundleId}/accept`, "POST", original);
     expect(result.status).toBe(200);
-    state.selectReport(retainedSetId);
+    const newer = await state.publishNewReport();
     const { json: refreshed } = await request(`${root}/bundles/${bundleId}/preview`, "POST");
-    expect(refreshed.expectedActiveRevision).toBe("3");
+    expect(refreshed.expectedActiveRevision).toBe("4");
     const recovered = await request(`${root}/bundles/${bundleId}/accept`, "POST",
       { bundleHash: refreshed.bundleHash, expectedActiveRevision: refreshed.expectedActiveRevision });
     expect(recovered).toEqual(result);
-    expect(state.selectedSetId()).toBe(retainedSetId);
-    expect((await request(`${root}/bundles/${bundleId}/preview`, "POST")).json.expectedActiveRevision).toBe("3");
+    expect(state.latestSetId()).toBe(newer);
+    expect((await request(`${root}/bundles/${bundleId}/preview`, "POST")).json.expectedActiveRevision).toBe("4");
     expect(await request(`${root}/bundles/${bundleId}/accept`, "POST", original)).toEqual(result);
     expect(state.stages).toHaveLength(3);
   });
@@ -301,11 +300,11 @@ describe("selected import route contracts", () => {
     expect(state.stages[1].id).not.toBe(original.id);
     expect(state.discardedStages).toEqual([original.id]);
     expect(state.acceptRequests).toEqual([]);
-    expect(state.selectedSetId()).toBeNull();
+    expect(state.latestSetId()).toBeNull();
   });
 
-  it.each([importedSetId, retainedSetId])("invalidates correction history while preserving the unrelated selected head %s", async selectedSetId => {
-    const { request, stage } = await fixture({ active: true, historical: true, selectedSetId });
+  it("invalidates correction history and automatically replaces the latest corrected period", async () => {
+    const { request, stage } = await fixture({ active: true, historical: true });
     const { json: before } = await request(`${root}/history`);
     const bundleId = "33333333-3333-4333-8333-333333333333";
     const changed = files.map(file => ({ ...file, content: file.content.replaceAll("Alpha", "Corrected Alpha") }));
@@ -316,15 +315,14 @@ describe("selected import route contracts", () => {
       .toMatchObject({ status: 409, json: { code: "selection_invalidated" } });
     const { json: history } = await request(`${root}/history`);
     expect(history.reports).toMatchObject({ historyRevision: "2", historyEpoch: "2",
-      activeSetId: selectedSetId === importedSetId ? accepted.setId : retainedSetId,
-      activeRevision: selectedSetId === importedSetId ? "3" : "2" });
+      activeSetId: accepted.setId, activeRevision: "3" });
     expect(history.value).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: importedSetId, visibility: "superseded" }),
       expect.objectContaining({ id: accepted.setId, supersedesSetId: importedSetId, visibility: "retained" }),
     ]));
     expect((await request(`${root}/aggregate?setId=${importedSetId}`)).json.value[0].agentName).toBe("Alpha");
     expect(await request(`${root}/sets/${importedSetId}/preview`, "POST", { operation: "select" }))
-      .toMatchObject({ status: 409, json: { code: "staging_unavailable" } });
+      .toMatchObject({ status: 400, json: { code: "invalid_operation" } });
     expect((await request(`${root}/sets/${importedSetId}/preview`, "POST", { operation: "delete" })).status).toBe(200);
   });
 
@@ -348,7 +346,7 @@ describe("selected import route contracts", () => {
     await request(`${root}/staging/${state.stages[0].id}`, "DELETE");
     expect(await request(`${root}/bundles/${bundleId}/accept`, "POST", body))
       .toMatchObject({ status: 409, json: { code: "bundle_fence_mismatch" } });
-    expect(state.selectedSetId()).toBeNull();
+    expect(state.latestSetId()).toBeNull();
   });
 
   it("admits concurrent uploads and acceptance only once and rejects cleanup after another tab commits", async () => {
@@ -389,11 +387,11 @@ describe("selected import route contracts", () => {
     expect(state.stages.every(stage => stage.status === "active")).toBe(true);
     expect(state.acceptRequests).toEqual([]);
     expect(state.discardedStages).toEqual([]);
-    expect(state.selectedSetId()).toBeNull();
+    expect(state.latestSetId()).toBeNull();
   });
 
-  it("owns immutable confirmation hashes and consumes a deletion once without invalidating unrelated heads twice", async () => {
-    const { request, state } = await fixture({ active: true, historical: true, selectedSetId: retainedSetId });
+  it("owns immutable deletion hashes and selects the next latest report exactly once", async () => {
+    const { request, state } = await fixture({ active: true, historical: true });
     expect(await request(`${root}/sets/${importedSetId}/preview`, "POST", { operation: "unsupported" }))
       .toMatchObject({ status: 400, json: { code: "invalid_operation" } });
     const { json: first } = await request(`${root}/sets/${importedSetId}/preview`, "POST", { operation: "delete" });
@@ -412,37 +410,37 @@ describe("selected import route contracts", () => {
     expect(attempts[1].json.code).toBe("confirmation_mismatch");
     expect(state.confirmations).toEqual([first]);
     expect((await request(`${root}/history`)).json)
-      .toMatchObject({ value: [{ id: retainedSetId }], reports: { activeRevision: "2", historyRevision: "2", historyEpoch: "2" } });
+      .toMatchObject({ value: [{ id: retainedSetId }], reports: { activeSetId: retainedSetId, activeRevision: "3", historyRevision: "2", historyEpoch: "2" } });
     expect((await request(`${root}/sets/${importedSetId}/preview`, "POST", { operation: "delete" })).status).toBe(409);
   });
 
-  it("requires fresh confirmation after an account replacement or shared-head change", async () => {
+  it("requires a fresh deletion confirmation after an account replacement or report publication", async () => {
     const first = await fixture({ active: true, historical: true }), replacement = await fixture({ active: true, historical: true });
-    const prepare = (request: typeof first.request) => request(`${root}/sets/${retainedSetId}/preview`, "POST", { operation: "select" });
+    const prepare = (request: typeof first.request) => request(`${root}/sets/${retainedSetId}/preview`, "POST", { operation: "delete" });
     const { json: prior } = await prepare(first.request), { json: current } = await prepare(replacement.request);
     expect(await replacement.request(`${root}/confirmations/${prior.id}`, "POST", prior))
       .toMatchObject({ status: 409, json: { code: "confirmation_mismatch" } });
     expect(await replacement.request(`${root}/confirmations/${current.id}`, "POST", { ...prior, id: current.id }))
       .toMatchObject({ status: 409, json: { code: "confirmation_mismatch" } });
-    first.state.selectReport(retainedSetId);
+    await first.state.publishNewReport();
     expect(await first.request(`${root}/confirmations/${prior.id}`, "POST", prior))
       .toMatchObject({ status: 409, json: { code: "confirmation_mismatch" } });
     expect(first.state.confirmations).toEqual([]);
     expect((await replacement.request(`${root}/confirmations/${current.id}`, "POST", current)).json)
-      .toEqual({ activeSetId: retainedSetId, activeRevision: "3" });
+      .toEqual({ activeSetId: importedSetId, activeRevision: "2" });
   });
 
   it("keeps duplicate acceptance from changing the active head or retained history", async () => {
-    const { request, stage } = await fixture({ active: true, historical: true, selectedSetId: retainedSetId, reusedExistingSet: true });
+    const { request, stage } = await fixture({ active: true, historical: true, reusedExistingSet: true });
     const bundleId = "33333333-3333-4333-8333-333333333333", body = await stage(bundleId);
     expect((await request(`${root}/bundles/${bundleId}/accept`, "POST", body)).json)
       .toEqual({ setId: importedSetId, activeRevision: "2", complete: true });
     expect((await request(`${root}/history`)).json)
-      .toMatchObject({ counts: { filtered: 2 }, reports: { activeSetId: retainedSetId, activeRevision: "2", historyRevision: "1" } });
+      .toMatchObject({ counts: { filtered: 2 }, reports: { activeSetId: importedSetId, activeRevision: "2", historyRevision: "1" } });
   });
 
   it("reuses canonical observations after reordered uploads without changing pinned evidence or revisions", async () => {
-    const { request, stage, state } = await fixture({ active: true, historical: true, selectedSetId: retainedSetId });
+    const { request, stage, state } = await fixture({ active: true, historical: true });
     const { json: before } = await request(`${root}/aggregate?setId=${importedSetId}`);
     const bundleId = "33333333-3333-4333-8333-333333333333";
     const reordered = files.map(file => {
@@ -486,7 +484,7 @@ describe("selected import route contracts", () => {
     const { json: after } = await request(`${root}/history/${accepted.setId}/observations`);
     for (const row of before.value) {
       const current = after.value.find((value: { kind: string }) => value.kind === row.kind);
-      if (row.kind === "agents") expect(current).toMatchObject({ acceptedAt: "2026-09-12T14:45:00.000Z", supersedesVersionId: row.versionId });
+      if (row.kind === "agents") expect(current).toMatchObject({ acceptedAt: "2026-09-12T14:45:00.001Z", supersedesVersionId: row.versionId });
       else expect(current).toEqual(row);
     }
     expect(before.value.every((row: { acceptedAt: string }) => row.acceptedAt === "2026-06-02T10:00:00.000Z")).toBe(true);
@@ -507,7 +505,7 @@ describe("selected import route contracts", () => {
       { bundleHash: cleanup.bundleHash, expectedActiveRevision: cleanup.expectedActiveRevision }))
       .toMatchObject({ status: 409, json: { code: "incompatible_bundle" } });
     for (const stage of cleanup.stages) expect((await request(`${root}/staging/${stage.stagingId}`, "DELETE")).status).toBe(204);
-    expect(state.selectedSetId()).toBeNull();
+    expect(state.latestSetId()).toBeNull();
     expect((await request(`${root}/bundles/${bundleId}/preview`, "POST")).json.stages).toEqual([]);
   });
 
@@ -550,7 +548,8 @@ describe("selected import route contracts", () => {
   it("pins exported rows to the original selection and invalidates reads and export status after deletion", async () => {
     const { request, state } = await fixture({ active: true, historical: true, role: "Viewer" });
     const { json: first } = await request(`${root}/aggregate?search=Alpha`);
-    state.selectReport(retainedSetId);
+    expect((await request(`${root}/aggregate?setId=${retainedSetId}`)).json.reports.setId).toBe(retainedSetId);
+    expect(state.latestSetId()).toBe(importedSetId);
     const { json: submitted } = await request("/api/data-exports", "POST", {
       selectionId: first.selection.id, kind: "official_agents", idempotencyKey: "44444444-4444-4444-8444-444444444444",
     });

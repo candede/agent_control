@@ -56,8 +56,8 @@ beforeEach(() => {
   });
   vi.spyOn(api, "readReportFacet").mockResolvedValue({ value: [], selection: reportPage([]).selection,
     counts: { total: 0, filtered: 0 }, page: { limit: 50, nextCursor: null, previousCursor: null } });
-  vi.spyOn(api, "previewReportOperation");
-  vi.spyOn(api, "confirmReportOperation");
+  vi.spyOn(api, "previewReportDeletion");
+  vi.spyOn(api, "confirmReportDeletion");
 });
 
 describe("focused report dialogs", () => {
@@ -230,7 +230,7 @@ describe("focused report dialogs", () => {
   });
 
   it("preserves the correction target through serialized navigation without deleting or reloading history", async () => {
-    vi.mocked(api.previewReportOperation).mockResolvedValue({
+    vi.mocked(api.previewReportDeletion).mockResolvedValue({
       id: "confirmation", setId: reportSetId, operation: "delete", hash: "a".repeat(64),
       activeRevision: reports.activeRevision, historyRevision: reports.historyRevision, historyEpoch: reports.historyEpoch,
     });
@@ -248,7 +248,7 @@ describe("focused report dialogs", () => {
     expect(screen.getByRole("dialog", { name: "Add CSV reports" })).toBeVisible();
     expect(importCorrection).toHaveBeenLastCalledWith(reportSetId);
     expect(importMount).toHaveBeenLastCalledWith(undefined);
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.readReportPage).toHaveBeenCalledOnce();
   });
 
@@ -258,8 +258,8 @@ describe("focused report dialogs", () => {
     expect(screen.getByRole("dialog", { name: "Manage reports" })).toHaveTextContent("UsageReportUploader or Admin access is required");
     await screen.findByRole("table");
     expect(importMount).not.toHaveBeenCalled();
-    expect(api.previewReportOperation).not.toHaveBeenCalled();
-    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+    expect(api.previewReportDeletion).not.toHaveBeenCalled();
+    expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(vi.mocked(api.readReportPage).mock.calls.every(([path]) => path === "official-usage/history")).toBe(true);
     expect(screen.queryByRole("button", { name: /Add CSV|Delete/ })).not.toBeInTheDocument();
   });

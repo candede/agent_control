@@ -675,11 +675,11 @@ describe("UnifiedAgentDetailModal", () => {
   });
 
   it("defaults to Overview with visible status facts and technical identifiers without disclosures", () => {
-    const { props } = renderDetail({ roles: ["AgentControl.Viewer"] });
+    renderDetail({ roles: ["AgentControl.Viewer"] });
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
     const tablist = within(dialog).getByRole("tablist", { name: "Agent details" });
-    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage", "Users", "Manage"]);
+    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage", "Users"]);
     expect(within(dialog).getByRole("tabpanel", { name: "Overview" })).toBeVisible();
     expect(within(dialog).getByText("Environment name").nextElementSibling).toHaveTextContent("Production");
     expect(within(dialog).getAllByText("Agent Builder").some(element => element.closest("details") === null)).toBe(true);
@@ -692,12 +692,36 @@ describe("UnifiedAgentDetailModal", () => {
     expect(within(dialog).queryByText("element-1")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("elementDetails.AgentMetadatas.definition.AgentIdentityId")).not.toBeInTheDocument();
     expect(within(dialog).getByText("agent-identity-1")).toBeVisible();
-    fireEvent.click(within(dialog).getByRole("tab", { name: "Manage" }));
-    expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
-    expect(within(dialog).getByText("Package one")).toBeInTheDocument();
-    expect(within(dialog).getByRole("heading", { name: "Manage" })).toBeVisible();
-    expect(within(dialog).queryByText(/Apply checks current settings before exact-target confirmation/)).not.toBeInTheDocument();
-    expect(within(dialog).getByText(/AgentControl.Admin role is required/)).toBeVisible();
+  });
+
+  it("keeps keyboard tab navigation within the non-admin tabs", async () => {
+    const onTabChange = vi.fn();
+    renderDetail({ roles: ["AgentControl.Viewer"], onTabChange });
+    const overview = screen.getByRole("tab", { name: "Overview" });
+    overview.focus();
+
+    await userEvent.keyboard("{End}{ArrowRight}{ArrowLeft}{Home}");
+
+    expect(onTabChange.mock.calls).toEqual([["users"], ["identities"], ["users"], ["identities"]]);
+    expect(overview).toHaveFocus();
+    expect(overview).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: "Manage" })).not.toBeInTheDocument();
+  });
+
+  it("removes Manage and its confirmation when the Admin role is lost", () => {
+    const { update } = renderDetail({
+      activeTab: "controls", packageConfirmation: <div>Confirm package change</div>,
+    });
+    expect(screen.getByRole("tab", { name: "Manage" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Confirm package change")).toBeVisible();
+
+    update({ roles: ["AgentControl.Viewer"] });
+
+    expect(screen.queryByRole("tab", { name: "Manage" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Confirm package change")).not.toBeInTheDocument();
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
+    for (const tab of screen.getAllByRole("tab")) expect(tab).toBeEnabled();
+    expect(screen.getByRole("dialog").querySelector(".agent-access-management, .agent-management-sections")).toBeNull();
   });
 
   it.each([
@@ -1172,11 +1196,12 @@ describe("UnifiedAgentDetailModal", () => {
   it("keeps the latest read-only access values rather than reverting to the first loaded detail", () => {
     const first = { ...record.packages[0], availableTo: "some" as const, allowedUsersAndGroups: [] };
     const latest = { ...first, availableTo: "none" as const };
-    const { update } = renderDetail({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: first });
-    update({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: latest });
+    const { update } = renderDetail({ activeTab: "controls", packageDetail: first }, []);
+    update({ activeTab: "controls", packageDetail: latest });
     const none = screen.getByRole("radio", { name: /No users/ });
     expect(none).toBeChecked();
-    update({ activeTab: "controls", roles: ["AgentControl.Viewer"], packageDetail: latest, packageDetailStale: true, packageDetailLoading: true });
+    expect(none).toBeDisabled();
+    update({ activeTab: "controls", packageDetail: latest, packageDetailStale: true, packageDetailLoading: true });
     expect(screen.getByRole("radio", { name: /No users/ })).toBe(none);
     expect(none).toBeChecked();
   });
@@ -1220,35 +1245,32 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("button", { name: "Block Package one (package-1)" })).toBeEnabled();
   });
 
-  it.each(["AgentControl.Viewer", "AgentControl.Admin"] as const)(
-    "withdraws invalidated assignments after a failed saved-detail read for %s",
-    async role => {
-      const previous: api.DirectoryPrincipal = {
-        resourceType: "user", resourceId: "previous-assignment", displayName: "previous-assignment", principalKind: "user",
-      };
-      const current = { ...previous, resourceId: "current-assignment", displayName: "current-assignment" };
-      const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
-        .mockResolvedValueOnce({ value: [previous] }).mockResolvedValue({ value: [current] });
-      const item = { ...record.packages[0], availableTo: "some" };
-      const { props, update } = renderDetail({
-        roles: [role], activeTab: "controls", record: { ...record, packages: [item] },
-        packageDetail: { ...item, allowedUsersAndGroups: [previous] },
-      }, capabilitiesWithDirectory());
-      expect(await screen.findByText("previous-assignment", { selector: "strong" })).toBeVisible();
-      update({ packageDetailLoading: true });
-      update({ packageDetail: undefined, packageDetailError: "Saved assignment details were denied." });
-      expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
-      expect(props.onInspectPackage).not.toHaveBeenCalled();
-      expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
-      await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
-      update({ packageDetail: undefined, packageDetailLoading: true });
-      expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
-      update({ packageDetail: { ...item, allowedUsersAndGroups: [current] } });
-      expect(await screen.findByText("current-assignment", { selector: "strong" })).toBeVisible();
-      expect(props.onInspectPackage).toHaveBeenCalledOnce();
-      expect(resolve).toHaveBeenCalledTimes(role === "AgentControl.Admin" ? 2 : 0);
-    },
-  );
+  it("withdraws invalidated Manage assignments after a failed saved-detail read", async () => {
+    const previous: api.DirectoryPrincipal = {
+      resourceType: "user", resourceId: "previous-assignment", displayName: "previous-assignment", principalKind: "user",
+    };
+    const current = { ...previous, resourceId: "current-assignment", displayName: "current-assignment" };
+    const resolve = vi.spyOn(api, "resolveDirectoryPrincipals")
+      .mockResolvedValueOnce({ value: [previous] }).mockResolvedValue({ value: [current] });
+    const item = { ...record.packages[0], availableTo: "some" };
+    const { props, update } = renderDetail({
+      activeTab: "controls", record: { ...record, packages: [item] },
+      packageDetail: { ...item, allowedUsersAndGroups: [previous] },
+    }, capabilitiesWithDirectory());
+    expect(await screen.findByText("previous-assignment", { selector: "strong" })).toBeVisible();
+    update({ packageDetailLoading: true });
+    update({ packageDetail: undefined, packageDetailError: "Saved assignment details were denied." });
+    expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
+    expect(props.onInspectPackage).not.toHaveBeenCalled();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "Retry saved details" }));
+    update({ packageDetail: undefined, packageDetailLoading: true });
+    expect(screen.queryAllByText("previous-assignment", { exact: true })).toHaveLength(0);
+    update({ packageDetail: { ...item, allowedUsersAndGroups: [current] } });
+    expect(await screen.findByText("current-assignment", { selector: "strong" })).toBeVisible();
+    expect(props.onInspectPackage).toHaveBeenCalledOnce();
+    expect(resolve).toHaveBeenCalledTimes(2);
+  });
 
   it("invalidates the draft when saved access assignments become unreadable", async () => {
     const principal: api.DirectoryPrincipal = {
@@ -1587,14 +1609,14 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.queryByText("Last modified", { selector: "dt" })).not.toBeInTheDocument();
   });
 
-  it("keeps assignment identities readable in Manage for viewers and pages long lists", async () => {
+  it("keeps assignment identities readable in Manage without write permission and pages long lists", async () => {
     renderDetail({
-      activeTab: "controls", roles: ["AgentControl.Viewer"],
+      activeTab: "controls",
       packageDetail: {
         ...record.packages[0], allowedUsersAndGroups: Array.from({ length: 10 }, (_, index) => ({ resourceType: "group", resourceId: `group-${index}` })),
         acquireUsersAndGroups: [{ resourceType: "user", resourceId: "installed-user" }],
       },
-    });
+    }, []);
     const availability = screen.getByRole("group", { name: "Saved users and groups" });
     expect(within(availability).getByText("group-0")).toBeVisible();
     expect(within(availability).getAllByRole("listitem")).toHaveLength(8);
@@ -1609,8 +1631,8 @@ describe("UnifiedAgentDetailModal", () => {
   it("distinguishes unloaded, unreported and explicitly empty saved assignments", async () => {
     const item = { ...record.packages[0], availableTo: "some", deployedTo: "some" };
     const { update } = renderDetail({
-      activeTab: "controls", roles: ["AgentControl.Viewer"], record: { ...record, packages: [item] },
-    });
+      activeTab: "controls", record: { ...record, packages: [item] },
+    }, []);
     expect(screen.getByText("Loading saved agent details...")).toBeVisible();
     update({ packageDetail: { ...item, acquireUsersAndGroups: [] } });
     expect(screen.getByRole("group", { name: "Saved users and groups" })).toHaveTextContent("Assignments not reported");
@@ -2398,11 +2420,22 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByText("Saved inventory status").parentElement).toHaveTextContent("Unknown");
   });
 
-  it("keeps viewers read-only even on a directly opened Manage route", async () => {
-    renderDetail({ record: observedRecord(), activeTab: "controls", roles: ["AgentControl.Viewer"] });
-    expect(screen.getByText(/AgentControl.Admin role is required/)).toBeVisible();
+  it.each<{ roles: api.AppRole[] }>([
+    { roles: [] },
+    { roles: ["AgentControl.Viewer"] },
+    { roles: ["AgentControl.UsageReportUploader"] },
+    { roles: ["AgentControl.Viewer", "AgentControl.UsageReportUploader"] },
+  ])("hides Manage and opens Overview for non-admin roles $roles on a direct Manage route", ({ roles }) => {
+    const { props } = renderDetail({ record: observedRecord(), activeTab: "controls", roles });
+    expect(screen.getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage", "Users"]);
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
+    expect(screen.getByRole("dialog").querySelector(".agent-access-management, .agent-management-sections")).toBeNull();
     expect(screen.queryByRole("button", { name: /Manage access|Manage installation|^Block |^Quarantine$|Restore from quarantine/ })).not.toBeInTheDocument();
+    expect(props.onUpdatePackageAccess).not.toHaveBeenCalled();
+    expect(props.onSetPackageBlocked).not.toHaveBeenCalled();
     expect(api.previewQuarantine).not.toHaveBeenCalled();
+    expect(api.submitQuarantine).not.toHaveBeenCalled();
   });
 
   it.each(["missing", "stale", "denied", "missing-metadata"] as const)("retains %s capability gates across the common Manage surface", async scenario => {

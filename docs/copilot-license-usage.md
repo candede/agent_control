@@ -21,8 +21,22 @@ separate experience and is not measured as a paid entitlement.
 
 Viewer, UsageReportUploader and Admin can read shared saved data and initiate
 read-only sync. New CSV imports require Uploader or Admin; published-report
-corrections, selection and deletion require Admin. Local import uses no
+corrections and deletion require Admin. Local import uses no
 Microsoft token. These app roles do not grant Microsoft permissions.
+
+## Personal report context
+
+Everyone with Viewer access can choose a report on Users or Agents. **Latest
+report** automatically follows the newest available content period, not the
+most recent upload. A personal choice carries across these pages through the
+`snapshot` URL parameter; it does not change the tenant default or anyone else's
+view. Returning to Latest removes that pin. Deleted or expired personal reports
+return to Latest with a notice.
+
+This adds no preference table, SQL view or duplicate report data. Saved reads
+retain their existing actor-bound selections and caches. The dropdown makes a
+bounded metadata read on opening, focus and once a minute while visible and
+online so Latest follows other operators' publications without provider reads.
 
 The following Microsoft Graph **application** permissions are the user-data
 subset of the current Permissions page's
@@ -226,6 +240,8 @@ relationships.
 A view dropdown defaults to **Paid M365 Copilot users** and also offers **Active users without paid Copilot**. The default view shows users with verified active paid features, including grace-period and partially active users and those with zero or unavailable activity. **Using agents**, **Needs attention**, **No reported agent activity**, and their adoption cohorts use that same licensed population. The API's `measuredActivityUsers`, `needsAttentionUsers` and `unknownMetricsUsers` also exclude inactive/unverified candidates. Measured activity includes positive evidence from either agent report or recent Office-app activity; unknown metrics covers uncertain agent activity or missing app evidence. The **All checked users** and **Unlinked report identities** sections are not shown, and the checked-directory-count/scope banner is removed.
 
 The paid view shares the non-paid view's search, matching count, **Filters** popup, removable chips, and table layout. Its popup contains **Company**, **Department**, **Activity**, **Low-response threshold**, and **Sort**. Organization dropdowns use all effectively licensed users in the saved snapshot and combine as exact, trimmed matches before 50-row paging. The Activity dropdown and summary cards select the same cohort. Clear and Reset preserve sorting; invalid thresholds show an error and retain the last valid filter.
+
+The four paid-user summary cards always show totals across all effectively licensed users in the selected saved snapshot. Card selection, search, company, department, sorting and paging affect only the table, matching count and export, not those totals. The selected card remains highlighted, and totals stay visible while filtered table results load. Summary reads share the initial unfiltered table request and refresh independently when saved source evidence, the selected report set or the low-response threshold changes.
 
 Both tables show the user, agent responses, agents used, company, department, and last activity. Paid-feature status and follow-up recommendations are available in user details rather than repeated in each row. Paid filtering, sorting and paging operate locally on the saved snapshot. Last activity comes from the Users report; Office-app dates remain separate in details. Unavailable sources retain concise recovery messages.
 

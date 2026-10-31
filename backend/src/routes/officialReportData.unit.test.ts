@@ -469,16 +469,27 @@ describe("report confirmation HTTP input", () => {
       expect(await request("POST", path, body)).toMatchObject({ status: 400 });
     }
   });
-  it("passes a valid preview operation through unchanged", async () => {
-    const confirmation = { id: selectionId, setId, operation: "select" as const, activeRevision: "1",
+  it("previews and confirms an actor-bound deletion", async () => {
+    const confirmation = { id: selectionId, setId, operation: "delete" as const, activeRevision: "1",
       historyRevision: "1", historyEpoch: "0", hash: "a".repeat(64) };
-    const preview = vi.spyOn(OfficialReportImports.prototype, "confirmPreview").mockResolvedValue(confirmation);
-    expect(await request("POST", `/official-usage/sets/${setId}/preview`, { operation: "select" }))
+    const preview = vi.spyOn(OfficialReportImports.prototype, "previewDeletion").mockResolvedValue(confirmation);
+    expect(await request("POST", `/official-usage/sets/${setId}/preview`, { operation: "delete" }))
       .toMatchObject({ status: 200, body: confirmation });
-    expect(preview).toHaveBeenCalledExactlyOnceWith(identity, setId, "select");
-    const confirm = vi.spyOn(OfficialReportImports.prototype, "confirm").mockResolvedValue({ activeSetId: setId, activeRevision: "2" });
+    expect(preview).toHaveBeenCalledExactlyOnceWith(identity, setId);
+    const confirm = vi.spyOn(OfficialReportImports.prototype, "confirmDeletion").mockResolvedValue({ activeSetId: setId, activeRevision: "2" });
     expect(await request("POST", `/official-usage/confirmations/${selectionId}`, confirmation)).toMatchObject({ status: 200 });
     expect(confirm).toHaveBeenCalledExactlyOnceWith(identity, confirmation);
+  });
+  it("rejects the removed tenant selection operation before preview or persistence", async () => {
+    const preview = vi.spyOn(OfficialReportImports.prototype, "previewDeletion");
+    const confirm = vi.spyOn(OfficialReportImports.prototype, "confirmDeletion");
+    expect(await request("POST", `/official-usage/sets/${setId}/preview`, { operation: "select" }))
+      .toMatchObject({ status: 400, body: { code: "invalid_operation" } });
+    expect(await request("POST", `/official-usage/confirmations/${selectionId}`, {
+      id: selectionId, setId, operation: "select", activeRevision: "1", historyRevision: "1", historyEpoch: "0", hash: "a".repeat(64),
+    })).toMatchObject({ status: 400, body: { code: "invalid_operation" } });
+    expect(preview).not.toHaveBeenCalled();
+    expect(confirm).toHaveBeenCalledOnce();
   });
 });
 

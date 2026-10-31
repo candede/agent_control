@@ -329,11 +329,12 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await imports(request).diagnostics((await options.identity(request)).identity, reportUuid(request.params.id), pageOptions(request.query), reports.codec));
   }));
   route("post", "/official-usage/sets/:id/preview", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports(request).confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
+    if (request.body?.operation !== "delete") throw new AppError(400, "invalid_operation", "Unsupported operation.");
+    response.json(await imports(request).previewDeletion((await options.identity(request)).identity, reportUuid(request.params.id)));
   }));
   route("post", "/official-usage/confirmations/:id", "browser-admin", failSafe(async (request, response) => {
     if (reportUuid(request.body?.id) !== reportUuid(request.params.id)) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
-    response.json(await imports(request).confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
+    response.json(await imports(request).confirmDeletion((await options.identity(request)).identity, request.body as ReportConfirmation));
   }));
   route("get", "/agent-inventory/:recordId/usage", "read", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);

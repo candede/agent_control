@@ -10,6 +10,7 @@ import { pool } from "../db/pool.js";
 import { AgentIdentityRepository } from "../db/agentIdentity.js";
 import { PurviewAuditRepository } from "../db/purviewAudit.js";
 import type { UnifiedAgentInventoryQuery } from "../types/unifiedAgents.js";
+import { reportUuid } from "../db/officialReportImports.js";
 import {
   parseUnifiedAgentRecordId, unifiedAgentRecordId, unifiedAgentInventoryScopes, unifiedAgentSortKeys, unifiedAgentViews,
   unifiedAgentAccessFilters, unifiedAgentUsageFilters, unifiedAgentManagementFilters, unifiedAgentRelevanceFilters,
@@ -212,6 +213,7 @@ export function unifiedAgentInventoryQuery(query: Record<string, unknown>): Unif
   }
   const blocked = first(query.blocked);
   return {
+    setId: query.setId === undefined ? undefined : reportUuid(query.setId),
     inventoryScope: oneOf(first(query.inventoryScope), "inventoryScope", unifiedAgentInventoryScopes) ?? "all",
     type: literalFacet(query.type, "type", 4096),
     view: filterValue(query.view, "view", unifiedAgentViews),

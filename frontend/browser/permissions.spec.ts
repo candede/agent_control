@@ -655,8 +655,13 @@ test("Viewer retains saved catalog access during stale read evidence", async ({ 
   await expect(page.getByRole("button", { name: "Export agent inventory CSV", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "View details for Synthetic package" }).click();
   const details = page.getByRole("dialog", { name: "Synthetic package" });
-  await details.getByRole("tab", { name: "Manage", exact: true }).click();
-  await expect(details.getByText("An AgentControl.Admin role is required to make changes.", { exact: true })).toBeVisible();
+  await expect(details.getByRole("tab")).toHaveText(["Overview", "Usage", "Users"]);
+  await expect(details.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
+  const detailRoute = new URL(page.url());
+  detailRoute.searchParams.set("detailTab", "controls");
+  await page.goto(detailRoute.toString());
+  await expect(details.getByRole("tab", { name: "Manage", exact: true })).toHaveCount(0);
+  await expect(details.getByRole("tabpanel", { name: "Overview" })).toBeVisible();
   await expect(details.getByRole("button", { name: "Apply", exact: true })).toHaveCount(0);
   await expect(details.locator("button:not(:disabled)").filter({ hasText: /^(Block |Unblock |Apply$)/ })).toHaveCount(0);
   const result = await page.evaluate(async () => {

@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdoptionHistoryPage } from "../../../backend/src/types/adoptionDashboard";
+import { adoptionSnapshotLabel } from "../adoptionTrends";
 import { ApiError } from "../api/client";
 import { adoptionSnapshot, reportPage, reportSelection } from "../test/reportDataFixture";
 import { deferred } from "../test/deferred";
@@ -22,6 +23,32 @@ const usersCard = () => within(screen.getByRole("region", { name: "Active users"
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe("adoption dashboard", () => {
+  it("shows the dashboard title without a saved-report shortcut and preserves empty-state navigation", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage([]))));
+    renderDashboard();
+
+    expect(screen.getByRole("heading", { name: "Understand adoption. Empower your people." })).toBeVisible();
+    expect(await screen.findByRole("link", { name: "Open Sync" })).toHaveAttribute("href", "/sync");
+    expect(screen.queryByRole("link", { name: "View saved reports" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["activity_range", undefined],
+    ["operator_asserted", "Admin-supplied reporting window"],
+    ["source_metadata", "Reporting window"],
+  ] as const)("keeps %s report dates without the redundant observed-activity label", async (periodProvenance, annotation) => {
+    const snapshot = adoptionSnapshot(1, { periodProvenance });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage([snapshot]))));
+    renderDashboard();
+
+    const table = within(await screen.findByRole("region", { name: "Report snapshots and comparisons" }));
+    const dates = table.getByRole("rowheader");
+    expect(dates).toHaveTextContent(adoptionSnapshotLabel(snapshot));
+    expect(table.queryByText("Observed activity", { exact: true })).not.toBeInTheDocument();
+    if (annotation) expect(within(dates).getByText(annotation)).toBeVisible();
+    else expect(dates.textContent).toBe(adoptionSnapshotLabel(snapshot));
+  });
+
   it.each([false, true])("shows only complete history when the first response arrives after expiry (complete=%s)", async complete => {
     vi.useFakeTimers();
     const selection = reportSelection(2, Date.now());

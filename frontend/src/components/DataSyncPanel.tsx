@@ -588,31 +588,6 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
         {!state && loading ? <p role="status">Loading saved data sync status...</p> : null}
         {state ? (
           <>
-            {currentRun ? (
-              !isComplete(currentRun) && currentRun.status !== "cancelled" ? (
-                <section className="data-sync-activity" aria-label="Current sync">
-                  <SyncProgress run={currentRun} stale={stateReadFailed || Boolean(busy)} />
-                  <div className="data-sync-activity-footer" role="group" aria-label="Current sync actions">
-                    <p className="data-sync-run-meta">
-                      {isProgressing(currentRun) ? "Sync continues when you switch tabs." : "Run results stay available when you start a new sync."}
-                      {" "}<button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
-                    </p>
-                    {runActions(currentRun)}
-                  </div>
-                </section>
-              ) : (
-                <div className="data-sync-last-run" role="status">
-                  {isComplete(currentRun) ? <CircleCheck size={19} aria-hidden="true" /> : <CircleAlert size={19} aria-hidden="true" />}
-                  <div>
-                    <strong>{isComplete(currentRun) ? savedSourceCount === automaticSyncSources.length && packageDetails?.status === "complete"
-                      ? "Sync complete" : "Source sync complete" : "Sync cancelled"}</strong>
-                    <span>{currentRun.sources.map(source => sourceDetails[source.source].label).join(", ")}
-                      {" · "}{formatInstant(currentRun.completedAt ?? currentRun.updatedAt)}</span>
-                  </div>
-                  <button type="button" className="sync-text-button" onClick={() => onRequestedRunChange(currentRun.id)}>View run details</button>
-                </div>
-              )
-            ) : null}
             <section className="data-sync-workspace" aria-labelledby="sync-workspace-heading">
               <div className="section-heading">
                 <div>
@@ -644,18 +619,36 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
                   onCancelRequested={() => onCancelRequested?.()} />
               </div>
               <div className="data-sync-workspace-footer">
-                <p>Sync keeps previous successful data until a replacement is ready.
+                <p>
+                  <strong className="data-sync-workspace-run" role="status">
+                    <span>{currentRun ? <>
+                      {(stateReadFailed || Boolean(busy)) && isProgressing(currentRun) ? "Last reported: " : ""}
+                      {isComplete(currentRun) && completedSteps !== totalSteps ? "Source sync complete" : runHeading(currentRun)}
+                    </> : "No sync run recorded."}</span>
+                    {currentRun?.sources.some(source => source.status === "awaiting_upload")
+                      ? <>{" · "}<span>{statusLabel("awaiting_upload")}</span></> : null}
+                  </strong>
+                  Sync keeps previous successful data until a replacement is ready. Sync continues when you switch tabs.
+                  {currentRun?.status === "waiting" ? " Resolve the waiting step or cancel this run before starting a new sync." : null}
                   {checkedAt ? <> Status checked <time dateTime={checkedAt}>{new Date(checkedAt).toLocaleTimeString()}</time>.</> : null}
                 </p>
-                <WorkbenchActionGate actionId="data-sync.start" compact>
-                  <button type="button" className="sync-text-button" disabled={cannotStart} onClick={() => {
-                    cleanConsent.current = false;
-                    setCleanAcknowledged(false);
-                    setConfirmClean(true);
-                  }}>
-                    Reset saved data...
+                <div className="data-sync-workspace-footer-actions" role="group" aria-label="Workspace sync actions">
+                  <button type="button" className="sync-text-button" disabled={!currentRun}
+                    onClick={() => { if (currentRun) onRequestedRunChange(currentRun.id); }}>
+                    View run details
                   </button>
-                </WorkbenchActionGate>
+                  {currentRun && isProgressing(currentRun) ? runActions(currentRun) : (
+                    <WorkbenchActionGate actionId="data-sync.start" compact>
+                      <button type="button" className="sync-text-button" disabled={cannotStart} onClick={() => {
+                        cleanConsent.current = false;
+                        setCleanAcknowledged(false);
+                        setConfirmClean(true);
+                      }}>
+                        Reset saved data...
+                      </button>
+                    </WorkbenchActionGate>
+                  )}
+                </div>
               </div>
             </section>
           </>
@@ -685,7 +678,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
               <div><dt>{requestedRun.completedAt ? "Duration (including waits)" : "Last update"}</dt><dd>{requestedRun.completedAt
                 ? syncDuration(requestedRun.startedAt, requestedRun.completedAt) : formatInstant(requestedRun.updatedAt)}</dd></div>
             </dl>
-            <SyncProgress run={requestedRun} showJobIds stale={Boolean(requestedRunError) || requestedRunLoading || Boolean(busy)} />
+            <SyncProgress run={requestedRun} stale={Boolean(requestedRunError) || requestedRunLoading || Boolean(busy)} />
             {runActions(requestedRun)}
             {requestedRun.sources.some(source => source.status === "awaiting_upload") ? (
               <div className="notice">
@@ -723,7 +716,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   );
 });
 
-function SyncProgress({ run, showJobIds = false, stale = false }: { run: DataSyncRun; showJobIds?: boolean; stale?: boolean }) {
+function SyncProgress({ run, stale = false }: { run: DataSyncRun; stale?: boolean }) {
   const { openPermissions } = useCapabilityContext();
   const automatic = run.sources.filter(source => source.source !== "usage_reports");
   const completed = automatic.filter(source => source.status === "succeeded").length;
@@ -731,15 +724,7 @@ function SyncProgress({ run, showJobIds = false, stale = false }: { run: DataSyn
   const queued = automatic.some(source => source.status === "queued");
   const complete = isComplete(run);
   const collecting = isProgressing(run) && (running.length > 0 || queued);
-  const heading = complete
-    ? "Sync complete"
-    : run.status === "cancelled"
-      ? "Sync cancelled"
-      : running.length
-        ? `Syncing ${running.map(source => sourceDetails[source.source].label.toLowerCase()).join(", ")}`
-        : queued && isProgressing(run)
-          ? "Preparing your sync"
-          : "Sync needs attention";
+  const heading = runHeading(run);
   return (
     <section className={`data-sync-progress${complete ? " is-complete" : ""}${collecting && !stale ? " is-running" : ""}`} aria-label="Sync status">
       <div className="data-sync-progress-heading" role="status" aria-live="polite">
@@ -759,16 +744,14 @@ function SyncProgress({ run, showJobIds = false, stale = false }: { run: DataSyn
             <SourceBadge status={source.status} stale={stale} />
             <div>
               <strong>{sourceDetails[source.source].label}</strong>
-              <p>{source.message || (source.status === "queued" ? "Waiting for collection to start."
-                : source.status === "running" ? "Waiting for the provider's next update." : statusLabel(source.status))}</p>
+              <p>{sourceMessage(source)}</p>
               {source.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
               {source.status === "permission_required" ? <button type="button" className="secondary" onClick={openPermissions}>Review permissions</button> : null}
-              {showJobIds && source.jobId ? <p className="data-sync-run-meta">Source job <code>{source.jobId}</code></p> : null}
+              {source.jobId ? <p className="data-sync-run-meta">Source job <code>{source.jobId}</code></p> : null}
             </div>
             <div className="data-sync-live-count">
               <strong>{source.status === "queued" || source.count === null ? "—" : source.count.toLocaleString()}</strong>
-              <span>{source.status === "succeeded" ? `${sourceDetails[source.source].unit} saved`
-                : source.status === "running" ? "processed in this stage" : "reported, not a saved total"}</span>
+              <span>{sourceCountLabel(source)}</span>
             </div>
           </li>
         ))}
@@ -792,8 +775,10 @@ function SavedSourceRow({ source, attempt, stale, disabled, onSync }: {
   disabled: boolean;
   onSync: () => void;
 }) {
+  const { openPermissions } = useCapabilityContext();
   const details = sourceDetails[source.source];
   const saved = source.status === "succeeded" || source.lastSuccessAt !== null;
+  const observation = attempt ?? source;
   return (
     <SyncSourceRow label={details.label} description={details.description}
       status={attempt?.status ?? source.status} stale={stale}
@@ -802,19 +787,53 @@ function SavedSourceRow({ source, attempt, stale, disabled, onSync }: {
         <div>
           <dt>Last saved count</dt>
           <dd>{saved ? source.count === null ? "Not reported" : source.count.toLocaleString() : "Not synced"}</dd>
-          {saved && source.count !== null ? <dd className="data-sync-count-unit">{details.unit}</dd> : null}
+          <dd className="data-sync-count-unit">{details.unit}</dd>
         </div>
         <div>
           <dt>Last successful sync</dt>
           <dd>{source.lastSuccessAt ? formatInstant(source.lastSuccessAt) : saved ? "Not recorded" : "Never"}</dd>
+          <dd className="data-sync-count-unit data-sync-attempt-count">{attempt
+            ? attempt.status === "queued" ? "Collection queued"
+              : attempt.count === null ? "Count not reported"
+                : `${attempt.count.toLocaleString()} ${sourceCountLabel(attempt)}`
+            : "No current attempt"}</dd>
         </div>
       </>}
       actions={
         <WorkbenchActionGate actionId="data-sync.start" compact>
           <button type="button" className="secondary" disabled={disabled} onClick={onSync}>Sync {details.label.toLowerCase()}</button>
         </WorkbenchActionGate>
-      } />
+      }>
+      <p role="status">
+        {stale && attempt ? "Last reported: " : ""}{sourceMessage(observation)}
+        {observation.status === "waiting_authorization" ? <>{" "}<a href="/api/auth/login">Sign in again</a></> : null}
+        {observation.status === "permission_required" ? <>{" "}<button type="button" className="sync-text-button"
+          onClick={openPermissions}>Review permissions</button></> : null}
+      </p>
+    </SyncSourceRow>
   );
+}
+
+function runHeading(run: DataSyncRun) {
+  if (isComplete(run)) return "Sync complete";
+  if (run.status === "cancelled") return "Sync cancelled";
+  const automatic = run.sources.filter(source => source.source !== "usage_reports");
+  const running = automatic.filter(source => source.status === "running");
+  if (running.length) return `Syncing ${running.map(source => sourceDetails[source.source].label.toLowerCase()).join(", ")}`;
+  return isProgressing(run) && automatic.some(source => source.status === "queued")
+    ? "Preparing your sync" : "Sync needs attention";
+}
+
+function sourceMessage(source: DataSyncSourceStatus) {
+  return source.message || (source.status === "queued" ? "Waiting for collection to start."
+    : source.status === "running" ? "Waiting for the provider's next update."
+      : source.status === "succeeded" ? "Collection completed."
+        : source.status === "not_started" ? "No collection recorded." : statusLabel(source.status));
+}
+
+function sourceCountLabel(source: DataSyncSourceStatus) {
+  return source.status === "succeeded" ? `${sourceDetails[source.source].unit} saved`
+    : source.status === "running" ? "processed in this stage" : "reported, not a saved total";
 }
 
 function isProgressing(run: DataSyncRun | null | undefined) {
