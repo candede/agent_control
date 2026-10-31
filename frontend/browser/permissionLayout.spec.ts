@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
+import { isApplicationCollectionCapability } from "../../backend/src/types/capability";
 import type { CapabilityView } from "../src/api/client";
 import { mockLayoutApi } from "./layoutFixtures";
 import { permissionLayoutRequestKind, type PermissionLayoutRequestKind } from "./permissionFixtures";
@@ -10,16 +11,17 @@ import { isAutomaticRefreshRequest } from "./automaticRefreshFixtures";
 function permissions(): CapabilityView[] {
   return capabilityDefinitions.map(definition => {
     const application = definition.mode === "application";
+    const optional = application && !isApplicationCollectionCapability(definition.id);
     const local = definition.mode === "local";
     const onDemand = definition.probe.kind === "on_demand";
-    const provider = ["graph.package.read.delegated", "graph.directory.read", "powerPlatform.inventory.read"].includes(definition.id);
+    const provider = ["graph.package.read.application", "powerPlatform.inventory.read"].includes(definition.id);
     return {
-      definition, enabled: !application,
-      ...(application ? { configuration: { enabled: false, sharedDataScope: false, revision: 1 } } : {}),
+      definition, enabled: !optional,
+      ...(application ? { configuration: { enabled: !optional, sharedDataScope: !optional, revision: 1 } } : {}),
       decision: {
-        capabilityId: definition.id, status: application ? "not_configured" : "available",
-        authorized: !application, fresh: true,
-        verification: application ? undefined : local ? "local" : onDemand ? "on_demand" : provider ? "provider" : "token",
+        capabilityId: definition.id, status: optional ? "not_configured" : "available",
+        authorized: !optional, fresh: true,
+        verification: optional ? undefined : local ? "local" : onDemand ? "on_demand" : provider ? "provider" : "token",
         ...(local || onDemand ? {} : {
           checkedAt: new Date(Date.now() - 1000).toISOString(),
           expiresAt: new Date(Date.now() + 300_000).toISOString(),
@@ -90,23 +92,69 @@ test.beforeEach(async ({ context }) => {
 });
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
 
-test("healthy Permissions keeps concise issues and setup alongside the user role reference", async ({ page }, info) => {
+test("healthy Permissions has three open sections, concise app roles and a permission-first reference", async ({ page }, info) => {
   const { unexpected, posts } = await mockPermissions(page, permissions);
   await page.goto("/permissions");
   await expect.poll(() => posts).toEqual(["/api/capabilities/check"]);
   await expectQuietPermissions(page);
   const center = page.locator(".permission-center");
   await expect(center.getByText("App administrator", { exact: true })).toHaveCount(0);
-  await expect(center.getByRole("region", { name: "App prerequisites" })).toBeVisible();
-  await expect(center.getByText("Required API permissions", { exact: true })).toBeVisible();
-  await expect(center.getByText("Log collection setup", { exact: true })).toBeVisible();
-  await expect(center.locator("details[open]")).toHaveCount(0);
-  const overview = await center.locator(":scope > header, .permission-issues, .permission-prerequisites, .permission-collection-setup").allInnerTexts();
-  expect(overview.join(" ").trim().split(/\s+/).length).toBeLessThanOrEqual(110);
-  await expect(center.getByRole("region", { name: "Signed-in user roles", exact: true })).toBeVisible();
+  const apiPermissions = center.getByRole("region", { name: "App registration permissions" });
+  await expect(apiPermissions).toBeVisible();
+  await expect(apiPermissions).not.toContainText(/AgentControl\.|\b(?:Viewer|Uploader|UsageReportUploader|Admin)\b/);
+  await expect(apiPermissions).not.toContainText(/\bapp[- ]roles?\b/i);
+  await expect(center.getByText("Log collection setup", { exact: true })).toHaveCount(0);
+  await expect(center.getByRole("link", { name: "Log setup", exact: true })).toHaveCount(0);
+  await expect(center.locator("details, summary, [aria-expanded], dialog")).toHaveCount(0);
+  await expect(center.locator(".permission-body > section")).toHaveCount(3);
+  await expect(center.getByRole("navigation", { name: "Permissions sections" })).toHaveCount(0);
+  await expect(center.getByRole("heading", { level: 3 })).toHaveText(["Issues", "App-defined roles", "App registration permissions"]);
+  await expect(center.getByRole("region", { name: "App-defined roles", exact: true })).toBeVisible();
+  const viewer = center.getByRole("article", { name: "Viewer", exact: true });
+  await expect(viewer).toContainText("AgentControl.Viewer");
+  await expect(viewer).toContainText("No signed-in Microsoft directory or reporting reader role is required");
+  const admin = center.getByRole("article", { name: "Admin", exact: true });
+  await expect(admin).toContainText("signed-in user's delegated permission");
+  await expect(admin).toHaveClass(/\bis-assigned\b/);
+  await expect(admin.getByText("Assigned to you", { exact: true })).toBeVisible();
+  await expect(viewer).not.toHaveClass(/\bis-assigned\b/);
+  await expect(admin).not.toHaveCSS("background-color", await viewer.evaluate(element => getComputedStyle(element).backgroundColor));
+  await expect(admin).not.toHaveCSS("border-color", await viewer.evaluate(element => getComputedStyle(element).borderColor));
+  await expect(center.getByRole("region", { name: "App-defined roles", exact: true })).toContainText("Application read permissions never authorize provider changes");
+  const packagePermission = center.locator(".permission-map-row").filter({ has: page.getByText("CopilotPackages.ReadWrite.All", { exact: true }) });
+  await expect(packagePermission).toContainText("Recommended signed-in administrator role: AI Administrator");
+  await expect(packagePermission).toContainText("Global Administrator is a broader alternative");
+  const packageRoles = packagePermission.locator(".permission-map-requirement strong");
+  await expect(packageRoles).toHaveText(["AI Administrator", "Global Administrator"]);
+  for (const role of await packageRoles.all()) await expect(role).toHaveCSS("font-weight", /[6-9]00|bold/);
+  await expect(packagePermission).toContainText("not a confirmed exclusive API role requirement");
+  await expect(packagePermission.getByRole("link", { name: "Agent-management roles" }))
+    .toHaveAttribute("href", "https://learn.microsoft.com/en-us/microsoft-agent-365/admin/agent-roles-perms");
+  await expect(packagePermission).toContainText("both application and delegated forms");
+  await expect(packagePermission).toContainText("delegated work or school accounts only");
+  await expect(packagePermission).toContainText("application form does not authorize these writes");
+  await expect(packagePermission.getByRole("link", { name: "Permission definition" }))
+    .toHaveAttribute("href", "https://learn.microsoft.com/en-us/graph/permissions-reference#copilotpackagesreadwriteall");
+  const platform = center.locator(".permission-map-row").filter({ has: page.getByText("ResourceQuery.Resources.Read", { exact: true }) });
+  await expect(platform).toContainText("ResourceQuery.Resources.Read");
+  await expect(platform.locator(".permission-map-requirement")).toContainText("Recommended for read-only sync: AI Reader");
+  await expect(platform.locator(".permission-map-requirement")).not.toContainText("Global Reader");
+  await expect(platform.locator(".permission-map-alternatives")).toContainText("Global Reader");
+  const readerSetup = platform.getByRole("region", { name: "Assign AI Reader to a viewer" });
+  await expect(readerSetup).toContainText("Identity > Roles & admins > AI Reader");
+  await expect(readerSetup).toContainText("AI Reader provides read-only inventory access");
+  await expect(readerSetup.getByRole("listitem")).toHaveCount(3);
+  await expect(readerSetup.getByRole("link", { name: "Role assignment instructions" })).toBeVisible();
+  await expect(platform).toContainText("no application permission equivalent");
+  const uploader = center.getByRole("article", { name: "Usage Report Uploader", exact: true });
+  await expect(uploader).not.toHaveClass(/\bis-assigned\b/);
+  await expect(uploader).toContainText("AgentControl.UsageReportUploader");
+  await expect(uploader).toContainText("Published-report corrections, selection and deletion require Admin");
   await expect(center.getByRole("button", { name: /Request consent|Authorize|Grant admin consent/, includeHidden: true })).toHaveCount(0);
   expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
+  await packagePermission.screenshot({ path: info.outputPath("package-permission.png") });
+  await center.getByRole("region", { name: "App-defined roles", exact: true }).screenshot({ path: info.outputPath("assigned-app-role.png") });
   await page.screenshot({ path: info.outputPath("permissions-overview.png"), fullPage: true });
   await center.getByRole("button", { name: "Check status", exact: true }).click();
   await expectQuietPermissions(page);
@@ -114,41 +162,78 @@ test("healthy Permissions keeps concise issues and setup alongside the user role
   expect(unexpected).toEqual([]);
 });
 
-test("disabled application modes remain optional permission references, not problems", async ({ page }, info) => {
+test("standard application reads are required references while deferred security stays hidden", async ({ page }, info) => {
   const { unexpected, posts } = await mockPermissions(page, permissions);
   await page.goto("/permissions");
   await expectQuietPermissions(page);
-  const setup = page.getByRole("region", { name: "App prerequisites" });
-  const required = setup.getByText("Required API permissions", { exact: true });
-  await required.focus();
-  await page.keyboard.press("Enter");
-  await expect(setup.getByText("Microsoft Graph / Delegated", { exact: true })).toBeVisible();
-  await expect(setup.getByText("Optional application permissions", { exact: true })).toBeVisible();
-  const optional = setup.locator("details.permission-optional");
-  await expect(optional).not.toHaveAttribute("open", "");
-  await expect(optional.getByRole("region", { name: "Microsoft Graph / Application", includeHidden: true })).not.toBeVisible();
-  await optional.getByText("Optional application permissions", { exact: true }).click();
-  const application = optional.getByRole("region", { name: "Microsoft Graph / Application", exact: true });
-  for (const permission of ["CopilotPackages.Read.All", "AuditLogsQuery.Read.All", "ThreatHunting.Read.All"]) {
+  const setup = page.getByRole("region", { name: "App registration permissions" });
+  await expect(setup.getByRole("region", { name: "Microsoft Graph / Delegated", exact: true })).toBeVisible();
+  await expect(setup.getByText("Optional application permissions", { exact: true })).toHaveCount(0);
+  const application = setup.getByRole("region", { name: "Microsoft Graph / Application", exact: true });
+  for (const permission of ["CopilotPackages.Read.All", "User.Read.All", "LicenseAssignment.Read.All", "Reports.Read.All"]) {
     await expect(application.getByText(permission, { exact: true })).toBeVisible();
   }
-  await expect(optional.getByText(/Only for administrator-configured app-only access/)).toBeVisible();
-  await expect(setup.getByRole("link", { name: "Open Entra admin center" })).toHaveAttribute("href", "https://entra.microsoft.com/");
+  await expect(setup.getByText(/AuditLogsQuery.Read.All|ThreatHunting.Read.All|AgentIdentity.Read.All/)).toHaveCount(0);
+  await expect(setup.getByRole("link", { name: "Open app registration" })).toHaveAttribute("href", "https://entra.microsoft.com/");
+  await expect(setup.locator("dt")).toHaveCount(11);
   await expect(setup.getByRole("button", { name: /Enable|Consent|Authorize/i, includeHidden: true })).toHaveCount(0);
   await expectQuietPermissions(page);
   expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
-  expect((await new AxeBuilder({ page }).include(".permission-prerequisites").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
-  await page.screenshot({ path: info.outputPath("permissions-optional-setup.png"), fullPage: true });
+  expect((await new AxeBuilder({ page }).include(".permission-registration").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
+  await page.screenshot({ path: info.outputPath("permissions-application-setup.png"), fullPage: true });
   expect(posts).toEqual(["/api/capabilities/check"]);
   expect(unexpected).toEqual([]);
 });
+
+for (const failing of [false, true]) {
+  test(`all permission guidance remains readable at responsive boundaries (${failing ? "issue" : "healthy"})`, async ({ page }, info) => {
+    const { unexpected } = await mockPermissions(page, () => permissions().map(view => !failing || view.definition.id !== "graph.package.read.application" ? view : {
+      ...view, decision: { ...view.decision, status: "missing_permission", authorized: false,
+        evidence: { category: "missing_permission", httpStatus: 403, correlationId: "responsive-request" } },
+    }));
+    await page.goto("/permissions");
+    const center = page.locator(".permission-center");
+    await expect(center).toHaveAttribute("aria-busy", "false");
+    for (const width of [360, 600, 601, 738, 760, 761, 1024, 1440]) {
+      await page.setViewportSize({ width, height: 876 });
+      await expect(center.locator("details, summary, dialog, [aria-expanded]")).toHaveCount(0);
+      await expect(center.locator(".permission-map-row")).toHaveCount(11);
+      const measurements = await center.evaluate(element => ({
+        overflow: element.scrollWidth > element.clientWidth + 1,
+        pageOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+        headings: [...element.querySelectorAll("h3")].map(heading => {
+          const style = getComputedStyle(heading);
+          return { width: heading.getBoundingClientRect().width, lines: heading.getBoundingClientRect().height / parseFloat(style.lineHeight) };
+        }),
+        descriptions: [...element.querySelectorAll(".permission-map-row dd")].map(description => description.getBoundingClientRect().width),
+        clipped: [...element.querySelectorAll(".permission-map-row, .permission-role-card, .permission-issue")].some(row => row.scrollWidth > row.clientWidth + 1),
+      }));
+      expect(measurements.overflow, `${width}px panel`).toBe(false);
+      expect(measurements.pageOverflow, `${width}px page`).toBe(false);
+      expect(measurements.clipped, `${width}px guidance`).toBe(false);
+      for (const heading of measurements.headings) {
+        expect(heading.width, `${width}px section heading`).toBeGreaterThanOrEqual(180);
+        expect(heading.lines, `${width}px section heading lines`).toBeLessThanOrEqual(2.1);
+      }
+      for (const description of measurements.descriptions) expect(description, `${width}px permission usage`).toBeGreaterThanOrEqual(180);
+      if (failing) await expect(center.getByText("responsive-request", { exact: true })).toBeVisible();
+      if (width === 738 || width === 1440) {
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await page.screenshot({ path: info.outputPath(`permissions-${width}px.png`) });
+        await center.getByRole("region", { name: "App-defined roles", exact: true }).screenshot({ path: info.outputPath(`permissions-roles-${width}px.png`) });
+        await center.getByRole("region", { name: "Microsoft Graph / Application", exact: true }).screenshot({ path: info.outputPath(`permissions-graph-${width}px.png`) });
+      }
+    }
+    expect(unexpected).toEqual([]);
+  });
+}
 
 test("unchecked, stale, disabled, unregistered and app-role decisions are not issues", async ({ page }) => {
   const now = Date.now();
   const { unexpected } = await mockPermissions(page, () => permissions().map((view): CapabilityView => {
     const decision = { ...view.decision, status: "missing_permission" as const, authorized: false };
     switch (view.definition.id) {
-      case "graph.package.read.delegated": return { ...view, decision: { ...decision, fresh: false } };
+      case "graph.package.read.application": return { ...view, decision: { ...decision, fresh: false } };
       case "graph.directory.read": return { ...view, decision: { ...decision, expiresAt: new Date(now - 1000).toISOString() } };
       case "powerPlatform.inventory.read": return { ...view, decision: { ...decision, checkedAt: undefined, expiresAt: undefined } };
       case "graph.package.block.manage": return { ...view, decision: { ...decision, status: "missing_internal_role" } };
@@ -170,12 +255,12 @@ test("unchecked, stale, disabled, unregistered and app-role decisions are not is
   expect(unexpected).toEqual([]);
 });
 
-test("fresh failures have friendly details, setup links, keyboard focus and explicit recovery", async ({ page }, info) => {
+test("fresh failures show all evidence inline with setup links and explicit recovery", async ({ page }, info) => {
   let recovered = false;
   const { unexpected, posts } = await mockPermissions(page, kind => {
     if (kind === "retry-failed") recovered = true;
     return permissions().map(view => {
-      if (kind === "catalog" || recovered || view.definition.id !== "graph.package.read.delegated") return view;
+      if (kind === "catalog" || recovered || view.definition.id !== "graph.package.read.application") return view;
       return { ...view, decision: {
         ...view.decision, status: "provider_error", authorized: false, verification: undefined,
         evidence: { category: "provider_timeout", phase: "provider_read", timeoutMs: 30_000, correlationId: "synthetic-timeout-request" },
@@ -185,44 +270,28 @@ test("fresh failures have friendly details, setup links, keyboard focus and expl
   });
   await page.goto("/permissions");
   const issues = page.getByRole("region", { name: "Issues", exact: true });
-  await expect(issues.getByRole("listitem")).toHaveCount(1);
+  await expect(issues.getByRole("article")).toHaveCount(1);
   await expect(issues.getByText("Agent inventory", { exact: true })).toBeVisible();
   await expect(issues.getByText("Microsoft did not respond after retrying.", { exact: true })).toBeVisible();
   await expect(page.locator(".capability-health")).toHaveAccessibleName("Permissions");
   await expect(page.locator(".capability-health")).toHaveAccessibleDescription("Permissions: 1 issue");
   await expect(issues.getByText("Package catalog read", { exact: true })).toHaveCount(0);
-  const trigger = issues.getByRole("button", { name: "Details: Agent inventory", exact: true });
-  expect(await issues.locator("strong").evaluate(element => getComputedStyle(element).textTransform)).toBe("none");
+  const issue = issues.getByRole("article", { name: "Agent inventory", exact: true });
   expect(await page.evaluate(collectLayoutFailures, { fields: [] })).toEqual([]);
   await page.screenshot({ path: info.outputPath("permissions-needs-attention.png"), fullPage: true });
-  await trigger.focus();
-  await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog", { name: "Agent inventory", exact: true });
-  await expect(dialog.getByRole("heading", { name: "Agent inventory", exact: true })).toBeFocused();
-  await expect(dialog.getByRole("region", { name: "Required setup" })).toContainText("Microsoft Graph / delegated: CopilotPackages.Read.All");
-  await expect(dialog.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
-  await expect(dialog.locator("details[open]")).toHaveCount(0);
-  await expect(dialog.getByText("synthetic-timeout-request", { exact: true })).not.toBeVisible();
-  expect(await dialog.textContent()).not.toMatch(/Verification|Evidence freshness|Operation access|Last success|last recorded success|Ready to try|provider authorization not verified/i);
-  await expect(dialog.getByRole("button", { name: "Request consent", includeHidden: true })).toHaveCount(0);
-  for (const key of ["Tab", "Shift+Tab"]) {
-    for (let index = 0; index < 12; index++) {
-      await page.keyboard.press(key);
-      expect(await dialog.evaluate(element => element.contains(document.activeElement))).toBe(true);
-    }
-  }
-  const technical = dialog.getByText("Technical details", { exact: true });
-  await technical.focus();
-  await page.keyboard.press("Enter");
-  await expect(dialog.getByText("synthetic-timeout-request", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("Retry the safe status check after checking connectivity.", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("https://graph.microsoft.com", { exact: true })).toBeVisible();
-  expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-  expect((await new AxeBuilder({ page }).include(".workbench-dialog[open]").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
-  await page.screenshot({ path: info.outputPath("permissions-details.png") });
-  await page.keyboard.press("Escape");
-  await expect(dialog).not.toBeVisible();
-  await expect(trigger).toBeFocused();
+  await expect(issue.getByRole("region", { name: "Required setup" })).toContainText("Microsoft Graph / application: CopilotPackages.Read.All");
+  await expect(issue.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
+  await expect(issue.getByText("synthetic-timeout-request", { exact: true })).toBeVisible();
+  await expect(issue.getByText("Retry the safe status check after checking connectivity.", { exact: true })).toBeVisible();
+  await expect(issue.getByText("https://graph.microsoft.com", { exact: true })).toBeVisible();
+  await expect(issue.getByText(/Grant admin consent/)).toHaveCount(0);
+  await expect(page.locator(".permission-center").locator("details, summary, dialog, [aria-expanded]")).toHaveCount(0);
+  const documentation = issue.getByRole("link", { name: "Entra admin center", exact: true });
+  await documentation.focus();
+  await page.keyboard.press("Tab");
+  await expect(issue.getByRole("link", { name: "Microsoft admin center", exact: true })).toBeFocused();
+  expect(await issue.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  expect((await new AxeBuilder({ page }).include(".permission-center").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   await page.getByRole("button", { name: "Check status", exact: true }).click();
   await expectQuietPermissions(page);
   expect(posts).toEqual(["/api/capabilities/check", "/api/capabilities/check?retry=failed"]);
@@ -240,24 +309,21 @@ test("an actual on-demand operation denial is actionable without a readiness war
     },
   }));
   await page.goto("/permissions");
-  const issue = page.getByRole("region", { name: "Issues", exact: true }).getByRole("listitem");
+  const issue = page.getByRole("region", { name: "Issues", exact: true }).getByRole("article");
   await expect(issue).toHaveCount(1);
   await expect(issue.getByText("Copilot license sync", { exact: true })).toBeVisible();
   await expect(issue.getByText("Microsoft denied the required API permission.", { exact: true })).toBeVisible();
   await expect(issue.getByRole("link", { name: "Admin setup", exact: true })).toHaveAttribute("href", "https://entra.microsoft.com/");
-  await issue.getByRole("button", { name: "Details: Copilot license sync", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Copilot license sync", exact: true });
-  await dialog.getByText("Technical details", { exact: true }).click();
-  await expect(dialog.getByText("synthetic-license-denial", { exact: true })).toBeVisible();
-  await expect(dialog.getByText("403", { exact: true })).toBeVisible();
-  expect(await dialog.textContent()).not.toMatch(/Ready to try|provider authorization not verified/i);
+  await expect(issue.getByText("synthetic-license-denial", { exact: true })).toBeVisible();
+  await expect(issue.getByText("403", { exact: true })).toBeVisible();
+  expect(await issue.textContent()).not.toMatch(/Ready to try|provider authorization not verified/i);
   expect(unexpected).toEqual([]);
 });
 
 test("a cached timeout stays quiet while the initial automatic retry is pending", async ({ page }) => {
   await watchPermissionWarnings(page);
   const { unexpected, posts } = await mockPermissions(page, () => permissions().map(view =>
-    view.definition.id !== "graph.package.read.delegated" ? view : {
+    view.definition.id !== "graph.package.read.application" ? view : {
       ...view, decision: {
         ...view.decision, status: "provider_error", authorized: false, verification: undefined,
         evidence: { category: "provider_timeout", phase: "provider_read", timeoutMs: 30_000 },
@@ -343,8 +409,8 @@ test("Check status shows real progress, animated work and reduced-motion feedbac
     expect(route.request().method()).toBe("GET");
     progressRequests.push({ query: new URL(route.request().url()).search, startedAt: performance.now() });
     return route.fulfill({ json: { progress: { checks: [
-      { capabilityId: "graph.package.read.delegated", state: completeInventory ? "complete" : "checking" },
-      { capabilityId: "graph.directory.read", state: "complete" },
+      { capabilityId: "graph.package.read.application", state: completeInventory ? "complete" : "checking" },
+      { capabilityId: "powerPlatform.quarantine.read", state: "complete" },
       { capabilityId: "powerPlatform.inventory.read", state: "checking" },
       { capabilityId: "defender.hunting.delegated", state: "complete" },
     ] } } });
@@ -353,8 +419,8 @@ test("Check status shows real progress, animated work and reduced-motion feedbac
     await page.emulateMedia({ reducedMotion: "no-preference" });
     await page.getByRole("button", { name: "Check status", exact: true }).click();
     const progress = page.getByRole("region", { name: "Permission check progress" });
-    await expect(progress.getByRole("status")).toContainText("2 of 4 reviewed");
-    await expect(progress.getByRole("progressbar")).toHaveAttribute("value", "2");
+    await expect(progress.getByRole("status")).toContainText("1 of 3 reviewed");
+    await expect(progress.getByRole("progressbar")).toHaveAttribute("value", "1");
     await expect(progress.getByText("Agent inventory", { exact: true })).toBeVisible();
     await expect(progress.getByText("Power Platform inventory", { exact: true })).toBeVisible();
     await expect(progress.getByText("Defender / Agent 365 logs", { exact: true })).toHaveCount(0);
@@ -367,7 +433,7 @@ test("Check status shows real progress, animated work and reduced-motion feedbac
     expect((await new AxeBuilder({ page }).include(".permission-progress").withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
     await page.screenshot({ path: info.outputPath("permissions-checking.png"), fullPage: true });
     completeInventory = true;
-    await expect(progress.getByRole("status")).toContainText("3 of 4 reviewed");
+    await expect(progress.getByRole("status")).toContainText("2 of 3 reviewed");
     await expect(progress.getByText("Agent inventory", { exact: true })).toHaveCount(0);
     await page.emulateMedia({ reducedMotion: "reduce" });
     expect(await spinner.evaluate(element => getComputedStyle(element).animationName)).toBe("none");

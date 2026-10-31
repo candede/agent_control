@@ -17,6 +17,7 @@ from fastmcp.server.auth.oauth_proxy.upstream import OAuthError
 from fastmcp.server.auth.providers.azure import AzureProvider
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.dependencies import get_access_token
+from joserfc.errors import JoseError
 from mcp.server.auth.provider import AccessToken as SDKAccessToken
 from mcp.server.auth.provider import (
     AuthorizationCode,
@@ -73,7 +74,15 @@ def valid_claims(
                 not api
                 or now - iat < 300
                 and isinstance(roles, list)
-                and any(role in {"AgentControl.Viewer", "AgentControl.Admin"} for role in roles)
+                and any(
+                    role
+                    in {
+                        "AgentControl.Viewer",
+                        "AgentControl.UsageReportUploader",
+                        "AgentControl.Admin",
+                    }
+                    for role in roles
+                )
             )
         )
     except ConfigurationError, TypeError, ValueError:
@@ -234,7 +243,12 @@ class TenantAzureProvider(AzureProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        original = self.jwt_issuer.verify_token(refresh_token.token, expected_token_use="refresh")
+        try:
+            original = self.jwt_issuer.verify_token(
+                refresh_token.token, expected_token_use="refresh"
+            )
+        except JoseError:
+            raise TokenError("invalid_grant", "Refresh credential is invalid; reconnect.") from None
         if await self.store.get(self.token_key(refresh_token.token), collection="revoked"):
             raise TokenError("invalid_grant", "Refresh credential was revoked.")
         try:
@@ -355,10 +369,12 @@ class ApiTokenExchange:
                         )
                 payload = json.loads(body)
                 assertion = payload.get("access_token") if isinstance(payload, dict) else None
+                token_type = payload.get("token_type") if isinstance(payload, dict) else None
                 if (
                     not isinstance(assertion, str)
                     or len(assertion) > 32768
-                    or payload.get("token_type", "").lower() != "bearer"
+                    or not isinstance(token_type, str)
+                    or token_type.lower() != "bearer"
                 ):
                     raise ValueError
                 verified = await self.verifier.verify_token(assertion)
@@ -415,7 +431,7 @@ async def request_stream(
         params=params,
         json=json_body,
     )
-    response = await client.send(request, stream=True, follow_redirects=False)
+    response = await client.send(request, stream=True, auth=None, follow_redirects=False)
     try:
         yield response
     finally:

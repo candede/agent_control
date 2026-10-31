@@ -164,33 +164,32 @@ for (const origin of ["licensed users", "Adoption", "reported users", "agent use
   }
 }
 
-test("user Logs offers human-attributed Defender invocations without starting a query on open", async ({ page }, info) => {
+test("user security deep links fall back safely without hiding adoption data or starting log reads", async ({ page }) => {
   const { dialog, writes, unexpected } = await openUser(page);
-  const scopes: string[] = [];
-  await page.route("**/api/hunting/jobs?**", route => {
-    const url = new URL(route.request().url());
-    expect(url.searchParams.get("agentRecordId")).toBeNull();
-    const human = url.searchParams.get("userObjectId");
-    expect(human).toMatch(/^[0-9a-f-]{36}$/i);
-    scopes.push(human!);
-    return route.fulfill({ json: { value: [], count: 0, limit: 20, offset: 0 } });
+  const securityRequests: string[] = [];
+  page.on("request", request => {
+    const path = new URL(request.url()).pathname;
+    if (/\/(?:hunting|audit-search|agent-inventory\/investigations)(?:\/|$)/.test(path)) securityRequests.push(path);
   });
-  await dialog.getByRole("tab", { name: "Logs", exact: true }).click();
-  await dialog.getByRole("combobox", { name: "Source" }).selectOption("defender");
-  await expect(dialog.getByText("No hunting history", { exact: true })).toBeVisible();
-  await expect(dialog.getByRole("combobox", { name: "Log type" }).locator("option")).toHaveText(["Agent invocations"]);
-  await expect(dialog.getByText(/Tool and inference events identify the agent account/)).toBeVisible();
+  const url = new URL(page.url());
+  url.searchParams.set("detail", selectedUsersPage().value[0].directory.objectId);
+  url.searchParams.set("tab", "purview");
+  await page.goto(`${url.pathname}${url.search}`);
+  await expect(dialog.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toBeVisible();
+  await expect(dialog.getByRole("tab", { name: "Logs", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("combobox", { name: "Source" })).toHaveCount(0);
+  await expect(dialog.getByText(/Purview|Defender|log identity/)).toHaveCount(0);
   await expect(dialog.locator("details")).toHaveCount(0);
-  expect(scopes).toHaveLength(1);
+  expect(securityRequests).toEqual([]);
   expect(writes).toEqual([]);
   expect(unexpected).toEqual([]);
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-  await dialog.screenshot({ path: info.outputPath("user-defender-logs.png") });
 });
 
 test("user details organize useful data into consistent accessible tabs without disclosures", async ({ page }, info) => {
   const { dialog, reads, writes, unexpected } = await openUser(page);
-  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Logs"]);
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility"]);
   await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toContainText("Contoso Health");
   await expect(dialog.getByLabel("User summary")).toContainText("200");
   await expect(dialog.getByText("Agent report dates", { exact: true })).toBeVisible();
@@ -200,7 +199,7 @@ test("user details organize useful data into consistent accessible tabs without 
   await dialog.screenshot({ path: info.outputPath("user-overview.png") });
 
   for (const [tab, screenshot] of [
-    ["Usage & agents", "user-usage"], ["Licenses", "user-licenses"], ["Responsibility", "user-responsibility"], ["Logs", "user-purview"],
+    ["Usage & agents", "user-usage"], ["Licenses", "user-licenses"], ["Responsibility", "user-responsibility"],
   ]) {
     await dialog.getByRole("tab", { name: tab, exact: true }).click();
     await expect(dialog.getByRole("tabpanel")).toHaveAccessibleName(tab);
@@ -214,11 +213,6 @@ test("user details organize useful data into consistent accessible tabs without 
     } else if (tab === "Responsibility") {
       await expect(dialog.getByRole("button", { name: "Open agent Responsible agent", exact: true })).toBeVisible();
       await expect(dialog.getByText("Responsible only", { exact: true })).toHaveCount(0);
-    } else {
-      await expect(dialog.getByRole("heading", { name: "Search Purview logs", exact: true })).toBeVisible();
-      await expect(dialog.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
-      await expect(dialog.getByRole("textbox", { name: "User principal names", exact: true })).toHaveCount(0);
-      await expect(dialog.getByRole("region", { name: "Available audit logs", exact: true })).toHaveCount(0);
     }
     await expect(dialog.locator("details")).toHaveCount(0);
     await expect(dialog.getByText(/containing bundle alone|Raw capability status|Owner, Created by and Last modified|not a daily event log/)).toHaveCount(0);
@@ -254,24 +248,19 @@ test("user tabs and agent filters persist through real refreshes with keyboard n
   await expect(search).toHaveValue("research");
   await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).focus();
   await page.keyboard.press("End");
-  await expect(dialog.getByRole("tab", { name: "Logs", exact: true })).toBeFocused();
-  const preset = dialog.getByRole("combobox", { name: "Log type", exact: true });
-  await preset.selectOption("copilot_studio_admin");
-  const purviewUserReads = reads.users;
-  const logsRefresh = page.waitForResponse(response => isAutomaticRefreshRequest(response.request()) && response.ok());
+  await expect(dialog.getByRole("tab", { name: "Responsibility", exact: true })).toBeFocused();
+  const responsibilityUserReads = reads.users;
+  const responsibilityRefresh = page.waitForResponse(response => isAutomaticRefreshRequest(response.request()) && response.ok());
   await page.clock.runFor(65_000);
-  await (await logsRefresh).finished();
+  await (await responsibilityRefresh).finished();
   await expect.poll(async () => {
     await page.clock.runFor(1_000);
     return reads.users;
-  }).toBeGreaterThan(purviewUserReads);
-  await expect(dialog.getByRole("tab", { name: "Logs", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(preset).toHaveValue("copilot_studio_admin");
+  }).toBeGreaterThan(responsibilityUserReads);
+  await expect(dialog.getByRole("tab", { name: "Responsibility", exact: true })).toHaveAttribute("aria-selected", "true");
   await dialog.getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await expect(search).toHaveValue("research");
-  await dialog.getByRole("tab", { name: "Logs", exact: true }).click();
-  await expect(preset).toHaveValue("copilot_studio_admin");
-  await dialog.getByRole("tab", { name: "Logs", exact: true }).focus();
+  await dialog.getByRole("tab", { name: "Responsibility", exact: true }).focus();
   await page.keyboard.press("Home");
   await expect(dialog.getByRole("tab", { name: "Overview", exact: true })).toBeFocused();
   await page.keyboard.press("Escape");

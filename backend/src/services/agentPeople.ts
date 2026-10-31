@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { AgentPeopleRepository, type AgentPeopleGeneration, type AgentPersonObservation } from "../db/agentPeople.js";
 import type { DataSyncScope, UserSourcePublication } from "../db/dataSync.js";
 import { pool } from "../db/pool.js";
@@ -17,7 +17,7 @@ type Dependencies = {
   repository: Pick<AgentPeopleRepository, "generation" | "referencedIds" | "directoryIds" | "read" | "save">;
   directory: Pick<DirectoryPrincipalsClient, "resolve">;
   revalidateUser: typeof revalidateAuthorizedUser;
-  delegatedToken: typeof acquireAuthorizedToken;
+  applicationToken: typeof acquireApplicationToken;
   requireAvailable: typeof capabilities.requireAvailable;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   observeOperation: typeof capabilities.observeOperation;
@@ -37,7 +37,7 @@ export class AgentPeopleService {
     this.dependencies = {
       repository: new AgentPeopleRepository(database), directory: new DirectoryPrincipalsClient(),
       revalidateUser: revalidateAuthorizedUser,
-      delegatedToken: acquireAuthorizedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      applicationToken: acquireApplicationToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       admissions: requireProviderAdmissions, now: () => new Date(), ...dependencies,
@@ -107,7 +107,7 @@ export class AgentPeopleService {
       this.dependencies.admissions();
     };
     fence();
-    const resolved = await this.dependencies.observeOperation("graph.directory.read", user,
+    const resolved = await this.dependencies.observeOperation("graph.users.read", user,
       reportFailure => this.resolvePending(context, pending, options, result, reportFailure, fence),
       { signal, clearOnSuccess: result => result.failed === 0 }).catch(error => {
       fence();
@@ -128,9 +128,9 @@ export class AgentPeopleService {
     requireSameUser(scope, freshUser);
     const token = await wait(() => commitAccountSessionValidation(validation, async () => {
       fence();
-      await wait(() => this.dependencies.requireAvailable("graph.directory.read", freshUser));
+      await wait(() => this.dependencies.requireAvailable("graph.users.read", freshUser));
       fence();
-      return wait(() => this.dependencies.delegatedToken(scope.tenantId, scope.principalId, "graph.directory.read"));
+      return wait(() => this.dependencies.applicationToken(scope.tenantId, "graph.users.read"));
     }));
     for (let offset = 0; offset < pending.length; offset += 8) {
       fence();
@@ -138,7 +138,7 @@ export class AgentPeopleService {
         fence();
         const checkedAt = this.dependencies.now().toISOString();
         try {
-          const values = await this.dependencies.directory.resolve(token, [{ resourceId: objectId, resourceType: "user" }], signal, fence);
+          const values = await this.dependencies.directory.resolve({ user: token }, [{ resourceId: objectId, resourceType: "user" }], signal, fence);
           fence();
           const person = values[0];
           if (values.length !== 1 || person.resourceId.toLowerCase() !== objectId || person.resourceType !== "user"
@@ -169,7 +169,7 @@ export class AgentPeopleService {
       requireSameUser(scope, current);
       await wait(() => commitAccountSessionValidation(validation, async () => {
         fence();
-        await wait(() => this.dependencies.requireAvailable("graph.directory.read", current));
+        await wait(() => this.dependencies.requireAvailable("graph.users.read", current));
         fence();
         // Hold account serialization until the transaction commits or rolls back, even after the caller times out.
         await this.dependencies.repository.save(scope, observations, { generation: options.generation,
@@ -197,7 +197,7 @@ function resolutionContext(user: AuthenticatedUser, beginOperationValidation: De
   throwIfResolutionAborted(signal);
   const scope = userScope(user);
   return { signal, scope, validation: beginAccountSessionValidation(scope.tenantId, scope.principalId),
-    validateCapability: beginOperationValidation("graph.directory.read", user) };
+    validateCapability: beginOperationValidation("graph.users.read", user) };
 }
 
 function assertCurrent(context: ResolutionContext) {

@@ -96,7 +96,7 @@ describe("WorkbenchActionGate", () => {
   it.each(["delegated", "application"] as const)(
     "revalidates %s evidence at click time when the diagnostics timer has not observed expiry", async mode => {
       const now = Date.now();
-      const definition = capabilityDefinitions.find(item => item.id === `graph.package.read.${mode}`)!;
+      const definition = capabilityDefinitions.find(item => item.id === (mode === "application" ? "graph.package.read.application" : "powerPlatform.inventory.read"))!;
       const onClick = vi.fn();
       const value: typeof capabilityContext = { ...capabilityContext, now, views: [{
         ...(mode === "application" ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
@@ -105,24 +105,21 @@ describe("WorkbenchActionGate", () => {
           checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 1_000).toISOString() },
       }] };
       render(<CapabilityContext value={value}><WorkbenchActionProvider value={workbenchActions}>
-        <WorkbenchActionGate actionId={mode === "application" ? "packages.refresh.application.resume" : "packages.refresh.resume"}>
+        <WorkbenchActionGate actionId={mode === "application" ? "packages.refresh.resume" : "power-platform.resume"}>
           <button type="button" onClick={onClick}>Resume</button>
         </WorkbenchActionGate>
       </WorkbenchActionProvider></CapabilityContext>);
       expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
       vi.spyOn(Date, "now").mockReturnValue(now + 1_000);
       await userEvent.click(screen.getByRole("button", { name: "Resume" }));
-      expect(onClick).toHaveBeenCalledTimes(mode === "delegated" ? 1 : 0);
-      if (mode === "application") {
-        expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
-        expect(screen.getByRole("button", { name: "Resume" })).toHaveAccessibleDescription(/evidence is stale/i);
-      }
+      expect(onClick).toHaveBeenCalledOnce();
+      expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
       expect(value.reload).not.toHaveBeenCalled();
     },
   );
 
   it.each(["missing", "unchecked"] as const)("describes a pending %s capability check instead of an unavailable action", state => {
-    const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
+    const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
     const value: typeof capabilityContext = { ...capabilityContext, pending: true,
       views: state === "missing" ? [] : [{
         enabled: true, definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
@@ -137,17 +134,17 @@ describe("WorkbenchActionGate", () => {
     expect(screen.queryByText(/unavailable|Not checked yet/)).not.toBeInTheDocument();
   });
 
-  it("does not imply that a delegated recheck runs an unchecked application capability", () => {
+  it("shows automatic checking for ordinary application collection", () => {
     const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
     render(<CapabilityContext value={{ ...capabilityContext, pending: true, views: [{
       enabled: true, definition, decision: { capabilityId: definition.id, status: "unknown", authorized: false, fresh: false,
         previewQualification: "not_required", remediation: [] },
     }] }}><WorkbenchActionProvider value={workbenchActions}>
-      <WorkbenchActionGate actionId="packages.refresh.application.resume"><button type="button">Resume</button></WorkbenchActionGate>
+      <WorkbenchActionGate actionId="packages.refresh.resume"><button type="button">Resume</button></WorkbenchActionGate>
     </WorkbenchActionProvider></CapabilityContext>);
     expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
-    expect(screen.queryByText("Checking capability status.")).not.toBeInTheDocument();
-    expect(screen.getByText(/Microsoft validates the configured application identity when it runs/)).toBeVisible();
+    expect(screen.getByText("Checking capability status.")).toBeVisible();
+    expect(screen.queryByText(/delegated check/)).not.toBeInTheDocument();
   });
 
   it("blocks clicks until exact signed-in action metadata is available", async () => {

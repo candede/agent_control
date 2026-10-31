@@ -5,6 +5,7 @@ import { OfficialReportImports, type ReportConfirmation } from "./officialReport
 import { CursorCodec, type SelectionIdentity } from "../services/dataSelections.js";
 import { AppError } from "../errors.js";
 import { operationalLog } from "../services/telemetry.js";
+import { currentSchemaSql } from "./currentSchema.js";
 
 vi.mock("../services/telemetry.js", async original => ({
   ...await original<typeof import("../services/telemetry.js")>(), operationalLog: vi.fn(),
@@ -25,21 +26,21 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function fixture() {
+function fixture(correctionsAllowed = true) {
   const database = new pg.Pool({ max: 4 });
   pools.add(database);
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
   const stages = (["agents", "userAgents", "users"] as const).map((kind, index) => ({
     id: `70000000-0000-4000-8000-00000000000${index + 1}`, kind, revision: 1, content_hash: String(index + 1).repeat(64),
     row_count: 1, reconciliation: { rows: 1, responses: 2, agentsUsed: null },
-    period_provenance: "activity_range", reporting_start: null, reporting_end: null,
+    period_provenance: "activity_range", reporting_start: null, reporting_end: null, correction_of_set_id: null as string | null,
     source_as_of_provenance: "operator_asserted", source_as_of: new Date(`2026-02-0${index + 1}T00:00:00Z`),
   }));
   const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
   const query = vi.fn(async (text: unknown, values?: unknown) => {
     if (typeof text !== "string") throw new Error("Expected SQL.");
     if (text === "COMMIT") return { ...result([]), command: "COMMIT" };
-    if (["BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK"].includes(text)) return result([]);
+    if (["BEGIN", "BEGIN ISOLATION LEVEL REPEATABLE READ", "ROLLBACK"].includes(text)) return result([]);
     if (text.startsWith("INSERT INTO data_principal_epochs")) return result([]);
     if (text.startsWith("SELECT epoch FROM data_principal_epochs")) return result([{ epoch: "1" }]);
     if (text.startsWith("SELECT revision::text FROM official_usage_state")) return result([{ revision: "4" }]);
@@ -55,8 +56,182 @@ function fixture() {
   vi.spyOn(client, "query").mockImplementation(query);
   vi.spyOn(database, "connect").mockImplementation(vi.fn(async () => client));
   vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected unscoped database query."));
-  return { imports: new OfficialReportImports(database), stages, query };
+  return { imports: new OfficialReportImports(database, correctionsAllowed), stages, query };
 }
+
+describe("stored report correction authorization", () => {
+  const denied = { status: 403, code: "missing_internal_role" };
+
+  it("rejects correction upload intent before acquiring persistence", async () => {
+    const { imports, query } = fixture(false);
+    const ensure = vi.spyOn(imports.history, "ensure");
+    await expect(imports.open(identity, { bundleId, correctionOfSetId: bundleId })).rejects.toMatchObject(denied);
+    expect(ensure).not.toHaveBeenCalled();
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("blocks correction review and acceptance after downgrade, but permits cleanup inspection", async () => {
+    const { imports, stages, query } = fixture(false);
+    for (const stage of stages) stage.correction_of_set_id = bundleId;
+    await expect(imports.bundle(identity, bundleId)).rejects.toMatchObject(denied);
+    const cleanup = await imports.bundle(identity, bundleId, { forDiscard: true });
+    expect(cleanup.stages).toHaveLength(3);
+    await expect(imports.acceptBundle(identity, bundleId, cleanup)).rejects.toMatchObject(denied);
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("UPDATE official_usage_"))).toBe(false);
+  });
+
+  it("keeps new report bundle review available to Uploaders", async () => {
+    const { imports, stages } = fixture(false);
+    for (const stage of stages) stage.source_as_of = stages[0].source_as_of;
+    await expect(imports.bundle(identity, bundleId)).resolves.toMatchObject({ complete: true, stages: expect.any(Array) });
+  });
+
+  it("keeps correction review available to Admins", async () => {
+    const { imports, stages } = fixture();
+    for (const stage of stages) {
+      stage.correction_of_set_id = bundleId;
+      stage.source_as_of = stages[0].source_as_of;
+    }
+    await expect(imports.bundle(identity, bundleId)).resolves.toMatchObject({ complete: true });
+  });
+
+  it("blocks correction stage previews before loading their example rows", async () => {
+    const { imports, query } = fixture(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => String(text).startsWith("SELECT s.id,s.revision,s.kind,s.bundle_id")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ correction_of_set_id: bundleId }] }
+      : original(text, values));
+    await expect(imports.preview(identity, bundleId)).rejects.toMatchObject(denied);
+    expect(query.mock.calls.some(([text]) => String(text).includes("SELECT row_data"))).toBe(false);
+  });
+
+  it("checks a stored single-stage correction inside the acceptance transaction before any write", async () => {
+    const { imports, stages, query } = fixture(false), original = query.getMockImplementation()!;
+    vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
+    vi.spyOn(imports.history, "lock").mockResolvedValue("scope");
+    query.mockImplementation(async (text, values) => {
+      const sql = String(text);
+      if (sql.startsWith("SELECT pg_advisory_xact_lock") || sql.startsWith("INSERT INTO official_usage_state")) {
+        return { command: "", oid: 0, fields: [], rowCount: 0, rows: [] };
+      }
+      if (sql.startsWith("SELECT active_set_id,revision::text")) {
+        return { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ revision: "4" }] };
+      }
+      if (sql.startsWith("SELECT s.*,i.id AS ingestion_id")) {
+        return { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ ...stages[0], correction_of_set_id: bundleId }] };
+      }
+      return original(text, values);
+    });
+    await expect(imports.accept(identity, { stagingId: stages[0].id, revision: 1,
+      contentHash: stages[0].content_hash, expectedActiveRevision: "4" })).rejects.toMatchObject(denied);
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("UPDATE official_usage_"))).toBe(false);
+    expect(query.mock.calls.map(([text]) => text)).toContain("ROLLBACK");
+  });
+
+  it("does not bypass current correction authorization through an accepted bundle receipt", async () => {
+    const { imports, query } = fixture(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => String(text).includes("FROM official_usage_bundle_receipts")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ result_set_id: bundleId, correction_of_set_id: bundleId }] }
+      : original(text, values));
+    await expect(imports.acceptBundle(identity, bundleId, { bundleHash: "a".repeat(64), expectedActiveRevision: "4" }))
+      .rejects.toMatchObject(denied);
+  });
+
+  it("blocks correction diagnostics after downgrade before querying companion reports", async () => {
+    const { imports, stages, query } = fixture(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => {
+      if (String(text).startsWith("SELECT s.* FROM official_usage_staging")) {
+        return { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ ...stages[0], correction_of_set_id: bundleId }] };
+      }
+      if (String(text).startsWith("WITH companions AS")) {
+        const rows = String(text).includes("SELECT count(*)::text AS n FROM diagnostics") ? [{ n: "0" }] : [];
+        return { command: "", oid: 0, fields: [], rowCount: rows.length, rows };
+      }
+      return original(text, values);
+    });
+    await expect(imports.diagnostics(identity, stages[0].id, {}, new CursorCodec("synthetic-report-diagnostics-secret")))
+      .rejects.toMatchObject(denied);
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("WITH companions AS"))).toBe(false);
+  });
+});
+
+describe("semantic-duplicate acceptance receipt authorization without a database", () => {
+  it("persists original correction intent independently of the canonical result in the current schema", () => {
+    const table = currentSchemaSql.match(/CREATE TABLE official_usage_bundle_receipts \(([\s\S]*?)\n\);/)?.[1];
+    expect(table).toMatch(/,\s*correction_of_set_id uuid/);
+  });
+
+  function duplicateAcceptance(correctionOf: string | null, canonicalCorrectionOf: string | null) {
+    const { imports, stages, query } = fixture(), original = query.getMockImplementation()!;
+    vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
+    vi.spyOn(imports.history, "lock").mockResolvedValue("scope");
+    vi.spyOn(imports, "cleanupIngestion").mockResolvedValue(0);
+    for (const stage of stages) {
+      stage.source_as_of = stages[0].source_as_of;
+      stage.correction_of_set_id = correctionOf;
+    }
+    const canonicalId = "90000000-0000-4000-8000-000000000001";
+    const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
+    let receipt: Record<string, unknown> | undefined;
+    query.mockImplementation(async (text, values) => {
+      const sql = String(text), args = values as unknown[];
+      if (sql.includes("FROM official_usage_bundle_receipts")) return result(receipt ? [receipt] : []);
+      if (sql.startsWith("SELECT pg_advisory_xact_lock") || sql.startsWith("INSERT INTO official_usage_state")) return result([]);
+      if (sql.startsWith("SELECT active_set_id,revision::text")) return result([{ active_set_id: canonicalId, revision: "4" }]);
+      if (sql.startsWith("SELECT s.*,i.id AS ingestion_id")) {
+        return result(stages.filter(stage => stage.id === args[0]).map(stage => ({
+          ...stage, bundle_id: bundleId, ingestion_id: stage.id, ingestion_state: "ready", status: "active",
+        })));
+      }
+      if (sql.startsWith("SELECT count(*)::int AS active")) return result([{ active: 0, tenant: 0 }]);
+      if (sql.startsWith("SELECT * FROM official_usage_sets WHERE tenant_id=")) return result([]);
+      if (sql.startsWith("SELECT 1 FROM official_usage_sets WHERE id=")) return result([{ exists: true }]);
+      if (sql.startsWith("SELECT s.id FROM official_usage_sets s")) return result([{ id: canonicalId }]);
+      if (sql.startsWith("SELECT kind,version_id")) return result(stages.map(stage => ({ kind: stage.kind, version_id: stage.id })));
+      if (sql.startsWith("UPDATE official_usage_ingestions") || sql.startsWith("UPDATE official_usage_staging")
+        || sql.startsWith("INSERT INTO official_usage_audit")) return result([]);
+      if (sql.startsWith("INSERT INTO official_usage_bundle_receipts")) {
+        const columns = sql.slice(sql.indexOf("(") + 1, sql.indexOf(")")).split(",").map(column => column.trim());
+        receipt = Object.fromEntries(columns.map((column, index) => [column, args[index]]));
+        return result([]);
+      }
+      return original(text, values);
+    });
+    const expireStaging = () => {
+      stages.length = 0;
+      if (receipt) {
+        receipt.supersedes_set_id = canonicalCorrectionOf;
+        receipt.deleted_at = null;
+      }
+    };
+    return { imports, query, canonicalId, expireStaging };
+  }
+
+  it("lets an Uploader replay a normal import that reused a corrected report after staging expires", async () => {
+    const { imports, query, canonicalId, expireStaging } = duplicateAcceptance(null, bundleId);
+    const uploader = new OfficialReportImports(imports.database, false);
+    vi.spyOn(uploader.history, "ensure").mockResolvedValue("scope");
+    vi.spyOn(uploader.history, "lock").mockResolvedValue("scope");
+    vi.spyOn(uploader, "cleanupIngestion").mockResolvedValue(0);
+    const input = await uploader.bundle(identity, bundleId);
+    const accepted = await uploader.acceptBundle(identity, bundleId, input);
+    expect(accepted).toEqual({ setId: canonicalId, activeRevision: "4", complete: true });
+    expireStaging();
+    query.mockClear();
+    await expect(uploader.acceptBundle(identity, bundleId, input)).resolves.toEqual(accepted);
+    expect(query.mock.calls.some(([text]) => String(text).includes("FROM official_usage_staging"))).toBe(false);
+  });
+
+  it("retains correction authorization when unchanged content reuses an ordinary report", async () => {
+    const { imports, query, canonicalId, expireStaging } = duplicateAcceptance(bundleId, null);
+    const input = await imports.bundle(identity, bundleId);
+    expect(await imports.acceptBundle(identity, bundleId, input)).toMatchObject({ setId: canonicalId, complete: true });
+    expireStaging();
+    query.mockClear();
+    const uploader = new OfficialReportImports(imports.database, false);
+    await expect(uploader.acceptBundle(identity, bundleId, input)).rejects.toMatchObject({ status: 403, code: "missing_internal_role" });
+    expect(query.mock.calls.some(([text]) => String(text).includes("FROM official_usage_staging"))).toBe(false);
+  });
+});
 
 describe("bundle validation and cleanup inspection without a database", () => {
   it("preserves normal validation of incompatible observation metadata", async () => {
@@ -259,8 +434,9 @@ describe("atomic staged-import discard without a database", () => {
 });
 
 describe("source-contract preview diagnostics without a database", () => {
-  it("compares the Users agents-used metric with distinct positive-response agent identities", async () => {
-    const { imports, stages, query } = fixture();
+  it.each([false, true])("compares positive-response agent identities for permitted diagnostics (correction=%s)", async correction => {
+    const { imports, stages, query } = fixture(correction);
+    stages[2].correction_of_set_id = correction ? bundleId : null;
     const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
     query.mockImplementation(async text => {
       if (typeof text !== "string") throw new Error("Expected SQL.");
@@ -283,8 +459,8 @@ describe("source-contract preview diagnostics without a database", () => {
 });
 
 describe("stream upload cancellation and batch rollback without a database", () => {
-  function ingestion() {
-    const { imports, query } = fixture();
+  function ingestion(correctionsAllowed = true) {
+    const { imports, query } = fixture(correctionsAllowed);
     const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
     const ensure = vi.spyOn(imports.history, "ensure").mockResolvedValue("1");
     const cleanup = vi.spyOn(imports, "cleanupIngestion").mockResolvedValue(0);
@@ -317,6 +493,22 @@ describe("stream upload cancellation and batch rollback without a database", () 
     return { imports, query, ensure, cleanup, onInsert };
   }
   const csv = "Username,Display name,Number of agents used,Agent responses received,Last activity date (UTC)\nuser,Name,1,1,\n";
+
+  it("allows Uploaders to stream and cancel new report drafts", async () => {
+    const { imports, cleanup } = ingestion(false);
+    const upload = await imports.open(identity, { bundleId });
+    await expect(upload.receive(Readable.from([Buffer.from(csv)]))).resolves.toMatchObject({ kind: "users", rows: 1 });
+    await upload.cancel();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("rejects joining a preexisting correction bundle without restating its correction intent", async () => {
+    const { imports, query } = ingestion(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => String(text).includes("AND correction_of IS NOT NULL")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{}] } : original(text, values));
+    await expect(imports.open(identity, { bundleId })).rejects.toMatchObject({ status: 403, code: "missing_internal_role" });
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("INSERT INTO official_usage_ingestions"))).toBe(false);
+  });
 
   it("does not initialize persistence for an already cancelled upload", async () => {
     const { imports, ensure, query } = ingestion(), controller = new AbortController();

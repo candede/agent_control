@@ -1,37 +1,47 @@
 # Defender and Agent 365 hunting
 
-Agent Control runs explicit, curated Microsoft Graph advanced-hunting queries for
-the selected agent, user, or user on an agent. It does not expose arbitrary KQL
+This guide documents the retained Defender/Agent 365 hunting backend and
+components. Defender and investigation-only identity entry points/setup are
+**hidden from the current UI** and are not part of the Permissions page's
+configuration checklist. Do not add these grants as prerequisites for normal
+deployment or synchronization. See the
+[current permission reference](user-roles-and-permissions.md#app-registration-permissions).
+
+The backend runs explicit, curated Microsoft Graph advanced-hunting queries for
+an exact agent, user or user-on-agent subject. It does not expose arbitrary KQL
 or collect telemetry.
 
-## Where to use it
+## Retained backend scope
 
-Open **Agents > agent details > Activity**, **Users > user details > Logs**, or
-select a user name in an agent's **Users** tab. Select Defender from the source
-selector. Purview searches remain separate from Defender runtime, tool, and
-inventory evidence.
+Purview searches remain separate from Defender runtime, tool and inventory
+evidence. Saved reads do not start a hunt. The component behavior below describes
+the retained implementation, not a navigation path available in the current
+workbench.
 
-Opening Activity does not run a hunt.
+Viewer-capable backend authority includes Viewer, Usage Report Uploader and
+Admin, subject to private ownership/configured shared scope. It does not grant
+access to Agent Control's local Audit tab/page or read/export endpoints, which
+require Admin.
 
-## Requirements
+## Required Microsoft access
 
 - Microsoft Graph delegated `ThreatHunting.Read.All`
 - Tenant-wide admin consent
 - Defender access to the queried data and device groups
 - Entra **Security Reader**, or equivalent Defender Unified RBAC access
-- `AgentControl.Viewer` or `AgentControl.Admin`
 
 Resolving a Copilot Studio agent's Entra identity also requires delegated
 `AgentIdentity.Read.All`. A user who does not own that identity needs
 **Agent ID Administrator**.
 
-See [Microsoft roles](user-roles-and-permissions.md).
+These backend-specific requirements do not add roles to the current inventory
+setup.
 
 ## Data sources
 
 Purview's [Agent 365 audit operations](https://learn.microsoft.com/en-us/purview/audit-log-activities#agent-365-activities) use names such as `AIInvokeAgent`, `AIExecuteTool`, and `AIInferenceCall`, distinct from Defender actions. The current saved Copilot audit projection is not relabeled as a complete Agent 365 audit collector. Optional Copilot Studio `BotId` fields are matched exactly with the environment; prefixed Copilot interaction IDs are not parsed into guessed bot identities.
 
-Saved ResourceQuery `properties.entraAgentId` is a **candidate**, not an automatically trusted crosswalk. **Resolve log identity** explicitly verifies that candidate through `GET /v1.0/servicePrincipals/{id}/microsoft.graph.agentIdentity`, using delegated `AgentIdentity.Read.All`. An administrator must add this permission and grant tenant consent in the existing app registration before use; it is not an in-app enable/consent action. Opening the modal does not make that provider request. The lookup validates the returned object ID and agent-identity type, then saves short-lived, tenant/principal/source-bound evidence. Current source visibility and identity are rechecked before publication and on subsequent use. Persistence requires the exact current development schema; no old-schema conversion runs during identity resolution.
+Saved ResourceQuery `properties.entraAgentId` is a **candidate**, not an automatically trusted crosswalk. The retained **Resolve log identity** operation verifies that candidate through `GET /v1.0/servicePrincipals/{id}/microsoft.graph.agentIdentity`, using delegated `AgentIdentity.Read.All`. An administrator must provision this backend-specific permission and tenant consent before using that operation; it is not an in-app enable/consent action or ordinary inventory prerequisite. Opening a modal does not make that provider request. The lookup validates the returned object ID and agent-identity type, then saves short-lived, tenant/principal/source-bound evidence. Current source visibility and identity are rechecked before publication and on subsequent use. Persistence requires the current schema; no old-schema conversion runs during identity resolution.
 
 Identity resolution pins its initiating session and capability generation before any saved-source read or token acquisition. Session, capability and provider admission are rechecked after awaited source and authorization reads, synchronously before each physical Graph attempt and database COMMIT, and through the final saved-context read and operation-evidence recording. Replacement capability authority cannot resume an earlier lookup, and authority changes take precedence over provider failures rather than being saved as lookup outcomes. The final saved-context read runs after operation-evidence recording, so source changes or mapping expiry during that wait cannot return obsolete verified IDs. The 25-second resolution budget and client cancellation bound dependency waits as well as Graph requests; late reads cannot publish an identity mapping, and in-flight database writes retain account serialization until their publication fences and transaction cleanup finish. While identity refresh is pending, the modal hides the previous Defender scope. It reloads saved context after both successful and failed lookups, so a persisted denial or missing identity replaces the old verified state before hunts are available again. Resolution controls reject invalidated or replaced saved context even before its observer rerenders.
 
@@ -53,9 +63,10 @@ Agent Builder can emit telemetry without Entra application IDs. `AgentsInfo` has
 
 ### Purview status and enablement
 
-**Open Audit Search** points to `https://purview.microsoft.com/audit/auditsearch`. This is the search experience, not a permanent auditing-settings switch. A conditional **Start recording user and admin activity** banner can enable auditing. An absent banner or an empty search history is not a definitive ingestion-status check.
+Microsoft's Audit Search portal is `https://purview.microsoft.com/audit/auditsearch`. This is the search experience, not a permanent auditing-settings switch. A conditional **Start recording user and admin activity** banner can enable auditing. An absent banner or an empty search history is not a definitive ingestion-status check.
 
-The expanded Permissions setup uses the [documented Exchange Online check](https://learn.microsoft.com/en-us/purview/audit-log-enable-disable):
+For the retained backend integration, use the [documented Exchange Online check](https://learn.microsoft.com/en-us/purview/audit-log-enable-disable);
+this is not a step on the current Permissions page:
 
 ```powershell
 Connect-ExchangeOnline

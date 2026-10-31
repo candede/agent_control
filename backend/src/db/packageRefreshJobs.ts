@@ -16,7 +16,7 @@ import { lockPackageInventoryScope } from "./packageControls.js";
 import { normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation } from "./sessions.js";
 
-export type PackageDataScope = { tenantId: string; principalId: string; tokenMode?: "delegated" | "application" };
+export type PackageDataScope = { tenantId: string; principalId: string; tokenMode?: "application" };
 const catalogRevisionHashSql = `encode(sha256(convert_to(jsonb_build_array(
   r.residual->'lastModifiedDateTime',r.residual->'appId',${normalizeNativeIdentitySql("(r.residual->>'manifestId')")},
   r.residual->'assetId',r.residual->'version',r.residual->'manifestVersion')::text,'UTF8')),'hex')`;
@@ -24,13 +24,13 @@ const detailPendingSql = `(r.detail_generation IS NULL OR coalesce(r.residual->'
   OR coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz,'-infinity'::timestamptz)<=clock_timestamp())`;
 const detailUnattemptedSql = `NOT EXISTS(SELECT 1 FROM package_refresh_jobs attempted
   WHERE attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details
-    AND (attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2)
+    AND attempted.principal_id=$2
     AND EXISTS(SELECT 1 FROM inventory_refresh_targets t WHERE t.job_id=attempted.id AND t.target_id=r.native_id
       AND t.catalog_revision_hash=${catalogRevisionHashSql})
     AND attempted.updated_at>clock_timestamp()-interval '1 hour')`;
 export type PackageRefreshInput = {
   authorizationPrincipalId: string;
-  tokenMode: "delegated" | "application";
+  tokenMode: "application";
   idempotencyKey: string;
   requestedIds?: readonly string[];
 };
@@ -72,8 +72,8 @@ export class PackageRefreshJobs {
     assertCurrent?.();
     requireProviderAdmissions();
     validateScope(scope);
-    if (scope.tenantId !== identity.tenantId || scope.principalId !== identity.principalId || scope.tokenMode === "application") {
-      throw new AppError(403, "scope_mismatch", "Selected refreshes require the current delegated inventory owner.");
+    if (scope.tenantId !== identity.tenantId || scope.tokenMode !== "application") {
+      throw new AppError(403, "scope_mismatch", "Selected refreshes require the tenant application collection scope.");
     }
     if (!/^[a-zA-Z0-9_-]{1,128}$/.test(input.idempotencyKey)
       || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(input.selectionId)) {
@@ -90,13 +90,13 @@ export class PackageRefreshJobs {
       throw new AppError(400, "invalid_targets", "Choose at most 5,000 explicit references.");
     }
     const queryHash = hash({ selectionId: input.selectionId, ids: ids ?? null, recordIds: recordIds ?? null });
-    const requestHash = hash({ authorizationPrincipalId: identity.principalId, queryHash, tokenMode: "delegated", scopeKind: "exact" });
+    const requestHash = hash({ authorizationPrincipalId: identity.principalId, queryHash, tokenMode: "application", scopeKind: "exact" });
     const selected = new InventoryQueries(this.database, config.sessionSecret);
     const id = await transaction(this.database, async client => {
       assertCurrent?.();
       await lockPackageInventoryScope(scope, client);
       const existing = (await client.query(`SELECT id,request_hash FROM package_refresh_jobs
-        WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='delegated' AND idempotency_key=$3`,
+        WHERE tenant_id=$1 AND principal_id=$2 AND token_mode='application' AND idempotency_key=$3`,
       [scope.tenantId, scope.principalId, input.idempotencyKey])).rows[0];
       if (existing) {
         if (existing.request_hash !== requestHash) throw new AppError(409, "idempotency_mismatch", "This key belongs to another refresh selection.");
@@ -114,8 +114,8 @@ export class PackageRefreshJobs {
         const jobId = randomUUID();
         await client.query(`INSERT INTO package_refresh_jobs(id,tenant_id,principal_id,authorization_principal_id,
           token_mode,idempotency_key,request_hash,query_hash,scope_kind)
-          VALUES($1,$2,$3,$3,'delegated',$4,$5,$6,'exact')`,
-        [jobId, scope.tenantId, scope.principalId, input.idempotencyKey, requestHash, queryHash]);
+          VALUES($1,$2,$3,$7,'application',$4,$5,$6,'exact')`,
+        [jobId, scope.tenantId, scope.principalId, input.idempotencyKey, requestHash, queryHash, identity.principalId]);
         let after: string | null = null, ordinal = 0;
         for (;;) {
           const rows = await selected.refreshTargetIds(client, context, after, ids, recordIds);
@@ -178,7 +178,7 @@ export class PackageRefreshJobs {
   async claimDueDetails(scope: PackageDataScope, authorizationPrincipalId: string, signedInAt?: number) {
     requireProviderAdmissions();
     validateScope(scope);
-    if (authorizationPrincipalId !== scope.principalId) throw new AppError(403, "scope_mismatch", "Automatic details require the signed-in delegated scope.");
+    if (scope.tokenMode !== "application" || !authorizationPrincipalId) throw new AppError(403, "scope_mismatch", "Automatic details require application collection and an initiating actor.");
     const id = await transaction(this.database, async client => {
       await lockPackageInventoryScope(scope, client);
       await client.query(`UPDATE package_refresh_jobs SET status='failed',error_code='package_refresh_expired',
@@ -206,7 +206,7 @@ export class PackageRefreshJobs {
           SELECT DISTINCT t.target_id,t.catalog_revision_hash
           FROM package_refresh_jobs attempted JOIN inventory_refresh_targets t ON t.job_id=attempted.id
           WHERE attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details
-            AND (attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2)
+            AND attempted.principal_id=$2
             AND attempted.updated_at>clock_timestamp()-interval '1 hour'
         )
         SELECT r.native_id,${catalogRevisionHashSql} AS catalog_revision_hash
@@ -228,11 +228,11 @@ export class PackageRefreshJobs {
       [scope.tenantId, scope.principalId, renewed ? previous.requested_ids : []]);
       if (!due.rows.length) return null;
       const jobId = randomUUID(), requestedIds = due.rows.map(target => target.native_id);
-      const queryHash = hash({ tokenMode: "delegated", scopeKind: "exact", requestedIds, autoDetails: true });
+      const queryHash = hash({ tokenMode: "application", scopeKind: "exact", requestedIds, autoDetails: true });
       await client.query(`INSERT INTO package_refresh_jobs(id,tenant_id,principal_id,authorization_principal_id,
         token_mode,idempotency_key,request_hash,query_hash,scope_kind,auto_details,deadline_at)
-        VALUES($1,$2,$3,$3,'delegated',$4,$5,$6,'exact',true,clock_timestamp()+interval '10 minutes')`,
-      [jobId, scope.tenantId, scope.principalId, `auto_details_${jobId}`, hash({ authorizationPrincipalId, queryHash }), queryHash]);
+        VALUES($1,$2,$3,$7,'application',$4,$5,$6,'exact',true,clock_timestamp()+interval '10 minutes')`,
+      [jobId, scope.tenantId, scope.principalId, `auto_details_${jobId}`, hash({ authorizationPrincipalId, queryHash }), queryHash, authorizationPrincipalId]);
       await insertRefreshTargets(client, jobId, requestedIds, due.rows.map(target => target.catalog_revision_hash));
       return jobId;
     });
@@ -254,7 +254,7 @@ export class PackageRefreshJobs {
       SELECT ${jobColumns},snapshot.id AS snapshot_id FROM package_refresh_jobs job
       LEFT JOIN data_generations snapshot ON snapshot.job_id=job.id AND snapshot.state IN ('published','retired')
       CROSS JOIN clock WHERE job.tenant_id=$1 AND job.principal_id=$2 AND job.authorization_principal_id=$3
-        AND job.token_mode='delegated' AND job.auto_details AND job.expires_at>clock.checked_at
+        AND job.token_mode='application' AND job.auto_details AND job.expires_at>clock.checked_at
       ORDER BY job.created_at DESC,job.id DESC LIMIT 1`, [scope.tenantId, scope.principalId, authorizationPrincipalId]);
     return rows[0] ? projectJob(rows[0]) : null;
   }

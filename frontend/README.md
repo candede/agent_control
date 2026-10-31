@@ -70,14 +70,32 @@ does not establish live browser or provider behavior.
 - **Users**: review licenses, activity, and agent relationships.
 - **Sync**: refresh provider data and import Microsoft 365 usage reports.
 
-- **Audit**: review administrative actions made through Agent Control.
-- **Permissions**: check app roles, Microsoft roles, API permissions, consent,
-  licensing, and provider access.
+- **Audit**: Admin-only tab/page for local administrative actions and CSV
+  export. Viewer and Usage Report Uploader cannot access its UI or API; recording
+  continues independently of who can read it. Exact caller filters preserve up
+  to 256 Unicode characters, including supplementary characters, in inputs and
+  reload/back/forward links.
+- **Permissions**: three always-visible sections, **Issues**, **App-defined
+  roles**, and **App registration permissions**, without a shortcut bar.
+  Direct assignments use purple cards and **Assigned to you** badges; inherited
+  **Included** cards stay neutral. The API reference lists the same 11 entries
+  in four groups as the [permission guide](../docs/user-roles-and-permissions.md#app-registration-permissions):
+  Graph Application, Graph Delegated, Power Platform Delegated and Sign-in /
+  OpenID Connect. Microsoft access guidance does not repeat local app roles.
+  Inventory sync recommends AI Reader with Entra assignment instructions;
+  quarantine status/changes require AI Administrator, Power Platform
+  Administrator or Global Administrator.
 
 Initial read-only sync starts automatically after sign-in while visible and
 online. Permissions is recovery guidance after an actual failure, not a setup
-approval step. Purview/Defender searches run explicitly under current real
-authorization; configured application reads need no prior qualification query.
+approval step. Graph reads use application identity, not the user's Microsoft
+reader roles; Power Platform remains delegated. Missing source access does not
+hide shared saved tenant data. Package collection and access-detail preparation
+errors preserve Microsoft's diagnostics; when none is provided, recovery points
+to the application's Graph permissions and credentials, not delegated user consent.
+Purview, Defender and investigation-only identity
+entry points/setup are hidden from the current UI; their retained backend
+contracts are not ordinary Permissions prerequisites.
 
 Saved workspace status and exact-run details refresh independently. Background
 workspace updates preserve pending exact-run reads and their polling schedule.

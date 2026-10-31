@@ -88,7 +88,7 @@ describe("session-driven automatic sync admission", () => {
     const { run } = await repository.submitDue(scope);
     const packages = new PackageRefreshJobs(fixture.runtime);
     const job = await packages.submit(scope, {
-      idempotencyKey: "mixed-run-final-publication", tokenMode: "delegated",
+      idempotencyKey: "mixed-run-final-publication", tokenMode: "application",
       authorizationPrincipalId: scope.principalId, requestedIds: [],
     });
     await repository.attachJob(scope, run!.id, "graph_packages", job.id);
@@ -226,7 +226,7 @@ describe("session-driven automatic sync admission", () => {
 
       const packages = new PackageRefreshJobs(fixture.runtime);
       const packageJob = await packages.submit(scope, {
-        idempotencyKey: "automatic-revision-package", tokenMode: "delegated", authorizationPrincipalId: scope.principalId,
+        idempotencyKey: "automatic-revision-package", tokenMode: "application", authorizationPrincipalId: scope.principalId,
       });
       await packages.markRunning(scope, packageJob.id);
       const summary = allowlistedPackage({ id: "revision-package", displayName: "Saved package", isBlocked: false });
@@ -234,7 +234,7 @@ describe("session-driven automatic sync admission", () => {
       await onlyChanged("graph_packages", true);
 
       const detailJob = await packages.submit(scope, { idempotencyKey: "automatic-revision-detail",
-        tokenMode: "delegated", authorizationPrincipalId: scope.principalId, requestedIds: [summary.id] });
+        tokenMode: "application", authorizationPrincipalId: scope.principalId, requestedIds: [summary.id] });
       await packages.markRunning(scope, detailJob.id);
       const packageExpiry = new Date(Date.now() + 1200);
       await refreshInventoryFixture(fixture.runtime, scope, detailJob.id, "packages",
@@ -433,7 +433,7 @@ describe("session-driven automatic sync admission", () => {
     expect(inventoryPresentation(selected.raw).value).toHaveLength(1);
     expect(await savedSourcesAvailable(scope)).toBe(true);
     expect(await details.detailCoverage(scope)).toMatchObject({ catalog_available: true, total: 1, fresh: 0, eligible: 1 });
-    const detailJob = await details.claimDueDetails(scope, scope.principalId);
+    const detailJob = await details.claimDueDetails({ ...scope, tokenMode: "application" }, scope.principalId);
     expect(detailJob).toMatchObject({ targetCount: 1 });
     expect((await fixture.runtime.query(`SELECT target_id FROM inventory_refresh_targets
       WHERE job_id=$1 ORDER BY ordinal`, [detailJob!.id])).rows).toEqual([{ target_id: "recover-me" }]);

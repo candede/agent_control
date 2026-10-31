@@ -11,6 +11,7 @@ CapabilityId = Literal[
     "graph.package.block.manage",
     "graph.package.reassign.manage",
     "graph.directory.read",
+    "graph.users.read",
     "graph.agentIdentity.read",
     "graph.licenses.read",
     "powerPlatform.inventory.read",
@@ -72,7 +73,9 @@ class Definition(WireModel):
         "licensed_usage",
         "report_import",
     ]
-    internalRoles: list[Literal["AgentControl.Viewer", "AgentControl.Admin"]]
+    internalRoles: list[
+        Literal["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"]
+    ]
     consentGroup: str | None = None
     probe: Probe
 

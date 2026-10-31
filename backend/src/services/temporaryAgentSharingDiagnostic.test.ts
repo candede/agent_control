@@ -1,15 +1,15 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { TemporaryAgentSharingDiagnostic } from "./temporaryAgentSharingDiagnostic.js";
-import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn(() => undefined) }));
-vi.mock("../auth/msal.js", () => ({ acquireAuthorizedToken: vi.fn(), revalidateAuthorizedUser: vi.fn() }));
+vi.mock("../auth/msal.js", () => ({ acquireApplicationToken: vi.fn(), acquireAuthorizedToken: vi.fn(), revalidateAuthorizedUser: vi.fn() }));
 vi.mock("./capabilities.js", () => ({ capabilities: {
   beginOperationValidation: vi.fn(() => () => {}), requireAvailable: vi.fn(async () => {}),
 } }));
@@ -23,8 +23,8 @@ afterEach(async () => {
 });
 
 async function fixture() {
-  const directory = await fs.mkdtemp(join(tmpdir(), "agent-sharing-case-"));
-  await fs.chmod(directory, 0o700);
+  const directory = join(fileURLToPath(new URL("../../../.local/agent-sharing-diagnostic-tests/", import.meta.url)), randomUUID());
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
   roots.push(directory);
   const user: AuthenticatedUser = { tenantId: "5dc17551-d2fb-4e89-93da-178b52154818", homeAccountId: "synthetic-admin",
     roles: ["AgentControl.Admin"], username: "admin@example.invalid", displayName: "Admin" };
@@ -35,7 +35,8 @@ async function fixture() {
   const powerPlatform = { getDiagnosticAgentDetail: vi.fn(async (_token: string, nativeId: string) =>
     ({ data: [{ name: nativeId, properties: { futureSharing: { orgWide: true }, missingPreviously: [], optional: null } }] })) };
   vi.mocked(revalidateAuthorizedUser).mockResolvedValue(user);
-  vi.mocked(acquireAuthorizedToken).mockResolvedValue("synthetic-transport-secret");
+  vi.mocked(acquireApplicationToken).mockResolvedValue("synthetic-transport-secret");
+  vi.mocked(acquireAuthorizedToken).mockResolvedValue("synthetic-power-platform-secret");
   const log = vi.fn();
   const dependencies = { enabled: true, directory, graph, powerPlatform, log };
   const service = new TemporaryAgentSharingDiagnostic(dependencies);
@@ -54,6 +55,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const service = new TemporaryAgentSharingDiagnostic({ ...f.dependencies, enabled: false, files: { ...fs, lstat } });
     await expect(service.run(f.user, f.context)).resolves.toBe("disabled");
     expect(lstat).not.toHaveBeenCalled();
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.graph.getDiagnosticPackageDetails).not.toHaveBeenCalled();
     expect(f.log).not.toHaveBeenCalled();
@@ -65,6 +67,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     else f.user.roles = ["AgentControl.Viewer"];
     await expect(f.service.run(f.user, f.context)).resolves.toBe("skipped");
     expect(await fs.readdir(f.directory)).toEqual([]);
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.log).toHaveBeenCalledWith("warn", "agent_sharing_diagnostic_skipped", expect.any(Object));
   });
@@ -84,6 +87,10 @@ describe("temporary two-agent sharing diagnostic", () => {
     expect(f.powerPlatform.getDiagnosticAgentDetail.mock.calls.map(call => call[1])).toEqual([
       "3deaf785-6ba7-44e6-b67d-e255791c432c", "97dbaaf8-5ee0-4c79-9ce3-0cd3c94ad2ab",
     ]);
+    expect(vi.mocked(acquireApplicationToken).mock.calls).toEqual(Array.from({ length: 4 }, () =>
+      [f.user.tenantId, "graph.package.read.application"]));
+    expect(vi.mocked(acquireAuthorizedToken).mock.calls).toEqual(Array.from({ length: 2 }, () =>
+      [f.user.tenantId, f.user.homeAccountId, "powerPlatform.inventory.read"]));
     expect((await fs.stat(capture.path)).mode & 0o777).toBe(0o700);
     for (const filename of capture.files) {
       expect((await fs.stat(join(capture.path, filename))).mode & 0o777).toBe(0o600);
@@ -123,10 +130,25 @@ describe("temporary two-agent sharing diagnostic", () => {
     expect(JSON.stringify(body)).not.toContain("private nested credential");
   });
 
+  it("redacts escaped credential keys inside stringified provider definitions", async () => {
+    const f = await fixture();
+    const definition = String.raw`{"sharing":{"orgWide":false},"authentication":{"api\u004bey":"synthetic embedded credential"}}`;
+    f.graph.getDiagnosticPackageDetails.mockResolvedValueOnce({ id: "target", futureChatSetting: false, recipients: [],
+      optional: null, instructions: definition, access_token: "secret" });
+    await expect(f.service.run(f.user, f.context)).resolves.toBe("succeeded");
+    const capture = await f.capture();
+    const body = JSON.parse(await fs.readFile(join(capture.path, "brd.graph-v1.0.json"), "utf8"));
+    expect(JSON.parse(body.instructions)).toEqual({
+      sharing: { orgWide: false }, authentication: { apiKey: "[REDACTED]" },
+    });
+    expect(JSON.stringify(body)).not.toContain("synthetic embedded credential");
+  });
+
   it("stops when fresh authorization no longer grants administrator scope", async () => {
     const f = await fixture();
     vi.mocked(revalidateAuthorizedUser).mockResolvedValue({ ...f.user, roles: ["AgentControl.Viewer"] });
     await expect(f.service.run(f.user, f.context)).rejects.toMatchObject({ code: "diagnostic_authorization_changed" });
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.graph.getDiagnosticPackageDetails).not.toHaveBeenCalled();
     expect((await f.capture()).files).toHaveLength(2);
@@ -135,9 +157,9 @@ describe("temporary two-agent sharing diagnostic", () => {
   it("cancels a pending token acquisition and ignores its late result", async () => {
     const f = await fixture();
     let resolve!: (value: string) => void;
-    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    vi.mocked(acquireApplicationToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
     const running = f.service.run(f.user, f.context);
-    await vi.waitFor(() => expect(acquireAuthorizedToken).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(acquireApplicationToken).toHaveBeenCalledOnce());
     f.controller.abort(new DOMException("Stopped", "AbortError"));
     await expect(running).rejects.toMatchObject({ name: "AbortError" });
     resolve("late-token");
@@ -162,9 +184,9 @@ describe("temporary two-agent sharing diagnostic", () => {
   it("does not overlap captures", async () => {
     const f = await fixture();
     let resolve!: (value: string) => void;
-    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    vi.mocked(acquireApplicationToken).mockImplementationOnce(() => new Promise(done => { resolve = done; }));
     const running = f.service.run(f.user, f.context);
-    await vi.waitFor(() => expect(acquireAuthorizedToken).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(acquireApplicationToken).toHaveBeenCalledOnce());
     await expect(f.service.run(f.user, f.context)).resolves.toBe("skipped");
     resolve("synthetic-transport-secret");
     await expect(running).resolves.toBe("succeeded");
@@ -176,7 +198,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     let started!: () => void;
     const authorizing = new Promise<void>(resolve => { started = resolve; });
-    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(() => { started(); return new Promise(() => {}); });
+    vi.mocked(acquireApplicationToken).mockImplementationOnce(() => { started(); return new Promise(() => {}); });
     const running = f.service.run(f.user, f.context);
     const rejected = expect(running).rejects.toMatchObject({ name: "TimeoutError" });
     await authorizing;
@@ -226,6 +248,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const f = await fixture();
     for (let index = 0; index < 3; index++) await fs.mkdir(join(f.directory, randomUUID()), { mode: 0o700 });
     await expect(f.service.run(f.user, f.context)).rejects.toMatchObject({ code: "diagnostic_capture_limit" });
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(await fs.readdir(f.directory)).toHaveLength(3);
   });
@@ -240,6 +263,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     }
     await expect(new TemporaryAgentSharingDiagnostic({ ...f.dependencies, directory }).run(f.user, f.context))
       .rejects.toMatchObject({ code: "diagnostic_storage_unsafe" });
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
   });
 
@@ -248,6 +272,7 @@ describe("temporary two-agent sharing diagnostic", () => {
     const open = vi.fn(async () => { throw new Error("Synthetic disk full"); });
     await expect(new TemporaryAgentSharingDiagnostic({ ...f.dependencies, files: { ...fs, open } }).run(f.user, f.context))
       .rejects.toMatchObject({ code: "diagnostic_storage_failed" });
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
     expect(acquireAuthorizedToken).not.toHaveBeenCalled();
     expect(f.log.mock.calls.some(call => call[1] === "agent_sharing_diagnostic_finished")).toBe(false);
   });

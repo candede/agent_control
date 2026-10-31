@@ -290,7 +290,7 @@ async function seedSnapshots(scope: DataSyncScope) {
   await publishFixtureEmptyActivity(fixture.runtime, identity(scope));
   for (const requestedIds of [[], ["package"]]) {
     const job = await packages.submit(scope, {
-      authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(), requestedIds,
+      authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: randomUUID(), requestedIds,
     });
     await packages.markRunning(scope, job.id);
     const records = [packageInventoryRecord(allowlistedPackage({ id: "package", displayName: "Fixture package", isBlocked: false }))];
@@ -315,7 +315,7 @@ async function seedSnapshots(scope: DataSyncScope) {
 
 function submitProvider(scope: DataSyncScope, provider: "packages" | "inventory") {
   return provider === "packages"
-    ? packages.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: randomUUID() })
+    ? packages.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: randomUUID() })
     : inventory.submit(scope, { roleScope: "full", requestedTypes: powerPlatformResourceTypes, idempotencyKey: randomUUID() });
 }
 

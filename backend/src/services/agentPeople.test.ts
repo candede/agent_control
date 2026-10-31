@@ -35,7 +35,7 @@ function harness() {
     userPrincipalName: "login@example.invalid", principalKind: "user" as const,
   }))) };
   const revalidateUser = vi.fn(async () => user);
-  const delegatedToken = vi.fn(async () => "fixture-token");
+  const applicationToken = vi.fn(async () => "fixture-token");
   const requireAvailable = vi.fn(async () => {});
   const beginOperationValidation = vi.fn(() => () => {});
   const admissions = vi.fn();
@@ -43,10 +43,10 @@ function harness() {
   const observeOperation = vi.fn(async (_id, _user, operation) => operation(reportedFailures));
   const service = new AgentPeopleService({} as pg.Pool, {
     observeOperation,
-    repository, directory, revalidateUser, delegatedToken, requireAvailable, beginOperationValidation, admissions,
+    repository, directory, revalidateUser, applicationToken, requireAvailable, beginOperationValidation, admissions,
     now: () => new Date(observedAt),
   });
-  return { service, user, repository, directory, revalidateUser, delegatedToken, requireAvailable, beginOperationValidation, admissions, reportedFailures, observeOperation };
+  return { service, user, repository, directory, revalidateUser, applicationToken, requireAvailable, beginOperationValidation, admissions, reportedFailures, observeOperation };
 }
 
 describe("persistent agent people resolution", () => {
@@ -54,7 +54,7 @@ describe("persistent agent people resolution", () => {
     const value = harness();
     expect(await value.service.resolve(value.user, [id, id.toUpperCase()], options))
       .toEqual({ changed: true, resolved: 1, notFound: 0, failed: 0 });
-    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
+    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith({ user: "fixture-token" },
       [{ resourceId: id, resourceType: "user" }], expect.any(AbortSignal), expect.any(Function));
     expect(value.repository.save).toHaveBeenCalledWith({
       tenantId: value.user.tenantId, principalId: value.user.homeAccountId,
@@ -71,7 +71,7 @@ describe("persistent agent people resolution", () => {
     expect(value.directory.resolve).not.toHaveBeenCalled();
     expect(value.revalidateUser).not.toHaveBeenCalled();
     expect(value.requireAvailable).not.toHaveBeenCalled();
-    expect(value.delegatedToken).not.toHaveBeenCalled();
+    expect(value.applicationToken).not.toHaveBeenCalled();
     expect(value.observeOperation).not.toHaveBeenCalled();
     value.repository.read.mockResolvedValueOnce([cachedPerson(id)]);
     await value.service.resolve(value.user, [id], { ...options, force: true });
@@ -83,7 +83,7 @@ describe("persistent agent people resolution", () => {
     value.repository.read.mockResolvedValueOnce([cachedPerson(id)]);
     await value.service.refreshReferences(value.user, new AbortController().signal,
       { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false, useCache: true });
-    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
+    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith({ user: "fixture-token" },
       [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal), expect.any(Function));
   });
 
@@ -120,7 +120,7 @@ describe("persistent agent people resolution", () => {
     value.repository.directoryIds.mockResolvedValue([id]);
     const publication = { runId: randomUUID(), jobId: randomUUID() };
     await value.service.refreshReferences(value.user, new AbortController().signal, publication, { incompleteOnly: false });
-    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
+    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith({ user: "fixture-token" },
       [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal), expect.any(Function));
     expect(value.repository.save.mock.calls[0][2]).toMatchObject({ generation, publication });
   });
@@ -130,7 +130,7 @@ describe("persistent agent people resolution", () => {
     value.repository.read.mockResolvedValueOnce([cachedPerson(id), cachedPerson(secondId, "lookup_failed")]);
     await value.service.refreshReferences(value.user, new AbortController().signal,
       { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: true });
-    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith("fixture-token",
+    expect(value.directory.resolve).toHaveBeenCalledExactlyOnceWith({ user: "fixture-token" },
       [{ resourceId: secondId, resourceType: "user" }], expect.any(AbortSignal), expect.any(Function));
   });
 
@@ -309,7 +309,7 @@ describe("persistent agent people resolution", () => {
           { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false })
         : value.service.resolve(value.user, [id], options);
       await expect(operation).rejects.toMatchObject({ code: "unauthorized" });
-      expect(value.delegatedToken).not.toHaveBeenCalled();
+      expect(value.applicationToken).not.toHaveBeenCalled();
       expect(value.directory.resolve).not.toHaveBeenCalled();
       expect(value.repository.save).not.toHaveBeenCalled();
     },
@@ -329,7 +329,7 @@ describe("persistent agent people resolution", () => {
       try {
         await expect(value.service.resolve(value.user, [id], options))
           .rejects.toMatchObject({ code: change === "revocation" ? "unauthorized" : "maintenance" });
-        expect(value.delegatedToken).not.toHaveBeenCalled();
+        expect(value.applicationToken).not.toHaveBeenCalled();
         expect(value.directory.resolve).not.toHaveBeenCalled();
         expect(value.repository.save).not.toHaveBeenCalled();
       } finally { await revoked; }
@@ -377,10 +377,10 @@ describe("persistent agent people resolution", () => {
           { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false, useCache: true })
         : value.service.resolve(value.user, [id], options);
       await expect(operation).rejects.toMatchObject({ code: "authorization_expired" });
-      expect(value.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.directory.read", value.user);
+      expect(value.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.users.read", value.user);
       expect(value.revalidateUser).not.toHaveBeenCalled();
       expect(value.requireAvailable).not.toHaveBeenCalled();
-      expect(value.delegatedToken).not.toHaveBeenCalled();
+      expect(value.applicationToken).not.toHaveBeenCalled();
       expect(value.directory.resolve).not.toHaveBeenCalled();
       expect(value.repository.save).not.toHaveBeenCalled();
       expect(value.observeOperation).not.toHaveBeenCalled();
@@ -392,7 +392,7 @@ describe("persistent agent people resolution", () => {
       const value = harness();
       let revoked: Promise<void> | undefined;
       const revoke = () => { revoked = revokeAccountSessionMutations(value.user.tenantId!, value.user.homeAccountId, async () => {}); };
-      if (phase === "token") value.delegatedToken.mockImplementationOnce(async () => { revoke(); return "fixture-token"; });
+      if (phase === "token") value.applicationToken.mockImplementationOnce(async () => { revoke(); return "fixture-token"; });
       if (phase === "publication") value.requireAvailable.mockImplementationOnce(async () => {})
         .mockImplementationOnce(async () => { revoke(); });
       if (phase === "evidence") value.observeOperation.mockImplementationOnce(async (_id, _user, operation) => {
@@ -429,7 +429,7 @@ describe("persistent agent people resolution", () => {
     value.beginOperationValidation.mockReturnValue(() => {
       if (!current) throw new AppError(401, "authorization_expired", "Directory capability changed.");
     });
-    if (stage === "token") value.delegatedToken.mockImplementationOnce(async () => { current = false; return "fixture-token"; });
+    if (stage === "token") value.applicationToken.mockImplementationOnce(async () => { current = false; return "fixture-token"; });
     if (stage === "provider") value.directory.resolve.mockImplementationOnce(async () => {
       current = false;
       return [{ resourceId: id, resourceType: "user", displayName: "Person", principalKind: "user" }];
@@ -458,7 +458,7 @@ describe("persistent agent people resolution", () => {
     };
     if (stage === "references") value.repository.referencedIds.mockImplementationOnce(fail);
     else if (stage === "cache") value.repository.read.mockImplementationOnce(fail);
-    else value.delegatedToken.mockImplementationOnce(fail);
+    else value.applicationToken.mockImplementationOnce(fail);
     const pending = stage === "references"
       ? value.service.refreshReferences(value.user, new AbortController().signal,
         { runId: randomUUID(), jobId: randomUUID() }, { incompleteOnly: false })
@@ -475,7 +475,7 @@ describe("persistent agent people resolution", () => {
       throw new AppError(503, "provider_error", "Upstream failure.");
     });
     await expect(value.service.resolve(value.user, [id], options)).rejects.toMatchObject({ code: "maintenance" });
-    expect(value.delegatedToken).not.toHaveBeenCalled();
+    expect(value.applicationToken).not.toHaveBeenCalled();
     expect(value.directory.resolve).not.toHaveBeenCalled();
     expect(value.repository.save).not.toHaveBeenCalled();
   });
@@ -534,7 +534,7 @@ describe("persistent agent people resolution", () => {
       if (phase === "cache") value.repository.read.mockImplementationOnce(async () => { await stall(); return []; });
       if (phase === "authentication") value.revalidateUser.mockImplementationOnce(async () => { await stall(); return value.user; });
       if (phase === "capability") value.requireAvailable.mockImplementationOnce(stall);
-      if (phase === "token") value.delegatedToken.mockImplementationOnce(async () => { await stall(); return "fixture-token"; });
+      if (phase === "token") value.applicationToken.mockImplementationOnce(async () => { await stall(); return "fixture-token"; });
       if (phase === "provider") value.directory.resolve.mockImplementationOnce(async () => {
         await stall();
         return [{ resourceId: id, resourceType: "user", principalKind: "user", displayName: "Late person" }];

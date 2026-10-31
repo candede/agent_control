@@ -196,7 +196,7 @@ async function publishPackageSnapshot(principalId: string, requestedIds?: string
   const scope = { tenantId, principalId };
   const job = await repository.submit(scope, {
     authorizationPrincipalId: principalId,
-    tokenMode: "delegated",
+    tokenMode: "application",
     idempotencyKey: `package-snapshot-${principalId}-${randomUUID()}`,
     requestedIds,
   });

@@ -13,7 +13,7 @@ const user: SessionUser = {
   username: "reader@example.invalid", roles: ["AgentControl.Viewer"],
 };
 
-function available(id: CapabilityId = "graph.package.read.delegated", now = Date.now()): CapabilityView {
+function available(id: CapabilityId = "graph.package.read.application", now = Date.now()): CapabilityView {
   return {
     enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
     ...(id.endsWith(".application") ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
@@ -49,7 +49,7 @@ describe("CapabilityGate", () => {
       const onClick = vi.fn(), replacement = vi.fn(), remember = vi.fn();
       const content = (current = value, disabled = false, click = onClick) => <StrictMode>
         <CapabilityContext value={current}>
-          <CapabilityGate capability="graph.package.read.delegated" roles={["AgentControl.Viewer"]}>
+          <CapabilityGate capability="graph.package.read.application" roles={["AgentControl.Viewer"]}>
             <RetainedButton remember={remember} type="button" disabled={disabled} onClick={click}>Run</RetainedButton>
           </CapabilityGate>
         </CapabilityContext>
@@ -88,7 +88,7 @@ describe("CapabilityGate", () => {
   it("respects child-disabled admission even when a child retains its click handler", () => {
     const remember = vi.fn(), onClick = vi.fn();
     render(<CapabilityContext value={context()}>
-      <CapabilityGate capability="graph.package.read.delegated">
+      <CapabilityGate capability="graph.package.read.application">
         <RetainedButton disabled remember={remember} onClick={onClick}>Run</RetainedButton>
       </CapabilityGate>
     </CapabilityContext>);
@@ -130,7 +130,7 @@ describe("CapabilityGate", () => {
     expect(screen.queryByRole("button", { name: /^Permissions:/ })).not.toBeInTheDocument();
   });
 
-  it("distinguishes catalog loading, delegated checking, failure and an explicit successful retry", () => {
+  it("distinguishes catalog loading, automatic checking, failure and an explicit successful retry", () => {
     const unknown = available();
     unknown.decision = { capabilityId: unknown.definition.id, status: "unknown", authorized: false,
       fresh: false, previewQualification: "not_required", remediation: [] };
@@ -160,7 +160,7 @@ describe("CapabilityGate", () => {
   });
 
   it("does not describe application authorization as an automatic delegated check", () => {
-    const unknown = available("graph.package.read.application");
+    const unknown = available("graph.users.read");
     unknown.decision = { capabilityId: unknown.definition.id, status: "unknown", authorized: false,
       fresh: false, previewQualification: "unqualified", remediation: [] };
     const value = context([unknown]);
@@ -171,15 +171,15 @@ describe("CapabilityGate", () => {
     expect(screen.getByText("Loading capability status.")).toBeVisible();
     view.rerender(content({ ...value, pending: true }));
     expect(screen.queryByText("Checking capability status.")).not.toBeInTheDocument();
-    expect(screen.getByText(/Microsoft validates the configured application identity when it runs/)).toBeVisible();
+    expect(screen.getByText(/Microsoft validates current permissions and provider access when the operation runs/)).toBeVisible();
     view.rerender(content({ ...value, error: "Permission checks failed. Use Check status to retry." }));
-    expect(screen.getByText(/Microsoft validates the configured application identity when it runs.*Permission checks failed/)).toBeVisible();
+    expect(screen.getByText(/Microsoft validates current permissions and provider access when the operation runs.*Permission checks failed/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
   });
 
   it("keeps current role denial distinct from a capability load or check failure", () => {
     render(<CapabilityContext value={{ ...context(), loading: true, error: "Permission checks failed." }}>
-      <CapabilityGate capability="graph.package.read.delegated" roles={["AgentControl.Admin"]}>
+      <CapabilityGate capability="graph.package.read.application" roles={["AgentControl.Admin"]}>
         <button type="button">Run</button>
       </CapabilityGate>
     </CapabilityContext>);
@@ -189,20 +189,16 @@ describe("CapabilityGate", () => {
   });
 
   it.each(["delegated", "application"] as const)("uses the wall clock when rendering expired %s evidence", mode => {
-    const now = Date.now(), capability = available(`graph.package.read.${mode}`, now);
+    const now = Date.now(), capability = available(mode === "application" ? "graph.package.read.application" : "powerPlatform.inventory.read", now);
     const value = { ...context([capability]), now };
     vi.spyOn(Date, "now").mockReturnValue(now + 60_000);
     render(<CapabilityContext value={value}>
       <CapabilityGate capability={capability.definition.id}><button type="button">Run</button></CapabilityGate>
     </CapabilityContext>);
-    if (mode === "delegated") expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
-    else {
-      expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
-      expect(screen.getByText(/stale/)).toBeVisible();
-    }
+    expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
   });
 
-  it("withdraws application admission and its stale presentation when a click observes a suspended expiry timer", () => {
+  it("allows current application collection when a click observes expired diagnostics", () => {
     const now = Date.now(), capability = available("graph.package.read.application", now);
     const onSubmit = vi.fn((event: React.FormEvent) => event.preventDefault());
     render(<CapabilityContext value={{ ...context([capability]), now }}>
@@ -214,15 +210,15 @@ describe("CapabilityGate", () => {
     expect(button).toBeEnabled();
     vi.spyOn(Date, "now").mockReturnValue(now + 60_000);
     fireEvent.click(button);
-    expect(onSubmit).not.toHaveBeenCalled();
-    expect(button).toBeDisabled();
-    expect(screen.getByText(/stale/)).toBeVisible();
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(button).toBeEnabled();
+    expect(screen.queryByText(/stale/)).not.toBeInTheDocument();
   });
 
   it("retains native refs, keys, titles and child descriptions as access changes", () => {
     const value = context(), ref = vi.fn(), onClick = vi.fn();
     const content = (current: Context) => <CapabilityContext value={current}>
-      <CapabilityGate capability="graph.package.read.delegated" compact>
+      <CapabilityGate capability="graph.package.read.application" compact>
         <button key="target" ref={ref} type="button" title="Exact target" aria-describedby="target-help" onClick={onClick}>Run</button>
       </CapabilityGate>
       <span id="target-help">Exact target details.</span>
@@ -299,10 +295,10 @@ describe("CapabilityGate", () => {
     function Harness({ epoch }: { epoch: number }) {
       const value = useCapabilities(user, epoch);
       return <CapabilityContext key={epoch} value={{ ...value, openPermissions }}>
-        <CapabilityGate capability="graph.package.read.delegated">
+        <CapabilityGate capability="graph.package.read.application">
           <RetainedButton remember={remember} onClick={onClick}>Run one</RetainedButton>
         </CapabilityGate>
-        <CapabilityGate capability="graph.package.read.delegated"><button type="button">Run two</button></CapabilityGate>
+        <CapabilityGate capability="graph.package.read.application"><button type="button">Run two</button></CapabilityGate>
       </CapabilityContext>;
     }
     const view = render(<Harness epoch={0} />);

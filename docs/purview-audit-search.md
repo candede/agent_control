@@ -1,41 +1,50 @@
 # Microsoft Purview Audit Search
 
-Agent Control uses Microsoft Graph Audit Search for explicit, bounded Purview
-queries. Purview records are investigation evidence, not Microsoft 365 Copilot
-usage totals.
+This guide documents the retained Microsoft Graph Audit Search backend and
+components. Purview entry points and setup are **hidden from the current UI**
+and are not part of the Permissions page's configuration checklist. Do not add
+these permissions as prerequisites for normal deployment or synchronization.
+See the [current permission reference](user-roles-and-permissions.md#app-registration-permissions).
 
-## Where to use it
+Purview records are investigation evidence, not Microsoft 365 Copilot usage
+totals or Agent Control's local administrative Audit history.
 
-- **Users > user details > Logs > Purview audit** runs a search for the selected
-  directory user.
-- **Agents > agent details > Activity > Purview audit** searches records for the
-  selected agent.
-- **Agents > agent details > Users > user name** opens Logs for that user on
-  that agent. The report user must resolve to a verified directory identity.
-- **Audit** contains only administrative actions performed through Agent
-  Control.
+## Retained backend scope
 
-Opening a tab does not start a Microsoft query. Select the filters and run the
-search explicitly.
+Explicit, bounded searches support exact directory-user and agent subjects.
+Report users must resolve to a verified directory identity. Saved reads do not
+start a Microsoft query. The component behavior below describes the retained
+implementation, not a navigation path available in the current workbench.
 
-## Requirements
+Viewer-capable backend authority includes Viewer, Usage Report Uploader and
+Admin; private ownership and configured shared scopes still apply. In contrast,
+the separate local **Audit** tab/page and its read/export endpoints require
+Admin. Audit recording is unchanged.
+
+## Required Microsoft access
 
 - Microsoft Graph delegated `AuditLogsQuery.Read.All`
 - Tenant-wide admin consent
 - Purview Audit enabled for the tenant
 - Purview **Audit Logs** or **View-Only Audit Logs** access
-- `AgentControl.Viewer` or `AgentControl.Admin`
 
 Recommended user access is **Security Reader** in Entra ID plus **Audit Reader**
-in Purview. See [Microsoft roles](user-roles-and-permissions.md).
+in Purview. This backend-specific guidance does not add roles to the current
+inventory setup.
 
-## Available searches
+## Retained search components
 
-**Check permissions** runs the same readiness refresh used by Permissions. For Purview delegated access, this checks token readiness, not the provider query lifecycle or complete Microsoft role/license entitlement. The tab distinguishes token verification from provider verification; **Run Audit Search** is the explicit functional create/poll/records check. Missing `AuditLogsQuery.Read.All` consent, Microsoft Purview Audit enablement, and the Audit Logs or View-Only Audit Logs role are surfaced as setup requirements, not empty results. **Open Permissions** remains available for configuration when access is not ready.
+The retained component's **Check permissions** checks token readiness, not the
+provider query lifecycle or complete Microsoft role/license entitlement.
+Purview is filtered out of the current Permissions UI; its **Check status**
+button is not a Purview setup workflow. **Run Audit Search** is the retained
+component's explicit functional create/poll/records operation. Missing
+`AuditLogsQuery.Read.All` consent, Microsoft Purview Audit enablement, and the
+Audit Logs or View-Only Audit Logs role are failures, not empty results.
 
 When an explicit delegated search or resume completes successfully, the panel refreshes readiness once to display the saved lifecycle evidence without replaying Audit Search. Partial and inconclusive jobs do not claim provider verification. Manual history refresh can retry the readiness read for that completed selection; merely opening saved history does not trigger this lifecycle refresh.
 
-Application mode requires configured identity/credentials, application permission, enabled mode and configured shared scope. An authorized Viewer/Admin submits an ordinary search directly; no prior approval query is required. Searches allow up to 168 hours, bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
+Application mode requires configured identity/credentials, application permission, enabled mode and configured shared scope. An authorized Viewer-capable caller submits an ordinary search directly; no prior approval query is required. Searches allow up to 168 hours, bounded to 20 pages and 5,000 stored rows. Actual provider errors and partial coverage remain visible.
 
 `PurviewAuditView` accepts `active?: boolean` (default `true`) for visited tabs that stay mounted. While inactive it renders no content, stops saved-history polling and aborts its owned reads/actions. Form fields and selected-job state are retained in memory for the same account, roles, selected UPN and meaningful capability access/configuration state. Capability timestamp, freshness and verification-only renewals do not remount the form.
 

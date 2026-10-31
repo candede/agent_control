@@ -11,6 +11,7 @@ import { normalizeEnvironmentIdentity } from "../../backend/src/services/invento
 import { quarantineTargetKey } from "./quarantineTarget";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
+export const maximumAuditOriginCharacters = 256;
 
 export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions";
 
@@ -39,7 +40,7 @@ export type AgentRouteState = {
   selectionStorage?: "session";
   selectionCount?: number;
   refreshJobId?: string;
-  refreshMode: "delegated" | "application";
+  refreshMode: "application";
   controlJobId?: string;
   environmentId?: string | null;
   inventorySnapshotId?: string;
@@ -87,7 +88,7 @@ type DataSyncRouteState = {
   powerPlatformJobId?: string;
   syncRunId?: string;
   refreshJobId?: string;
-  refreshMode: "delegated" | "application";
+  refreshMode: "application";
   reports?: SyncReportRouteState;
 };
 
@@ -144,7 +145,7 @@ export function parseDataSyncRoute(search: string): DataSyncRouteState {
     powerPlatformJobId: bounded(params.get("powerPlatformJob"), 512)?.toLowerCase(),
     syncRunId: durableRouteId(params.get("syncRun")),
     refreshJobId: durableRouteId(params.get("refreshJob")),
-    refreshMode: params.get("mode") === "application" ? "application" : "delegated",
+    refreshMode: "application",
     reports: parseSyncReportRoute(search),
   };
 }
@@ -206,7 +207,7 @@ export function parseAgentRoute(search: string): AgentRouteState {
     selectedIds,
     ...(selectionStored ? { selectionStorage: "session" as const, selectionCount } : {}),
     refreshJobId: durableRouteId(params.get("refreshJob")),
-    refreshMode: params.get("mode") === "application" ? "application" : "delegated",
+    refreshMode: "application",
     controlJobId: durableRouteId(params.get("controlJob")),
     environmentId,
     inventorySnapshotId: durableRouteId(params.get("inventorySnapshot"), 64),
@@ -301,9 +302,9 @@ export function parseAuditRoute(search: string): AuditRouteState {
     page: Math.min(boundedPage(params.get("page")), maximumAuditPageIndex),
     originChannel: ["webapp", "mcp", "unknown"].includes(params.get("origin") ?? "")
       ? params.get("origin") as "webapp" | "mcp" | "unknown" : "all",
-    originIntegrationClientId: bounded(params.get("integration"), 256),
-    originClientId: bounded(params.get("client"), 256),
-    originCallingAgentId: bounded(params.get("callingAgent"), 256),
+    originIntegrationClientId: boundedAuditOrigin(params.get("integration")),
+    originClientId: boundedAuditOrigin(params.get("client")),
+    originCallingAgentId: boundedAuditOrigin(params.get("callingAgent")),
   };
 }
 
@@ -314,9 +315,14 @@ export function auditRouteSearch(state: AuditRouteState) {
   if (state.action !== "all" && localAuditActions.has(state.action)) params.set("action", state.action);
   if (state.status !== "all" && localAuditStatuses.has(state.status)) params.set("status", state.status);
   if (state.originChannel && state.originChannel !== "all") params.set("origin", state.originChannel);
-  if (state.originIntegrationClientId) params.set("integration", state.originIntegrationClientId);
-  if (state.originClientId) params.set("client", state.originClientId);
-  if (state.originCallingAgentId) params.set("callingAgent", state.originCallingAgentId);
+  for (const [key, value] of [
+    ["integration", state.originIntegrationClientId],
+    ["client", state.originClientId],
+    ["callingAgent", state.originCallingAgentId],
+  ] as const) {
+    const filter = boundedAuditOrigin(value);
+    if (filter) params.set(key, filter);
+  }
   if (Number.isSafeInteger(state.page) && state.page > 0) params.set("page", String(Math.min(state.page, maximumAuditPageIndex) + 1));
   return params;
 }
@@ -350,7 +356,7 @@ export function parseUsersRoute(search: string): UsersRouteState {
     view: params.get("view") === "activity" ? "activity" : "licenses",
     ...(detailId !== null ? {
       detailId: isGraphGuid(detailId) ? detailId.toLowerCase() : "invalid",
-      detailTab: userDetailTabs.find(tab => tab === params.get("tab")) ?? "overview",
+      detailTab: userDetailTabs.find(tab => tab !== "purview" && tab === params.get("tab")) ?? "overview",
     } : {}),
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
@@ -372,7 +378,7 @@ export function usersRouteSearch(state: UsersRouteState) {
   if (state.view === "activity") params.set("view", state.view);
   if (state.detailId) {
     params.set("detail", isGraphGuid(state.detailId) ? state.detailId.toLowerCase() : "invalid");
-    if (state.detailTab && state.detailTab !== "overview") params.set("tab", state.detailTab);
+    if (state.detailTab && state.detailTab !== "overview" && state.detailTab !== "purview") params.set("tab", state.detailTab);
   }
   const search = bounded(state.search.trim().slice(0, 256), 256);
   if (search) params.set("q", search);
@@ -423,6 +429,11 @@ function boundedSelectionCount(value: string | null) {
 
 function bounded(value: string | null, maximum: number) {
   return value && value.length <= maximum && !/[\0\r\n]/.test(value) ? value : undefined;
+}
+
+function boundedAuditOrigin(value: string | null | undefined) {
+  const label = bounded(value ?? null, maximumAuditOriginCharacters * 2);
+  return label && [...label].length <= maximumAuditOriginCharacters ? label : undefined;
 }
 
 function durableRouteId(value: string | null | undefined, maximum = 512) {

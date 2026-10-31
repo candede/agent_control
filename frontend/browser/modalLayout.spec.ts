@@ -37,18 +37,18 @@ test("empty report management stays compact without diagnostics or inactive cont
   expect(state.unexpected).toEqual([]);
 });
 
-test("user details restore all five task-focused tabs without exposing storage diagnostics", async ({ page }, info) => {
+test("user details retain adoption tabs without exposing deferred security or storage diagnostics", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   await page.goto("/users");
   const trigger = page.getByRole("button", { name: "Ada", exact: true });
   await trigger.click();
   const dialog = page.getByRole("dialog", { name: "Ada", exact: true });
-  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility", "Logs"]);
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage & agents", "Licenses", "Responsibility"]);
   await expect(dialog.getByRole("region", { name: "Saved directory organization" })).toBeVisible();
   await expect(dialog.getByRole("region", { name: "User reported activity" })).toBeVisible();
   await expect(dialog.getByText("Agent report dates", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("region", { name: "Report provenance" })).toHaveCount(0);
-  for (const tab of ["Overview", "Usage & agents", "Licenses", "Responsibility", "Logs"]) {
+  for (const tab of ["Overview", "Usage & agents", "Licenses", "Responsibility"]) {
     await dialog.getByRole("tab", { name: tab, exact: true }).click();
     const panel = dialog.getByRole("tabpanel", { name: tab, exact: true });
     await expect(panel).toBeVisible();
@@ -62,10 +62,6 @@ test("user details restore all five task-focused tabs without exposing storage d
     }
     if (tab === "Licenses") await expect(panel.getByRole("list", { name: "Paid feature states" })).toBeVisible();
     if (tab === "Responsibility") await expect(panel.getByRole("heading", { name: "Agent responsibility" })).toBeVisible();
-    if (tab === "Logs") {
-      await expect(panel.getByRole("combobox", {name:"Source",exact:true})).toHaveValue("purview");
-      await expect(panel.getByRole("heading", {name:"Search Purview logs",exact:true})).toBeVisible();
-    }
     expect((await new AxeBuilder({ page }).include(".user-detail-modal").analyze()).violations).toEqual([]);
     await dialog.screenshot({ path: info.outputPath(`user-${tab.replaceAll(" ", "-")}.png`) });
   }

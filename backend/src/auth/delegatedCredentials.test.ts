@@ -8,7 +8,7 @@ import { activateAccountSession, clearAccountSessionMutationsForTest, revokeAcco
 import * as msal from "./msal.js";
 import { createBearerCredentials, createBrowserCredentials, DelegatedCredentialStore, boundedClaimsChallenge } from "./delegatedCredentials.js";
 import { account, browserAuthenticationResult, browserSession, epochAuthority, guest, guestHome, guestTenant, native, oboFetcher, sdkResponse, tenant, verifiedBearer } from "./authFoundationTestSupport.js";
-import { authExchangeTimeoutMs } from "./boundedAuth.js";
+import { authExchangeTimeoutMs, identityThrottled } from "./boundedAuth.js";
 import { browserRequestPrincipal } from "./requestPrincipal.js";
 import { withAuthority, withReadAuthorityRefresh } from "./authorityContext.js";
 import { AppError } from "../errors.js";
@@ -146,7 +146,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
 
     await expect(source.acquire("powerPlatform.inventory.read")).rejects.toMatchObject({ status: 401, code });
     expect(() => source.assertCurrent()).not.toThrow();
-    await expect(source.acquire("graph.package.read.delegated")).resolves.toBe("synthetic-revalidation-access");
+    await expect(source.acquire("graph.directory.read")).resolves.toBe("synthetic-revalidation-access");
   });
 
   it.each(["interaction_required", "authorization_expired"])("reports %s as capability evidence without invalidating a valid browser session", async code => {
@@ -175,7 +175,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
 
     expect(result.find(view => view.definition.id === "powerPlatform.inventory.read")?.decision)
       .toMatchObject({ status: "unknown", evidence: { category: code } });
-    expect(result.find(view => view.definition.id === "graph.package.read.delegated")?.decision.status).toBe("available");
+    expect(result.find(view => view.definition.id === "graph.directory.read")?.decision.status).toBe("available");
     expect(acquire).toHaveBeenCalled();
     expect(() => source.assertCurrent()).not.toThrow();
   });
@@ -211,11 +211,11 @@ describe("ephemeral exact-principal delegated credentials", () => {
     ]);
     expect(first.principal.sessionEpoch).toBe("2");
     expect(first.reference.id).not.toBe(second.reference.id);
-    await expect(first.acquire("graph.package.read.delegated")).resolves.toBe("first-independent-grant");
-    await expect(second.acquire("graph.package.read.delegated")).resolves.toBe("second-independent-grant");
+    await expect(first.acquire("graph.directory.read")).resolves.toBe("first-independent-grant");
+    await expect(second.acquire("graph.directory.read")).resolves.toBe("second-independent-grant");
     await expect(createBearerCredentials(oldAssertion, epochs, { fetcher })).rejects.toMatchObject({ code: "unauthorized" });
     expect(() => old.assertCurrent()).toThrow(expect.objectContaining({ code: "unauthorized" }));
-    await expect(old.acquire("graph.package.read.delegated")).rejects.toMatchObject({ code: "unauthorized" });
+    await expect(old.acquire("graph.directory.read")).rejects.toMatchObject({ code: "unauthorized" });
     expect(() => store.reauthorize(oldReference, first)).toThrow(expect.objectContaining({ code: "authorization_required" }));
     first.assertCurrent(); second.assertCurrent();
   });
@@ -314,8 +314,10 @@ describe("ephemeral exact-principal delegated credentials", () => {
       expect(body.get("assertion")).toBeTruthy();
     }
     const scopes = fetcher.mock.calls.map(([, request]) => new URLSearchParams(String(request?.body)).get("scope")!);
-    expect(scopes[0]).toContain("https://graph.microsoft.com/User.ReadBasic.All");
-    expect(scopes[1]).toContain("https://graph.microsoft.com/CopilotPackages.Read.All");
+    const identity = scopes[0].split(/\s+/);
+    expect(identity).toEqual(expect.arrayContaining(["openid", "profile"]));
+    expect(identity.every(scope => ["openid", "profile", "offline_access"].includes(scope))).toBe(true);
+    expect(scopes[1]).toContain("https://graph.microsoft.com/CopilotPackages.ReadWrite.All");
     expect(scopes[2]).toContain("https://api.powerplatform.com/");
     expect(scopes[2]).not.toContain("graph.microsoft.com");
   });
@@ -326,8 +328,8 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const first = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: firstFetcher });
     const second = await createBearerCredentials(await verifiedBearer({ oid: guest }), epochAuthority(), { fetcher: secondFetcher });
     const [one, two, other] = await Promise.all([
-      first.acquire("graph.package.read.delegated"), first.acquire("graph.package.read.delegated"),
-      second.acquire("graph.package.read.delegated"),
+      first.acquire("graph.directory.read"), first.acquire("graph.directory.read"),
+      second.acquire("graph.directory.read"),
     ]);
     expect(one).toBe(two);
     expect(other).toBe("second-private-grant");
@@ -337,13 +339,53 @@ describe("ephemeral exact-principal delegated credentials", () => {
     expect(anotherConnection.reference.id).not.toBe(first.reference.id);
   });
 
+  it("does not publish an acquired token after concurrent revalidation removes its initiating role", async () => {
+    const epochs = epochAuthority(), session = browserSession();
+    session.user!.roles = ["AgentControl.Admin"];
+    const source = createBrowserCredentials(await browserRequestPrincipal(session, account(), epochs), epochs);
+    const acquisition = Promise.withResolvers<ReturnType<typeof browserAuthenticationResult>>();
+    const renewal = Promise.withResolvers<ReturnType<typeof browserAuthenticationResult>>();
+    const acquiring = Promise.withResolvers<void>(), renewing = Promise.withResolvers<void>();
+    const finalEpoch = Promise.withResolvers<string>(), checkingFinalEpoch = Promise.withResolvers<void>();
+    let epochReads = 0;
+    epochs.sessionEpoch.mockImplementation(async () => {
+      if (++epochReads === 3) {
+        checkingFinalEpoch.resolve();
+        return finalEpoch.promise;
+      }
+      return "1";
+    });
+    const acquire = vi.spyOn(msal, "acquireDelegatedTokenResult").mockImplementation(() => {
+      acquiring.resolve();
+      return acquisition.promise;
+    });
+    vi.spyOn(msal, "revalidateAuthenticatedUserResult").mockImplementation(() => {
+      renewing.resolve();
+      return renewal.promise;
+    });
+    const pending = [source.acquire("graph.package.block.manage"), source.acquire("graph.package.block.manage")];
+    const rejected = Promise.all(pending.map(result => expect(result).rejects.toMatchObject({ code: "authorization_required" })));
+    await acquiring.promise;
+    const revalidating = source.revalidate();
+    await renewing.promise;
+    acquisition.resolve(browserAuthenticationResult());
+    await checkingFinalEpoch.promise;
+    const result = browserAuthenticationResult();
+    renewal.resolve({ ...result, idTokenClaims: { ...result.idTokenClaims, roles: ["AgentControl.Viewer"] } });
+    finalEpoch.resolve("1");
+    await revalidating;
+    expect(source.principal.roles).toEqual(["AgentControl.Viewer"]);
+    await rejected;
+    expect(acquire).toHaveBeenCalledOnce();
+  });
+
   it("bounds worker references, survives request cancellation through retained authority, but restart requires same-principal reauthorization", async () => {
     const controller = new AbortController();
     const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher(), signal: controller.signal });
     const store = new DelegatedCredentialStore(2);
     const reference = store.retain(source);
     controller.abort();
-    await expect(store.resolve(reference, source.principal).acquire("graph.package.read.delegated")).resolves.toBe("synthetic-opaque-provider-access");
+    await expect(store.resolve(reference, source.principal).acquire("graph.directory.read")).resolves.toBe("synthetic-opaque-provider-access");
     const restarted = new DelegatedCredentialStore();
     expect(() => restarted.resolve(reference, source.principal)).toThrow(expect.objectContaining({ code: "authorization_required" }));
     const other = await createBearerCredentials(await verifiedBearer({ oid: guest }), epochAuthority(), { fetcher: oboFetcher({ oid: guest, uid: guestHome, utid: guestTenant }) });
@@ -399,7 +441,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const fetcher = oboFetcher();
     const source = await createBearerCredentials(await verifiedBearer(), epochs, { fetcher });
     epochs.sessionEpoch.mockResolvedValue("2");
-    await expect(source.acquire("graph.package.read.delegated")).rejects.toMatchObject({ code: "authorization_required" });
+    await expect(source.acquire("graph.directory.read")).rejects.toMatchObject({ code: "authorization_required" });
     expect(fetcher).toHaveBeenCalledOnce();
     const secondEpochs = epochAuthority();
     const secondFetcher = oboFetcher();
@@ -409,7 +451,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
       secondEpochs.bearerAuthority.mockResolvedValue({ epoch: "2", issuedAfter: "0" });
       return sdkResponse({}, request);
     });
-    await expect(second.acquire("graph.package.read.delegated")).rejects.toMatchObject({ code: "principal_mapping_unavailable" });
+    await expect(second.acquire("graph.directory.read")).rejects.toMatchObject({ code: "principal_mapping_unavailable" });
   });
 
   it("rejects changed provider identity, wrong audience, permissions and app-only responses without returning tokens", async () => {
@@ -422,17 +464,17 @@ describe("ephemeral exact-principal delegated credentials", () => {
       const fetcher = oboFetcher();
       const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
       fetcher.mockImplementationOnce(async (_url, request) => sdkResponse(options, request));
-      await expect(source.acquire("graph.package.read.delegated")).rejects.toBeInstanceOf(Error);
+      await expect(source.acquire("graph.directory.read")).rejects.toBeInstanceOf(Error);
     }
   });
 
   it("preserves actual claims challenge as bounded reauthorization, revokes the source and never retries writes", async () => {
     const fetcher = oboFetcher();
-    const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
+    const source = await createBearerCredentials(await verifiedBearer({ roles: ["AgentControl.Admin"] }), epochAuthority(), { fetcher });
     const claims = JSON.stringify({ access_token: { polids: { essential: true, values: [guestHome] } } });
     fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ error: "interaction_required", error_description: "private error body",
       claims, access_token: "private-body-token" }), { status: 400 }));
-    const error = await source.acquire("graph.package.read.delegated").catch(error => error);
+    const error = await source.acquire("graph.package.block.manage").catch(error => error);
     expect(error).toMatchObject({ status: 401, code: "claims_challenge", details: { claims } });
     expect(JSON.stringify(error)).not.toMatch(/private-body-token|private error body/);
     expect(() => source.assertCurrent()).toThrow(expect.objectContaining({ code: "authorization_required" }));
@@ -449,12 +491,72 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const fetcher = oboFetcher();
     const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
     fetcher.mockResolvedValueOnce(new Response("private throttle body", { status: 429, headers: { "retry-after": "60" } }));
-    await expect(source.acquire("graph.package.read.delegated")).rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 60 });
-    await expect(source.acquire("graph.package.read.delegated")).rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 60 });
+    await expect(source.acquire("graph.directory.read")).rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 60 });
+    await expect(source.acquire("graph.directory.read")).rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 60 });
     expect(fetcher).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(60_000);
-    await expect(source.acquire("graph.package.read.delegated")).resolves.toBe("synthetic-opaque-provider-access");
+    await expect(source.acquire("graph.directory.read")).resolves.toBe("synthetic-opaque-provider-access");
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("preserves the longest cooldown when concurrent capability acquisitions are throttled", async () => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const first = Promise.withResolvers<ReturnType<typeof browserAuthenticationResult>>();
+    const second = Promise.withResolvers<ReturnType<typeof browserAuthenticationResult>>();
+    const acquire = vi.spyOn(msal, "acquireDelegatedTokenResult")
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockResolvedValue(browserAuthenticationResult());
+    const longer = expect(source.acquire("graph.directory.read"))
+      .rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 60 });
+    const shorter = expect(source.acquire("powerPlatform.inventory.read"))
+      .rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(acquire).toHaveBeenCalledTimes(2);
+    first.reject(identityThrottled("60"));
+    await longer;
+    second.reject(identityThrottled("1"));
+    await shorter;
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(source.acquire("graph.directory.read"))
+      .rejects.toMatchObject({ code: "provider_throttled", retryAfterSeconds: 58 });
+    expect(acquire).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(58_000);
+    await expect(source.acquire("graph.directory.read")).resolves.toBe("synthetic-revalidation-access");
+    expect(acquire).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    { status: 401, deadline: false }, { status: 429, deadline: false },
+    { status: 401, deadline: true }, { status: 429, deadline: true },
+  ])("ignores late $status failures from abandoned renewals (deadline=$deadline)", async ({ status, deadline }) => {
+    vi.useFakeTimers();
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const renewal = Promise.withResolvers<ReturnType<typeof browserAuthenticationResult>>();
+    const revalidate = vi.spyOn(msal, "revalidateAuthenticatedUserResult")
+      .mockImplementationOnce(() => renewal.promise)
+      .mockResolvedValue(browserAuthenticationResult());
+    const controller = new AbortController();
+    const pending = source.revalidate(controller.signal);
+    const rejected = expect(pending).rejects.toMatchObject({
+      code: deadline ? "authentication_timeout" : "authentication_cancelled",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(revalidate).toHaveBeenCalledOnce();
+    if (deadline) await vi.advanceTimersByTimeAsync(authExchangeTimeoutMs);
+    else controller.abort();
+    await rejected;
+    await expect(source.revalidate()).resolves.toMatchObject({ principalId: source.principal.principalId });
+
+    renewal.reject(status === 429 ? identityThrottled("60")
+      : new AppError(401, "interaction_required", "Synthetic abandoned renewal failure."));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(() => source.assertCurrent()).not.toThrow();
+    await expect(source.revalidate()).resolves.toMatchObject({ principalId: source.principal.principalId });
   });
 
   it("cancels only departing waiters and rejects late results after all waiters cancel", async () => {
@@ -464,16 +566,16 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const gate = new Promise<void>(resolve => { release = resolve; });
     fetcher.mockImplementationOnce(async (_url, request) => { await gate; return sdkResponse({}, request); });
     const controller = new AbortController();
-    const first = source.acquire("graph.package.read.delegated", controller.signal);
+    const first = source.acquire("graph.directory.read", controller.signal);
     const rejected = expect(first).rejects.toMatchObject({ code: "authentication_cancelled" });
-    const second = source.acquire("graph.package.read.delegated");
+    const second = source.acquire("graph.directory.read");
     controller.abort(); release();
     await rejected;
     await expect(second).resolves.toBe("synthetic-opaque-provider-access");
     const all = new AbortController();
     const never = new Promise<Response>(() => {});
     fetcher.mockImplementationOnce(async () => never);
-    const pending = source.acquire("graph.package.read.delegated", all.signal);
+    const pending = source.acquire("graph.directory.read", all.signal);
     const cancelled = expect(pending).rejects.toMatchObject({ code: "authentication_cancelled" });
     all.abort();
     await cancelled;
@@ -485,13 +587,13 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const fetcher = oboFetcher();
     const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
     fetcher.mockImplementationOnce(async () => new Promise(() => {}));
-    const pending = source.acquire("graph.package.read.delegated");
+    const pending = source.acquire("graph.directory.read");
     const timeout = expect(pending).rejects.toMatchObject({ code: "authentication_timeout" });
     await vi.advanceTimersByTimeAsync(authExchangeTimeoutMs);
     await timeout;
     source.revoke();
     const short = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher({ expiresIn: 30 }) });
-    await short.acquire("graph.package.read.delegated");
+    await short.acquire("graph.directory.read");
     expect(short.expiresAt).toBeLessThan(short.principal.expiresAt);
     await vi.advanceTimersByTimeAsync(30_000);
     expect(() => short.assertCurrent()).toThrow(expect.objectContaining({ code: "authorization_required" }));
@@ -525,7 +627,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
     const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
     const issuedAt = source.principal.rolesValidatedAt;
     expect((await source.revalidate()).rolesValidatedAt).toBe(issuedAt);
-    fetcher.mockImplementationOnce(async (_url, request) => sdkResponse({ scope: "openid profile" }, request));
+    fetcher.mockImplementationOnce(async (_url, request) => sdkResponse({ scope: "openid" }, request));
     await expect(source.revalidate()).rejects.toMatchObject({ code: "missing_permission" });
   });
 
@@ -564,6 +666,29 @@ describe("ephemeral exact-principal delegated credentials", () => {
     expect(fresh.principal).toBe(original);
   });
 
+  it("rejects a capability token for a different known browser local account", async () => {
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), account(), epochs), epochs);
+    const result = browserAuthenticationResult();
+    vi.spyOn(msal, "acquireDelegatedTokenResult").mockResolvedValue({
+      ...result, uniqueId: guest, account: { ...account(), localAccountId: guest },
+      idTokenClaims: { ...result.idTokenClaims, oid: guest },
+    });
+
+    await expect(source.acquire("graph.directory.read"))
+      .rejects.toMatchObject({ code: "unauthorized", message: "Microsoft returned a different local account." });
+    expect(() => source.assertCurrent()).toThrow(expect.objectContaining({ code: "authorization_required" }));
+  });
+
+  it("permits browser acquisition when the initial cached local account was unavailable", async () => {
+    const epochs = epochAuthority();
+    const source = createBrowserCredentials(await browserRequestPrincipal(browserSession(), null, epochs), epochs);
+    vi.spyOn(msal, "acquireDelegatedTokenResult").mockResolvedValue(browserAuthenticationResult());
+
+    await expect(source.acquire("graph.directory.read")).resolves.toBe("synthetic-revalidation-access");
+    source.assertCurrent();
+  });
+
   it("enforces capacity and rejects application/local modes or absent API roles before provider dispatch", async () => {
     const fetcher = oboFetcher();
     const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
@@ -584,7 +709,7 @@ describe("ephemeral exact-principal delegated credentials", () => {
   it("serializes only bounded non-secret provenance and remains unregistered on every production route", async () => {
     const assertion = await verifiedBearer();
     const source = await createBearerCredentials(assertion, epochAuthority(), { fetcher: oboFetcher() });
-    await source.acquire("graph.package.read.delegated");
+    await source.acquire("graph.directory.read");
     const serialized = JSON.stringify({ principal: source.principal, reference: source.reference, source });
     expect(serialized).not.toMatch(/synthetic-opaque-provider-access|synthetic-foundation-secret|accessToken|clientSecret|oboAssertion/);
     expect(inspect(source, { depth: 10 })).not.toMatch(/synthetic-opaque-provider-access|synthetic-foundation-secret|accessToken|clientSecret|oboAssertion/);

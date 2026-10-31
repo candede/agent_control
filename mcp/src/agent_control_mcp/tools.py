@@ -559,7 +559,7 @@ OPERATIONS = (
         "/api/agents/refresh-jobs",
         i.RefreshPackages,
         jobs.PackageRefreshJob,
-        "Explicitly submit delegated catalog/exact package collection.",
+        "Explicitly submit application-authenticated catalog/exact package collection.",
         provider=True,
     ),
     Operation(
@@ -568,7 +568,7 @@ OPERATIONS = (
         "/api/agents/{id}/refresh-jobs",
         i.RefreshPackage,
         jobs.PackageRefreshJob,
-        "Explicitly collect one exact delegated package.",
+        "Explicitly collect one exact package with the tenant application.",
         provider=True,
     ),
     Operation(
@@ -587,7 +587,7 @@ OPERATIONS = (
         "/api/agents/refresh-jobs",
         i.PackageJobs,
         jobs.RefreshJobs[jobs.PackageRefreshJob],
-        "Read saved delegated package refresh history.",
+        "Read saved application package refresh history for the current actor.",
     ),
     Operation(
         "get_package_refresh_job",
@@ -595,7 +595,7 @@ OPERATIONS = (
         "/api/agents/refresh-jobs/{id}",
         i.PackageJobId,
         jobs.PackageRefreshJob,
-        "Read one saved delegated package refresh job.",
+        "Read one saved application package refresh job.",
     ),
     Operation(
         "list_package_refresh_targets",
@@ -611,7 +611,7 @@ OPERATIONS = (
         "/api/agents/refresh-jobs/{id}/resume",
         i.PackageJobId,
         jobs.PackageRefreshJob,
-        "Explicitly resume delegated collection with current authorization.",
+        "Explicitly resume application collection with current actor authorization.",
         provider=True,
     ),
     Operation(
@@ -848,8 +848,9 @@ OPERATIONS = (
         "/api/audit/events",
         i.AuditInput,
         jobs.AuditEvents,
-        "Read bounded administrative audit with origin/caller filters. Reported labels are inert, "
-        "not authenticated vendor/agent identity; historical unknown stays unknown.",
+        "Admin: read bounded administrative audit with origin/caller filters. "
+        "Reported labels are inert, not authenticated vendor/agent identity; "
+        "historical unknown stays unknown.",
     ),
     Operation(
         "preview_agent_control",

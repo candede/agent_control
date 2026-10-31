@@ -492,7 +492,7 @@ describe("DataSyncPanel", () => {
     expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
   });
 
-  it("keeps first-sync setup focused on automatic collection without redundant actions", async () => {
+  it("keeps first-sync collection automatic without making completion an access prerequisite", async () => {
     api.getState.mockResolvedValue(syncState());
     const onSetupStatusChange = vi.fn();
     const overflow = document.body.style.overflow;
@@ -505,14 +505,14 @@ describe("DataSyncPanel", () => {
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
     const dialog = screen.getByRole("dialog", { name: "Set up your workspace" });
     expect(screen.getByRole("heading", { name: "Set up your workspace" })).toHaveFocus();
-    expect(within(dialog).queryByRole("button", { name: /^Close/ })).not.toBeInTheDocument();
-    expect(fireEvent(dialog, new Event("cancel", { cancelable: true }))).toBe(false);
+    expect(within(dialog).getByRole("button", { name: /^Close/ })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Continue to workspace" })).toBeVisible();
     expect(dialog).toHaveAttribute("open");
     expect(document.body.style.overflow).toBe("hidden");
     expect(api.getState).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(api.start).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
-    expect(within(dialog).queryByRole("button")).not.toBeInTheDocument();
+    expect(dialog).toHaveTextContent("You can use saved tenant data while sources sync or need attention");
     expect(screen.getByText("Your first sync starts automatically.")).toBeVisible();
     expect(onOpenSync).not.toHaveBeenCalled();
     expect(api.openPermissions).not.toHaveBeenCalled();
@@ -525,6 +525,34 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledTimes(2);
     expect(api.start).not.toHaveBeenCalled();
   });
+
+  it.each(["running", "failed", "permission_required", "waiting_authorization"] as const)(
+    "allows continuing with saved data while first-sync Users is %s without cancelling collection", async status => {
+      const current = syncState({
+        sources: sourceIds.map(id => id === "power_platform"
+          ? source(id, "succeeded", { count: 1658 }) : source(id, "not_started")),
+        run: run(status === "running" ? "running" : "partial", [
+        source("users", status, { message: status === "failed" ? "The configured application could not be authorized." : "", canRetry: status !== "running" }),
+        source("graph_packages", "failed"),
+        source("power_platform", "succeeded", { count: 1658 }),
+      ]) });
+      api.getState.mockResolvedValue(current);
+      const ref = createRef<DataSyncPanelHandle>();
+      const overflow = document.body.style.overflow;
+      renderPanel({ active: false, onOpenSync: vi.fn(), ref });
+      const notice = await screen.findByRole("dialog");
+      expect(within(notice).getByRole("list", { name: "First sync sources" })).toHaveTextContent("1,658 resources saved");
+      if (status === "failed") expect(within(notice).queryByRole("link", { name: "Sign in again" })).not.toBeInTheDocument();
+      if (status === "waiting_authorization") expect(within(notice).getByRole("link", { name: "Sign in again" })).toBeVisible();
+      await userEvent.click(within(notice).getByRole("button", { name: "Continue to workspace" }));
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(document.body.style.overflow).toBe(overflow);
+      await act(async () => { await ref.current!.refresh(); });
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+      expect(api.start).not.toHaveBeenCalled();
+      expect(api.cancel).not.toHaveBeenCalled();
+    },
+  );
 
   it("keeps live first-sync progress across navigation, hides after zero-record success, and returns after a reset", async () => {
     const ref = createRef<DataSyncPanelHandle>();
@@ -539,7 +567,7 @@ describe("DataSyncPanel", () => {
     expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
-    expect(within(screen.getByRole("dialog", { name: "Your first sync is in progress" })).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("dialog", { name: "Your first sync is in progress" })).getByRole("button", { name: "Continue to workspace" })).toBeVisible();
     expect(view.container.querySelector(".first-sync-actions")).not.toBeInTheDocument();
     view.rerenderPanel({ active: true });
     expect(await screen.findByRole("region", { name: "Data sync" })).toBeVisible();
@@ -670,8 +698,12 @@ describe("DataSyncPanel", () => {
     expect(api.start).not.toHaveBeenCalled();
   });
 
-  it("keeps permission recovery available when another source is still syncing", async () => {
+  it.each([true, false])("keeps permission recovery available when another source is still syncing and saved data is %s", async saved => {
     api.getState.mockResolvedValue(syncState({
+      sources: saved ? [
+        source("users", "succeeded", { count: 42, lastSuccessAt: "2026-09-15T10:01:00.000Z" }),
+        ...syncState().sources.slice(1),
+      ] : syncState().sources,
       run: run("running", [
         source("users", "permission_required", { message: "Administrator consent is required." }),
         source("graph_packages", "running", { count: 650 }),
@@ -682,6 +714,8 @@ describe("DataSyncPanel", () => {
     renderPanel({ active: false, onOpenSync });
 
     expect(await screen.findByRole("heading", { name: "First sync needs attention" })).toBeVisible();
+    expect(screen.getByRole("progressbar")).toHaveAttribute("value", saved ? "1" : "0");
+    if (saved) expect(screen.getByText("42 directory users checked saved")).toBeVisible();
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "Review permissions" }));
     expect(api.openPermissions).toHaveBeenCalledOnce();

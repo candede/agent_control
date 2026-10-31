@@ -27,7 +27,7 @@ const packageValue = (id: string, blocked = false, overrides: Record<string, unk
     appId: `app-${id}`, manifestId: `manifest-${id}`, assetId: `asset-${id}`, ...overrides });
 async function running(idempotencyKey: string, requestedIds?: string[], owner: PackageDataScope = scope) {
   const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId,
-    tokenMode: owner.tokenMode ?? "delegated", idempotencyKey, requestedIds });
+    tokenMode: owner.tokenMode ?? "application", idempotencyKey, requestedIds });
   expect(await jobs.markRunning(owner, job.id)).toBe(true);
   return job.id;
 }
@@ -69,7 +69,7 @@ async function selected(query: InventoryQuery = {}, owner = scope) {
 describe.sequential("streamed package inventory and durable refresh jobs", () => {
   it("gives admitted package work four hours and publishes beyond the old thirty-minute window", async () => {
     const owner = { tenantId: "tenant-long-package-refresh", principalId: "reader-long-package-refresh" };
-    const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: "long-refresh" });
+    const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "application", idempotencyKey: "long-refresh" });
     expect((await fixture.operator.query(`SELECT EXTRACT(EPOCH FROM (deadline_at-created_at))::double precision AS seconds
       FROM package_refresh_jobs WHERE id=$1`, [job.id])).rows[0].seconds).toBeCloseTo(4 * 60 * 60, 1);
     await fixture.operator.query(`UPDATE package_refresh_jobs SET created_at=clock_timestamp()-interval '2 hours',
@@ -86,7 +86,7 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
 
   it("does not let retained dispatch-expired jobs exhaust fresh admission", async () => {
     const owner = { tenantId: "tenant-package-deadline", principalId: "reader-package-deadline" };
-    const input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const };
+    const input = { authorizationPrincipalId: owner.principalId, tokenMode: "application" as const };
     const expired = [];
     for (let index = 0; index < 5; index++) expired.push(await jobs.submit(owner, { ...input, idempotencyKey: `expired-${index}` }));
     await fixture.runtime.query(`UPDATE package_refresh_jobs SET deadline_at=clock_timestamp()-interval '1 second'
@@ -99,14 +99,14 @@ describe.sequential("streamed package inventory and durable refresh jobs", () =>
   });
 
   it("cancels only the requesting principal's unfinished read job", async () => {
-    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cancel" });
+    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: "package-cancel" });
     expect(await jobs.cancel({ ...scope, principalId: "other-reader" }, job.id, scope.principalId)).toBeUndefined();
     expect(await jobs.cancel(scope, job.id, "other-reader")).toMatchObject({ status: "waiting_authorization" });
     expect(await jobs.cancel(scope, job.id, scope.principalId)).toMatchObject({ status: "cancelled", errorCode: "cancelled" });
   });
 
   it("retains internal sync cleanup provenance instead of blaming the requesting principal", async () => {
-    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "package-cleanup" });
+    const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: "package-cleanup" });
     await jobs.cancel(scope, job.id, scope.principalId, "sync_cleanup");
     await jobs.cancel(scope, job.id, scope.principalId);
     expect(await jobs.getJob(scope, job.id)).toMatchObject({

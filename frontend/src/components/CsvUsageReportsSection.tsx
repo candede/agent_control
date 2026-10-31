@@ -32,7 +32,7 @@ export function CsvUsageReportsSection({
       <div className="data-sync-toolbar">
         {canUploadUsage ? <button type="button" onClick={onOpenUsageImport}>
           <Upload size={16} aria-hidden="true" />Add CSV reports
-        </button> : <p>An AgentControl.Admin can import reports.</p>}
+        </button> : <p>An AgentControl.UsageReportUploader or AgentControl.Admin can import reports.</p>}
         <button type="button" className="secondary" onClick={onManageUsageReports}>Manage reports</button>
       </div>
     </header>

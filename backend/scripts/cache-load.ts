@@ -26,7 +26,7 @@ try {
   const identity=await reportIdentity(fixture.runtime,{...actor,roles:["AgentControl.Admin"]});
   const reader=new LargeTenantUsersReports(fixture.runtime,"synthetic-cache-load-cursor-secret",35);
   const exports=new OfficialReportExports(reader,actor);
-  const packageJob=await packageRepository.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:"cache-load-publish"});
+  const packageJob=await packageRepository.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"application",idempotencyKey:"cache-load-publish"});
   assert.equal(await packageRepository.markRunning(scope,packageJob.id),true);
   const store=new InventoryGenerations(fixture.runtime);
   const input=await inventoryJobInput(fixture.runtime,scope,"packages",packageJob.id);
@@ -104,10 +104,10 @@ try {
 
   const submitted=[];
   for (let index=0;index<5;index+=1) submitted.push(await packageRepository.submit(scope,{
-    authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:`cache-load-queue-${index}`,requestedIds:[`load-${String(index).padStart(4,"0")}`],
+    authorizationPrincipalId:scope.principalId,tokenMode:"application",idempotencyKey:`cache-load-queue-${index}`,requestedIds:[`load-${String(index).padStart(4,"0")}`],
   }));
   await assert.rejects(()=>packageRepository.submit(scope,{
-    authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:"cache-load-queue-overflow",requestedIds:["load-0009"],
+    authorizationPrincipalId:scope.principalId,tokenMode:"application",idempotencyKey:"cache-load-queue-overflow",requestedIds:["load-0009"],
   }),error=>Boolean(error && typeof error==="object" && "code" in error && error.code==="job_limit"));
   const oldestAge=Date.now()-Math.min(...submitted.map(job=>Date.parse(job.createdAt)));
   assert.ok(oldestAge<30_000,"Cache-only queue age exceeded 30 seconds.");

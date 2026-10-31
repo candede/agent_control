@@ -23,6 +23,7 @@ import type { QuarantineJob, QuarantineReconciliationResult } from "../../backen
 import type { CopilotStudioQuarantineControlService } from "../../backend/src/services/copilotStudioQuarantineControl.js";
 import type { CopilotStudioQuarantineRepository } from "../../backend/src/db/copilotStudioQuarantine.js";
 import type { InventoryMutationStages } from "../../backend/src/db/inventoryMutationStages.js";
+import type { NativeInventory } from "../../backend/src/db/nativeInventory.js";
 import type { JobRepository } from "../../backend/src/db/jobs.js";
 import type { reconcileBulkJob } from "../../backend/src/services/bulkJobs.js";
 
@@ -38,6 +39,7 @@ export type Contracts = {
   package: CopilotPackageDetail;
   responsibility: AgentResponsibilityPage;
   native: InventorySourceAwareDetail;
+  studioTargets: Awaited<ReturnType<NativeInventory["getQuarantineSelection"]>>;
   users: ReportPage<CombinedUser>;
   user: OfficialReportDetail<CombinedUser>;
   plans: ReportPage<CopilotServicePlan>;

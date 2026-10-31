@@ -8,12 +8,12 @@ export function hasRole(user: SessionUser | undefined, role: AppRole) {
 
 export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
   if (!hasRole(user, "AgentControl.Viewer")) return ["permissions"];
-  return [
+  const views: WorkbenchViewId[] = [
     "dashboard",
     "agents",
     "users",
     "sync",
-    "audit",
-    "permissions",
   ];
+  if (hasRole(user, "AgentControl.Admin")) views.push("audit");
+  return [...views, "permissions"];
 }

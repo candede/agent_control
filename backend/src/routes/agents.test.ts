@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bulkJobs, launchBulkJob, requireWorkerCapacity } from "../services/bulkJobs.js";
-import { acquireAuthorizedToken } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken } from "../auth/msal.js";
 import { InventoryMutationStages } from "../db/inventoryMutationStages.js";
 import { packageInventory } from "../services/packageInventory.js";
 import { createJobConfirmation, JobRepository } from "../db/jobs.js";
@@ -30,6 +30,8 @@ import {
   parsePackageRefreshIds,
   submitCanaryJob,
   canaryFailureCompletion,
+  createAgentJobReadRouter,
+  createAgentRefreshTargetsRouter,
 } from "./agents.js";
 
 vi.mock("../db/pool.js", () => ({
@@ -62,6 +64,7 @@ vi.mock("../services/bulkJobs.js", async original => ({
 vi.mock("../auth/msal.js", async original => ({
   ...await original<typeof import("../auth/msal.js")>(),
   acquireAuthorizedToken: vi.fn(async () => "token"),
+  acquireApplicationToken: vi.fn(async () => "application-user-token"),
 }));
 vi.mock("../services/reportIdentity.js", () => ({ reportIdentity: vi.fn() }));
 
@@ -97,11 +100,28 @@ describe("package job cancellation metadata", () => {
 
 describe("package refresh admission responses", () => {
   it.each(["/agents/refresh-jobs", "/agents/:id/refresh-jobs", "/agents/refresh-jobs/:id/resume"])(
+    "rejects obsolete or malformed authentication modes before admitting %s", async path => {
+      const submit = vi.spyOn(packageInventory, "submit");
+      const start = vi.spyOn(packageInventory, "start");
+      const handler = handlers.get(`post ${path}`);
+      if (!handler) throw new Error("Package refresh handler was not registered.");
+      for (const mode of ["delegated", "", null, false]) {
+        const request: Partial<Request> = { body: { mode }, params: { id: groupId }, get: vi.fn() };
+        const response = { json: vi.fn<Response["json"]>(), status: vi.fn<Response["status"]>().mockReturnThis() };
+        await expect(handler(request as Request, response as Response, error => { if (error) throw error; }))
+          .rejects.toMatchObject({ status: 400, code: "invalid_token_mode" });
+      }
+      expect(submit).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["/agents/refresh-jobs", "/agents/:id/refresh-jobs", "/agents/refresh-jobs/:id/resume"])(
     "returns saved permission diagnostics from %s rather than a sign-in-only waiting response", async path => {
       const user = { tenantId: groupId, homeAccountId: "package-reader", displayName: "Reader",
         username: "reader@example.invalid", roles: ["AgentControl.Viewer" as const] };
       const waiting = {
-        id: groupId, authorizationPrincipalId: user.homeAccountId, tokenMode: "delegated" as const,
+        id: groupId, authorizationPrincipalId: user.homeAccountId, tokenMode: "application" as const,
         scopeKind: "broad" as const, requestedIds: [], autoDetails: false,
         status: "waiting_authorization" as const, pageCount: 0, observedCount: 0, totalRecords: null,
         snapshotId: null, createdAt: "2026-09-09T00:00:00.000Z", attemptedAt: null,
@@ -112,7 +132,7 @@ describe("package refresh admission responses", () => {
       vi.spyOn(packageInventory, "submit").mockResolvedValue(waiting);
       vi.spyOn(packageInventory, "start").mockRejectedValue(new AppError(403, "missing_permission", "Consent required."));
       vi.spyOn(packageInventory, "get").mockResolvedValue(failed);
-      const request: Partial<Request> = { body: { mode: "delegated" }, params: { id: groupId }, get: vi.fn() };
+      const request: Partial<Request> = { body: { mode: "application" }, params: { id: groupId }, get: vi.fn() };
       new session.MemoryStore().createSession(request as Request, {
         cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, clientId: userId, user,
       });
@@ -122,6 +142,98 @@ describe("package refresh admission responses", () => {
       await handler(request as Request, response as Response, error => { if (error) throw error; });
       expect(response.status).toHaveBeenCalledWith(202);
       expect(response.json).toHaveBeenCalledWith(failed);
+    },
+  );
+});
+
+describe("agent job read authority", () => {
+  const user = { tenantId: groupId, homeAccountId: "job-history-reader", displayName: "Reader",
+    username: "reader@example.invalid", roles: ["AgentControl.Viewer" as const] };
+  const scope = { tenantId: user.tenantId, principalId: user.homeAccountId };
+  const identity = { ...scope, sessionEpoch: 0, authorizationHash: "viewer" };
+  const job: NonNullable<Awaited<ReturnType<JobRepository["get"]>>> = {
+    id: groupId, capabilityId: "graph.package.block.manage", tokenMode: "delegated",
+    status: "succeeded", action: "block", targetBlockedState: true,
+    confirmationHash: null, confirmation: null, confirmedAt: null,
+    total: 1, completed: 1, succeeded: 1, failed: 0, skipped: 0, inconclusive: 0, cancelled: 0,
+    currentAgentName: undefined, createdAt: "2026-09-24T12:00:00.000Z",
+    updatedAt: "2026-09-24T12:00:00.000Z", canResume: false,
+  };
+  const page = { value: [], revision: "1", counts: { total: 0, filtered: 0 },
+    page: { limit: 50, nextCursor: null, previousCursor: null } };
+  const refreshHistory = { value: [], lastAttemptAt: null, lastSuccessAt: null };
+  const reads = [
+    { path: "/agents/bulk-jobs/:id", body: job,
+      setup: (wait: Promise<void>) => vi.spyOn(JobRepository.prototype, "get").mockImplementationOnce(async () => { await wait; return job; }) },
+    { path: "/agents/bulk-jobs", body: { value: [job] },
+      setup: (wait: Promise<void>) => vi.spyOn(JobRepository.prototype, "list").mockImplementationOnce(async () => { await wait; return { value: [job] }; }) },
+    { path: "/agents/bulk-jobs/:id/items", body: page,
+      setup: (wait: Promise<void>) => vi.spyOn(JobRepository.prototype, "items").mockImplementationOnce(async () => { await wait; return page; }) },
+    { path: "/agents/refresh-jobs", body: refreshHistory,
+      setup: (wait: Promise<void>) => vi.spyOn(PackageRefreshJobs.prototype, "listJobs").mockImplementationOnce(async () => { await wait; return refreshHistory; }) },
+    { path: "/agents/refresh-jobs/:id/targets", body: page,
+      setup: (wait: Promise<void>) => vi.spyOn(PackageRefreshJobs.prototype, "targets").mockImplementationOnce(async () => { await wait; return page; }) },
+  ];
+
+  beforeEach(async () => {
+    await activateAccountSession(scope.tenantId, scope.principalId, async () => {});
+    createAgentJobReadRouter(pool);
+    createAgentRefreshTargetsRouter(pool);
+    vi.spyOn(capabilities, "requireApplicationDataScope").mockResolvedValue({
+      enabled: true, sharedDataScope: true, previewQualified: false, revision: 1,
+    });
+    vi.mocked(reportIdentity).mockReset().mockResolvedValue(identity);
+  });
+
+  function invoke(path: string) {
+    const handler = handlers.get(`get ${path}`);
+    if (!handler) throw new Error("Expected agent job read handler.");
+    const request: Partial<Request> = { params: { id: groupId }, query: {} };
+    new session.MemoryStore().createSession(request as Request, {
+      cookie: new session.Cookie(), accountId: user.homeAccountId, tenantId: user.tenantId, clientId: userId, user,
+    });
+    const response = { json: vi.fn<Response["json"]>(), setHeader: vi.fn<Response["setHeader"]>() };
+    const pending = Promise.resolve(handler(request as Request, response as Response, error => { if (error) throw error; }));
+    return { pending, response };
+  }
+
+  it.each(reads)("preserves current results for $path", async ({ path, body, setup }) => {
+    setup(Promise.resolve());
+    const { pending, response } = invoke(path);
+    await pending;
+    expect(response.json).toHaveBeenCalledExactlyOnceWith(body);
+  });
+
+  it.each(reads.flatMap(read => (["resolve", "reject"] as const).map(settlement => ({ ...read, settlement }))))(
+    "fences $path when storage settles with $settlement after replacement sign-in", async ({ path, setup, settlement }) => {
+      const storage = Promise.withResolvers<void>();
+      const reading = setup(storage.promise);
+      const { pending, response } = invoke(path);
+      const observed = pending.catch(error => error);
+      await vi.waitFor(() => expect(reading).toHaveBeenCalledOnce());
+      await activateAccountSession(scope.tenantId, scope.principalId, async () => {});
+      if (settlement === "resolve") storage.resolve();
+      else storage.reject(new Error("Late private job read failure."));
+      expect(await observed).toMatchObject({ code: "unauthorized" });
+      expect(response.json).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["/agents/bulk-jobs/:id/items", "/agents/refresh-jobs/:id/targets"])(
+    "does not read %s after replacement sign-in during selection identity lookup", async path => {
+      const lookup = Promise.withResolvers<typeof identity>();
+      vi.mocked(reportIdentity).mockReturnValueOnce(lookup.promise);
+      const items = vi.spyOn(JobRepository.prototype, "items");
+      const targets = vi.spyOn(PackageRefreshJobs.prototype, "targets");
+      const { pending, response } = invoke(path);
+      const observed = pending.catch(error => error);
+      await vi.waitFor(() => expect(reportIdentity).toHaveBeenCalledOnce());
+      await activateAccountSession(scope.tenantId, scope.principalId, async () => {});
+      lookup.resolve(identity);
+      expect(await observed).toMatchObject({ code: "unauthorized" });
+      expect(items).not.toHaveBeenCalled();
+      expect(targets).not.toHaveBeenCalled();
+      expect(response.json).not.toHaveBeenCalled();
     },
   );
 });
@@ -192,15 +304,16 @@ describe("directory request lifecycle", () => {
   const user = { tenantId: scope.tenantId, homeAccountId: scope.principalId,
     username: "reader@example.invalid", displayName: "Reader", roles: ["AgentControl.Viewer" as const] };
   const principal = { resourceType: "user", resourceId: userId, displayName: "Person", principalKind: "user" as const };
+  const tokenAcquisition = (method: "get" | "post") => vi.mocked(method === "get" ? acquireAuthorizedToken : acquireApplicationToken);
 
-  function startRequest(method: "get" | "post") {
+  function startRequest(method: "get" | "post", resourceType = "user") {
     const path = method === "get" ? "/directory/principals" : "/directory/principals/resolve";
     const handler = handlers.get(`${method} ${path}`);
     if (!handler) throw new Error("Directory handler was not registered.");
     const json = vi.fn<Response["json"]>();
     const response = Object.assign(new EventEmitter(), { json, writableEnded: false });
     const request: Partial<Request> = {
-      path, query: { search: "person" }, body: { principals: [{ resourceType: "user", resourceId: userId }] },
+      path, query: { search: "person" }, body: { principals: [{ resourceType, resourceId: userId }] },
       sessionID: "directory-session",
     };
     new session.MemoryStore().createSession(request as Request, {
@@ -218,6 +331,7 @@ describe("directory request lifecycle", () => {
   beforeEach(async () => {
     await activateAccountSession(scope.tenantId, scope.principalId, async () => undefined);
     vi.mocked(acquireAuthorizedToken).mockReset().mockResolvedValue("token");
+    vi.mocked(acquireApplicationToken).mockReset().mockResolvedValue("application-user-token");
     vi.spyOn(operationalState, "requireProviderAdmissions").mockImplementation(() => undefined);
     vi.spyOn(capabilities, "requireAvailable").mockResolvedValue({
       capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
@@ -232,6 +346,27 @@ describe("directory request lifecycle", () => {
     await pending;
     expect(json).toHaveBeenCalledExactlyOnceWith({ value: [principal] });
     expect(response.listenerCount("close")).toBe(0);
+    expect(acquireApplicationToken).toHaveBeenCalledExactlyOnceWith(scope.tenantId, "graph.users.read");
+    if (method === "get") {
+      expect(acquireAuthorizedToken).toHaveBeenCalledExactlyOnceWith(scope.tenantId, scope.principalId, "graph.directory.read");
+      expect(DirectoryPrincipalsClient.prototype.search).toHaveBeenCalledWith(
+        { user: "application-user-token", group: "token" }, "person", undefined, expect.any(AbortSignal), expect.any(Function));
+    } else {
+      expect(acquireAuthorizedToken).not.toHaveBeenCalled();
+      expect(capabilities.requireAvailable).toHaveBeenCalledExactlyOnceWith("graph.users.read", user);
+      expect(DirectoryPrincipalsClient.prototype.resolve).toHaveBeenCalledWith(
+        { user: "application-user-token" }, [{ resourceType: "user", resourceId: userId }], expect.any(AbortSignal), expect.any(Function));
+    }
+  });
+
+  it("uses only delegated group authorization for group-only validation", async () => {
+    const { pending } = startRequest("post", "group");
+    await pending;
+    expect(acquireApplicationToken).not.toHaveBeenCalled();
+    expect(acquireAuthorizedToken).toHaveBeenCalledExactlyOnceWith(scope.tenantId, scope.principalId, "graph.directory.read");
+    expect(capabilities.requireAvailable).toHaveBeenCalledExactlyOnceWith("graph.directory.read", user);
+    expect(DirectoryPrincipalsClient.prototype.resolve).toHaveBeenCalledWith(
+      { group: "token" }, [{ resourceType: "group", resourceId: userId }], expect.any(AbortSignal), expect.any(Function));
   });
 
   it.each((["get", "post"] as const).flatMap(method =>
@@ -243,7 +378,7 @@ describe("directory request lifecycle", () => {
       return { capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
         verification: "provider", previewQualification: "not_required", remediation: [] };
     });
-    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
+    if (stage === "token") tokenAcquisition(method).mockImplementationOnce(async () => {
       await replaceSession();
       return "token";
     });
@@ -260,7 +395,7 @@ describe("directory request lifecycle", () => {
   });
 
   it.each(["get", "post"] as const)("does not dispatch %s directory work after admissions close during token acquisition", async method => {
-    vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
+    tokenAcquisition(method).mockImplementationOnce(async () => {
       vi.mocked(operationalState.requireProviderAdmissions).mockImplementation(() => {
         throw new AppError(503, "maintenance", "Provider work paused.");
       });
@@ -280,7 +415,7 @@ describe("directory request lifecycle", () => {
     vi.spyOn(capabilities, "beginOperationValidation").mockReturnValue(() => {
       if (!current) throw new AppError(401, "authorization_expired", "Directory capability changed.");
     });
-    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
+    if (stage === "token") tokenAcquisition(method).mockImplementationOnce(async () => {
       current = false;
       return "token";
     });
@@ -290,7 +425,7 @@ describe("directory request lifecycle", () => {
     }
     const { pending, json } = startRequest(method);
     await expect(pending).rejects.toMatchObject({ code: "authorization_expired" });
-    expect(capabilities.beginOperationValidation).toHaveBeenCalledWith("graph.directory.read", user);
+    expect(capabilities.beginOperationValidation).toHaveBeenCalledWith(method === "get" ? "graph.directory.read" : "graph.users.read", user);
     if (stage === "token") {
       expect(DirectoryPrincipalsClient.prototype.search).not.toHaveBeenCalled();
       expect(DirectoryPrincipalsClient.prototype.resolve).not.toHaveBeenCalled();
@@ -306,7 +441,7 @@ describe("directory request lifecycle", () => {
       throw new AppError(503, "provider_error", "Upstream failure.");
     };
     if (stage === "capability") vi.mocked(capabilities.requireAvailable).mockImplementationOnce(failure);
-    else if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(failure);
+    else if (stage === "token") tokenAcquisition(method).mockImplementationOnce(failure);
     else {
       const lookup = method === "get" ? DirectoryPrincipalsClient.prototype.search : DirectoryPrincipalsClient.prototype.resolve;
       vi.mocked(lookup).mockImplementationOnce(failure);
@@ -319,7 +454,7 @@ describe("directory request lifecycle", () => {
 
   it.each(["get", "post"] as const)("does not dispatch %s directory work after disconnection during token acquisition", async method => {
     const token = Promise.withResolvers<string>();
-    vi.mocked(acquireAuthorizedToken).mockReturnValueOnce(token.promise);
+    tokenAcquisition(method).mockReturnValueOnce(token.promise);
     const { pending, response, json } = startRequest(method);
     const observed = pending.catch(error => error);
     await setImmediate();
@@ -341,7 +476,7 @@ describe("directory request lifecycle", () => {
     const token = Promise.withResolvers<string>();
     const result = Promise.withResolvers<typeof principal[]>();
     let lookupSignal: AbortSignal | undefined;
-    vi.mocked(acquireAuthorizedToken).mockReturnValueOnce(stage === "token" ? token.promise : Promise.resolve("token"));
+    tokenAcquisition(method).mockReturnValueOnce(stage === "token" ? token.promise : Promise.resolve("token"));
     if (method === "get") vi.mocked(DirectoryPrincipalsClient.prototype.search).mockImplementationOnce(
       async (_token, _query, _limit, signal) => { lookupSignal = signal; return result.promise; },
     );
@@ -445,6 +580,7 @@ describe("package mutation worker admission", () => {
     vi.mocked(launchBulkJob).mockReset();
     vi.mocked(requireWorkerCapacity).mockReset();
     vi.mocked(acquireAuthorizedToken).mockReset().mockResolvedValue("token");
+    vi.mocked(acquireApplicationToken).mockReset().mockResolvedValue("application-user-token");
     vi.spyOn(JobRepository.prototype, "getByIdempotency").mockResolvedValue(undefined);
     vi.spyOn(InventoryMutationStages.prototype, "submit").mockResolvedValue(receipt);
     vi.spyOn(InventoryMutationStages.prototype, "preview").mockResolvedValue({ ...confirmed.summary, confirmationHash: confirmed.confirmationHash });
@@ -525,7 +661,7 @@ describe("package mutation worker admission", () => {
       return { capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
         verification: "provider", previewQualification: "not_required", remediation: [] };
     });
-    if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementationOnce(async () => {
+    if (stage === "token") vi.mocked(acquireApplicationToken).mockImplementationOnce(async () => {
       await replaceSession();
       return "token";
     });
@@ -590,10 +726,22 @@ describe("package mutation worker admission", () => {
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 
-  it.each(["token", "recovery"] as const)("does not resume after session replacement during %s", async stage => {
-    vi.spyOn(bulkJobs, "get").mockResolvedValue({ ...receipt, status: "waiting_authorization", canResume: true });
-    vi.spyOn(bulkJobs, "recover").mockImplementation(async () => {
-      if (stage === "recovery") await replaceSession();
+  it.each(["lookup", "capability", "token", "recovery", "final-lookup"] as const)("does not resume after session replacement during %s", async stage => {
+    const currentJob = { ...receipt, status: "waiting_authorization" as const, canResume: true };
+    const get = vi.spyOn(bulkJobs, "get").mockResolvedValue(currentJob);
+    if (stage === "lookup" || stage === "final-lookup") {
+      if (stage === "final-lookup") get.mockResolvedValueOnce(currentJob);
+      get.mockImplementationOnce(async () => { await replaceSession(); return currentJob; });
+    }
+    if (stage === "capability") vi.mocked(capabilities.requireAvailable).mockImplementationOnce(async () => {
+      await replaceSession();
+      return { capabilityId: receipt.capabilityId, status: "available", authorized: true, fresh: true,
+        verification: "on_demand", previewQualification: "not_required", remediation: [] };
+    });
+    let replacement: Promise<void> | undefined;
+    const recover = vi.spyOn(bulkJobs, "recover").mockImplementation(async () => {
+      if (stage === "recovery") replacement = replaceSession();
+      return 0;
     });
     if (stage === "token") vi.mocked(acquireAuthorizedToken).mockImplementation(async () => {
       await replaceSession();
@@ -602,6 +750,10 @@ describe("package mutation worker admission", () => {
 
     await expect(requestMutation("/agents/bulk-jobs/:id/resume", { confirmed: true }))
       .rejects.toMatchObject({ code: "unauthorized" });
+    await replacement;
+    if (["lookup", "capability"].includes(stage)) expect(acquireAuthorizedToken).not.toHaveBeenCalled();
+    if (["lookup", "capability", "token"].includes(stage)) expect(recover).not.toHaveBeenCalled();
+    if (stage === "recovery") expect(get).toHaveBeenCalledOnce();
     expect(launchBulkJob).not.toHaveBeenCalled();
   });
 });

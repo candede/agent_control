@@ -277,6 +277,9 @@ reported client/agent labels and provider source. Unknown historical Microsoft
 events and unknown attribution remain explicit; neither is inferred into a
 verified action. Audit is append-only application data, not cryptographic proof
 against database administrators.
+Only Admin can read/export local administrative audit history or see its
+Audit tab/page. Viewer and Usage Report Uploader have no direct UI/API access;
+recording is unchanged and remains separate from Microsoft Purview searches.
 
 ## Lifecycle and recovery
 

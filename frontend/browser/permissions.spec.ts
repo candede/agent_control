@@ -138,7 +138,7 @@ test.afterEach(async ({ page }, testInfo) => {
   await page.unrouteAll({ behavior: "wait" });
 });
 
-test("signed-in user role guide maps actions to Microsoft access without app-role clutter", async ({ page }, info) => {
+test("app-defined roles and permission-first guidance have separate visible sections", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
   const commands: string[] = [];
   page.on("request", request => {
@@ -146,36 +146,34 @@ test("signed-in user role guide maps actions to Microsoft access without app-rol
       && new URL(request.url()).pathname !== "/api/capabilities/check") commands.push(new URL(request.url()).pathname);
   });
   await page.goto("/permissions");
-  const sections = page.getByRole("navigation", { name: "Permissions sections", exact: true });
-  await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
-  const guide = page.getByRole("region", { name: "Signed-in user roles", exact: true });
+  await expect(page.getByRole("navigation", { name: "Permissions sections", exact: true })).toHaveCount(0);
+  const guide = page.getByRole("region", { name: "App-defined roles", exact: true });
+  await guide.scrollIntoViewIfNeeded();
   await expect(guide).toBeVisible();
-  await expect(guide.getByRole("article", { name: "Refresh Microsoft 365 agent inventory", exact: true })).toContainText("CopilotPackages.Read.All");
-  const controls = guide.getByRole("article", { name: "Block, unblock or change agent access", exact: true });
-  await expect(controls).toContainText("CopilotPackages.ReadWrite.All");
-  await expect(controls).toContainText("Entra role: not specified by the package API.");
-  await expect(guide.getByRole("article", { name: "Sync users and Copilot licenses", exact: true })).toContainText("Directory Readers");
-  await expect(guide.getByRole("article", { name: "Download usage CSVs for import", exact: true })).toContainText("Reports Reader");
-  await expect(guide.getByRole("article", { name: "Check quarantine status, quarantine or restore Studio agents", exact: true })).toContainText("AI Administrator");
-  await expect(guide.getByRole("article", { name: "Search Purview audit for a user", exact: true })).toContainText("Audit Reader");
-  await expect(guide).not.toContainText(/AgentControl\.|In Agent Control|documentation reviewed|certify/i);
-  await expect(guide.getByRole("article")).toHaveCount(11);
+  await expect(guide.getByRole("article", { name: "Viewer", exact: true })).toContainText("AgentControl.Viewer");
+  await expect(guide.getByRole("article", { name: "Usage Report Uploader", exact: true })).toContainText("AgentControl.UsageReportUploader");
+  await expect(guide.getByRole("article", { name: "Admin", exact: true })).toContainText("AgentControl.Admin");
+  await expect(guide).toContainText("Reports Reader or AI Administrator");
+  await expect(guide.getByRole("article", { name: /Purview|Defender|log identity/ })).toHaveCount(0);
+  await expect(guide).not.toContainText(/documentation reviewed|certify/i);
+  await expect(guide.getByRole("article")).toHaveCount(3);
   expect((await guide.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(600);
   await expect(guide.locator("details")).toHaveCount(0);
   await expect(guide.getByRole("navigation")).toHaveCount(0);
   expect(await guide.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1)).toBe(true);
   expect((await new AxeBuilder({ page }).include(".permission-user-roles").analyze()).violations).toEqual([]);
-  await sections.getByRole("link", { name: "Signed-in user roles", exact: true }).click();
-  await page.screenshot({ path: info.outputPath("signed-in-user-roles.png") });
-  await guide.getByRole("link", { name: "App API permissions", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "App prerequisites", exact: true })).toBeInViewport();
-  await expect(page.getByRole("region", { name: "App prerequisites", exact: true }).getByText("Required API permissions", { exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath("app-defined-roles.png") });
+  const registrationHeading = page.getByRole("heading", { name: "App registration permissions", exact: true });
+  await registrationHeading.scrollIntoViewIfNeeded();
+  await expect(registrationHeading).toBeInViewport();
+  await expect(page.getByRole("region", { name: "App registration permissions", exact: true }).locator("dt")).toHaveCount(11);
   expect(commands).toEqual([]);
   expect(unexpected).toEqual([]);
 });
 
 test("log setup is concise and agent blockers link to manual setup without running a hunt", async ({ page }, testInfo) => {
+  test.fixme(true, "Security setup UI is deferred.");
   const unexpectedRequests = await mockLayoutApi(page);
   const commands: string[] = [];
   page.on("request", request => {
@@ -229,6 +227,7 @@ test("log setup is concise and agent blockers link to manual setup without runni
 });
 
 test("selected agent identity resolution is explicit and does not start a hunt", async ({ page }) => {
+  test.fixme(true, "Agent investigation UI is deferred; retained component behavior is covered by unit tests.");
   const unexpectedRequests = await mockLayoutApi(page);
   const recordId = "graph_packages:layout-package-1";
   const entraId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -348,31 +347,23 @@ test("administrator prerequisites replace in-app consent before and after a miss
   await expect(packageIssue.getByRole("button", { name: "Request consent", exact: true })).toHaveCount(0);
   await expect(packageIssue.getByRole("link", { name: "Admin setup", exact: true })).toHaveAttribute("href", "https://entra.microsoft.com/");
   await expect(packageIssue.getByText("Microsoft denied the required API permission.", { exact: true })).toBeVisible();
-  await expect(packageIssue.getByRole("button", { name: "Details: Package blocking", exact: true })).toBeVisible();
-  const prerequisites = page.getByRole("region", { name: "App prerequisites" });
-  expect((await prerequisites.innerText()).trim().split(/\s+/).length).toBeLessThanOrEqual(65);
-  await prerequisites.getByText("Required API permissions", { exact: true }).click();
-  await expect(prerequisites.getByText("AgentIdentity.Read.All", { exact: true })).toBeVisible();
-  await expect(prerequisites.getByText("Microsoft Graph / Delegated", { exact: true })).toBeVisible();
-  const permissionMappings = prerequisites.locator(".permission-feature-list > div");
+  await expect(packageIssue.getByRole("region", { name: "Required setup" })).toContainText("CopilotPackages.ReadWrite.All");
+  const prerequisites = page.getByRole("region", { name: "App registration permissions" });
+  await expect(prerequisites.getByText("AgentIdentity.Read.All", { exact: true })).toHaveCount(0);
+  await expect(prerequisites.getByRole("region", { name: "Microsoft Graph / Delegated", exact: true })).toBeVisible();
+  const permissionMappings = prerequisites.locator(".permission-map-row");
   for (const [permission, feature] of [
-    ["openid", "Sign-in: authenticate your account using an ID token."],
-    ["profile", "Sign-in: identify your account and display its name and username."],
-    ["offline_access", "Session renewal: refresh delegated access tokens without repeated sign-in."],
-    ["AgentIdentity.Read.All", "Agents > Activity: verify a Studio agent's Entra identity for log matching."],
-    ["LicenseAssignment.Read.All", "Users / Sync: read the tenant product and service-plan catalog."],
-    ["ThreatHunting.Read.All", "Agents > Activity: run Defender / Agent 365 log hunts."],
-    ["CopilotStudio.AdminActions.Invoke", "Agents > Manage: quarantine or restore a Studio agent."],
+    ["openid", "Account sign-in"], ["profile", "Account display"], ["offline_access", "Session renewal"],
+    ["LicenseAssignment.Read.All", "Tenant license catalog"], ["CopilotStudio.AdminActions.Invoke", "Studio quarantine status and changes"],
   ]) {
     const row = permissionMappings.filter({ has: page.getByText(permission, { exact: true }) });
     await expect(row).toHaveCount(1);
     await expect(row.getByText(feature, { exact: true })).toBeVisible();
   }
-  await expect(prerequisites.getByText("Not used by this app:", { exact: true })).toBeVisible();
-  await expect(prerequisites.getByText(/current app requests these read scopes separately/)).toBeVisible();
-  await expect(prerequisites.getByRole("region", { name: /Application/ })).toHaveCount(0);
+  await expect(prerequisites.getByText("User.Read", { exact: true })).toBeVisible();
+  await expect(prerequisites.getByRole("region", { name: "Microsoft Graph / Application", exact: true })).toBeVisible();
   expect(await prerequisites.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-  expect((await new AxeBuilder({ page }).include(".permission-prerequisites").analyze()).violations).toEqual([]);
+  expect((await new AxeBuilder({ page }).include(".permission-registration").analyze()).violations).toEqual([]);
   await prerequisites.screenshot({ path: test.info().outputPath("permission-feature-map.png") });
   missingConsent = false;
   await check.click();
@@ -572,20 +563,15 @@ for (const [status, message] of [
     const issues = page.getByRole("region", { name: "Issues", exact: true });
     if (message) {
       for (const [name, permission, audience] of [
-        ["Agent inventory", "Microsoft Graph / delegated: CopilotPackages.Read.All", "https://graph.microsoft.com"],
+        ["Agent inventory", "Microsoft Graph / application: CopilotPackages.Read.All", "https://graph.microsoft.com"],
         ["Power Platform inventory", "Power Platform / delegated: ResourceQuery.Resources.Read", "8578e004-a5c6-46e7-913e-12f58912df43"],
       ]) {
-        const trigger = issues.getByRole("button", { name: `Details: ${name}`, exact: true });
-        await trigger.click();
-        const details = page.getByRole("dialog", { name, exact: true });
+        const details = issues.getByRole("article", { name, exact: true });
         await expect(details.getByText(message, { exact: true })).toBeVisible();
         await expect(details.getByRole("region", { name: "Required setup" }).getByText(permission, { exact: true })).toBeVisible();
-        await expect(details.getByText(audience, { exact: true })).not.toBeVisible();
-        await details.getByText("Technical details", { exact: true }).click();
         await expect(details.getByText(audience, { exact: true })).toBeVisible();
         await expect(details.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
-        await page.keyboard.press("Escape");
-        await expect(trigger).toBeFocused();
+        await expect(details.locator("details, summary, dialog")).toHaveCount(0);
       }
     } else {
       await expect(issues.getByText("No issues reported.", { exact: true })).toBeVisible();
@@ -600,7 +586,7 @@ for (const [status, message] of [
     await issues.screenshot({ path: info.outputPath(`permission-issues-${status}.png`) });
   });
 }
-test("automatic checks, administrator setup, panels and focus return", async ({ page }) => {
+test("automatic checks and inline administrator setup require no disclosure", async ({ page }) => {
   let checks = 0;
   let legacyProbes = 0;
   const unexpectedProviderWorkloads: string[] = [];
@@ -621,22 +607,16 @@ test("automatic checks, administrator setup, panels and focus return", async ({ 
   await expect(page.getByRole("button", { name: "Sign in with Entra ID" })).toBeVisible();
   await login(page, "missing_delegated_grant");
   const missingIssue = page.locator(".permission-issue-list > li").filter({ hasText: "Agent inventory" });
-  const setup = missingIssue.getByRole("button", { name: "Details: Agent inventory", exact: true });
-  await setup.focus();
-  await page.keyboard.press("Enter");
-  const dialog = page.getByRole("dialog"); await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole("region", { name: "Required setup" })).toBeVisible();
-  await expect(dialog.locator("details[open]")).toHaveCount(0);
-  await expect(dialog.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
+  await expect(missingIssue.getByRole("region", { name: "Required setup" })).toBeVisible();
+  await expect(missingIssue.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
+  await expect(page.locator(".permission-center").locator("details, summary, dialog")).toHaveCount(0);
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
-  for (let index = 0; index < 8; index += 1) {
-    await page.keyboard.press("Tab");
-    expect(await dialog.evaluate(element => element.contains(document.activeElement))).toBe(true);
-  }
-  await page.keyboard.press("Escape"); await expect(dialog).not.toBeVisible(); await expect(setup).toBeFocused();
+  await missingIssue.getByRole("link", { name: "Entra admin center", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(missingIssue.getByRole("link", { name: "Microsoft admin center", exact: true })).toBeFocused();
   await expect(missingIssue.getByRole("button", { name: "Request consent" })).toHaveCount(0);
   await expect(missingIssue.getByRole("link", { name: "Admin setup" })).toHaveAttribute("href", "https://entra.microsoft.com/");
-  await expect(page.getByRole("region", { name: "App prerequisites" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "App registration permissions" })).toBeVisible();
   await expect(page.getByText("never-render-provider-text")).toHaveCount(0);
   expect(legacyProbes).toBe(0);
   expect(unexpectedProviderWorkloads).toEqual([]);
@@ -937,7 +917,7 @@ test("exact saved source jobs remain readable during provider outage without a r
   await expect(page.getByRole("button", { name: "Start a new source refresh" })).toBeDisabled();
   expect(writes).toBe(0);
 });
-test("two-role hierarchy, private evidence, and saved audit during outage", async ({ page, browser }) => {
+test("admin-only audit, private evidence, and saved audit during outage", async ({ page, browser }) => {
   let providerRefreshes = 0;
   await page.route(url => url.pathname === "/api/agents/synthetic-package", route => route.fulfill({ json: {
     id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, sourceSystem: "graph_packages",
@@ -957,9 +937,11 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await expect(page.getByRole("button", { name: "Choose CSV files", exact: true })).toBeEnabled();
   await page.getByRole("button", { name: "Cancel import", exact: true }).click();
   await login(page, "role-Viewer");
-  for (const view of ["Agents", "Users", "Audit"]) {
+  for (const view of ["Agents", "Users"]) {
     await expect(page.getByRole("button", { name: view, exact: true })).toBeVisible();
   }
+  await expect(page.getByRole("button", { name: "Audit", exact: true })).toHaveCount(0);
+  expect(await page.evaluate(async () => (await fetch("/api/audit/events")).status)).toBe(403);
   await expect(page.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   await expect(page.getByRole("button", { name: "Add CSV reports", exact: true })).toHaveCount(0);
@@ -980,6 +962,7 @@ test("two-role hierarchy, private evidence, and saved audit during outage", asyn
   await page.getByRole("button", { name:"Check status",exact:true }).click();
   await expect(page.getByRole("region", {name:"Issues",exact:true}).getByRole("alert"))
     .toContainText("Permission checks failed after retrying.");
+  await login(page, "role-Admin");
   await page.getByRole("button", { name: "Audit", exact: true }).click();
   await expect(page.getByRole("region", { name: "Audit log", exact: true })).toBeVisible();
   expect(await page.evaluate(async () => (await fetch("/api/audit/events")).status)).toBe(200);
@@ -1079,6 +1062,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await page.screenshot({ path: testInfo.outputPath("workbench-routes.png"), fullPage: true });
 });
 test("Purview audit starts in user details and remains scoped, explicit, partial-aware, and content-free", async ({ page }) => {
+  test.fixme(true, "Purview UI is deferred; retained component behavior is covered by unit tests.");
   const unexpectedRequests = await mockLayoutApi(page);
   const jobId = "77777777-7777-4777-8777-777777777777";
   const now = Date.now();
@@ -1216,6 +1200,7 @@ test("Purview audit starts in user details and remains scoped, explicit, partial
   expect(unexpectedRequests).toEqual([]);
 });
 test("Defender hunting is explicit, fixed-template, scoped, partial-aware and content-free", async ({ page }) => {
+  test.fixme(true, "Defender UI is deferred; retained component behavior is covered by unit tests.");
   const unexpectedRequests = await mockLayoutApi(page);
   const jobId = "88888888-8888-4888-8888-888888888888";
   const applicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";

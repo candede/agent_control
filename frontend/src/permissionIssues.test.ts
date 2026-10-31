@@ -6,9 +6,11 @@ import { providerActionAllowed } from "./capabilityState";
 import { isTransientPermissionCheck, permissionIssue, permissionIssues } from "./permissionIssues";
 
 const now = Date.parse("2026-09-24T00:00:00Z");
-function fixture(status: CapabilityStatus = "missing_permission", id: CapabilityId = "graph.package.read.delegated"): CapabilityView {
+function fixture(status: CapabilityStatus = "missing_permission", id: CapabilityId = "graph.package.read.application"): CapabilityView {
+  const definition = capabilityDefinitions.find(definition => definition.id === id)!;
   return {
-    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === id)!,
+    enabled: true, definition,
+    ...(definition.mode === "application" ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
     decision: {
       capabilityId: id, status, authorized: status === "available", fresh: true,
       checkedAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now + 60000).toISOString(),
@@ -52,24 +54,24 @@ describe("actual permission issues", () => {
     expect(permissionIssue({ ...view, definition: { ...view.definition, mode: "local" } }, now)).toBeUndefined();
     expect(permissionIssue({ ...view, definition: { ...view.definition, probe: { ...view.definition.probe, adapterRegistered: false } } }, now)).toBeUndefined();
   });
-  it("omits disabled application modes and allows an actual enabled-mode failure", () => {
+  it("omits unavailable application evidence and reports an actual configured collector failure", () => {
     const view = fixture();
-    view.definition = capabilityDefinitions.find(definition => definition.id === "defender.hunting.application")!;
+    view.definition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
     view.decision.capabilityId = view.definition.id;
     expect(permissionIssue({ ...view, enabled: false }, now)).toBeUndefined();
     expect(permissionIssue({ ...view, enabled: false, configuration: { enabled: false, sharedDataScope: false, revision: 1 } }, now)).toBeUndefined();
-    expect(permissionIssue({ ...view, enabled: true }, now)?.name).toBe("App-only Defender logs");
+    expect(permissionIssue({ ...view, enabled: true }, now)?.name).toBe("Agent inventory");
   });
-  it.each(["graph.licenses.read", "reports.copilotUsage.read"] as const)("keeps an unused or successfully admitted %s read silent and actionable", id => {
-    const view = fixture("available");
-    view.definition = capabilityDefinitions.find(definition => definition.id === id)!;
+  it.each(["graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)("keeps an unused or successfully admitted %s application read silent and actionable without user provider roles", id => {
+    const view = fixture("available", id);
     view.decision = { capabilityId: id, status: "available", authorized: true, fresh: true, verification: "on_demand",
       previewQualification: "not_required", remediation: [] };
     expect(permissionIssue(view, now)).toBeUndefined();
+    expect(view.definition.mode).toBe("application");
     expect(providerActionAllowed(view, false, now)).toBe(true);
   });
   it.each(["interaction_required", "authorization_expired"])("reports actual %s as sign-in recovery, not a missing grant", category => {
-    const view = fixture("unknown");
+    const view = fixture("unknown", "graph.package.read.delegated");
     view.decision.evidence = { category };
     const issue = permissionIssue(view, now);
     expect(issue?.action).toEqual({ label: "Sign in again", href: "/api/auth/login?returnTo=%2Fpermissions" });
@@ -92,10 +94,9 @@ describe("actual permission issues", () => {
       expect(issue?.message).not.toMatch(/sign in/i);
     }
   });
-  it.each(["graph.licenses.read", "reports.copilotUsage.read", "graph.agentIdentity.read"] as const)(
+  it.each(["graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)(
     "reports a real %s operation failure separately from its admission decision and clears it on recovery", id => {
-      const view = fixture("available");
-      view.definition = capabilityDefinitions.find(definition => definition.id === id)!;
+      const view = fixture("available", id);
       view.decision = { capabilityId: id, status: "available", authorized: true, fresh: true, verification: "on_demand",
         previewQualification: "not_required", remediation: [] };
       view.operationFailure = { status: "missing_permission", checkedAt: new Date(now - 1000).toISOString(),
@@ -109,6 +110,22 @@ describe("actual permission issues", () => {
       expect(view).toEqual(before);
       expect(permissionIssue({ ...view, operationFailure: undefined }, now)).toBeUndefined();
     });
+  it.each([
+    "graph.agentIdentity.read", "purview.audit.search.delegated", "purview.audit.search.application",
+    "defender.hunting.delegated", "defender.hunting.application",
+  ] as const)("omits deferred %s checks and operation issues without changing provider authorization", id => {
+    const view = fixture("available", id);
+    view.decision.verification = "on_demand";
+    view.operationFailure = { status: "missing_permission", checkedAt: view.decision.checkedAt!,
+      expiresAt: view.decision.expiresAt!, evidence: { httpStatus: 403 }, remediation: [] };
+    const before = structuredClone(view);
+    const allowedBefore = providerActionAllowed(view, false, now);
+    expect(permissionIssue(view, now)).toBeUndefined();
+    expect(permissionIssue(fixture("missing_role", id), now)).toBeUndefined();
+    expect(permissionIssues([view, fixture()], now)).toHaveLength(1);
+    expect(providerActionAllowed(view, false, now)).toBe(allowedBefore);
+    expect(view).toEqual(before);
+  });
   it.each([
     ["checkedAt", "invalid"], ["checkedAt", new Date(now + 1).toISOString()],
     ["expiresAt", "invalid"], ["expiresAt", new Date(now).toISOString()],
@@ -148,6 +165,14 @@ describe("actual permission issues", () => {
     expect(permissionIssues([timeout, denied], now, true).map(issue => issue.view.definition.id)).toEqual([denied.definition.id]);
     expect(permissionIssues([timeout, denied], now, false).map(issue => issue.view.definition.id))
       .toEqual([timeout.definition.id, denied.definition.id]);
+  });
+  it.each([
+    ["missing_permission", 401], ["missing_role", 403], ["provider_error", 429],
+  ] as const)("retains a persistent %s application failure with HTTP %i during initial confirmation", (status, httpStatus) => {
+    const view = fixture(status);
+    view.decision.evidence = { httpStatus, ...(httpStatus === 429 ? { category: "provider_throttled" } : {}) };
+    expect(isTransientPermissionCheck(view, now)).toBe(false);
+    expect(permissionIssues([view], now, true)[0]?.decision.status).toBe(status);
   });
   it.each([
     { fresh: false },

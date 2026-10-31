@@ -3,11 +3,14 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataGenerations } from "../src/db/dataGenerations.js";
+import { PackageRefreshJobs } from "../src/db/packageRefreshJobs.js";
+import * as configuration from "../src/config.js";
 import { DataSyncService } from "../src/services/dataSync.js";
 import { InventoryReconciliation } from "../src/services/inventoryReconciliation.js";
 import { InventoryRuntime } from "../src/services/inventoryRuntime.js";
 import { PackageInventoryService } from "../src/services/packageInventory.js";
 import { PowerPlatformInventoryService } from "../src/services/powerPlatformInventory.js";
+import { loadOperationalState } from "../src/services/operationalState.js";
 import type { DataSyncRun } from "../src/types/dataSync.js";
 import type { AuthenticatedUser } from "../src/types/session.js";
 import { capacityProvider, fixtureTenant, otherTenant } from "./capacityProvider.js";
@@ -62,6 +65,30 @@ function fixture() {
 }
 
 describe("capacity initial sync without infrastructure", () => {
+  it("injects application package collection with separate initiating actor attribution", async () => {
+    const f = fixture(), packages: PackageInventoryService[] = [];
+    const clientId = "88888888-8888-4888-8888-888888888888";
+    vi.spyOn(configuration, "findTenantConfiguration").mockReturnValue({
+      tenantId: fixtureTenant, clientId, clientSecret: "synthetic-capacity-secret", domains: ["example.invalid"],
+      displayName: "Capacity fixture",
+    });
+    await loadOperationalState({ query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [{ mode: "normal" }] }) });
+    f.packageDrain.mockImplementation(async function(this: PackageInventoryService) { packages.push(this); });
+    await capacityInitialSync(f.database, f.user, 10);
+    expect(packages).toHaveLength(1);
+    const stopped = new Error("Synthetic package submission checkpoint");
+    const submit = vi.spyOn(PackageRefreshJobs.prototype, "submit").mockRejectedValue(stopped);
+    await expect(packages[0].submit(f.user, { tokenMode: "application", idempotencyKey: "capacity-application" }))
+      .rejects.toBe(stopped);
+    expect(submit).toHaveBeenCalledExactlyOnceWith(
+      { tenantId: fixtureTenant, principalId: clientId, tokenMode: "application" },
+      { authorizationPrincipalId: f.user.homeAccountId, tokenMode: "application", idempotencyKey: "capacity-application" },
+      expect.any(Function),
+    );
+    expect(f.database.query).not.toHaveBeenCalled();
+    expect(f.database.connect).not.toHaveBeenCalled();
+  });
+
   it("uses initial orchestration and the current actor epoch before returning a canonical publication", async () => {
     const f = fixture();
     await expect(capacityInitialSync(f.database, f.user, 10)).resolves.toMatchObject({

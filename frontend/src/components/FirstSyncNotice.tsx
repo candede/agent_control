@@ -6,7 +6,7 @@ import { automaticSyncSources, syncSourceDetails, syncStatusLabel } from "./sync
 import { WorkbenchDialog } from "./WorkbenchDialog";
 
 export function FirstSyncNotice({
-  state, loading, busy, error, stale, automaticRefresh, cannotStart, onStart, onCancel, onCheckStatus, onOpenPermissions,
+  state, loading, busy, error, stale, automaticRefresh, cannotStart, onStart, onCancel, onCheckStatus, onOpenPermissions, onDismiss,
 }: {
   state: DataSyncState;
   loading: boolean;
@@ -19,6 +19,7 @@ export function FirstSyncNotice({
   onCancel: () => void;
   onCheckStatus: () => void;
   onOpenPermissions: () => void;
+  onDismiss: () => void;
 }) {
   const attempts = state.run?.sources.filter(source => automaticSyncSources.some(id => id === source.source)) ?? [];
   const sources = automaticSyncSources.map(id => {
@@ -41,7 +42,8 @@ export function FirstSyncNotice({
   const syncError = error || (automaticRefresh?.phase === "backoff" ? automaticRefresh.message : undefined);
   const canRetry = Boolean(state.run || error || automaticRefresh?.paused)
     || automaticRefresh?.phase === "backoff" || automaticRefresh?.phase === "failed";
-  const needsPermissions = automaticRefresh?.phase === "permission_required";
+  const needsPermissions = automaticRefresh?.phase === "permission_required"
+    || progressing && attempts.some(source => source.status === "permission_required");
   const title = stale ? "Sync status is unavailable"
     : updating ? "Updating sync status"
       : needsAttention ? "First sync needs attention"
@@ -53,8 +55,8 @@ export function FirstSyncNotice({
       : automaticRefresh?.message
         ?? (!state.run ? "Your first sync starts automatically." : undefined);
 
-  return <WorkbenchDialog open title={title} className="first-sync-dialog"
-    description="We're preparing your users and agent inventory. This can take several minutes, especially for large tenants. Your workspace will open automatically when all three sources are saved.">
+  return <WorkbenchDialog open title={title} className="first-sync-dialog" onClose={onDismiss}
+    description="Read-only collection runs automatically. You can use saved tenant data while sources sync or need attention.">
     <div className="first-sync-notice">
     {syncError ? <div className="error-banner" role="alert">{syncError}{stale ? " Progress below is the last reported status." : null}</div> : null}
       <div className="first-sync-completion">
@@ -80,6 +82,7 @@ export function FirstSyncNotice({
     {automaticMessage && automaticMessage !== syncError ? <p>{automaticMessage}</p> : null}
     {progressing && !collecting ? <p>Resolve the waiting step, or cancel this sync before trying again.</p> : null}
     <p>Sync only reads Microsoft data; it does not change settings.</p>
+    <button type="button" className="secondary" onClick={onDismiss}>Continue to workspace</button>
     {canRetry && !progressing || progressing && !collecting || needsAttention || stale || error ? <div className="first-sync-actions">
       {canRetry && !progressing ? <WorkbenchActionGate actionId="data-sync.start">
         <button type="button" disabled={cannotStart || loading || stale || automaticRefresh?.checking || automaticRefresh?.online === false}

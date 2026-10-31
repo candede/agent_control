@@ -185,7 +185,7 @@ describe("permission browser request sentinels", () => {
       userPrincipalNames: [], ipAddresses: [], objectIds: [], administrativeUnitIds: [],
     });
     await stageReport(new File(["synthetic"], "agents.csv"), { bundleId: "60000000-0000-4000-8000-000000000001" }, {});
-    await startPackageRefresh("delegated", { idempotencyKey: "synthetic-key" });
+    await startPackageRefresh("application", { idempotencyKey: "synthetic-key" });
     await blockAgent("package/encoded", "confirmation");
     await unblockAgent("package/encoded", "confirmation");
     await blockAgents(["package"], "confirmation");

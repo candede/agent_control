@@ -7,6 +7,8 @@ import type { SelectionIdentity } from "../services/dataSelections.js";
 import { officialReportLimits } from "../services/officialReportStream.js";
 import { operationalLog } from "../services/telemetry.js";
 import type { OfficialUsageMetadata } from "../types/officialReportRecords.js";
+import { hasAppRole } from "../types/capability.js";
+import { requestUser } from "../middleware/requestAuthentication.js";
 
 type Upload = Awaited<ReturnType<OfficialReportImports["open"]>>;
 type UploadState = {
@@ -16,6 +18,19 @@ type UploadState = {
 };
 const uploading = Symbol("official-report-upload");
 type UploadRequest = Request & { [uploading]?: UploadState };
+
+function multipartFailure(error: unknown): unknown {
+  if (error instanceof multer.MulterError) {
+    return new AppError(error.code === "LIMIT_FILE_SIZE" ? 413 : 400, "invalid_multipart", "Multipart file/field limits exceeded.");
+  }
+  // Busboy exposes malformed wire syntax as ordinary errors, not MulterError.
+  if (error instanceof Error && !(error instanceof AppError) && ([
+    "Multipart: Boundary not found", "Malformed content type", "Malformed part header", "Unexpected end of form", "Unexpected end of file",
+  ].includes(error.message) || error.message.startsWith("Unsupported content type: "))) {
+    return new AppError(400, "invalid_multipart", "Malformed multipart upload.");
+  }
+  return error;
+}
 
 function metadata(fields: Record<string, unknown>): OfficialUsageMetadata {
   const allowed = ["reportingStart", "reportingEnd", "periodProvenance", "sourceAsOf", "sourceAsOfProvenance", "downloadedAt"];
@@ -42,7 +57,7 @@ function metadata(fields: Record<string, unknown>): OfficialUsageMetadata {
   };
 }
 
-export function officialReportMultipart(imports: OfficialReportImports, identity: (request: Request) => Promise<SelectionIdentity>): RequestHandler {
+export function officialReportMultipart(imports: (request: Request) => OfficialReportImports, identity: (request: Request) => Promise<SelectionIdentity>): RequestHandler {
   const reservations = new Map<string, number>();
   let active = 0;
   async function cancel(state?: UploadState) {
@@ -52,13 +67,15 @@ export function officialReportMultipart(imports: OfficialReportImports, identity
   const storage: multer.StorageEngine = {
     _handleFile(request: UploadRequest, file, callback) {
       const state = request[uploading]!;
+      let streamFailure: unknown;
+      file.stream.once("error", error => { streamFailure = error; });
       state.receiving = (async () => {
         const who = await identity(request);
-        state.upload = await imports.open(who, state.intent, state.controller.signal);
+        state.upload = await imports(request).open(who, state.intent, state.controller.signal);
         return state.upload.receive(file.stream);
       })();
       void state.receiving.then(result => callback(null, { size: result.wireBytes }), error => {
-        state.fail?.(error); callback(error);
+        state.fail?.(error === streamFailure ? multipartFailure(error) : error); callback(error);
       });
     },
     _removeFile(request: UploadRequest, _file, callback) {
@@ -81,6 +98,9 @@ export function officialReportMultipart(imports: OfficialReportImports, identity
       }
       intent = { bundleId: reportUuid(request.query.bundleId), rejectDuplicateKind: duplicate === "true",
         ...(request.query.correctionOfSetId === undefined ? {} : { correctionOfSetId: reportUuid(request.query.correctionOfSetId) }) };
+      if (intent.correctionOfSetId && !hasAppRole(requestUser(request).roles, "AgentControl.Admin")) {
+        throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to correct a published report set.");
+      }
     } catch (error) { next(error); return; }
     const tenant = requestScope(request).tenantId;
     if (active >= 4 || (reservations.get(tenant) ?? 0) >= 2) {
@@ -132,8 +152,7 @@ export function officialReportMultipart(imports: OfficialReportImports, identity
       if (completed) return;
       void (async () => {
         try {
-          if (error) throw error instanceof multer.MulterError
-            ? new AppError(error.code === "LIMIT_FILE_SIZE" ? 413 : 400, "invalid_multipart", "Multipart file/field limits exceeded.") : error;
+          if (error) throw multipartFailure(error);
           if (!request.file || !state.upload) throw new AppError(400, "missing_report", "Select exactly one CSV file.");
           state.finishing = state.upload.finish(metadata(request.body));
           const preview = await state.finishing;

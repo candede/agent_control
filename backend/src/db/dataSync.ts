@@ -639,9 +639,10 @@ async function requireSourceJobScope(client: pg.PoolClient, scope: DataSyncScope
   // Users sync has an attempt UUID, not a persisted provider job.
   if (sourceId !== "graph_packages" && sourceId !== "power_platform") return;
   const table = sourceId === "graph_packages" ? "package_refresh_jobs" : "power_platform_refresh_jobs";
-  const authority = sourceId === "graph_packages" ? "AND token_mode='delegated' AND authorization_principal_id=$3" : "";
+  const authority = sourceId === "graph_packages"
+    ? "authorization_principal_id=$3 AND token_mode='application'" : "principal_id=$3";
   // A previously authorized association survives provider-job retention for failed-source reconciliation.
-  const job = await client.query(`SELECT 1 FROM ${table} WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 ${authority}
+  const job = await client.query(`SELECT 1 FROM ${table} WHERE id=$1 AND tenant_id=$2 AND ${authority}
     UNION ALL SELECT 1 FROM data_sync_source_jobs
       WHERE job_id=$1 AND tenant_id=$2 AND principal_id=$3 AND run_id=$4 AND source_id=$5
         AND NOT EXISTS (SELECT 1 FROM ${table} WHERE id=$1) LIMIT 1`,

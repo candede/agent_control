@@ -161,7 +161,7 @@ describe("configured tenant session persistence", () => {
     await assertCurrentStoredSession(database, "second", otherTenant.tenantId, "same-account", "AgentControl.Viewer");
     expect(database.query).toHaveBeenCalledWith(
       expect.stringContaining("sess->>'clientId'=$5 AND sess->'user'->>'tenantId'=$2 AND sess->'user'->>'homeAccountId'=$3"),
-      ["second", otherTenant.tenantId, "same-account", "AgentControl.Viewer", otherTenant.clientId],
+      ["second", otherTenant.tenantId, "same-account", ["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"], otherTenant.clientId],
     );
     vi.mocked(database.query).mockResolvedValueOnce({ rowCount: 0, rows: [] } as never);
     await expect(assertCurrentStoredSession(database, "second", otherTenant.tenantId, "same-account", "AgentControl.Viewer")).rejects.toMatchObject({ code: "unauthorized" });
@@ -169,5 +169,17 @@ describe("configured tenant session persistence", () => {
     config.tenants = [tenant];
     await expect(assertCurrentStoredSession(database, "second", otherTenant.tenantId, "same-account", "AgentControl.Viewer")).rejects.toMatchObject({ code: "unauthorized" });
     expect(database.query).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["AgentControl.Viewer", ["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"]],
+    ["AgentControl.UsageReportUploader", ["AgentControl.UsageReportUploader", "AgentControl.Admin"]],
+    ["AgentControl.Admin", ["AgentControl.Admin"]],
+  ] as const)("uses the current role hierarchy without elevating stored sessions requiring %s", async (requiredRole, inheritedRoles) => {
+    await assertCurrentStoredSession(database, "second", otherTenant.tenantId, "same-account", requiredRole);
+    expect(database.query).toHaveBeenCalledWith(
+      expect.stringContaining("jsonb_exists_any"),
+      ["second", otherTenant.tenantId, "same-account", inheritedRoles, otherTenant.clientId],
+    );
   });
 });

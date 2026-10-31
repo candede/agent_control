@@ -10,11 +10,26 @@ Export all three files for the same reporting period.
 
 ## Required access
 
-The Microsoft 365 account exporting the files needs a role that can download
-user-level usage reports, such as **Reports Reader** or **AI Administrator**.
+| Task | Required role | Microsoft API permission |
+| --- | --- | --- |
+| View accepted reports | Viewer, Uploader or Admin | None |
+| Upload, validate and publish new sets; discard own unaccepted drafts | `AgentControl.UsageReportUploader` or `AgentControl.Admin` | None |
+| Correct, select or delete published sets | `AgentControl.Admin` | None |
+| Download original CSVs from Microsoft 365 | **Reports Reader** or **AI Administrator** on the exporting account | No additional permission on this app registration |
 
-Importing and managing reports in Agent Control requires
-`AgentControl.Admin`. `AgentControl.Viewer` can view accepted reports.
+The logged-in account must hold the app role for each local operation. Uploader
+includes Viewer; Admin includes both.
+
+Reviewing correction drafts, including diagnostics and acceptance retries,
+requires Admin even when unchanged content reuses an existing report set.
+Uploaders can retry ordinary imports that reuse a corrected report set.
+Cleanup inspection and discarding owned unaccepted drafts remain available
+to Uploaders.
+
+The Uploader app role does not grant Microsoft 365 report-download permissions.
+Application `Reports.Read.All` supplies Office app activity, not these three
+agent-usage exports; the CSV workflow remains separate. **Usage Summary Reports
+Reader** does not include user details.
 
 See [Microsoft roles and permissions](user-roles-and-permissions.md).
 
@@ -61,7 +76,8 @@ copy.
 - Use **Users** for licensing and reported user activity.
 - Use **Dashboard** for adoption changes across retained reports, independently of
   the report currently selected on Agents or Users.
-- Use the report selector on Agents or Users to change the displayed report set.
+- Admin uses the report selector on Agents or Users to change the selected
+  report set; Viewer and Uploader see the selected report as read-only context.
 - Use **Sync > Manage reports** to inspect or delete accepted report sets.
 
 Deleting a report requires Admin confirmation. Importing a new report does not
@@ -97,7 +113,7 @@ prove that two records represent the same agent.
 2. Open **Reports** (use **Show all** if Reports is hidden), then **Usage**. Under **Reports**, select **Microsoft Copilot > Agents**.
 3. Select one documented reporting window: 7 days or 30 days.
 4. Select each **Agents**, **Users & agents**, and **Users** table/tab and use its **Export CSV** action for that same period.
-5. Keep the original files until Agent Control displays **Reports imported** (or **Reports already imported**). An exact duplicate reuses the original report set; the upload flow selects it for viewing without creating another copy.
+5. Keep the original files until Agent Control displays **Reports imported**. An exact duplicate reuses the original report set without creating another copy or changing the selected report.
 
 Microsoft says interaction usage can become visible within one hour. That is source latency, not proof that an exported or imported set is current. You do not need to record or enter dates to import the files.
 
@@ -179,6 +195,9 @@ call Microsoft providers.
 
 The dashboard's **Adoption by department** panel shows ten departments per page.
 Its company dropdown keeps an accessible label without a visible heading.
+Changing company preserves the previous layout as a non-interactive name-and-bar
+skeleton with a loading indicator until the new results arrive, avoiding a
+temporary collapse. Loading animation respects reduced-motion preferences.
 Numbered buttons, ellipses, and previous/next arrows allow direct page navigation
 while retaining the current rows and organization-wide metrics during loading.
 `GET /api/copilot-usage/adoption/departments` returns `page.number` and `page.offset`
@@ -190,13 +209,13 @@ Use either `pageNumber` or a signed `cursor`, not both.
 
 The **Sync** page presents **CSV usage reports** separately from automatic sync and sync history. Its compact summary shows the saved-set count, **Observed activity dates (UTC)** across all retained complete sets, and last import time. The dates include all three CSV kinds and older reports, regardless of current selection or pagination; they are not administrator-supplied reporting windows. Undated reports show **No dates found in imported reports**. Dates are never inferred from import time, and the bounds do not imply continuous coverage or additive response totals.
 
-The saved history API exposes the observed activity bounds as `summary.activityDateRange.earliestDateUtc` and `latestDateUtc`. It separately retains explicit reporting-window bounds as `summary.reportingWindows.earliestStartDateUtc` and `latestEndDateUtc`, both nullable `YYYY-MM-DD` values; inferred activity ranges do not contribute to those explicit bounds. Draft, incomplete, deleted and damaged sets are excluded, as are other tenants. The summary covers the whole retained history; per-bundle accounting is derived only from observations on the requested page. Imports and deletion update the compact summary automatically. A failed read hides unverified ranges and offers **Retry**; there is no routine refresh button. Viewers can inspect the summary and history; only Admins can import/delete.
+The saved history API exposes the observed activity bounds as `analytics.history.earliestActivityDateUtc` and `latestActivityDateUtc`. It separately retains explicit reporting-window bounds as `analytics.history.earliestReportingStart` and `latestReportingEnd`, both nullable `YYYY-MM-DD` values; inferred activity ranges do not contribute to those explicit bounds. Draft, incomplete, deleted and damaged sets are excluded, as are other tenants. The summary covers the whole retained history; per-bundle accounting is derived only from observations on the requested page. Imports and deletion update the compact summary automatically. A failed read hides unverified ranges and offers **Retry**; there is no routine refresh button. Viewers, Uploaders and Admins can inspect the summary and history. Uploaders and Admins can import new sets; only Admins can correct or delete published sets.
 
-Initial automatic sync collects Users, Graph packages and Power Platform independently of manual CSV reports. Missing reports show **Import needed** without blocking automatic-source setup. An Admin uploads the three companion exports, reviews the summary and selects **Import reports**. Saved-data browsing remains available while uploads or permissions are pending.
+Initial automatic sync collects Users, Graph packages and Power Platform independently of manual CSV reports. Missing reports show **Import needed** without blocking automatic-source setup. An Uploader or Admin uploads the three companion exports, reviews the summary and selects **Import reports**. Saved-data browsing remains available while uploads or permissions are pending.
 
 A changed usable report selection makes the directory source due for refresh; a tenant-shared directory collection started after that change acknowledges it. Report availability and this refresh decision require all three report kinds to be undeleted, unexpired and consistent with their stored row counts. An unusable bundle does not trigger a report-specific refresh or count as a completed CSV import.
 
-Ordinary uploads require no correction acknowledgement. Exact repeated content is deduplicated against non-deleted report sets; unchanged payloads can be reused while source associations and metadata remain available. Changed counts, names, activity values, or supplied source metadata create a new independent report set, even for an already imported reporting window. Newer sets become selected; a historical backfill with an earlier end/start range preserves the existing selection and its revision. An undated import also preserves a dated selection. First imports, newer/equal ranges and corrections to the active set retain their normal activation behavior. The acceptance API preserves selection, revision, and original acceptance time for duplicates. A saved non-active import offers **Keep current report** or an explicit **Use imported reports** confirmation. Content reuse does not establish cross-report user identity.
+Ordinary uploads require no correction acknowledgement. Exact repeated content is deduplicated against non-deleted report sets; unchanged payloads can be reused while source associations and metadata remain available. Changed counts, names, activity values, or supplied source metadata create a new independent report set, even for an already imported reporting window. **Add CSV reports** requests `preserveSelection: true`: the tenant's first complete import is selected automatically, while later imports do not select a different report or fill an empty selection. Duplicates preserve the accepted report's original acceptance time. The success screen offers **Close** or **Add more reports**, not a selection action. Admins can select a different report separately from the Agents or Users report-set dropdown. Content reuse does not establish cross-report user identity.
 
 Deleting a report set does not prevent uploading those CSVs again. A fresh upload creates a new report set and import time without a restore or approval step; the previous record remains deleted. Retrying the original completed request cannot restore its deleted result or select a newer copy. The same rules apply before and after deleted data is purged by retention.
 
@@ -212,20 +231,20 @@ For example, response totals of 100 for June 1-30 and 120 for June 15-July 15 do
 
 The Agents overview keeps four separate measures: agents in the saved repository and Power Platform inventory, including inaccessible agents; agents with a known unblocked package available to some/all users and no known native quarantine (across hosts, not only Teams); distinct report IDs with positive-response evidence **in the selected report set**; and IDs in that same set with positive-response evidence and last activity in the last 30 UTC calendar days. Changing the selected set updates the report cards, usage columns and user reporting together without merging snapshots. Creation or publication alone does not establish end-user access. Shared package versions count once per logical inventory agent. The first two cards clear table filters and show the matching repository/access list without navigating away. Missing access evidence has its own filter and is not labelled unavailable. Partial collection is noted inside the cards. The selected report's activity range, age and unknown-period status remain visible when usage columns are shown.
 
-Full resync preserves accepted report history, including the Sync page's explicitly confirmed **Reset saved data** option. That option clears saved users and inventory, not official reports. Deleting reports remains a separate, explicitly confirmed Admin operation. Opening the uploader leaves Sync's jobs in place. **Cancel** returns to Sync; **OK** after a verified import closes the dialog and opens Agents with that report set selected.
+Full resync preserves accepted report history, including the Sync page's explicitly confirmed **Reset saved data** option. That option clears saved users and inventory, not official reports. Deleting reports remains a separate, explicitly confirmed Admin operation. Opening the uploader leaves Sync's jobs in place. Cancelling an import or selecting **Close** after a verified import returns to Sync without navigating to Agents or selecting another report.
 
 ## Add CSV reports
 
-1. Sign in with `AgentControl.Admin`. Admin includes all Viewer access, including aggregate and user-level accepted report views.
+1. Sign in with `AgentControl.UsageReportUploader` or `AgentControl.Admin`. Both include Viewer access to accepted reports; correcting an existing report requires Admin.
 2. Open **Sync > Add CSV reports** (`/sync?reports=import`). Every ordinary opening starts a fresh upload, even if a previous import finished or server-side drafts exist.
 3. Drop the three original exports into the dialog or select **Choose CSV files**. Files must be CSVs, at most 256 MiB each. Companions may also be added in separate picker operations. No dates or source metadata need to be entered.
 4. Validation starts immediately. Each compact file card shows its filename, report type and row count, or its checking/error status. Valid companions remain in the same bundle; **Choose CSV files** supplies missing/rejected reports. To replace the whole draft, cancel it and reopen **Add CSV reports**.
 5. Once all three kinds validate, **Ready to import** shows the three file summaries and one **Import reports** action in the footer. The server still checks the content hash and selection revision and publishes all companions atomically. Hashes, parser versions, storage accounting, and informational source warnings stay out of this flow; source differences remain available in report details.
-6. The UI verifies the exact saved report and its selection using fresh reads. It does not substitute a different report or call a failed read success. **Reports imported** has one action: **OK**, which rechecks the destination, closes the dialog, and opens Agents. A deletion or another administrator's selection change while the success screen was open is reported rather than silently opening a different set. If verification fails after saving, **Verify saved import** checks the saved result without uploading or importing twice.
+6. The UI verifies the exact saved report using a fresh read. It does not substitute a different report or call a failed read success. **Reports imported** offers **Close**, which returns to Sync, or **Add more reports**, which starts a fresh upload without retaining the completed draft or correction target. Neither action rereads the report or changes the shared selection. If verification fails after saving, **Verify saved import** checks the saved result without uploading or importing twice.
 
 The success screen includes a compact **Agents**, **Users**, and **Responses** summary from that exact report set. Agent and user counts are records in their respective CSVs, including zero-response records, not inventory or active-user totals. Responses use the Agents CSV only; overlapping totals from the three exports are never added. Statistics use the full saved reports, not the one-row verification page, and do not add another approval step.
 
-**Cancel import**, including Escape before publication, asks for confirmation before discarding this draft's unaccepted staging or cancelling an upload. Cleanup failures remain visible and retryable. During acceptance or saved-result verification, cancellation is disabled. An uncertain acceptance must be verified before discarding staged files. Once an exact read verifies a saved backfill, duplicate or correction that is not the current report, **Keep current report** or Escape closes the dialog while retaining the saved import and leaving the tenant's current report unchanged. **Use imported reports** is a separate, explicitly confirmed selection action. The active success screen and **OK** still recheck the exact destination before opening it. Leaving the page stops follow-up requests; abandoned staging retains its server expiry. The compact dialog scrolls its body when needed rather than stretching an empty result to a fixed full-page height.
+**Cancel import**, including Escape before publication, asks for confirmation before discarding this draft's unaccepted staging or cancelling an upload. An empty fresh import closes without a server mutation. Cleanup failures remain visible and retryable. During acceptance or saved-result verification, cancellation is disabled. An uncertain acceptance must be verified before discarding staged files. After a successful exact read, **Close** or Escape retains the saved import and returns to Sync without another read or selection change. If saved-result verification fails, **Close saved import** can return to Sync while retaining the saved report; it does not claim verification succeeded. Leaving the page stops follow-up requests; abandoned staging retains its server expiry. The compact dialog scrolls its body when needed rather than stretching an empty result to a fixed full-page height.
 
 Source metadata remains available to API clients but is not an input in this dialog. Resumed drafts preserve any explicit reporting period and source-as-of metadata when adding missing companions.
 
@@ -253,7 +272,7 @@ existing inline refresh indicator does not add a row or move the table.
 
 ## Manage retained reports
 
-**Sync > Manage reports** (`/sync?reports=manage`) is one paginated list showing import time, activity dates, report/row counts and current/saved status. **View report** is read-only for both roles. Only Admins see **Add CSV reports** and deletion. Selection belongs to the Agents/Users report-set dropdown. History reloads on opening, mutations and window focus; failed reads offer **Retry** and disable unverified actions. Deletion separately confirms whether it clears the selected report.
+**Sync > Manage reports** (`/sync?reports=manage`) is one paginated list showing import time, activity dates, report/row counts and current/saved status. **View report** is read-only for all three roles. Uploaders and Admins see **Add CSV reports**; deletion remains Admin-only. Selection belongs to the Agents/Users report-set dropdown. History reloads on opening, mutations and window focus; failed reads offer **Retry** and disable unverified actions. Deletion separately confirms whether it clears the selected report.
 
 Exact retries use a finite content-free receipt containing tenant, actor, bundle, original hash/revision and original result. They return that result after staging cleanup without republishing/reselecting; changed intent fails. Acceptance reports `reusedExistingSet`, and the UI verifies that exact set even outside the bounded admin list. Viewing selection is a separate fenced request; uncertain selection responses are checked before retrying. Explicit corrections retain supersession semantics; ordinary imports do not create corrections. Deleting the selected set clears selection without choosing an older set.
 
@@ -263,7 +282,7 @@ The read-only inspector in **Sync > Manage reports** shows exact tenant-wide sou
 
 Open an agent's name to inspect its exact report ID, separate licensed/unlicensed source categories, and reconciliation. **Report quality & sources** expands source authority, freshness, versions, file warnings, and interpretation limits; **Source totals differ** remains visible when totals disagree. Technical details do not expand automatically.
 
-The **Manage reports** list omits storage accounting, duplicate payload counts, hashes, and lineage; these remain in API/storage contracts. **Report details** has one **Back to reports** action rather than refresh/current-snapshot shortcuts. Viewing a report pins subsequent queries and CSV export to that set without changing the tenant's selection. History and the inspector are readable by Viewers and Admins; importing, corrections, selection and deletion remain Admin operations. Failed reads remain explicit and disable unverified actions. A failed next-page read never relabels the previous page and offers a return to the first page.
+The **Manage reports** list omits storage accounting, duplicate payload counts, hashes, and lineage; these remain in API/storage contracts. **Report details** has one **Back to reports** action rather than refresh/current-snapshot shortcuts. Viewing a report pins subsequent queries and CSV export to that set without changing the tenant's selection. History and the inspector are readable by Viewers, Uploaders and Admins. Uploaders and Admins can import new sets; corrections, selection and deletion remain Admin operations. Failed reads remain explicit and disable unverified actions. A failed next-page read never relabels the previous page and offers a return to the first page.
 
 Current agent usage belongs to **Agents**; person-level analytics, licensing, and user CSV export belong to **Users**. Use the primary navigation for those workspaces, Permissions, and Audit. Provider collection, **Import reports**, and **Manage reports** all belong to **Sync**. Exact contextual links from an agent or user to its retained source snapshot open the Sync inspector rather than another usage dashboard.
 
@@ -275,7 +294,7 @@ A snapshot dashboard includes all its rows, including undated and zero-response 
 | The three files cannot be imported together | Export all three again from the same report page and reporting period. |
 | Names are concealed | Change the Microsoft 365 report privacy setting and export fresh files. |
 | Rows appear only in the report | Refresh inventory and review report-to-inventory associations. |
-| Import is denied | Confirm the signed-in user has `AgentControl.Admin`. |
+| Import is denied | Confirm the signed-in user has `AgentControl.UsageReportUploader` or `AgentControl.Admin`; corrections require Admin. |
 | A report is no longer needed | Delete it from **Sync > Manage reports**. |
 
 Response totals and agent counts from the Users export are shown separately from the user-agent relationship totals when they disagree. A source discrepancy is a data-quality signal, not a reason to discard rows or overwrite one report with another. Identifiers seen in only one report remain available with their missing-source status.
@@ -389,10 +408,11 @@ Use the current [deployment workflow](deployment-setup.md): initialization accep
 
 | Boundary | Limit |
 | --- | --- |
-| File upload | 8 MiB, 50,000 rows, 4 KiB per field, valid UTF-8 |
-| In-memory admission | Two concurrent uploads per application process; 15-second processing deadline |
-| Actor staging | Nine retained rows, 150,000 parsed rows, 96 MiB; one kind per bundle intent |
-| Tenant staging | 30 retained rows, 500,000 parsed rows, 256 MiB |
+| File upload | 256 MiB; Users: 100,000 rows, Agents: 200,000 rows, Users & agents: 1,000,000 rows; 4 KiB per field, valid UTF-8 |
+| In-memory admission | Four concurrent uploads per application process, at most two per tenant; 30-minute upload deadline |
+| Actor staging | Nine unexpired drafts, 1 GiB staged bytes; one kind per bundle intent |
+| Tenant staging | 30 unexpired drafts, 2 GiB staged bytes |
+| Bundle staging | 1 GiB staged bytes |
 | Staging lifetime | 30 minutes; abandoned rows cleaned before admission, at startup and periodically |
 | Atomic acceptance receipt | 180 days; content-free and independent of staging cleanup |
 | Accepted content | Retained until explicit deletion; shared payloads remain while referenced by another retained report |
@@ -408,6 +428,7 @@ Run [operator retention](operations.md#run-retention) using its exact project/da
 ## Failure recovery
 
 - A malformed, incompatible or schema-drift file is rejected without changing the active set. Correct the input and stage that kind again in the same bundle.
+- Malformed multipart boundaries, part headers and truncated forms return `400 invalid_multipart`; persistence and finalization failures retain their own error status.
 - A missing companion leaves the bundle unpublished. Choose the missing CSVs; **Import reports** becomes available once all three types validate.
 - A stale bundle hash or active revision returns a conflict. **Retry** gets a fresh preview after a definite rejection; an uncertain response instead replays the original request.
 - A partial cancellation failure remains visible. **Retry** cleans up only this draft's remaining staging before closing.

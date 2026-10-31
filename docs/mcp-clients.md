@@ -54,7 +54,7 @@ OAuth identity or blanket tool execution approval.
 
 ## Shared service contract
 
-Start from [deployment setup](deployment-setup.md#local-fastmcp-foundation-phase-05)
+Start from [deployment setup](deployment-setup.md#optional-mcp-service)
 and the [optional local container](deployment-setup.md#optional-local-mcp-container).
 The [local server-settings sample](../mcp/examples/local-settings.example.json)
 belongs to that documented `ConfigureMcp` wizard, **not** to any client below.
@@ -73,7 +73,7 @@ The example origin below is synthetic; use an operator-approved existing origin.
 | Two separate callbacks | Entra returns to **`https://mcp.example.test/auth/callback`**. MCP then returns to the exact **client's** allowlisted callback. Never register the vendor callback as the MCP application's Entra callback |
 | Upstream scopes | SDK requests `api://<MCP-client-guid>/Mcp.Access openid profile offline_access`; delegated OBO requests only `api://<API-client-guid>/AgentControl.Access`. Never paste API/Graph tokens into client settings |
 | Refresh | Form POST `/token`, `grant_type=refresh_token`, same downstream `client_id`, exact `resource`, current refresh token. Store the returned rotated refresh token. Revocation returns `invalid_grant` (pinned SDK currently HTTP 401); reconnect, not a mutation retry |
-| Authorization | Per-user delegated identity, API Viewer/Admin and actual provider permissions. DCR client names and tool annotations grant no permission |
+| Authorization | Per-user delegated identity and API app roles: Viewer, UsageReportUploader, Admin. Local Audit requires Admin. Application Graph reads and delegated provider work retain their respective authority; DCR client names and tool annotations grant no permission. |
 | Catalog | **124 tools**, one typed **`request` object** per call, including `{"request":{}}` for empty input. Discover the current schemas; no resources/prompts or client scheduler are implemented by this service |
 
 ### Native OAuth evidence matrix

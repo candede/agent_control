@@ -45,7 +45,7 @@ test("edits access and installation and reviews blocking inside one agent modal"
   await page.route("**/api/directory/principals/resolve", route => route.fulfill({ json: { value: [principal] } }));
   let freshReads = 0;
   const refresh: PackageRefreshJob = {
-    id: "inline-exact-read", authorizationPrincipalId: "layout-principal", tokenMode: "delegated",
+    id: "inline-exact-read", authorizationPrincipalId: "layout-principal", tokenMode: "application",
     scopeKind: "exact", targetCount: 1, resultRevision: layoutTime, status: "succeeded", pageCount: 1,
     observedCount: 1, totalRecords: 1, snapshotId: unifiedAgents.value[0].observations.graphPackages!.snapshotId,
     createdAt: layoutTime, attemptedAt: layoutTime, updatedAt: layoutTime, finishedAt: layoutTime,

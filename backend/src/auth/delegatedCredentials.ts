@@ -20,7 +20,7 @@ type CredentialOperations = {
   revalidate(signal: AbortSignal): Promise<RequestPrincipal>;
   acquire(capabilityId: CapabilityId, signal: AbortSignal): Promise<AuthenticationResult>;
 };
-const identityScopes = ["https://graph.microsoft.com/User.ReadBasic.All", "openid", "profile"];
+const identityScopes = ["openid", "profile"];
 
 export async function createBearerCredentials(
   verified: VerifiedBearer, epochs: PrincipalEpochAuthority,
@@ -33,7 +33,7 @@ export async function createBearerCredentials(
     const response = await obo(verified, identityScopes, signal, options.fetcher ?? fetch);
     assertTenantConfiguration(verified.tenantId, fingerprint);
     const principal = await bearerRequestPrincipal(verified, response.result, response.clientInfo, epochs,
-      principalId => validateTokenResult(tenant, response.result, "delegated", "https://graph.microsoft.com", ["User.ReadBasic.All"], [], principalId), signal);
+      principalId => validateTokenResult(tenant, response.result, "delegated", "https://graph.microsoft.com", identityScopes, [], principalId), signal);
     assertAuthSignal(signal);
     return { principal, expiresAt: response.result.expiresOn!.getTime() };
   });
@@ -44,7 +44,7 @@ export async function createBearerCredentials(
       const fresh = await obo(verified, identityScopes, signal, options.fetcher ?? fetch);
       const mapped = await bearerRequestPrincipal(verified, fresh.result, fresh.clientInfo, epochs,
         principalId => validateTokenResult(getTenantConfiguration(principal.tenantId), fresh.result, "delegated",
-          "https://graph.microsoft.com", ["User.ReadBasic.All"], [], principalId), signal);
+          "https://graph.microsoft.com", identityScopes, [], principalId), signal);
       requireSamePrincipal(principal, mapped);
       return mapped;
     },
@@ -65,12 +65,16 @@ export function createBrowserCredentials(principal: RequestPrincipal, epochs: Pr
   return new CredentialSource(principal, epochs, {
     revalidate: async () => {
       const result = await revalidateAuthenticatedUserResult(principal.tenantId, principal.principalId);
-      if (principal.localAccountId && result.account?.localAccountId !== principal.localAccountId) throw AppError.unauthorized("Microsoft returned a different local account.");
+      requireSameLocalAccount(principal, result);
       const user = toAuthenticatedUser(result);
       if (user.tenantId !== principal.tenantId || user.homeAccountId !== principal.principalId) throw AppError.unauthorized();
       return refreshBrowserPrincipal(principal, user);
     },
-    acquire: (capabilityId) => acquireDelegatedTokenResult(principal.tenantId, principal.principalId, capabilityId),
+    acquire: async capabilityId => {
+      const result = await acquireDelegatedTokenResult(principal.tenantId, principal.principalId, capabilityId);
+      requireSameLocalAccount(principal, result);
+      return result;
+    },
   });
 }
 
@@ -156,6 +160,8 @@ class CredentialSource implements DelegatedCredentialSource {
       return result.accessToken;
     }, signal);
     if (typeof result !== "string") throw new Error("invalid credential operation");
+    this.assertCurrent();
+    if (this.#principal.authorizationHash !== authorizationHash) throw authorizationRequired();
     return result;
   }
 
@@ -171,7 +177,8 @@ class CredentialSource implements DelegatedCredentialSource {
         const linked = AbortSignal.any([activeSignal, this.#controller.signal]);
         try { return await operation(linked); }
         catch (error) {
-          if (isApplicationError(error) && error.status === 429) this.#cooldownUntil = Date.now() + (error.retryAfterSeconds ?? 30) * 1000;
+          assertAuthSignal(linked);
+          if (isApplicationError(error) && error.status === 429) this.#cooldownUntil = Math.max(this.#cooldownUntil, Date.now() + (error.retryAfterSeconds ?? 30) * 1000);
           if (isApplicationError(error) && error.status === 401) {
             const capabilitySpecific = this.#principal.transport === "browser" && key.startsWith("token:")
               && ["interaction_required", "authorization_expired"].includes(error.code);
@@ -366,6 +373,12 @@ function challengeValue(value: unknown) {
 function requireSamePrincipal(expected: RequestPrincipal, actual: RequestPrincipal) {
   if (["tenantId", "principalId", "localAccountId", "apiClientId", "integrationClientId", "transport", "sessionEpoch"].some(key =>
     expected[key as keyof RequestPrincipal] !== actual[key as keyof RequestPrincipal])) throw mappingUnavailable();
+}
+
+function requireSameLocalAccount(principal: RequestPrincipal, result: AuthenticationResult) {
+  if (principal.localAccountId && result.account?.localAccountId !== principal.localAccountId) {
+    throw AppError.unauthorized("Microsoft returned a different local account.");
+  }
 }
 
 function authorizationRequired() {

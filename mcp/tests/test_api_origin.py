@@ -70,6 +70,39 @@ async def test_real_sdk_obo_audience_and_typed_canonical_progress(invocation, en
     assert invocation.api_token.token.encode() not in contents
 
 
+async def test_uploader_only_api_role_and_typed_import_capability(invocation, entra):
+    entra.response_claims = {"roles": ["AgentControl.UsageReportUploader"]}
+    from agent_control_mcp.models import Definition
+
+    body = {
+        "id": "reports.official.import",
+        "displayName": "Official report upload",
+        "purpose": "Publish new official CSV report sets",
+        "provider": "Local",
+        "maturity": "local",
+        "cloud": "local",
+        "audience": "local",
+        "mode": "local",
+        "permissions": [],
+        "providerRoles": [],
+        "licenses": [],
+        "configuration": [],
+        "sources": [],
+        "dataClass": "report_import",
+        "internalRoles": ["AgentControl.UsageReportUploader"],
+        "probe": {
+            "kind": "local_policy",
+            "adapterRegistered": True,
+            "description": "Local upload authorization",
+        },
+    }
+    assert Definition.model_validate(body).model_dump(exclude_unset=True) == body
+    entra.api_responses.append(httpx2.Response(200, json={"value": []}))
+    await invocation.get_capabilities()
+    assert invocation.api_token.claims["roles"] == ["AgentControl.UsageReportUploader"]
+    assert len(entra.api_calls) == 1
+
+
 async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence(invocation, entra):
     body = {
         "value": [
@@ -83,7 +116,7 @@ async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence
                     "cloud": "global",
                     "audience": "https://graph.microsoft.com",
                     "mode": "delegated",
-                    "permissions": ["User.ReadBasic.All"],
+                    "permissions": ["Group.Read.All"],
                     "providerRoles": [],
                     "licenses": [],
                     "configuration": [],
@@ -218,6 +251,43 @@ async def test_obo_upstream_outage_remains_retryable_and_redacted(
         await invocation.get_capabilities()
     assert deadline.value.status == 504
     assert "sensitive transport" not in str(deadline.value.as_dict())
+
+
+@pytest.mark.parametrize("token_type", [None, True, 0, [], {}])
+async def test_obo_rejects_non_string_token_types(invocation, entra, token_type):
+    entra.exchange_error = httpx2.Response(
+        200,
+        json={"access_token": entra.token(api=True), "token_type": token_type},
+    )
+    with pytest.raises(AdapterError) as error:
+        await invocation.get_capabilities()
+    assert error.value.status == 401
+    assert error.value.code == "reauthorization_required"
+    assert entra.api_calls == []
+
+
+@pytest.mark.parametrize("authorization", [None, "Bearer synthetic-delegated-assertion"])
+async def test_request_stream_never_inherits_shared_client_auth(authorization):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx2.Response(200, json={})
+
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(respond),
+        auth=("synthetic-shared-user", "synthetic-shared-password"),
+        cookies={"shared": "synthetic-cookie"},
+    ) as client:
+        async with auth.request_stream(
+            client,
+            "POST",
+            "https://api.example.test/api/capabilities",
+            headers={"Authorization": authorization} if authorization else None,
+        ) as response:
+            assert response.status_code == 200
+    assert requests[0].headers.get("Authorization") == authorization
+    assert "Cookie" not in requests[0].headers
 
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 413, 429, 503, 504])

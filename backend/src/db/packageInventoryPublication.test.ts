@@ -15,7 +15,7 @@ describe("streamed package publication transaction", () => {
   afterAll(async () => { await fixture?.close(); });
   async function start(scope: { tenantId: string; principalId: string }) {
     const job = await jobs.submit(scope, { authorizationPrincipalId: scope.principalId,
-      tokenMode: "delegated", idempotencyKey: randomUUID() });
+      tokenMode: "application", idempotencyKey: randomUUID() });
     await jobs.markRunning(scope, job.id);
     return job;
   }

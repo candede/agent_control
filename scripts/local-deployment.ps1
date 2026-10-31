@@ -165,27 +165,31 @@ API permissions and tenant administrator consent are prerequisites.
 Configure them before admitting users; the app does not request or grant permissions.
 
 Entra admin center > App registrations > your app > API permissions >
-Add a permission. Select the API and Delegated permissions for user-driven features.
+Add a permission. Select Application permissions for the four standard Graph reads;
+select Delegated permissions for sign-in, Power Platform and administrative changes.
+
+Microsoft Graph - Application permissions:
+  CopilotPackages.Read.All       Tenant package catalog and exact package details.
+  User.Read.All                 Users, agent creators/owners and license assignments.
+  LicenseAssignment.Read.All     Product and service-plan catalog.
+  Reports.Read.All               Per-user Copilot Office app activity.
+These reads use the configured application credentials automatically, without an
+application-enable or scope-approval step. Any assigned Viewer can start them;
+no administrator needs to keep signing into Agent Control.
+Reports.Read.All does not replace the Agents, Users & agents, and Users CSV exports.
 
 Microsoft Graph - Delegated permissions:
   openid                         Sign-in: authenticate the account.
   profile                        Sign-in: account identity and display name.
   offline_access                 Session renewal without repeated sign-in.
-  CopilotPackages.Read.All       Read the Copilot package catalog.
   CopilotPackages.ReadWrite.All  Block/unblock and other package controls.
-                                Also satisfies package-read permission checks.
-  User.ReadBasic.All             Look up users.
-  Group.Read.All                 Look up groups.
-  User.Read.All                  Discover Copilot-capable users.
-  LicenseAssignment.Read.All     Check paid Copilot service assignments.
-  Reports.Read.All               Read Microsoft 365 Copilot usage reports.
-  AgentIdentity.Read.All         Verify newer Studio log identities.
-  AuditLogsQuery.Read.All        Search Microsoft Purview audit records.
-  ThreatHunting.Read.All         Run Defender advanced hunting queries.
+                                Also authorizes exact control readback.
+  Group.Read.All                 Management group lookup.
 
 User.Read is not used by Agent Control.
-Keep CopilotPackages.Read.All and User.ReadBasic.All alongside broader grants:
-the current app requests these read scopes separately.
+User search, recipient validation and exact adoption people resolution use
+application User.Read.All. Group.Read.All is only for delegated group lookups.
+MCP identity mapping uses openid/profile and needs no directory-read grant.
 
 Power Platform - Delegated permissions:
   ResourceQuery.Resources.Read   Read Power Platform inventory.
@@ -193,15 +197,16 @@ Power Platform - Delegated permissions:
   Resource/application ID: 8578e004-a5c6-46e7-913e-12f58912df43
 
 Select Grant admin consent in the existing app registration.
-After sign-in, the app checks delegated access automatically without requiring
+After sign-in, the app checks read access automatically without requiring
 probe-button clicks. Normal sign-in, MFA or Conditional Access may still require
 the user's participation; feature permission grants remain administrator-managed.
 Automatic checks never change packages, quarantine agents or run investigations.
 Token acquisition alone does not prove provider access, roles or licensing.
-Optional Microsoft Graph Application permissions, ONLY for separately enabled
-app-only features: CopilotPackages.Read.All, AuditLogsQuery.Read.All,
-ThreatHunting.Read.All. A client secret does not require Application permissions;
-do not add both permission types by default.
+No delegated fallback is used for standard Graph collection.
+Purview, Defender and investigation-only identity setup are hidden from the UI.
+Their backend is unchanged; deferred investigation-only permissions are
+AgentIdentity.Read.All, AuditLogsQuery.Read.All and ThreatHunting.Read.All.
+They are not prerequisites for adoption use.
 
 App roles (separate from API permissions):
   Add the appRoles entries from infra/entra-app-manifest.json, preserving the
@@ -210,22 +215,34 @@ App roles (separate from API permissions):
   a role is defined, not who receives it.
   In Enterprise applications > your app > Properties, set Assignment required
   to Yes. Under Users and groups, assign one role to each approved user/group:
-    AgentControl.Viewer  Observe inventory, reports and investigations.
-    AgentControl.Admin   All viewing plus supported changes, imports and configuration.
-  Admin includes Viewer access; only one role assignment is needed.
-  Assign only the Viewer or Admin role.
+    AgentControl.Viewer               Observe tenant data and request read synchronization.
+    AgentControl.UsageReportUploader  Viewer access plus upload, validation and
+                                     publication of new official CSV report sets.
+    AgentControl.Admin                All viewing and upload access plus supported
+                                     changes, report corrections/deletion and configuration.
+  Admin includes Viewer access and Usage Report Uploader access.
+  Usage Report Uploader includes Viewer access; only one role assignment is needed.
+  Assign only the Viewer, UsageReportUploader or Admin role.
+  Uploaders can inspect and discard their own uncommitted drafts; correcting or
+  deleting published reports remains Admin-only. Downloading Microsoft CSVs still
+  requires the external Reports Reader or AI Administrator role; app roles do not
+  grant that provider access.
   Sign out and back in after assignment. Provider permissions still apply.
 
-Provider-side requirements still apply to the signed-in user:
-  Inventory: one of Global Administrator, Power Platform Administrator, Dynamics 365
+Provider-side requirements still apply to the signed-in user for delegated actions:
+  Power Platform inventory: one of Global Administrator, Power Platform Administrator, Dynamics 365
   Administrator, Global Reader, AI Administrator or AI Reader. AI roles are
   limited to AI-scoped resources.
   Quarantine: one of Global Administrator, AI Administrator or Power Platform Administrator.
-  Purview: Audit Logs or View-Only Audit Logs access, with auditing enabled.
-  Defender: Defender XDR RBAC and data-source access.
+  Power Platform Inventory rejects service principals and managed identities.
+  Package controls: application Admin role, delegated CopilotPackages.ReadWrite.All,
+  licensing and exact confirmation. The package API publishes no additional
+  Entra administrator-role prerequisite.
 Applicable licensing is also required (including Microsoft Agent 365 for package
 APIs). CSV report import and local application audit need no external API permission.
-Consent alone does not enable unsupported operations or qualify provider writes.
+Read collection starts automatically while a signed-in browser is visible and
+online. This is not an unattended scheduler. Consent alone does not enable
+unsupported operations.
 
 This wizard displays guidance only; it does not verify or grant permissions.
 See docs/deployment-setup.md and docs/provider-contracts.md

@@ -35,11 +35,11 @@ vi.mock("./OfficialUsageImportPanel", () => ({
   },
 }));
 
-function Host({ canManage = true }: { canManage?: boolean }) {
+function Host({ canManage = true, canImport = canManage }: { canManage?: boolean; canImport?: boolean }) {
   const [route, setRoute] = useState<SyncReportRouteState>();
   return <>
-    <button onClick={() => setRoute({ view: canManage ? "import" : "manage", activityWindowDays: 30 })}>Open reports</button>
-    <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage={canManage}
+    <button onClick={() => setRoute({ view: canImport ? "import" : "manage", activityWindowDays: 30 })}>Open reports</button>
+    <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage={canManage} canImport={canImport}
       revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
   </>;
 }
@@ -61,11 +61,24 @@ beforeEach(() => {
 });
 
 describe("focused report dialogs", () => {
+  it("opens new uploads for a non-admin Uploader but refuses correction deep links", async () => {
+    const props = { onRouteChange: vi.fn(), canManage: false, canImport: true, revision: 0, onChanged: vi.fn() };
+    const { rerender } = render(<OfficialUsageImportModal {...props} route={{ view: "import", activityWindowDays: 30 }} />);
+    expect(screen.getByRole("dialog", { name: "Add CSV reports" })).toBeVisible();
+    expect(importMount).toHaveBeenCalled();
+    importMount.mockClear();
+    rerender(<OfficialUsageImportModal {...props} route={{ view: "import", reportSetId, activityWindowDays: 30 }} />);
+    expect(screen.getByRole("dialog", { name: "Manage reports" })).toHaveTextContent("Admin access is required to replace saved reports");
+    await screen.findByRole("table");
+    expect(importMount).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /Delete report|Correct report/ })).not.toBeInTheDocument();
+  });
+
   it.each(["reports", "workbench"] as const)("keeps shared scrolling locked when %s closes before the other dialog", first => {
     const overflow = document.body.style.overflow;
     const content = (reportsOpen: boolean, workbenchOpen: boolean) => <>
       <OfficialUsageImportModal route={reportsOpen ? { view: "import", activityWindowDays: 30 } : undefined}
-        onRouteChange={vi.fn()} canManage revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
+        onRouteChange={vi.fn()} canManage canImport revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
       <WorkbenchDialog open={workbenchOpen} title="Sync status">Status</WorkbenchDialog>
     </>;
     const { rerender, unmount } = render(content(first === "reports", first === "workbench"));
@@ -87,7 +100,7 @@ describe("focused report dialogs", () => {
     const { unmount } = render(<StrictMode>
       <WorkbenchDialog open title="Sync status">Status</WorkbenchDialog>
       <OfficialUsageImportModal route={{ view: "import", activityWindowDays: 30 }}
-        onRouteChange={vi.fn()} canManage revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
+        onRouteChange={vi.fn()} canManage canImport revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
     </StrictMode>);
     expect(document.body.style.overflow).toBe("hidden");
     unmount();
@@ -110,7 +123,7 @@ describe("focused report dialogs", () => {
         <section className="data-sync-reports" aria-label="Sync report actions">
           {canManage ? <button>Add CSV reports</button> : null}<button>Manage reports</button>
         </section>
-        <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage={canManage}
+        <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage={canManage} canImport={canManage}
           revision={0} onChanged={vi.fn()} onImported={vi.fn()} />
       </>;
     }
@@ -162,7 +175,7 @@ describe("focused report dialogs", () => {
     const onRouteChange = vi.fn();
     const onImported = vi.fn();
     render(<OfficialUsageImportModal route={{ view: "import", activityWindowDays: 30 }}
-      onRouteChange={onRouteChange} canManage revision={0} onChanged={vi.fn()} onImported={onImported} />);
+      onRouteChange={onRouteChange} canManage canImport revision={0} onChanged={vi.fn()} onImported={onImported} />);
     expect(onImported).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(onRouteChange).toHaveBeenCalledExactlyOnceWith(undefined);
@@ -174,7 +187,7 @@ describe("focused report dialogs", () => {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({
         view: "import", stagingId: "saved-stage", reportSetId, activityWindowDays: 30,
       });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={vi.fn()} />;
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0} onChanged={vi.fn()} />;
     }
     render(<RoutedHost />);
     const retiredStage = importStage.mock.lastCall?.[0];
@@ -191,7 +204,7 @@ describe("focused report dialogs", () => {
   it("offers Add CSV reports from management, starting a new import rather than reusing a staging link", async () => {
     function RoutedHost() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "manage", stagingId: "old-stage", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport
         revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
     }
     render(<RoutedHost />);
@@ -203,7 +216,7 @@ describe("focused report dialogs", () => {
   it("keeps report inspection read-only in the same dialog and returns to the report list", async () => {
     function RoutedHost() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "manage", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport
         revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
     }
     render(<RoutedHost />);
@@ -224,8 +237,8 @@ describe("focused report dialogs", () => {
     function RoutedHost() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "manage", activityWindowDays: 30 });
       return <OfficialUsageImportModal route={route} onRouteChange={next => setRoute(parseSyncReportRoute(
-        dataSyncRouteSearch({ refreshMode: "delegated", reports: next }).toString(),
-      ))} canManage revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
+        dataSyncRouteSearch({ refreshMode: "application", reports: next }).toString(),
+      ))} canManage canImport revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
     }
     render(<RoutedHost />);
     await userEvent.click(await screen.findByRole("button", { name: "Delete report set" }));
@@ -241,8 +254,8 @@ describe("focused report dialogs", () => {
 
   it("keeps Viewer imports denied without mounting the importer or an agent locator", async () => {
     render(<OfficialUsageImportModal route={{ view: "import", activityWindowDays: 30 }}
-      onRouteChange={vi.fn()} canManage={false} revision={0} onChanged={vi.fn()} onImported={vi.fn()} />);
-    expect(screen.getByRole("dialog", { name: "Manage reports" })).toHaveTextContent("An administrator is required");
+      onRouteChange={vi.fn()} canManage={false} canImport={false} revision={0} onChanged={vi.fn()} onImported={vi.fn()} />);
+    expect(screen.getByRole("dialog", { name: "Manage reports" })).toHaveTextContent("UsageReportUploader or Admin access is required");
     await screen.findByRole("table");
     expect(importMount).not.toHaveBeenCalled();
     expect(api.previewReportOperation).not.toHaveBeenCalled();
@@ -252,7 +265,7 @@ describe("focused report dialogs", () => {
   });
 
   it("unmounts report data on close and reloads it on reopening", async () => {
-    render(<Host canManage={false} />);
+    render(<Host canManage={false} canImport={false} />);
     await userEvent.click(screen.getByRole("button", { name: "Open reports" }));
     await screen.findByRole("table");
     await userEvent.click(screen.getByRole("button", { name: "Close reports" }));
@@ -264,7 +277,7 @@ describe("focused report dialogs", () => {
 
   it("does not let a queued close dismiss a reopened draft or its replacement account owner", async () => {
     vi.useFakeTimers();
-    const props = { onRouteChange: vi.fn(), canManage: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
+    const props = { onRouteChange: vi.fn(), canManage: true, canImport: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
     const route: SyncReportRouteState = { view: "import", activityWindowDays: 30 };
     const content = (open: boolean, owner = "first") => <OfficialUsageImportModal key={owner} {...props} route={open ? route : undefined} />;
     const { rerender, unmount } = render(content(true));
@@ -290,7 +303,7 @@ describe("focused report dialogs", () => {
   });
 
   it("passes explicit staging and report-window links without silently substituting defaults", async () => {
-    const props = { onRouteChange: vi.fn(), canManage: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
+    const props = { onRouteChange: vi.fn(), canManage: true, canImport: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
     const view = render(<OfficialUsageImportModal {...props} route={{ view: "import", stagingId: "exact-stage", activityWindowDays: 7 }} />);
     expect(importMount).toHaveBeenLastCalledWith("exact-stage");
     await act(async () => view.rerender(<OfficialUsageImportModal {...props}
@@ -301,7 +314,7 @@ describe("focused report dialogs", () => {
   });
 
   it("preserves owned input when saving or clearing its resume link and rejects retired draft callbacks", async () => {
-    const props = { onRouteChange: vi.fn(), canManage: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
+    const props = { onRouteChange: vi.fn(), canManage: true, canImport: true, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
     const route: SyncReportRouteState = { view: "import", activityWindowDays: 30 };
     const view = render(<OfficialUsageImportModal {...props} route={route} />);
     const input = screen.getByLabelText("Selected import draft");
@@ -331,7 +344,7 @@ describe("focused report dialogs", () => {
   it.each(["close", "revision"] as const)("retires pending report history on %s without admitting its late response", async transition => {
     const pending = deferred<ReturnType<typeof reportPage<unknown>>>();
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);
-    const props = { onRouteChange: vi.fn(), canManage: false, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
+    const props = { onRouteChange: vi.fn(), canManage: false, canImport: false, revision: 0, onChanged: vi.fn(), onImported: vi.fn() };
     const route: SyncReportRouteState = { view: "manage", activityWindowDays: 30 };
     const view = render(<OfficialUsageImportModal {...props} route={route} />);
     expect(api.readReportPage).toHaveBeenCalledOnce();

@@ -41,7 +41,7 @@ describe("workbench metadata", () => {
   });
 
   it("uses application authorization for application package refresh recovery", () => {
-    expect(getWorkbenchMetadata().actions.find(action => action.id === "packages.refresh.application.resume")).toMatchObject({
+    expect(getWorkbenchMetadata().actions.find(action => action.id === "packages.refresh.resume")).toMatchObject({
       roles: ["AgentControl.Viewer"], capabilityId: "graph.package.read.application",
       method: "POST", route: "/api/agents/refresh-jobs/:id/resume", recovery: "resume_unsent",
     });
@@ -72,11 +72,11 @@ describe("workbench metadata", () => {
   it("keeps report workflows in Sync with native imports and cancellable persisted exports", () => {
     const actions = getWorkbenchMetadata().actions;
     expect(actions.find(action => action.id === "usage.import")).toMatchObject({
-      label: "Import reports in Sync", roles: ["AgentControl.Admin"], capabilityId: "reports.official.import",
+      label: "Import reports in Sync", roles: ["AgentControl.UsageReportUploader"], capabilityId: "reports.official.import",
       method: "POST", route: "/api/official-usage/bundles/:id/accept", preview: "required", confirmation: "explicit",
     });
     expect(actions.find(action => action.id === "usage.staging.cancel")).toMatchObject({
-      label: "Discard actor-owned staging in Sync", roles: ["AgentControl.Admin"],
+      label: "Discard actor-owned staging in Sync", roles: ["AgentControl.UsageReportUploader"],
       method: "DELETE", route: "/api/official-usage/staging/:id", confirmation: "explicit",
     });
     expect(actions.find(action => action.id === "usage.export.aggregate")).toMatchObject({
@@ -85,6 +85,18 @@ describe("workbench metadata", () => {
     });
     expect(actions.find(action => action.id === "usage.export.users")).toMatchObject({
       roles: ["AgentControl.Viewer"], method: "POST", route: "/api/data-exports", recovery: "cancel_unsent",
+    });
+  });
+
+  it("requires Admin for the Audit view, reads and exports", () => {
+    const metadata = getWorkbenchMetadata();
+    expect(metadata.views.find(view => view.id === "audit")).toMatchObject({ roles: ["AgentControl.Admin"] });
+    expect(metadata.actions.find(action => action.id === "audit.export")).toMatchObject({ roles: ["AgentControl.Admin"] });
+    expect(declaredRoutePolicies.get("GET /audit/events")).toMatchObject({
+      access: "authenticated", roles: ["AgentControl.Admin"],
+    });
+    expect(declaredRoutePolicies.get("POST /audit/events/export.csv")).toMatchObject({
+      access: "authenticated", roles: ["AgentControl.Admin"], csrf: true, browserOnly: true,
     });
   });
 
@@ -131,7 +143,7 @@ describe("workbench metadata", () => {
       route: "/api/agents/refresh-selection",
       method: "POST",
       nativeTarget: "graph_package_id",
-      capabilityId: "graph.package.read.delegated",
+      capabilityId: "graph.package.read.application",
       recovery: "reauthorize",
     });
     expect(metadata.actions.filter(action => action.source === "data_sync").map(action => action.id)).toEqual([

@@ -481,8 +481,7 @@ CREATE TABLE package_refresh_jobs (
   , expires_at timestamp with time zone DEFAULT clock_timestamp() + CAST('7 days' AS interval) NOT NULL
   , auto_details boolean DEFAULT FALSE NOT NULL
   , CONSTRAINT inventory_refresh_job_mode CHECK (NOT auto_details
-                                              OR (scope_kind = CAST('exact' AS text)
-                                              AND token_mode = CAST('delegated' AS text)))
+                                              OR scope_kind = CAST('exact' AS text))
   , CONSTRAINT package_refresh_jobs_authorization_principal_id_check CHECK (length(authorization_principal_id) >= 1
                                                                         AND length(authorization_principal_id) <= 256)
   , CONSTRAINT package_refresh_jobs_error_code_check CHECK (length(error_code) <= 128)
@@ -505,8 +504,7 @@ CREATE TABLE package_refresh_jobs (
                                                                          , CAST('cancelled' AS text)]))
   , CONSTRAINT package_refresh_jobs_tenant_id_check CHECK (length(tenant_id) >= 1
                                                        AND length(tenant_id) <= 128)
-  , CONSTRAINT package_refresh_jobs_token_mode_check CHECK (token_mode = ANY(ARRAY[CAST('delegated' AS text)
-                                                                                 , CAST('application' AS text)]))
+  , CONSTRAINT package_refresh_jobs_token_mode_check CHECK (token_mode = CAST('application' AS text))
   , CONSTRAINT package_refresh_jobs_total_records_check CHECK (total_records >= 0
                                                            AND total_records <= ${inventoryLimits.sourceRows})
   , CONSTRAINT package_refresh_jobs_pkey PRIMARY KEY (id)
@@ -1063,6 +1061,7 @@ CREATE TABLE official_usage_bundle_receipts (
     tenant_id text NOT NULL
   , actor_principal_id text NOT NULL
   , bundle_id uuid NOT NULL
+  , correction_of_set_id uuid
   , bundle_hash text NOT NULL
   , expected_active_revision bigint NOT NULL
   , result_set_id uuid NOT NULL

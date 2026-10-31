@@ -12,7 +12,6 @@ param(
     [string]$ArtifactPath = (Join-Path $PSScriptRoot 'artifacts/release/agent-control-linux-x64.zip'),
     [string]$ReceiptPath = (Join-Path $PSScriptRoot 'artifacts/release/azure-deployment-receipt.json'),
     [string]$ResumeReceiptPath,
-    [string]$AuthenticationSmokeReceiptPath,
     [string]$QualificationTargetsFile,
     [string]$RestorePoint,
 
@@ -210,7 +209,7 @@ try {
     }
     $context = New-AzureDeploymentContext -Root $PSScriptRoot -Target $target -ExecutionMode $ExecutionMode `
         -MockFixturePath $MockFixturePath -ArtifactPath $ArtifactPath -ReceiptPath $ReceiptPath `
-        -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action -AuthenticationSmokeReceiptPath $AuthenticationSmokeReceiptPath `
+        -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action `
         -QualificationTargets $(if ($QualificationTargetsFile) { Get-Content -LiteralPath ([IO.Path]::GetFullPath($QualificationTargetsFile)) -Raw | ConvertFrom-Json -Depth 20 } else { $null }) `
         -Component $Component
     $receipt = Invoke-AzureDeployment -Context $context -Action $Action -RestorePoint $RestorePoint

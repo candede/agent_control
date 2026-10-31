@@ -249,7 +249,7 @@ function Test-ApprovedQualificationTargets {
         [string]::IsNullOrWhiteSpace([string]$Qualification.restorationOwner)) {
         throw 'Qualification expiry/restoration ownership is invalid.'
     }
-    $roles = @('AgentControl.Viewer', 'AgentControl.Admin')
+    $roles = @('AgentControl.Viewer', 'AgentControl.UsageReportUploader', 'AgentControl.Admin')
     foreach ($persona in @($Qualification.personas)) {
         Assert-GuidValue $persona.principalObjectId 'Qualification principalObjectId'
         if (-not @($persona.appRoles).Count -or @($persona.appRoles | Where-Object { $_ -cnotin $roles }).Count) {
@@ -507,7 +507,6 @@ function New-AzureDeploymentContext {
         [string]$ReceiptPath,
         [string]$ResumeReceiptPath,
         [ValidateSet('Plan', 'Deploy', 'PointInTimeRestore', 'Recover', 'Cleanup', 'Stop')][string]$RequestedAction,
-        [string]$AuthenticationSmokeReceiptPath,
         $QualificationTargets,
         [ValidateSet('All','Application','Mcp')][string]$Component = 'All'
     )
@@ -541,7 +540,6 @@ function New-AzureDeploymentContext {
         RestoredServerName = $null
         ServingServerName = $Target.resources.postgresFlexibleServer.name
         QualificationTargets = $QualificationTargets
-        AuthenticationSmokeReceiptPath = $(if ($AuthenticationSmokeReceiptPath) { [IO.Path]::GetFullPath($AuthenticationSmokeReceiptPath) } else { $null })
         Resuming = $false
         ResumeEvidence = @{}
         PreviousFailedStep = $null
@@ -619,39 +617,6 @@ function Invoke-DeploymentHttpGet {
     return @{ statusCode = [int]$response.StatusCode; body = [string]$response.Content; contentType = [string]$response.Headers.'Content-Type' }
 }
 
-function Test-AuthenticationSmokeReceipt {
-    param($Context, [string]$ContainedStartedAt)
-    if (-not $Context.AuthenticationSmokeReceiptPath -or -not (Test-Path -LiteralPath $Context.AuthenticationSmokeReceiptPath -PathType Leaf)) {
-        throw 'A human-approved authentication smoke receipt is required before public admission can open.'
-    }
-    $receipt = Get-Content -LiteralPath $Context.AuthenticationSmokeReceiptPath -Raw | ConvertFrom-Json -Depth 20
-    $artifact = Test-ReleaseArtifact $Context.ArtifactPath
-    $performedAt = [DateTimeOffset]::MinValue
-    if ($receipt.receiptVersion -ne 1 -or $receipt.isApproval -ne $true -or $receipt.loginCallbackSessionVerified -ne $true) {
-        throw 'Authentication smoke receipt must be an explicit version-1 login/callback/session approval.'
-    }
-    if ($receipt.deploymentRunId -cne $Context.RunId -or $receipt.targetApprovalDigest -cne (Get-TargetApprovalDigest $Context.Target)) {
-        throw 'Authentication smoke receipt does not bind the exact deployment run and approved target.'
-    }
-    if ($receipt.canonicalOrigin -cne $Context.Target.canonicalOrigin -or $receipt.callbackUri -cne $Context.Target.callbackUri -or
-        $receipt.artifactSha256 -cne $artifact.checksum) {
-        throw 'Authentication smoke receipt does not bind the exact origin, callback and artifact.'
-    }
-    try { $performedAt = [DateTimeOffset]$receipt.performedAt } catch { throw 'Authentication smoke receipt approval/time evidence is invalid.' }
-    if ([string]::IsNullOrWhiteSpace([string]$receipt.approvedBy) -or [string]::IsNullOrWhiteSpace([string]$receipt.reference) -or
-        $performedAt -gt [DateTimeOffset]::UtcNow.AddMinutes(5) -or $performedAt -lt [DateTimeOffset]::UtcNow.AddHours(-8)) {
-        throw 'Authentication smoke receipt approval/time evidence is invalid.'
-    }
-    if ($Context.ExecutionMode -eq 'Real') {
-        if ($receipt.evidenceType -cne 'human_operator' -or -not $ContainedStartedAt -or $performedAt -lt [DateTimeOffset]$ContainedStartedAt) {
-            throw 'Real authentication evidence must be human-approved after the contained application start.'
-        }
-    } elseif ($receipt.evidenceType -cne 'synthetic_fixture') {
-        throw 'Mock authentication evidence must be explicitly labeled synthetic_fixture.'
-    }
-    return @{ authentication = 'human-approved-contract'; performedAt = $performedAt.ToString('o'); valuesRedacted = $true }
-}
-
 function Import-AzureDeploymentReceipt {
     param($Context, [string]$Path, [string]$RequestedAction)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Resume receipt was not found.' }
@@ -672,8 +637,8 @@ function Import-AzureDeploymentReceipt {
         throw 'Resume artifact differs from the exact recorded application release.'
     }
     if ($RequestedAction -eq 'Cleanup') {
-        if ($receipt.status -notin @('failed', 'cleanup_failed', 'awaiting_authentication_smoke')) { throw 'Cleanup accepts only an exact failed or contained-pause receipt.' }
-    } elseif ($receipt.action -cne $RequestedAction -or $receipt.status -notin @('failed', 'cleanup_succeeded', 'awaiting_authentication_smoke',
+        if ($receipt.status -notin @('failed', 'cleanup_failed')) { throw 'Cleanup accepts only an exact failed receipt.' }
+    } elseif ($receipt.action -cne $RequestedAction -or $receipt.status -notin @('failed', 'cleanup_succeeded',
         'mcp_failed','deployed_mcp_failed','recovered_mcp_failed')) {
         throw 'Resume action must match the failed receipt action.'
     }
@@ -683,7 +648,7 @@ function Import-AzureDeploymentReceipt {
         'approval_checkpoint', 'resume_verify', 'resource_deploy', 'network_reconcile', 'enter_maintenance',
         'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
         'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
-        'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
+        'database_reopen', 'open_and_verify',
         'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup',
         'mcp_preflight','mcp_what_if','mcp_stop','mcp_apply','mcp_start','mcp_verify','mcp_resume_verify'
     )
@@ -728,6 +693,7 @@ function Import-AzureDeploymentReceipt {
 function Invoke-RealAzureOperation {
     param($Context, [string]$Name, $OperationInput)
     $target = $Context.Target
+    $origin = $target.canonicalOrigin.TrimEnd('/')
     if ($Name -like 'mcp_*') { return Invoke-AzureMcpOperation $Context $Name }
     switch ($Name) {
         'prerequisites' {
@@ -826,7 +792,7 @@ function Invoke-RealAzureOperation {
                 $target.callbackUri -notin @($app.web.redirectUris)) {
                 Write-Host "Registration preview requires exactly these role values: $($expectedRoles -join ', ')"
                 Write-Host "Registration preview requires callback: $($target.callbackUri)"
-                throw 'Registration differs from the approved two-role Users/Groups/callback preview. Apply the displayed administrator-owned change, then rerun; the wizard never writes directory configuration.'
+                throw 'Registration differs from the approved three-role Users/Groups/callback preview. Apply the displayed administrator-owned change, then rerun; the wizard never writes directory configuration.'
             }
             $servicePrincipals = Get-AzJson @('ad', 'sp', 'list', '--filter', "appId eq '$($target.entraApplicationId)'")
             if (@($servicePrincipals).Count -ne 1) { throw 'The exact application service principal is missing or ambiguous.' }
@@ -1110,12 +1076,12 @@ function Invoke-RealAzureOperation {
             return @{ admission = 'closed'; app = 'started_contained'; startedAt = [DateTimeOffset]::UtcNow.ToString('o') }
         }
         'contained_smoke' {
-            $health = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/health"
-            $ready = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/ready"
-            $rootPage = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/"
-            $deepLink = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/agents"
-            $unauthenticated = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/agents"
-            $auth = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/auth/status"
+            $health = Invoke-DeploymentHttpGet $Context "$origin/api/health"
+            $ready = Invoke-DeploymentHttpGet $Context "$origin/api/ready"
+            $rootPage = Invoke-DeploymentHttpGet $Context "$origin/"
+            $deepLink = Invoke-DeploymentHttpGet $Context "$origin/agents"
+            $unauthenticated = Invoke-DeploymentHttpGet $Context "$origin/api/agents"
+            $auth = Invoke-DeploymentHttpGet $Context "$origin/api/auth/status"
             $healthBody = try { $health.body | ConvertFrom-Json } catch { $null }
             $authBody = try { $auth.body | ConvertFrom-Json } catch { $null }
             if ($health.statusCode -ne 200 -or $healthBody.ok -ne $true -or $ready.statusCode -ne 503 -or
@@ -1125,26 +1091,23 @@ function Invoke-RealAzureOperation {
             }
             return @{ admission = 'closed'; health = 'passed'; readiness = 'maintenance'; staticAndDeepLink = 'passed'; unauthenticatedApiDenied = $true; authConfiguration = 'passed' }
         }
-        'authentication_smoke_verify' {
-            return Test-AuthenticationSmokeReceipt $Context ([string]$OperationInput.ContainedStartedAt)
-        }
         'open_and_verify' {
             Get-AzJson @('webapp', 'config', 'appsettings', 'delete', '--ids', $target.expectedResourceIds.appService, '--setting-names', 'MAINTENANCE_MODE') | Out-Null
             $ready = $null
             $attempts = 0
             do {
                 $attempts++
-                $ready = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/ready"
+                $ready = Invoke-DeploymentHttpGet $Context "$origin/api/ready"
                 if ($ready.statusCode -ne 200 -and $attempts -lt 5 -and $Context.ExecutionMode -eq 'Real') { Start-Sleep -Seconds ([Math]::Min(20, 2 * $attempts)) }
             } while ($ready.statusCode -ne 200 -and $attempts -lt 5)
-            $auth = Invoke-DeploymentHttpGet $Context "$($target.canonicalOrigin)/api/auth/status"
+            $auth = Invoke-DeploymentHttpGet $Context "$origin/api/auth/status"
             $readyBody = try { $ready.body | ConvertFrom-Json } catch { $null }
             $authBody = try { $auth.body | ConvertFrom-Json } catch { $null }
             if ($ready.statusCode -ne 200 -or $readyBody.ok -ne $true -or $auth.statusCode -ne 200 -or
                 $authBody.authConfigured -ne $true -or $authBody.callback -cne $target.callbackUri) {
                 throw 'Post-open readiness/auth configuration verification failed; admission must be reclosed.'
             }
-            return @{ admission = 'open'; readiness = 'passed'; authConfiguration = 'passed'; attempts = $attempts; loginProof = 'human-approved-receipt' }
+            return @{ admission = 'open'; readiness = 'passed'; authConfiguration = 'passed'; attempts = $attempts; loginProof = 'not_verified_by_deployment_checks' }
         }
         'database_reopen' {
             return Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'reopen') -ServerName $Context.ServingServerName
@@ -1248,7 +1211,7 @@ function Invoke-DeploymentOperation {
     $safeResumeRechecks = @('prerequisites', 'operator_identity', 'bicep_build', 'sku_pricing_preflight', 'vault_preflight',
         'registration_verify', 'qualification_preflight', 'target_inventory', 'release_inspection', 'bicep_what_if',
         'approval_checkpoint', 'resume_verify', 'drain_verify', 'backup_health_verify', 'runtime_access_verify',
-        'contained_smoke', 'authentication_smoke_verify', 'contain_runtime',
+        'contained_smoke', 'contain_runtime',
         'mcp_preflight','mcp_what_if','mcp_stop','mcp_start','mcp_verify','mcp_resume_verify')
     if ($Context.Resuming -and $Context.Completed.Contains($Name) -and $Name -notin $safeResumeRechecks) {
         $Context.Calls.Add("resume-skip:$Name")
@@ -1288,6 +1251,7 @@ function New-AzureBootstrapDirectory {
         return $Context.BootstrapDirectory
     }
     $directory = Join-Path $Context.Root "artifacts/azure-bootstrap/$($Context.RunId)"
+    $Context.BootstrapDirectory = $directory
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     Protect-AzureBootstrapPath $directory -Directory
     foreach ($pair in @(
@@ -1299,7 +1263,6 @@ function New-AzureBootstrapDirectory {
         [IO.File]::WriteAllText($path, $pair.value)
         Protect-AzureBootstrapPath $path
     }
-    $Context.BootstrapDirectory = $directory
     $Context.BootstrapSecretsMaterialized = $true
     Assert-AzureBootstrapMaterialized $Context
     return $directory
@@ -1830,9 +1793,6 @@ function Invoke-AzureDeployment {
     try {
         if ($Action -eq 'Cleanup') {
             $failedStep = 'cleanup'
-            if ($Context.ResumeStatus -eq 'awaiting_authentication_smoke') {
-                $evidence.containment = Invoke-DeploymentOperation $Context 'contain_runtime'
-            }
             $evidence.cleanup = Invoke-DeploymentOperation $Context 'cleanup'
             foreach ($step in @('cleanup', 'network_reconcile')) { [void]$Context.Completed.Remove($step) }
             if (-not $Context.Completed.Contains('recovery_switch')) {
@@ -1898,14 +1858,6 @@ function Invoke-AzureDeployment {
             $evidence.start_contained = Invoke-DeploymentOperation $Context 'start_contained'
             $failedStep = 'contained_smoke'
             $evidence.contained_smoke = Invoke-DeploymentOperation $Context 'contained_smoke'
-            $failedStep = 'authentication_smoke_verify'
-            if ($Context.ExecutionMode -eq 'Real' -and (-not $Context.AuthenticationSmokeReceiptPath -or
-                -not (Test-Path -LiteralPath $Context.AuthenticationSmokeReceiptPath -PathType Leaf))) {
-                return Write-AzureDeploymentReceipt $Context 'awaiting_authentication_smoke' $failedStep $evidence
-            }
-            $evidence.authentication_smoke_verify = Invoke-DeploymentOperation $Context 'authentication_smoke_verify' @{
-                ContainedStartedAt = $evidence.start_contained.startedAt
-            }
             $failedStep = 'database_reopen'
             $evidence.database_reopen = Invoke-DeploymentOperation $Context 'database_reopen'
             $failedStep = 'open_and_verify'
@@ -1948,14 +1900,6 @@ function Invoke-AzureDeployment {
         $evidence.start_contained = Invoke-DeploymentOperation $Context 'start_contained'
         $failedStep = 'contained_smoke'
         $evidence.contained_smoke = Invoke-DeploymentOperation $Context 'contained_smoke'
-        $failedStep = 'authentication_smoke_verify'
-        if ($Context.ExecutionMode -eq 'Real' -and (-not $Context.AuthenticationSmokeReceiptPath -or
-            -not (Test-Path -LiteralPath $Context.AuthenticationSmokeReceiptPath -PathType Leaf))) {
-            return Write-AzureDeploymentReceipt $Context 'awaiting_authentication_smoke' $failedStep $evidence
-        }
-        $evidence.authentication_smoke_verify = Invoke-DeploymentOperation $Context 'authentication_smoke_verify' @{
-            ContainedStartedAt = $evidence.start_contained.startedAt
-        }
         $failedStep = 'database_reopen'
         $evidence.database_reopen = Invoke-DeploymentOperation $Context 'database_reopen'
         $failedStep = 'open_and_verify'
@@ -1977,7 +1921,7 @@ function Invoke-AzureDeployment {
             @($Context.Calls | Where-Object { $_ -in @('resource_deploy', 'start_contained', 'database_reopen', 'open_and_verify') }).Count)) {
             try {
                 $evidence.containment = Invoke-DeploymentOperation $Context 'contain_runtime'
-                foreach ($step in @('start_contained', 'contained_smoke', 'authentication_smoke_verify', 'database_reopen', 'open_and_verify')) {
+                foreach ($step in @('start_contained', 'contained_smoke', 'database_reopen', 'open_and_verify')) {
                     [void]$Context.Completed.Remove($step)
                 }
             } catch {

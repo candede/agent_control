@@ -91,6 +91,36 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.resetAllMocks(); });
 
 describe("streamed complete-set import confirmation", () => {
+  it("allows a standalone UsageReportUploader to publish a new complete set without report-management authority", async () => {
+    const principal: SessionUser = { tenantId: "tenant", homeAccountId: "uploader", username: "uploader@example.invalid",
+      displayName: "Uploader", roles: ["AgentControl.UsageReportUploader"] };
+    render(<CapabilityContext value={{ user: principal, views: [], now: Date.now(), pending: false, loading: false,
+      error: undefined, reload: vi.fn(), openPermissions: vi.fn() }}>
+      <OfficialUsageImportPanel {...callbacks} />
+    </CapabilityContext>);
+    await choose();
+    await accept();
+    await imported();
+    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
+    expect(api.stageReport).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.stageReport).mock.calls.every(([, intent]) => intent.correctionOfSetId === undefined)).toBe(true);
+    expect(api.previewReportOperation).not.toHaveBeenCalled();
+    expect(api.confirmReportOperation).not.toHaveBeenCalled();
+  });
+
+  it("denies correction imports to a standalone UsageReportUploader before reading or uploading files", () => {
+    const principal: SessionUser = { homeAccountId: "uploader", username: "uploader@example.invalid",
+      displayName: "Uploader", roles: ["AgentControl.UsageReportUploader"] };
+    render(<CapabilityContext value={{ user: principal, views: [], now: Date.now(), pending: false, loading: false,
+      error: undefined, reload: vi.fn(), openPermissions: vi.fn() }}>
+      <OfficialUsageImportPanel {...callbacks} correctionOfSetId={reportSetId} />
+    </CapabilityContext>);
+    expect(screen.getByRole("alert")).toHaveTextContent("Admin access is required to replace saved reports");
+    expect(api.readReportStage).not.toHaveBeenCalled();
+    expect(api.stageReport).not.toHaveBeenCalled();
+    expect(api.acceptReportBundle).not.toHaveBeenCalled();
+  });
+
   it.each(["bundle", "stage"] as const)("resumes an uppercase %s UUID using canonical saved receipts", async kind => {
     const bundle = "abcdefab-1234-4567-89ab-abcdefabcdef", stage = "fedcbafe-1234-4567-89ab-fedcbafedcba";
     stages = kinds.map((kind, index) => reportStage(kind, bundle, index === 0 ? { id: stage } : {}));
@@ -406,7 +436,7 @@ describe("streamed complete-set import confirmation", () => {
       return <OfficialUsageImportModal route={route} onRouteChange={next => {
         if (!next) callbacks.onCancel();
         setRoute(next);
-      }} canManage revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
+      }} canManage canImport revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
     }
     render(<Host />);
     await choose(); await accept();
@@ -432,7 +462,7 @@ describe("streamed complete-set import confirmation", () => {
   it("adds another report set in a fresh wizard without discarding saved reports or selecting either import", async () => {
     function Host() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={callbacks.onChanged} />;
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0} onChanged={callbacks.onChanged} />;
     }
     render(<Host />);
     await choose(); await accept(); await imported();
@@ -538,7 +568,7 @@ describe("streamed complete-set import confirmation", () => {
     });
     function Host() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0}
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0}
         onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
     }
     render(<Host />);
@@ -599,7 +629,7 @@ describe("streamed complete-set import confirmation", () => {
       return <OfficialUsageImportModal route={route} onRouteChange={next => {
         if (!next) callbacks.onCancel();
         setRoute(next);
-      }} canManage revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
+      }} canManage canImport revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
     }
     render(<Host />);
     expect(await screen.findByRole("alert")).toHaveTextContent("Draft lookup unavailable");
@@ -622,7 +652,7 @@ describe("streamed complete-set import confirmation", () => {
     function Host() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
       return <OfficialUsageImportModal route={route} onRouteChange={next => { routes(next); setRoute(next); }}
-        canManage revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
+        canManage canImport revision={0} onChanged={callbacks.onChanged} onImported={callbacks.onDone} />;
     }
     render(<Host />);
     await choose([files()[0]]);
@@ -1069,7 +1099,7 @@ describe("streamed complete-set import confirmation", () => {
       return <>
         <button onClick={() => setRoute({ view: "import", activityWindowDays: 30,
           stagingId: source === "resume" ? "denied-stage" : undefined })}>Open reports</button>
-        <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0}
+        <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0}
           onChanged={callbacks.onChanged} onImported={callbacks.onDone} />
       </>;
     }
@@ -1120,7 +1150,7 @@ describe("streamed complete-set import confirmation", () => {
       : vi.mocked(api.acceptReportBundle).mock.calls[0][2];
     view.rerender(content(["AgentControl.Viewer"]));
     expect(signal?.aborted).toBe(true);
-    expect(screen.getByRole("alert")).toHaveTextContent("Current Admin access");
+    expect(screen.getByRole("alert")).toHaveTextContent("Current UsageReportUploader or Admin access");
     await act(async () => {
       if (operation === "upload") upload.resolve(reportStage("agents", vi.mocked(api.stageReport).mock.calls[0][1].bundleId));
       else acceptance.resolve({ setId: reportSetId, complete: true, activeRevision: "5" });
@@ -1278,7 +1308,7 @@ describe("streamed complete-set import confirmation", () => {
     });
     function Host() {
       const [route, setRoute] = useState<SyncReportRouteState | undefined>({ view: "import", activityWindowDays: 30 });
-      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
+      return <OfficialUsageImportModal route={route} onRouteChange={setRoute} canManage canImport revision={0} onChanged={vi.fn()} onImported={vi.fn()} />;
     }
     render(<Host />);
     await choose([files()[0], file("bad.csv")]);

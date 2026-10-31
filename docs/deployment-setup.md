@@ -1,11 +1,14 @@
 # Deployment setup
 
 This guide configures Microsoft Entra ID and starts Agent Control locally.
+For the web application, start with [prerequisites](#prerequisites), then
+[configure its registration](#configure-the-entra-application) and
+[start locally](#start-locally).
 
-The [MCP integration contract](mcp-integration.md) documents the separate,
-locally implemented delegated API integration, registration audiences, secret
-ownership and independent API/web operation. It is not permission to
-provision MCP or change an existing production project.
+MCP is optional and is not required for browser sign-in, synchronization or
+administration. Its [registration guide](../infra/entra-id-api-mcp-app-registrations.md)
+and [integration contract](mcp-integration.md) cover separate audiences,
+credentials and the same underlying API authorization.
 
 ## Optional delegated API binding
 
@@ -31,10 +34,10 @@ conflicting bindings fail explicitly. Local onboarding preserves the object
 without adding consent prompts; metadata contains no client secret. Existing
 `TENANTS_JSON`/`TENANTS_JSON_FILE` ownership and protected file handling remain.
 
-For a separately approved later registration change, the existing API exposes
+For the optional MCP integration, the existing API exposes
 `api://<apiClientId>/AgentControl.Access`, uses v2 access tokens
-(`api.requestedAccessTokenVersion=2`), and retains Viewer/Admin **user/group**
-assignments. A distinct tenant-specific integration confidential client receives
+(`api.requestedAccessTokenVersion=2`), and retains Viewer, UsageReportUploader and
+Admin **user/group** assignments. A distinct tenant-specific integration confidential client receives
 that delegated scope through **administrator-managed consent**. For example,
 an API scope declaration (merge with existing configuration, never replace it):
 
@@ -51,23 +54,22 @@ an API scope declaration (merge with existing configuration, never replace it):
 
 The API validates v2 token audience as the **API client GUID**, not an audience
 array, MCP resource token, ID token or `api://` scope URI. API-owned OBO uses
-existing admin-consented Graph `User.ReadBasic.All`/OIDC metadata to prove native
+the existing `openid` and `profile` scopes and OIDC metadata to prove native
 and guest private identity, without a Graph data read or prior portal login.
-Actual live account/client-info continuity is not yet proven; unsupported
-responses stay closed. No runtime consent writer, app-only grant, directory
+Local fixtures do not prove live account/client-info continuity; unsupported
+responses stay closed. No runtime consent writer, app-only identity mapping, directory
 lookup fallback or identity migration is supplied. See the
 [integration contract](mcp-integration.md#current-principal-and-credential-foundation)
 for deadlines, role freshness and claims challenges, and its
 [canonical integration](mcp-integration.md#current-canonical-integration)
 for active HTTP/worker boundaries.
-These examples authorize no tenant setup, grant or deployment.
-
 Existing routes accept delegated bearer authority only where the frozen map
 allows it. Do not combine Authorization with the browser session cookie or
 provide identity/origin headers as authority. Browser-only sign-in, import,
 configuration and downloads retain cookie Origin/CSRF protections.
-Provider permissions still require administrator-managed consent and independent
-capability readiness. Long-running work pauses when its initiating source
+Provider permissions still require administrator-managed consent and actual
+provider authorization. Readiness diagnostics are not an extra approval step.
+Long-running work pauses when its initiating source
 expires or becomes stale; obtain fresh same-account authorization and explicitly
 resume unsent work. Restart does not recover credentials from portal caches,
 sessions or durable jobs. Sent-unknown writes must reconcile before resend.
@@ -90,12 +92,11 @@ provider or MCP deployment result.
 The [current local qualification procedure](operations.md#current-release-qualification-for-deployment-testing)
 rebuilds manifest-matching images and distinguishes real local SQL/container/
 Azurite proof from unavailable Entra/provider/App Service proof. Follow the
-ordinary configured `deploy-local.ps1 start/check/stop` lifecycle below only for
-an explicitly authorized testing target. No qualification receipt enables reads
-or controls at runtime, and these instructions do not authorize phase12 or an
-existing production project.
+ordinary configured `deploy-local.ps1 start/check/stop` lifecycle below for the
+intended deployment target. No qualification receipt enables reads or controls
+at runtime.
 
-## Local FastMCP foundation (phase 05)
+## Optional MCP service
 
 Use the [current client-specific onboarding and workflow recipes](mcp-clients.md)
 for exact downstream callbacks, discovery/resource/PKCE, DCR, supported client
@@ -104,15 +105,16 @@ below is different from the client's OAuth return URI.
 
 The installable `mcp/` package now implements tenant-specific OAuth,
 authenticated Streamable HTTP, encrypted OAuth state and a typed canonical API
-adapter. Phases06–07 register124 typed saved-read, explicit collection,
-investigation and exact shared/package/Studio control tools automatically.
+adapter. It registers typed saved-read, explicit collection, investigation and
+exact shared/package/Studio control tools automatically.
 See the [implemented catalog](mcp-integration.md#implemented-typed-business-catalog-phase-06)
 for exact paging, output and delegated-only contracts, and
 [exact controls](mcp-integration.md#implemented-exact-controls-phase-07) for
 Admin/provider permissions, client confirmation, receipt expiry and non-replay.
 The web app remains independent.
-This section is source/setup guidance, not permission to register applications,
-grant consent, deploy, reset storage or test customer accounts.
+Configure real registrations and consent using the
+[Agent Control registration guide](../infra/entra-id-api-mcp-app-registrations.md).
+Software tests alone do not prove live provider access.
 
 Use Python **3.14** and uv **0.12.17**. Install only through the approved feed;
 there is no public-index fallback or automatic Python download:
@@ -177,9 +179,10 @@ release-acceptance file or runtime feature-enable ceremony.
 
 With approved configuration in place, start the source service using
 `uv run --frozen --no-sync agent-control-mcp`. It binds port8000; the configured
-external HTTPS host/resource remain exact. Reverse proxy/TLS, container image,
-mount lifecycle and deployment integration belong to08/10, not this source-only
-phase. `/health` and `/ready` return bounded non-secret status. `/diagnostics`
+external HTTPS host/resource remain exact. For managed image, mount, proxy and
+lifecycle configuration, use the [local container](#optional-local-mcp-container)
+or [Azure deployment](azure-production-deployment.md#optional-independent-mcp-app-service)
+instructions. `/health` and `/ready` return bounded non-secret status. `/diagnostics`
 requires bearer authorization on every call; protocol session IDs alone never
 authorize a request.
 
@@ -440,40 +443,90 @@ these roles manually:
 
 | Role | Use |
 | --- | --- |
-| `AgentControl.Viewer` | View inventory, reports, and investigations |
-| `AgentControl.Admin` | Viewer access plus supported changes, imports, and configuration |
+| `AgentControl.Viewer` | View tenant data and request read-only synchronization |
+| `AgentControl.UsageReportUploader` | Viewer access plus upload, validation and publication of new CSV report sets |
+| `AgentControl.Admin` | Viewer and Uploader access plus published-report corrections/selection/deletion, supported controls, configuration and local Audit read/export |
 
-The roles must be enabled and allow **Users/Groups**. Admin already includes
-Viewer access, so each user or group needs only one role.
+The roles must be enabled and allow **Users/Groups**. Uploader includes Viewer;
+Admin includes both. Each user or group needs only one role.
+App roles do not grant Microsoft provider permissions or roles.
+Only Admin can see the Audit tab/page or read/export its local administrative
+logs through the API. Audit recording is unchanged.
 
 ### 4. Require assignment
 
 Open **Enterprise applications > your application > Properties** and set
 **Assignment required?** to **Yes**.
 
-Assign each approved user or group either **Agent Control Viewer** or
-**Agent Control Admin**. Sign out and back in after changing assignments.
+Under **Users and groups**, assign each approved user or group **Agent Control Viewer**,
+**Agent Control Usage Report Uploader**, or **Agent Control Admin**.
+Sign out and back in after changing assignments.
 
 ### 5. Add API permissions
 
-Open **App registrations > your application > API permissions**. Add only the
-permissions needed for the features you plan to use.
+Open **App registrations > your application > API permissions**. Configure the
+same **11 entries in four groups** shown on Permissions. App-defined roles are
+covered by steps 3–4 above; the following requirements concern Microsoft access.
 
-| API | Delegated permission | Feature |
-| --- | --- | --- |
-| Microsoft Graph / OpenID Connect | `openid`, `profile`, `offline_access` | Sign-in and session renewal |
-| Microsoft Graph | `CopilotPackages.Read.All` | Package inventory |
-| Microsoft Graph | `CopilotPackages.ReadWrite.All` | Package availability, assignments, block, and unblock |
-| Microsoft Graph | `User.ReadBasic.All` | Basic user lookup |
-| Microsoft Graph | `Group.Read.All` | Group lookup |
-| Microsoft Graph | `User.Read.All` | User and license synchronization |
-| Microsoft Graph | `LicenseAssignment.Read.All` | Product and service-plan catalog |
-| Microsoft Graph | `Reports.Read.All` | Microsoft 365 Copilot activity |
-| Microsoft Graph | `AgentIdentity.Read.All` | Copilot Studio identity matching |
-| Microsoft Graph | `AuditLogsQuery.Read.All` | Purview audit search |
-| Microsoft Graph | `ThreatHunting.Read.All` | Defender and Agent 365 hunting |
-| Power Platform | `ResourceQuery.Resources.Read` | Copilot Studio agents and environments |
-| Power Platform | `CopilotStudio.AdminActions.Invoke` | Quarantine status and changes |
+#### Microsoft Graph / Application
+
+The four application read grants use configured tenant application credentials
+and admin consent. No signed-in Microsoft directory/reporting role or separate
+application-enable/scope-approval step is required. Collection starts
+automatically after permitted sign-in while visible and online, without an
+administrator session. It is not an unattended scheduler, and package collection
+has no delegated fallback.
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `CopilotPackages.Read.All` | Published Copilot agent/package inventory, metadata and sharing details. Requires applicable Microsoft Agent 365 licensing, application credentials and tenant admin consent. |
+| `User.Read.All` | Directory users and Copilot license assignments; exact creator/owner resolution; management user search and user-ID validation. |
+| `LicenseAssignment.Read.All` | Tenant product SKUs and service-plan catalog. |
+| `Reports.Read.All` | 28-day per-user Copilot activity in Office apps; not the three imported agent-usage CSV reports. |
+
+#### Microsoft Graph / Delegated
+
+Signed-in user identity supports management group lookups and package changes.
+User lookups use application access.
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `CopilotPackages.ReadWrite.All` | Package block/unblock, availability/installation assignments and control readback. Requires delegated tenant admin consent and a Microsoft Agent 365 license. Recommended signed-in administrator role: **AI Administrator**; **Global Administrator** is a broader alternative. Package writes support delegated work or school accounts only. |
+| `Group.Read.All` | Management group search/resolution using the signed-in user's delegated directory visibility. |
+
+Microsoft defines both application and delegated forms of the package permission,
+but the application form does not authorize these writes. Select **Microsoft
+Graph > Delegated permissions** for package controls and grant tenant admin
+consent. The role recommendation follows Microsoft's agent-management guidance
+for the Microsoft 365 admin center. The package API does not publish an explicit
+role minimum; this is not a confirmed exclusive API role requirement. See the
+[recommended administrator role and assignment instructions](user-roles-and-permissions.md#package-management-administrator-roles).
+
+#### Power Platform / Delegated
+
+Power Platform is separate from Graph. Inventory and administrative actions
+depend on the signed-in user's Microsoft privileges.
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `ResourceQuery.Resources.Read` | Copilot Studio agents and environment inventory. Recommend **AI Reader**, the least-privileged supported Entra inventory role for this sync; **no application permission equivalent**. Saved tenant data remains readable without sync access. |
+| `CopilotStudio.AdminActions.Invoke` | Studio quarantine status and quarantine/restore. Both status and changes require **AI Administrator**, **Power Platform Administrator** or **Global Administrator**. |
+
+Power Platform inventory has **no application permission equivalent** and rejects
+service principals/managed identities. The logged-in user's role controls sync.
+Recommend **AI Reader** for read-only sync. An Entra
+**Privileged Role Administrator** assigns AI Reader through **Identity > Roles &
+admins > AI Reader > Add assignments**; the viewer then signs in again (activating
+the role first if PIM-eligible). The API permission is not a user role, and
+inventory access grants neither quarantine status nor changes.
+See the [viewer setup steps](user-roles-and-permissions.md#assign-ai-reader-to-a-viewer).
+
+Global Reader, AI Administrator, Power Platform Administrator, Dynamics 365
+Administrator and Global Administrator also support inventory if already assigned;
+do not grant broader roles just for sync. AI roles cover agents/environments;
+the other listed roles cover all inventory. These are Microsoft's inventory-feature
+roles; the REST API does not publish a separate minimum. Users without source
+access can still read saved tenant data.
 
 The Power Platform application ID is:
 
@@ -481,11 +534,27 @@ The Power Platform application ID is:
 8578e004-a5c6-46e7-913e-12f58912df43
 ```
 
+#### Sign-in / OpenID Connect
+
+These are account sign-in scopes, not Graph data permissions. They do not
+authorize inventory reads or administrative changes. `User.Read` is not used.
+
+| Scope | Purpose |
+| --- | --- |
+| `openid` | Authenticate the account using an ID token; no provider-data access. |
+| `profile` | Display the account's name and username. |
+| `offline_access` | Renew delegated tokens when Microsoft policy allows; no additional API permissions. |
+
 Select **Grant admin consent** after adding permissions. Agent Control does not
 request these grants during sign-in.
 
 Microsoft roles and licensing are separate from API permissions. See
 [Microsoft roles and permissions](user-roles-and-permissions.md).
+
+Purview, Defender and investigation-only identity setup are hidden from the UI
+and are not part of this checklist or prerequisites for the current page. Their
+retained backend contracts are documented separately in
+[provider contracts](provider-contracts.md#retained-backend-investigations).
 
 ## Start locally
 
@@ -510,11 +579,17 @@ Use the port selected in the wizard if it differs from `3001`.
 
 ### Check permissions and collect data
 
-After signing in:
+Read-only collection begins automatically after sign-in. Open **Sync** for source
+progress and explicit refreshes. Use **Permissions > Check status** to diagnose
+an actual source failure, not as a prerequisite to collection. Missing Power
+Platform user access does not prevent application-based Graph sources syncing.
 
-1. Open **Permissions** and select **Check status**.
-2. Resolve any missing role, permission, consent, or license.
-3. Open **Sync** and refresh the sources you want to use.
+Startup verifies the current/empty schema. If an existing database is
+incompatible, follow the [explicit reset procedure](operations.md#reset-application-data)
+only after confirming the target and data loss. Changing permissions is not a
+reason to reset saved inventory, reports or history. Successful initialization
+or an explicitly confirmed reset returns to normal automatic first-run sync
+without another enable/approval step.
 
 ### Temporary two-agent sharing investigation
 
@@ -538,7 +613,8 @@ publication, the separate function requests only these two agents in tenant
 
 Six response artifacts retain unprojected **parsed JSON**, including unknown
 properties and missing/null/empty distinctions. They are not byte-for-byte wire
-captures. Credential-named fields and the active access token are redacted.
+captures. Credential-named fields and the active access token are redacted,
+including credential fields with escaped names inside stringified JSON definitions.
 Request headers, cookies and authentication responses are never captured.
 Responses that fail identity/scope validation are rejected rather than saved.
 Denied or missing targets are recorded explicitly in the manifest.

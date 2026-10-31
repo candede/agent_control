@@ -328,6 +328,54 @@ async def test_callback_errors_and_deadlines_do_not_expose_provider_diagnostics(
     assert deadline.json()["error"] == "temporarily_unavailable"
 
 
+async def test_signing_key_rotation_returns_invalid_grant_for_old_refresh(
+    browser, settings, entra
+):
+    client_id, issued = await tokens(browser)
+    runtime = build_service(
+        replace(settings, signing_key=Fernet.generate_key()),
+        transport=httpx2.MockTransport(entra.route),
+    )
+    provider_calls = len(entra.calls)
+    try:
+        async with runtime.app.app.router.lifespan_context(runtime.app.app):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=runtime.app),
+                base_url=settings.public_origin,
+            ) as restarted:
+                response = await restarted.post(
+                    "/token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": issued["refresh_token"],
+                        "client_id": client_id,
+                        "resource": settings.public_url,
+                    },
+                )
+                assert response.status_code == 401, response.text
+                assert response.json()["error"] == "invalid_grant"
+                assert issued["refresh_token"] not in response.text
+                assert len(entra.calls) == provider_calls
+                new_client, reconnected = await tokens(restarted)
+                renewed = await restarted.post(
+                    "/token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": reconnected["refresh_token"],
+                        "client_id": new_client,
+                        "resource": settings.public_url,
+                    },
+                )
+                assert renewed.status_code == 200
+                authenticated = await restarted.get(
+                    "/diagnostics",
+                    headers={"Authorization": f"Bearer {renewed.json()['access_token']}"},
+                )
+                assert authenticated.status_code == 200
+    finally:
+        await runtime.http.aclose()
+
+
 async def test_refresh_denial_reconnect_and_isolated_principals(browser, service, entra, settings):
     first_client, first = await tokens(browser)
     entra.oid = OTHER

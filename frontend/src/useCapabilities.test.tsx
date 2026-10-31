@@ -16,7 +16,7 @@ const user: SessionUser = {
   roles: ["AgentControl.Viewer"],
 };
 
-function available(expiresAt = new Date(Date.now() + 60_000).toISOString(), capabilityId: CapabilityId = "graph.package.read.delegated"): CapabilityView {
+function available(expiresAt = new Date(Date.now() + 60_000).toISOString(), capabilityId: CapabilityId = "graph.package.read.application"): CapabilityView {
   return {
     enabled: true, definition: capabilityDefinitions.find(definition => definition.id === capabilityId)!,
     ...(capabilityId.endsWith(".application") ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
@@ -817,11 +817,11 @@ it("bounds timer delays when the browser clock is far behind the evidence timest
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 
-it.each([false, true])("expires application evidence without an automatic application check (delegated evidence present: %s)", async withDelegated => {
+it.each([false, true])("expires application diagnostics without revoking collection or adding a check (delegated evidence present: %s)", async withDelegated => {
   vi.useFakeTimers();
   const saved = [
     available(new Date(Date.now() + 1_000).toISOString(), "graph.package.read.application"),
-    ...(withDelegated ? [available()] : []),
+    ...(withDelegated ? [available(undefined, "powerPlatform.inventory.read")] : []),
   ];
   const fetchMock = vi.fn(async () => Response.json({ value: saved }));
   vi.stubGlobal("fetch", fetchMock);
@@ -831,7 +831,8 @@ it.each([false, true])("expires application evidence without an automatic applic
   expect(fetchMock).toHaveBeenCalledTimes(2);
 
   await act(() => vi.advanceTimersByTimeAsync(1_001));
-  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(false);
+  expect(evidenceIsFresh(result.current.views[0], result.current.now)).toBe(false);
+  expect(providerActionAllowed(result.current.views[0], false, result.current.now)).toBe(true);
   if (withDelegated) expect(providerActionAllowed(result.current.views[1], false, result.current.now)).toBe(true);
   await act(() => vi.advanceTimersByTimeAsync(30_000));
   expect(fetchMock).toHaveBeenCalledTimes(2);

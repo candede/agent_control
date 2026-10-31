@@ -25,7 +25,7 @@ export function useAgentPeople(record: UnifiedAgentRecord, roles: AppRole[], onP
   const capabilities = useContext(CapabilityContext);
   const [localNow, setLocalNow] = useState(Date.now);
   const now = Math.max(localNow, capabilities?.now ?? 0);
-  const directory = capabilities?.views.find(view => view.definition.id === "graph.directory.read");
+  const directory = capabilities?.views.find(view => view.definition.id === "graph.users.read");
   const canRead = hasAppRole(roles, "AgentControl.Viewer");
   const canLookup = Boolean(canRead && providerActionAllowed(directory, false, now));
   const resource = record.powerPlatformResource;

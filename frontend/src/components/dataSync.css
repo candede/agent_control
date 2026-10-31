@@ -289,6 +289,7 @@
 
 .data-sync-last-run {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   padding: 12px 16px;
@@ -438,7 +439,7 @@
 .sync-history-pagination > div { display: flex; gap: 8px; }
 
 .sync-inventory-tools { padding: 18px 24px; }
-.sync-inventory-summary { display: flex; align-items: center; gap: 14px; }
+.sync-inventory-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
 .sync-inventory-summary > svg { flex-shrink: 0; color: var(--ink); }
 .sync-inventory-summary > div { flex: 1; min-width: 0; }
 .sync-inventory-summary > button { flex-shrink: 0; }
@@ -478,7 +479,6 @@
   .data-sync-source dl { gap: 12px; }
   .data-sync-workspace-footer { display: grid; }
   .data-sync-workspace-footer > button { justify-self: start; }
-  .data-sync-last-run { flex-wrap: wrap; }
   .data-sync-last-run > button { margin-left: 31px; }
   .data-sync-activity { padding: 14px; }
   .data-sync-progress-heading strong { font-size: 16px; }
@@ -487,7 +487,6 @@
   .data-sync-live-count strong { font-size: 20px; }
   .csv-usage-range { grid-template-columns: minmax(0, 1fr); }
   .data-sync-run-facts { grid-template-columns: minmax(0, 1fr); }
-  .sync-inventory-summary { flex-wrap: wrap; }
   .sync-inventory-summary > svg { display: none; }
   .sync-inventory-summary > div { flex-basis: 100%; }
   .sync-inventory-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -158,7 +158,7 @@ function syntheticSdkClient(input: { oid: string; uid: string; utid: string; cli
       return {
         status: 200, headers: {}, body: {
           token_type: "Bearer", access_token: "synthetic-opaque-provider-token", expires_in: 3600,
-          scope: "User.ReadBasic.All openid profile",
+          scope: "openid profile",
           ...(input.idToken ? { id_token: jwt } : {}),
           ...(input.clientInfo ? { client_info: encode({ uid: input.uid, utid: input.utid }) } : {}),
         } as T,
@@ -222,6 +222,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         expect(policy).toBeDefined();
         if (policy?.access === "public") expect(policyText).toBe("P");
         else if (policy?.roles?.includes("AgentControl.Viewer")) expect(policyText).toMatch(/^V(?:;|$)/);
+        else if (policy?.roles?.includes("AgentControl.UsageReportUploader")) expect(policyText).toMatch(/^U(?:;|$)/);
         else if (policy?.roles?.includes("AgentControl.Admin")) expect(policyText).toMatch(/^A(?:;|$)/);
         else expect(policyText).toBe("S");
         if (policy?.access === "authenticated" && policy.capabilityId) expect(row[3]).toContain(policy.capabilityId);
@@ -273,7 +274,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
       code: "synthetic-one-use-code", redirectUri: "https://example.invalid/api/auth/callback", scopes: ["openid", "profile"],
     });
     const exchanged = await client.acquireTokenOnBehalfOf({
-      oboAssertion: "synthetic-api-audience-assertion", scopes: ["https://graph.microsoft.com/User.ReadBasic.All"],
+      oboAssertion: "synthetic-api-audience-assertion", scopes: ["openid", "profile"],
     });
     expect(result.account?.homeAccountId).toBe(`${fixture.uid}.${fixture.utid}`);
     expect(exchanged?.account?.homeAccountId).toBe(result.account?.homeAccountId);
@@ -289,7 +290,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
   it("exposes sub-only fallback as non-equivalent, not an admitted home identity", async () => {
     const { client } = syntheticSdkClient({ oid: guest, uid: guestHome, utid: guestTenant, clientInfo: false, idToken: true });
     const result = await client.acquireTokenOnBehalfOf({
-      oboAssertion: "synthetic-api-audience-assertion", scopes: ["https://graph.microsoft.com/User.ReadBasic.All"],
+      oboAssertion: "synthetic-api-audience-assertion", scopes: ["openid", "profile"],
     });
     expect(result?.account?.homeAccountId).toBe("application-specific-subject");
     expect(result?.account?.homeAccountId).not.toBe(`${guestHome}.${guestTenant}`);
@@ -299,7 +300,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
   it("does not pretend every OBO response supplies an SDK account", async () => {
     const { client } = syntheticSdkClient({ oid: guest, uid: guestHome, utid: guestTenant, clientInfo: true, idToken: false });
     const result = await client.acquireTokenOnBehalfOf({
-      oboAssertion: "synthetic-api-audience-assertion", scopes: ["https://graph.microsoft.com/User.ReadBasic.All"],
+      oboAssertion: "synthetic-api-audience-assertion", scopes: ["openid", "profile"],
     });
     expect(result?.account).toBeNull();
   });

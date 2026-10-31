@@ -239,7 +239,7 @@ describe("durable bounded reconciliation", () => {
       isBlocked: false, manifestId: randomUUID(), identityDetailsCollected: false,
     })));
     const graph = await publish(principal, "packages", packages);
-    const scope = { tenantId: input.scope.tenantId, principalId: principal };
+    const scope = { tenantId: input.scope.tenantId, principalId: principal, tokenMode: "application" as const };
     const jobs = new PackageRefreshJobs(fixture.runtime);
     const detailJob = (await jobs.claimDueDetails(scope, principal))!;
     expect(detailJob.targetCount).toBe(20);

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 import { ApiError, captureRequestSession, getCapabilityCheckProgress, type CapabilityCheckProgress, type CapabilityView } from "../api/client";
 import { permissionFeatureName } from "../permissionIssues";
+import { isDeferredSecurityCapability } from "../deferredSecurityUi";
 import { retryPermissionRead } from "../useCapabilities";
 
 type Props = {
@@ -97,7 +98,7 @@ function CheckRun({ loading, activeCheck, views }: Props) {
 
   const checks = progress?.checks.flatMap(check => {
     const view = views.find(item => item.definition.id === check.capabilityId);
-    return view ? [{ ...check, name: permissionFeatureName(view) }] : [];
+    return view && !isDeferredSecurityCapability(view.definition.id) ? [{ ...check, name: permissionFeatureName(view) }] : [];
   }) ?? [];
   const complete = checks.filter(check => check.state === "complete").length;
   const active = checks.filter(check => check.state !== "complete");

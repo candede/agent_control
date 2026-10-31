@@ -70,7 +70,7 @@ describe("route policy declarations", () => {
   it("requires directory-read authorization, Viewer access and CSRF for persisted people resolution", () => {
     expect(declaredRoutePolicies.get("POST /agent-inventory/people/resolve")).toEqual({
       access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"],
-      capabilityId: "graph.directory.read", csrf: true,
+      capabilityId: "graph.users.read", csrf: true,
     });
   });
 

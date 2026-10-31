@@ -28,7 +28,7 @@ import { lockBodyScroll } from "../bodyScrollLock";
 import { useSavedQueryClient } from "../savedQueries";
 import { WorkbenchActionGate } from "../workbenchActionContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
-import { auditRouteSearch, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
+import { auditRouteSearch, maximumAuditOriginCharacters, maximumAuditPageIndex, parseAuditRoute, parseWorkbenchView, workbenchUrl, type AuditRouteState } from "../workbenchRouting";
 import { auditDefaultPageSize, auditMaximumSearchLength, auditMetadata } from "../../../backend/src/types/audit";
 import { unknownOrigin, type AuditOriginV1, type AttributionField } from "../../../backend/src/types/actionOrigin";
 
@@ -322,7 +322,10 @@ function LocalAuditLogView({
         </label>
         {(["originIntegrationClientId", "originClientId", "originCallingAgentId"] as const).map((field, index) => <label key={field}>
           <span>{["Integration client ID", "Calling client ID", "Calling agent ID"][index]}</span>
-          <input value={route[field] ?? ""} maxLength={256} onChange={event => updateRoute({ [field]: event.target.value || undefined, page: 0 })} />
+          <input value={route[field] ?? ""} maxLength={maximumAuditOriginCharacters * 2} onChange={event => {
+            const value = event.target.value;
+            if ([...value].length <= maximumAuditOriginCharacters) updateRoute({ [field]: value || undefined, page: 0 });
+          }} />
         </label>)}
         <div className="filter-actions" aria-label="Audit actions">
           <button

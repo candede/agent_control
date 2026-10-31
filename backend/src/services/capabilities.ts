@@ -1,5 +1,5 @@
 import type { AuthenticatedUser } from "../types/session.js";
-import { hasAppRole, packageMutationCapability, supportsAutomaticCapabilityCheck, type CapabilityCheckProgress, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityOperationFailure, type CapabilityStatus } from "../types/capability.js";
+import { hasAppRole, isApplicationCollectionCapability, packageMutationCapability, supportsAutomaticCapabilityCheck, type CapabilityCheckProgress, type CapabilityDecision, type CapabilityDefinition, type CapabilityId, type CapabilityOperationFailure, type CapabilityStatus } from "../types/capability.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { types } from "node:util";
 import { AppError, errorName, errorTelemetry, hasNativeErrorPrototype, isApplicationError } from "../errors.js";
@@ -8,7 +8,6 @@ import { acquireApplicationToken, acquireAuthorizedToken, isRetryableIdentityPro
 import { adminManagedPermissionsMessage } from "../auth/flows.js";
 import { CapabilityRepository, capabilityContractRevision, capabilityPermissionRevision, type CapabilityConfiguration, type CapabilityEvidence, type EvidenceKey } from "../db/capabilities.js";
 import { capabilityDefinitions, getCapabilityDefinition, hasAnyRole } from "./capabilityRegistry.js";
-import { DirectoryPrincipalsClient } from "./directoryPrincipals.js";
 import { packageReadTimeoutMs, GraphPackagesClient } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import type { AuditAction } from "../types/audit.js";
@@ -25,7 +24,6 @@ type ProbeDependencies = {
   delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
   packageProbe: (token: string, signal?: AbortSignal, assertCurrent?: () => void) => Promise<unknown>;
-  directoryProbe: (token: string, signal?: AbortSignal) => Promise<unknown>;
   inventoryProbe: (token: string, signal?: AbortSignal) => Promise<unknown>;
 };
 type SharedCheck<T> = { completion: Promise<T>; controller: AbortController; waiters: number };
@@ -34,7 +32,6 @@ const defaultProbeDependencies: ProbeDependencies = {
   delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
   packageProbe: (token, signal, assertCurrent) => new GraphPackagesClient(undefined, { maxAttempts: 1 }).checkCatalogAccess(token, signal, assertCurrent),
-  directoryProbe: (token, signal) => new DirectoryPrincipalsClient().search(token, "agent-control-permission-check", 1, signal),
   inventoryProbe: (token, signal) => new PowerPlatformResourceQueryClient(undefined, { maxAttempts: 1 }).checkAccess(token, signal),
 };
 
@@ -243,7 +240,7 @@ export class CapabilityService {
   }
 
   async requireApplicationDataScope(capabilityId: CapabilityId, user: AuthenticatedUser) {
-    if (currentAuthority()?.principal.transport === "bearer") throw new AppError(403, "invalid_token_mode", "Integration operations require delegated data scope.");
+    if (currentAuthority()?.principal.transport === "bearer" && !isApplicationCollectionCapability(capabilityId)) throw new AppError(403, "invalid_token_mode", "Integration investigations require delegated data scope.");
     const definition = requiredDefinition(capabilityId);
     if (definition.mode !== "application" || !hasAnyRole(user.roles, definition.internalRoles)) {
       throw new AppError(403, "missing_internal_role", "The application data scope is not authorized for this role.");
@@ -355,9 +352,8 @@ export class CapabilityService {
         : this.probes.applicationToken(user.tenantId!, definition.id), timeoutMs, cancellation, beforeRequest);
       this.requireGeneration(definition.id, user, generation);
       phase = "provider_read";
-      timeoutMs = definition.id.startsWith("graph.package.read.") ? packageReadTimeoutMs : automaticCheckDeadlineMs;
-      if (definition.id.startsWith("graph.package.read.")) await retryReadiness(signal => this.probes.packageProbe(token, signal, beforeRequest), timeoutMs, cancellation, beforeRequest);
-      else if (definition.id === "graph.directory.read") await retryReadiness(signal => this.probes.directoryProbe(token, signal), timeoutMs, cancellation, beforeRequest);
+      timeoutMs = definition.id === "graph.package.read.application" ? packageReadTimeoutMs : automaticCheckDeadlineMs;
+      if (definition.id === "graph.package.read.application") await retryReadiness(signal => this.probes.packageProbe(token, signal, beforeRequest), timeoutMs, cancellation, beforeRequest);
       else if (definition.id === "powerPlatform.inventory.read") await retryReadiness(signal => this.probes.inventoryProbe(token, signal), timeoutMs, cancellation, beforeRequest);
     } catch (error) {
       beforeRequest();
@@ -409,6 +405,7 @@ export class CapabilityService {
     const definition = requiredDefinition(capabilityId);
     if (!hasAppRole(user.roles, "AgentControl.Admin")) throw new AppError(403, "missing_internal_role", "Admin role is required.");
     if (definition.mode !== "application") throw new AppError(400, "invalid_configuration", "Only application-mode capabilities use this configuration.");
+    if (isApplicationCollectionCapability(capabilityId)) throw new AppError(400, "invalid_configuration", "Tenant read collection uses configured application credentials and Microsoft consent automatically.");
     if (!user.tenantId || !user.homeAccountId) throw AppError.unauthorized("Capability configuration requires an exact account.");
     const validation = beginAccountSessionValidation(user.tenantId, user.homeAccountId);
     const principalKey = this.principalGenerationKey(user.tenantId, user.homeAccountId);
@@ -445,7 +442,9 @@ export class CapabilityService {
     if (this.pendingPrincipalInvalidations.has(this.principalGenerationKey(user.tenantId!, user.homeAccountId))) {
       throw new AppError(503, "capability_invalidation_failed", "Capability evidence could not be invalidated. Retry after account authorization cleanup succeeds.");
     }
-    const configuration = await this.repository.configuration(user.tenantId!, definition.id);
+    const configuration: CapabilityConfiguration = isApplicationCollectionCapability(definition.id)
+      ? { enabled: true, sharedDataScope: true, previewQualified: false, revision: 1 }
+      : await this.repository.configuration(user.tenantId!, definition.id);
     this.requireGeneration(definition.id, user, generation);
     return configuration;
   }

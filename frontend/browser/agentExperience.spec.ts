@@ -103,7 +103,7 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await page.screenshot({ path: info.outputPath("agents-inventory.png"), fullPage: true });
   await page.getByRole("button", { name: "Service desk assistant", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Service desk assistant" });
-  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage", "Users", "Manage", "Activity"]);
+  await expect(dialog.getByRole("tab")).toHaveText(["Overview", "Usage", "Users", "Manage"]);
   await expect(dialog.getByText("Representative saved catalog observation; no live provider requests.")).toBeVisible();
   await expect(dialog.getByRole("button", { name: /Review usage|Review access|Details & services/ })).toHaveCount(0);
   await expect(dialog.getByText("Tenant adoption snapshot")).toHaveCount(0);
@@ -135,14 +135,13 @@ test("Agents separates its compact overview from agent details and snapshot resp
   await expect(dialog.getByRole("heading", { name: "Quarantine and restore" })).toHaveCount(0);
   expect(await dialog.boundingBox()).toEqual(bounds);
   await page.screenshot({ path: info.outputPath("agent-access.png") });
-  await dialog.getByRole("tab", { name: "Activity" }).click();
-  await expect(dialog.getByRole("heading", { name: "Agent logs", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("tab", { name: "Activity", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("heading", { name: "Agent logs", exact: true })).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: "Search tenant interactions" })).toHaveCount(0);
   await expect(dialog.getByRole("link", { name: "View management audit" })).toHaveCount(0);
   await expect(dialog.getByText("No saved activity is linked to this agent.")).toHaveCount(0);
-  await expect(dialog.getByRole("region", { name: "Hunting authorization pending" }))
-    .toContainText("Delegated authorization is not ready");
-  await expect(dialog.getByRole("button", { name: "Run hunt", exact: true })).toBeDisabled();
+  await expect(dialog.getByRole("region", { name: "Hunting authorization pending" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "Run hunt", exact: true })).toHaveCount(0);
   expect((await new AxeBuilder({ page }).include("dialog[open]").analyze()).violations).toEqual([]);
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
   await page.screenshot({ path: info.outputPath("agent-activity.png") });

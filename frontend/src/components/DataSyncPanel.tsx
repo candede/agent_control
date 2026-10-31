@@ -97,6 +97,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
   const { openPermissions } = useCapabilityContext();
   const available = useBrowserAvailability();
   const [state, setState] = useState<DataSyncState>();
+  const [firstSyncDismissed, setFirstSyncDismissed] = useState(false);
   const [packageDetails, setPackageDetails] = useState<PackageDetailSyncState>();
   const packageDetailsRef = useRef<PackageDetailsSyncPanelHandle>(null);
   const [requestedRunResult, setRequestedRunResult] = useState<{ principalKey: string; run: DataSyncRun }>();
@@ -532,7 +533,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
 
   if (!active) {
     if (!onOpenSync) return null;
-    if (state?.onboardingRequired) return <FirstSyncNotice state={state} loading={loading} busy={busy} error={error}
+    if (state?.onboardingRequired && !firstSyncDismissed) return <FirstSyncNotice state={state} loading={loading} busy={busy} error={error}
       stale={stateReadFailed}
       automaticRefresh={automaticRefresh} cannotStart={cannotStart}
       onStart={sources => { if (!loadController.current) void start("initial", sources); }}
@@ -541,7 +542,7 @@ const PrincipalDataSyncPanel = forwardRef<DataSyncPanelHandle, DataSyncPanelProp
         onCancelRequested?.();
         void perform("cancel", signal => cancelDataSyncRun(currentRun.id, { signal }));
       }}
-      onCheckStatus={checkStatus} onOpenPermissions={openPermissions} />;
+      onCheckStatus={checkStatus} onOpenPermissions={openPermissions} onDismiss={() => setFirstSyncDismissed(true)} />;
     if (!state && error) return <section className="data-sync-panel" aria-label="Workspace status">
       <h2>Workspace status is unavailable</h2>
       <p>We could not check whether your workspace is ready. Retry the status check.</p>

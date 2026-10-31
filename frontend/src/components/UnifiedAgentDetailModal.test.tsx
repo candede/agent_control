@@ -181,6 +181,12 @@ function capabilitiesWithDirectory(): CapabilityView[] {
       verification: "provider", previewQualification: "not_required", remediation: [],
       checkedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
     },
+  }, {
+    enabled: true, definition: capabilityDefinitions.find(definition => definition.id === "graph.users.read")!,
+    decision: {
+      capabilityId: "graph.users.read", status: "available", authorized: true, fresh: true,
+      verification: "on_demand", previewQualification: "not_required", remediation: [],
+    },
   }];
 }
 
@@ -249,9 +255,10 @@ describe("unified authoring and person evidence", () => {
     expect(lookup).not.toHaveBeenCalled();
   });
 
-  it("keeps inventory-only person references unverified and available for explicit lookup", () => {
+  it("keeps inventory-only person references unverified and available for application-only user lookup", () => {
     const lookup = vi.spyOn(api, "resolveAgentPeople");
-    renderDetail({ record: { ...nativeRecord(), people: {} }, onOpenPerson: vi.fn() }, capabilitiesWithDirectory());
+    const views = capabilitiesWithDirectory().filter(view => view.definition.id !== "graph.directory.read");
+    renderDetail({ record: { ...nativeRecord(), people: {} }, onOpenPerson: vi.fn() }, views);
     expect(field("Owner")).toHaveTextContent("Unverified directory identity.");
     expect(field("Created by")).toHaveTextContent("Unverified directory identity.");
     expect(screen.queryByRole("button", { name: /View responsibility for/ })).not.toBeInTheDocument();
@@ -672,7 +679,7 @@ describe("UnifiedAgentDetailModal", () => {
 
     const dialog = screen.getByRole("dialog", { name: "Unified builder" });
     const tablist = within(dialog).getByRole("tablist", { name: "Agent details" });
-    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage", "Users", "Manage", "Activity"]);
+    expect(within(tablist).getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage", "Users", "Manage"]);
     expect(within(dialog).getByRole("tabpanel", { name: "Overview" })).toBeVisible();
     expect(within(dialog).getByText("Environment name").nextElementSibling).toHaveTextContent("Production");
     expect(within(dialog).getAllByText("Agent Builder").some(element => element.closest("details") === null)).toBe(true);
@@ -695,7 +702,7 @@ describe("UnifiedAgentDetailModal", () => {
 
   it.each([
     ["identities", "identities", "Overview"],
-    ["reports", "reports", "Usage"], ["users", "users", "Users"], ["audit-security", "audit-security", "Activity"], ["controls", "controls", "Manage"],
+    ["reports", "reports", "Usage"], ["users", "users", "Users"], ["audit-security", "identities", "Overview"], ["controls", "controls", "Manage"],
   ])("resolves the current %s route to the %s panel under the %s label", (activeTab, panel, name) => {
     renderDetail({ activeTab });
     expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
@@ -1919,14 +1926,14 @@ describe("UnifiedAgentDetailModal", () => {
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
     update({ activeTab: undefined });
     fireEvent.keyDown(screen.getByRole("tab", { name: "Overview" }), { key: "End" });
-    expect(screen.getByRole("tab", { name: "Activity" })).toHaveFocus();
-    expect(props.onTabChange).toHaveBeenLastCalledWith("audit-security");
-    fireEvent.keyDown(screen.getByRole("tab", { name: "Activity" }), { key: "ArrowRight" });
+    expect(screen.getByRole("tab", { name: "Manage" })).toHaveFocus();
+    expect(props.onTabChange).toHaveBeenLastCalledWith("controls");
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Manage" }), { key: "ArrowRight" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveFocus();
     expect(props.onTabChange).toHaveBeenLastCalledWith("identities");
     fireEvent.keyDown(screen.getByRole("tab", { name: "Overview" }), { key: "ArrowLeft" });
-    expect(screen.getByRole("tab", { name: "Activity" })).toHaveFocus();
-    fireEvent.keyDown(screen.getByRole("tab", { name: "Activity" }), { key: "Home" });
+    expect(screen.getByRole("tab", { name: "Manage" })).toHaveFocus();
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Manage" }), { key: "Home" });
     expect(screen.getByRole("tab", { name: "Overview" })).toHaveFocus();
   });
 
@@ -2273,15 +2280,12 @@ describe("UnifiedAgentDetailModal", () => {
       purview: { status: "unavailable", mode: "search", presets: [], reasonCode: "unsupported_identity_crosswalk" },
     });
     renderDetail({ record: observedRecord(), activeTab });
-    if (activeTab === "audit-security") {
-      expect(await screen.findByRole("heading", { name: "Purview linking not supported for this agent" })).toBeVisible();
-      expect(context).toHaveBeenCalledOnce();
-      expect(screen.getByRole("region", { name: /Investigations for/ }).querySelector("details")).toBeNull();
-    } else expect(context).not.toHaveBeenCalled();
+    expect(context).not.toHaveBeenCalled();
+    expect(screen.queryByRole("tab", { name: "Activity" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Saved observations for|No saved activity is linked/)).not.toBeInTheDocument();
   });
 
-  it("keeps Purview and ready content during same-agent refreshes, then replaces the saved context", async () => {
+  it("keeps deferred investigations unmounted across deep links and inventory refreshes while Manage remains available", async () => {
     const context = {
       recordId: record.id, displayName: record.displayName,
       defender: { status: "unavailable" as const, entraAgentIds: [], reasonCode: "unsupported_identity_crosswalk" as const },
@@ -2291,16 +2295,15 @@ describe("UnifiedAgentDetailModal", () => {
       ...context, purview: { ...context.purview, reason: "Updated saved mapping is unavailable." },
     });
     const { update } = renderDetail({ activeTab: "audit-security", inventoryRevision: "first" });
-    await screen.findByRole("heading", { name: "Purview identity not mapped" });
-    fireEvent.change(screen.getByRole("combobox", { name: "Source" }), { target: { value: "purview" } });
-    expect(screen.getByText("No exact bot mapping.")).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
     update({ dataRevision: 1, inventoryRevision: "second" });
-    expect(screen.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
-    expect(screen.getByText("No exact bot mapping.")).toBeVisible();
-    await screen.findByText("Updated saved mapping is unavailable.");
-    expect(screen.queryByText("No exact bot mapping.")).not.toBeInTheDocument();
-    expect(lookup).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("combobox", { name: "Source" })).toHaveValue("purview");
+    expect(screen.queryByRole("tab", { name: "Activity" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: /Investigations for/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Source" })).not.toBeInTheDocument();
+    expect(lookup).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("tab", { name: "Manage" }));
+    update({ activeTab: "controls" });
+    expect(screen.getByRole("heading", { name: "Manage" })).toBeVisible();
   });
 
   it("offers common Manage controls for every package and quarantine with exact target callbacks", async () => {

@@ -687,21 +687,37 @@ describe("export session publication fence", () => {
     },
   );
 
-  it("accepts inherited Viewer access but propagates absent stored sessions and invalid sources", async () => {
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)(
+    "accepts Viewer access from %s but propagates absent stored sessions and invalid sources", async role => {
+      const { request } = authorizedTransport();
+      request.session.user!.roles = [role];
+      const validateSource = vi.fn(async () => undefined);
+      const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+      const validate = () => validateSession(validateSource);
+      await validate();
+      expect(storedSession.query).toHaveBeenCalledWith(expect.any(String), [
+        request.sessionID, "csv-tenant", request.session.accountId,
+        ["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"], "csv-client",
+      ]);
+      expect(validateSource).toHaveBeenCalledOnce();
+      validateSource.mockRejectedValueOnce(new AppError(409, "dataset_invalidated", "Source expired."));
+      await expect(validate()).rejects.toMatchObject({ code: "dataset_invalidated" });
+      storedSession.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
+      await expect(validate()).rejects.toMatchObject({ code: "unauthorized" });
+      expect(validateSource).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([
+    ["AgentControl.Viewer", "AgentControl.UsageReportUploader"],
+    ["AgentControl.Viewer", "AgentControl.Admin"],
+    ["AgentControl.UsageReportUploader", "AgentControl.Admin"],
+  ] as const)("does not elevate %s to %s for exports", (role, requiredRole) => {
     const { request } = authorizedTransport();
-    const validateSource = vi.fn(async () => undefined);
-    const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
-    const validate = () => validateSession(validateSource);
-    await validate();
-    expect(storedSession.query).toHaveBeenCalledWith(expect.any(String), [
-      request.sessionID, "csv-tenant", request.session.accountId, "AgentControl.Viewer", "csv-client",
-    ]);
-    expect(validateSource).toHaveBeenCalledOnce();
-    validateSource.mockRejectedValueOnce(new AppError(409, "dataset_invalidated", "Source expired."));
-    await expect(validate()).rejects.toMatchObject({ code: "dataset_invalidated" });
-    storedSession.query.mockResolvedValueOnce({ rowCount: 0, rows: [] });
-    await expect(validate()).rejects.toMatchObject({ code: "unauthorized" });
-    expect(validateSource).toHaveBeenCalledTimes(2);
+    request.session.user!.roles = [role];
+    expect(() => createExportPublicationValidator(request, requiredRole))
+      .toThrow(expect.objectContaining({ code: "unauthorized" }));
+    expect(storedSession.query).not.toHaveBeenCalled();
   });
 
   it("rechecks durable session revocation after a source read without holding the logout lock", async () => {

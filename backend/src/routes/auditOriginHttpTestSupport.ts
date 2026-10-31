@@ -29,7 +29,7 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
   vi.spyOn(pool, "connect").mockImplementation(fixture.runtime.connect.bind(fixture.runtime));
   config.tenants = [{ ...tenant, integration: { ...tenant.integration!, clientId: integrationClientId } }];
   clearAccountSessionMutationsForTest(); clearAdmissionForTest();
-  const authentication = { ...browserAuthenticationResult(), account: selected, uniqueId: selected.localAccountId, scopes: ["User.ReadBasic.All"],
+  const authentication = { ...browserAuthenticationResult(), account: selected, uniqueId: selected.localAccountId, scopes: ["openid", "profile"],
     idTokenClaims: { ...browserAuthenticationResult().idTokenClaims, oid: selected.localAccountId, roles } };
   replaceMsalClientForTest(tenant.tenantId, {
     getAuthCodeUrl: async () => { throw new Error("No live browser login"); },

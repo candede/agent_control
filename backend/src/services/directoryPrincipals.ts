@@ -37,10 +37,19 @@ export type DirectoryPrincipal = PackageAccessEntity & {
   userPrincipalName?: string;
 };
 
+export type DirectoryTokens = { user?: string; group?: string };
+
+function directoryToken(tokens: DirectoryTokens, kind: string) {
+  if (kind !== "user" && kind !== "group") throw new AppError(400, "invalid_principal", "Directory lookup requires a user or group.");
+  const token = tokens[kind];
+  if (!token) throw new AppError(401, "authorization_required", `Authorization for ${kind} lookup is unavailable.`);
+  return token;
+}
+
 export class DirectoryPrincipalsClient {
   constructor(private readonly fetcher: FetchLike = fetch) {}
 
-  async search(accessToken: string, query: string, limit = defaultSearchLimit, signal?: AbortSignal, assertCurrent?: () => void) {
+  async search(tokens: Required<DirectoryTokens>, query: string, limit = defaultSearchLimit, signal?: AbortSignal, assertCurrent?: () => void) {
     signal?.throwIfAborted();
     assertCurrent?.();
     if (typeof query !== "string" || /[\u0000-\u001f\u007f-\u009f]/.test(query)) {
@@ -63,6 +72,8 @@ export class DirectoryPrincipalsClient {
         `Directory searches cannot exceed ${maxSearchQueryLength} characters.`,
       );
     }
+    const userToken = directoryToken(tokens, "user");
+    const groupToken = directoryToken(tokens, "group");
 
     const normalizedLimit = Math.min(
       Math.max(Math.trunc(limit) || defaultSearchLimit, 1),
@@ -73,10 +84,10 @@ export class DirectoryPrincipalsClient {
     try {
       const [users, groups] = await Promise.all([
         this.searchCollection<GraphUser>(
-          buildUserSearchUrl(normalizedQuery, normalizedLimit), accessToken, batchSignal, assertCurrent,
+          buildUserSearchUrl(normalizedQuery, normalizedLimit), userToken, batchSignal, assertCurrent,
         ),
         this.searchCollection<GraphGroup>(
-          buildGroupSearchUrl(normalizedQuery, normalizedLimit), accessToken, batchSignal, assertCurrent,
+          buildGroupSearchUrl(normalizedQuery, normalizedLimit), groupToken, batchSignal, assertCurrent,
         ),
       ]);
       batchSignal.throwIfAborted();
@@ -105,7 +116,7 @@ export class DirectoryPrincipalsClient {
     }
   }
 
-  async resolve(accessToken: string, entities: PackageAccessEntity[], signal?: AbortSignal, assertCurrent?: () => void) {
+  async resolve(tokens: DirectoryTokens, entities: PackageAccessEntity[], signal?: AbortSignal, assertCurrent?: () => void) {
     signal?.throwIfAborted();
     assertCurrent?.();
     if (!Array.isArray(entities)) {
@@ -119,6 +130,7 @@ export class DirectoryPrincipalsClient {
       );
     }
     const unique = deduplicateEntities(entities);
+    for (const entity of unique) directoryToken(tokens, entity.resourceType);
 
     const controller = new AbortController();
     const batchSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
@@ -129,9 +141,9 @@ export class DirectoryPrincipalsClient {
         batchSignal.throwIfAborted();
         try {
           if (entity.resourceType === "user") {
-            return await this.resolveUser(accessToken, entity.resourceId, batchSignal, assertCurrent);
+            return await this.resolveUser(directoryToken(tokens, "user"), entity.resourceId, batchSignal, assertCurrent);
           }
-          return await this.resolveGroup(accessToken, entity.resourceId, batchSignal, assertCurrent);
+          return await this.resolveGroup(directoryToken(tokens, "group"), entity.resourceId, batchSignal, assertCurrent);
         } catch (error) {
           controller.abort(error);
           throw error;

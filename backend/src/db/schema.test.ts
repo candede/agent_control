@@ -37,7 +37,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "inventory tables", rows: Array.from({ length: 21 }, () => ({ relation: "inventory_roots" })) },
     { name: "inventory payload", rows: [{ valid: true }] },
     { name: "inventory guards", rows: [{ count: 14 }] },
-    { name: "inventory indexes", rows: [{ count: 11 }] },
+    { name: "inventory indexes", rows: [{ count: 20 }] },
     { name: "inventory grants", rows: [inventoryGrants] },
     { name: "job pages", rows: [{ revision: true, triggers: 3 }] },
     { name: "refresh targets", rows: [{ targets: true, target_job: true, detail_metadata: true, permissions: true }] },
@@ -152,7 +152,7 @@ describe("current schema source contracts", () => {
     }
     const tables = [...topLevel.matchAll(/^CREATE TABLE ([a-z_]+)/gm)].map(match => match[1]).sort();
     expect(tables).toEqual(Object.keys(backupTableKeys).sort());
-    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(157);
+    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(166);
     const alterations = topLevel.split(";").map(statement => statement.trim()).filter(statement => /^ALTER /i.test(statement));
     expect(alterations).toHaveLength(90);
     for (const statement of alterations) {
@@ -166,6 +166,14 @@ describe("current schema source contracts", () => {
     expect(schemaSql).toContain("defender_hunting_jobs_query_version_check CHECK (query_version = 3)");
     expect(schemaSql).toContain("defender_hunting_snapshots_query_version_check CHECK (query_version = 3)");
     expect(schemaSql).toContain("defender_hunting_rows_projection_version_check CHECK (projection_version = 3)");
+  });
+
+  it("indexes all current record generation references", () => {
+    for (const table of ["package_record_rows", "power_platform_record_rows", "unified_agent_rows"]) {
+      for (const column of ["catalog_generation", "detail_generation", "control_generation"]) {
+        expect(topLevel).toMatch(new RegExp(`^CREATE INDEX ${table}_${column}\\s+ON ${table} \\(${column}\\);`, "m"));
+      }
+    }
   });
 
   it("creates but does not populate the fingerprint marker and retains required fresh seed rows", () => {
@@ -216,6 +224,14 @@ describe("current schema source contracts", () => {
       }
     },
   );
+
+  it("supports only application package collection in the current schema", () => {
+    const definition = schemaSql.match(/CREATE TABLE package_refresh_jobs \([\s\S]*?\n\);/)?.[0];
+    expect(definition).toContain("CONSTRAINT package_refresh_jobs_token_mode_check CHECK (token_mode = CAST('application' AS text))");
+    const automatic = definition!.match(/CONSTRAINT inventory_refresh_job_mode CHECK[\s\S]*?(?=\n  , CONSTRAINT)/)?.[0];
+    expect(automatic).toContain("scope_kind = CAST('exact' AS text)");
+    expect(automatic).not.toContain("delegated");
+  });
 
   it("enqueues quarantine readbacks only for case-exact native resource IDs, including GUID-looking IDs", () => {
     const enqueue = schemaSql.match(/CREATE FUNCTION inventory_fence_native_readback\(\)[\s\S]*?END\$\$/)?.[0];
@@ -438,7 +454,7 @@ describe("schema verification without a database", () => {
     ["inventory tables", [{ relation: null }], "inventory_schema_missing"],
     ["inventory payload", [{ valid: false }], "inventory_payload_schema"],
     ["inventory guards", [{ count: 13 }], "inventory_schema_guards"],
-    ["inventory indexes", [{ count: 10 }], "inventory_schema_indexes"],
+    ["inventory indexes", [{ count: 19 }], "inventory_schema_indexes"],
   ] as const)("rejects incomplete active inventory structures at %s", async (stage, rows, message) => {
     const database = databaseWithResults(...resultsBefore(stage), [...rows]);
     await expect(verifySchema(database)).rejects.toThrow(message);

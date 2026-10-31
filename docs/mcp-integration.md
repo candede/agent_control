@@ -1,11 +1,10 @@
 # MCP integration v1: canonical API contract
 
 The canonical API, browser and worker contracts are implemented in current
-source. Phases 05–07 implement the Python FastMCP authentication/storage/API
-adapter and typed saved-read, collection, investigation and exact control catalog.
-This document claims no MCP
-deployment, live Entra consent or live provider result.
-See the [remaining roadmap](../plans/fastmcp-integration/README.md).
+source. The optional Python FastMCP service provides authentication/storage/API
+adapters and typed saved-read, collection, investigation and exact control tools.
+It is not required for the web application. Local implementation/tests do not
+prove a live deployment, Entra consent or provider result.
 Update this operation/feature map when current contracts change.
 
 The [phase11 release record](../plans/fastmcp-integration/completions/11-release-qualification.md)
@@ -83,7 +82,7 @@ capability evidence, quarantine and audit use this key. Sessions' generated
 reviewed usage associations are tenant-wide. Directory/licensing/activity,
 Graph packages, Power Platform, canonical inventory and saved people joins also
 have one tenant owner (`scope_kind=tenant`, `principal_id=NULL`, `token_mode=tenant`).
-Viewer and Admin roles read that saved data without provider source-read permission.
+Viewer, UsageReportUploader and Admin roles read that saved data without provider source-read permission.
 Provider refreshes still use the initiating actor's current authorization and
 credentials; application-mode packages publish to the same tenant root.
 Collector/session fencing and private execution receipts remain actor-bound.
@@ -112,9 +111,9 @@ or contradictory tenant/audience. Never accept the MCP's unsigned mapping
 header or create a fabricated browser session.
 
 02 must retain ephemeral identity evidence from this exchange, not raw response
-claims in PostgreSQL. The bounded bootstrap exchange may use the already
-admin-managed Graph `User.ReadBasic.All` delegated grant plus OIDC metadata;
-it makes **no Graph data request**. This adds no Graph grant to ordinary browser
+claims in PostgreSQL. The bounded bootstrap exchange requests only `openid`
+and `profile` for OIDC identity metadata;
+it makes **no Graph data request** and requires no directory-read grant. This adds no Graph grant to ordinary browser
 saved reads. For a bearer user without sufficient verified exchange evidence,
 saved bearer admission stays closed; never impose provider work on ordinary
 saved-data GET handlers. Once mapped, saved reads use only verified principal
@@ -137,7 +136,8 @@ Primary evidence is dated below. Implemented pin: FastMCP **4.1.0**, release
 and transitive dependencies; recheck this contract on drift.
 
 1. Existing API registration remains browser confidential/OIDC client, owns
-   Viewer/Admin user roles and Graph/Power Platform delegated permissions.
+   Viewer, UsageReportUploader and Admin user roles, the four standard Graph
+   application read grants, and delegated Power Platform/management permissions.
    Expose one delegated scope `api://<apiClientId>/AgentControl.Access`;
    configure v2 access tokens and required user identity/role claims. Assign
    the users on this API enterprise application; MCP login roles do not confer
@@ -289,7 +289,7 @@ downstream OAuth client ID. It does not expose tokens, connection handles,
 session IDs, user names or provider/SQL details. It reports the actual registered
 business-tool count and bounded OAuth file/byte usage, not inferred readiness
 or provider permission. Storage inspection failures return a redacted503.
-See [setup](deployment-setup.md#local-fastmcp-foundation-phase-05) and
+See [setup](deployment-setup.md#optional-mcp-service) and
 [storage lifecycle](security-model.md#fastmcp-oauth-state-and-recovery).
 
 ### Implemented typed business catalog (phase 06)
@@ -319,15 +319,17 @@ The catalog covers saved capabilities/workspace jobs; inventory selections,
 facets, detail, members, sections, children and About; exact saved users,
 licensing, responsibility and relationships; adoption/champions; official
 reports, history, analytics, usage and explicit comparisons; saved
-investigations/audit; and explicit delegated collection, directory enrichment,
+investigations/audit; and explicit application Graph collection, delegated Power Platform collection, directory enrichment,
 identity resolution, capability checks, Audit Search/hunts and their bounded
 job/results/recovery operations, plus the exact controls below.
 Local Purview/Defender cache deletion requires confirmation of the exact job ID
 and is marked destructive. No CSV import, capability configuration, binary
 download, automatic browser
 refresh, arbitrary HTTP/SQL/KQL or application-identity fallback is registered.
-Browser application-mode investigation behavior is unchanged; MCP provider
-submission inputs remain delegated-only, matching bearer policy.
+Browser application-mode investigation behavior is unchanged. MCP investigation
+submissions remain delegated-only. Standard Graph collection uses the configured
+tenant application, with the authenticated initiating user's current app-role and
+session authority; package refresh inputs accept only `application`.
 
 ### Implemented exact controls (phase 07)
 
@@ -338,6 +340,11 @@ canonical map below. Existing `search_access_principals` and
 `resolve_access_principals` serve access editing; search is bounded and is not
 exhaustive discovery. No canary, release receipt, enable switch or MCP approval
 state gates ordinary supported controls.
+
+For the signed-in package operator, recommend **AI Administrator**;
+**Global Administrator** is a broader alternative. This follows Microsoft's
+Microsoft 365 admin-center role guidance, not a confirmed exclusive API role
+minimum. See the [role recommendation and its scope](user-roles-and-permissions.md#package-management-administrator-roles).
 
 Controls require current API-owned **Admin** authority and the actual delegated
 provider permission: Graph `CopilotPackages.ReadWrite.All` or Power Platform
@@ -475,8 +482,8 @@ Another user's or expired connection's grant cannot resume a job.
   captures **that response's** `client_info`; it does not inspect SDK-private
   cache entities. The SDK's sole `client-request-id` query is allowed; no
   alternate endpoint, discovery, redirect or browser cache supplies identity.
-  Bootstrap exchanges the already administrator-consented
-  Graph `User.ReadBasic.All` plus OIDC scopes for identity metadata only.
+  Bootstrap requests only the existing `openid` and `profile` scopes for
+  identity metadata, without a Graph directory-read permission.
   It performs **zero Graph data requests**. Every provider acquisition requests
   only its capability's resource scopes and proves the same SDK home/local/
   tenant/API identity, expiry and grants. A successful endpoint response must
@@ -503,9 +510,13 @@ Another user's or expired connection's grant cannot resume a job.
   provider expiry, with one-second SDK rounding safety on acquired tokens),
   `assertCurrent`, `revalidate`, capability-specific `acquire`,
   and `revoke`. Duplicate requests coalesce only inside the exact source and
-  capability/authorization hash. Cancelling one waiter leaves other callers;
+  capability/authorization hash. Every acquisition waiter rechecks current
+  authorization before returning a token, including concurrent role changes.
+  Cancelling one waiter leaves other callers;
   the last cancellation stops shared work and prevents late publication.
-  `Retry-After` delta/date cooldowns are honored; there is no automatic token or
+  Late failures from cancelled or timed-out work cannot revoke renewed authority
+  or impose a cooldown. Concurrent `Retry-After` delta/date responses preserve
+  the longest outstanding cooldown; there is no automatic token or
   provider-write replay. Whole exchange/bootstrap/epoch work is bounded to ten
   seconds. A bounded validated `access_token` claims challenge is returned
   only as safe reauthorization details; raw provider errors and tokens are not.
@@ -796,7 +807,8 @@ public SPA boundaries. All route
 modules are mounted once under `/api`; tables show full HTTP paths. Parameter
 names are literal route grammar, not display-name selectors. `—` means **no
 MCP tool / no bearer admission**, not missing implementation. `V` includes
-Admin, `A` means Admin, `S` means any validated session, `P` public. Authenticated
+UsageReportUploader and Admin, `U` means UsageReportUploader or Admin, `A` means
+Admin, `S` means any validated session, `P` public. Authenticated
 non-GETs retain CSRF and same-Origin for browser transport. Capabilities are
 exact IDs from `capabilityRegistry`; where dynamic, the service rechecks them.
 Tool names are the finite server allowlist. Phase06 read/collection/investigation
@@ -843,12 +855,12 @@ not merely hide `tools/list` results.
 | `GET /api/agent-inventory/:recordId/sections` | IS, exact `sourceScopeId,sourceIdentity` ->section page | getInventorySections/Overview config | list_agent_sections | V |
 | `GET /api/agent-inventory/:recordId/about` | required selectionId/sourceScopeId/sourceIdentity,field long/native/short,cursor? ->AgentAboutPage;16384 Unicode characters/segment,full saved bytes via continuation | getAgentAbout/SavedAgentAbout/AgentOverview; long then native then short; automatically loads complete text without load-more controls or inline provenance | read_agent_about | V |
 | `GET /api/agent-responsibility` | `objectId?,search?<=256,selectionId?,cursor?,limit=50<=100` ->people or selected person's agents/roles | getAgentResponsibility/Users responsibility | list_agent_responsibility | V |
-| `POST /api/agent-inventory/people/resolve` | `{recordId,force?:false}` ->saved people/changed; derive referenced IDs | resolveAgentPeople/Look up people | resolve_agent_people | V; graph.directory.read |
+| `POST /api/agent-inventory/people/resolve` | `{recordId,force?:false}` ->saved people/changed; derive referenced IDs | resolveAgentPeople/Look up people | resolve_agent_people | V; graph.users.read (application) |
 | `POST /api/agents/selections` | `{query:I}` ->201 actor-bound tenant package selection | getAgents capture | capture_packages | V |
 | `GET /api/agents` | I + paging ->tenant PackagePage | getAgents/package/access views | list_packages | V |
 | `GET /api/agents/:id/detail` | exact `selectionId` ->saved CopilotPackageDetail | getAgentDetails/package editor | get_package | V |
 | `GET /api/inventory/resources/:nativeId/related` | required `snapshotId`, `environmentId?:""`; no type ->saved source-aware activity | retained API; modal uses investigation context | get_native_agent_activity | V |
-| `GET /api/inventory/quarantine-selection` | required `snapshotId`, repeated exact `selected` IDs (empty default) ->resolved native selection | retained native selection API | resolve_studio_targets | V |
+| `GET /api/inventory/quarantine-selection` | required `snapshotId`, 1–25 distinct repeated exact `selected` IDs ->native resources (`PowerPlatformResource[]`) and current snapshot | retained native selection API | resolve_studio_targets | V |
 
 ### Users, licensing, official reports, cohorts and retained history
 
@@ -912,13 +924,13 @@ limits and bounded SQL stream batches; no MCP file/blob/download tool.
 
 | Method route | Exact input/default -> output | Browser consumer / feature | MCP tool | Policy |
 | --- | --- | --- | --- | --- |
-| `POST /api/official-usage/staging` | multipart file + optional operator reportingStart/End,periodProvenance,sourceAsOf/Provenance,downloadedAt; query bundleId,correctionOfSetId?,rejectDuplicateKind? ->preview | stageReport/Add CSV reports | — | A |
-| `GET /api/official-usage/staging/:id` | exact UUID ->OfficialReportPreview | readReportStage/resume explicit draft | — | A |
-| `GET /api/official-usage/staging/:id/diagnostics` | cursor?,limit=50<=100 ->diagnostics page | readReportDiagnostics/import errors | — | A |
-| `DELETE /api/official-usage/staging/:id` | exact UUID ->204 | discardReportStage/confirmed cleanup | — | A |
-| `POST /api/official-usage/staging/:id/accept` | OfficialReport acceptance intent/hash/revision ->accepted | retained single-stage API; ordinary browser uses bundle | — | A |
-| `POST /api/official-usage/bundles/:id/preview` | `{forDiscard?:boolean}` ->OfficialReportBundlePreview | previewReportBundle/validate or cleanup | — | A |
-| `POST /api/official-usage/bundles/:id/accept` | `{contentHash,expectedActiveRevision,acknowledgeCorrection?}` ->OfficialReportAccepted | acceptReportBundle/import/replay verification | — | A |
+| `POST /api/official-usage/staging` | multipart file + optional operator reportingStart/End,periodProvenance,sourceAsOf/Provenance,downloadedAt; query bundleId,correctionOfSetId?,rejectDuplicateKind? ->preview | stageReport/Add CSV reports | — | U; corrections A |
+| `GET /api/official-usage/staging/:id` | exact UUID ->OfficialReportPreview | readReportStage/resume explicit draft | — | U; own new drafts; corrections A |
+| `GET /api/official-usage/staging/:id/diagnostics` | cursor?,limit=50<=100 ->diagnostics page | readReportDiagnostics/import errors | — | U; own new drafts; corrections A |
+| `DELETE /api/official-usage/staging/:id` | exact UUID ->204 | discardReportStage/confirmed cleanup | — | U; own unaccepted new drafts; corrections A |
+| `POST /api/official-usage/staging/:id/accept` | OfficialReport acceptance intent/hash/revision ->accepted | retained single-stage API; ordinary browser uses bundle | — | U; own new imports; corrections A |
+| `POST /api/official-usage/bundles/:id/preview` | `{forDiscard?:boolean}` ->OfficialReportBundlePreview | previewReportBundle/validate or cleanup | — | U; own new imports; corrections A |
+| `POST /api/official-usage/bundles/:id/accept` | `{contentHash,expectedActiveRevision,acknowledgeCorrection?}` ->OfficialReportAccepted | acceptReportBundle/import/replay verification | — | U; own new imports; corrections A |
 | `POST /api/official-usage/sets/:id/preview` | `{operation:select\|delete}` ->OfficialReportConfirmation | previewReportOperation/dropdown/delete | — | A |
 | `POST /api/official-usage/confirmations/:id` | exact full server confirmation,body id=path ->confirmed | confirmReportOperation/shared selection/deletion | — | A |
 | `POST /api/data-exports` | OfficialReportExportRequest `{selectionId,kind,ids?,idempotencyKey}` ->202 `{id}` | createReportExport/all filtered inventory/users/report CSV | — | V |
@@ -952,14 +964,14 @@ Existing signed-in browser visibility/initial/check/due behaviors stay unchanged
 | `GET /api/data-sync/package-details` | no query ->PackageDetailSyncState | getPackageDetailSyncState | get_package_detail_sync | V |
 | `POST /api/data-sync/package-details/start` | absent/empty object,no query ->202 state | startPackageDetailSync | start_package_detail_sync | V |
 | `POST /api/data-sync/package-details/cancel` | absent/empty object,no query ->state | cancelPackageDetailSync | cancel_package_detail_sync | V |
-| `POST /api/agents/refresh-jobs` | `{mode?:delegated,ids?:1..5000}`; Idempotency-Key? ->202 job | startPackageRefresh/explicit catalog | refresh_packages | V; graph.package.read.delegated or application |
-| `POST /api/agents/:id/refresh-jobs` | `{mode?:delegated}` exact package path ->202 exact job | startExactPackageRefresh/access editor | refresh_package | V |
-| `POST /api/agents/refresh-selection` | `{selectionId,ids?,recordIds?}` key? ->202 selected job | refreshPackageIdentityDetails/bulk preparation | refresh_selected_packages | V; graph.package.read.delegated |
-| `GET /api/agents/refresh-jobs` | J,mode=delegated ->job list | getPackageRefreshJobs/initial discovery | list_package_refresh_jobs | V |
-| `GET /api/agents/refresh-jobs/:id` | mode=delegated ->job | getPackageRefreshJob | get_package_refresh_job | V |
-| `GET /api/agents/refresh-jobs/:id/targets` | mode=delegated,revision?,cursor?,limit=50<=100 ->targets | getPackageRefreshTargets | list_package_refresh_targets | V |
-| `POST /api/agents/refresh-jobs/:id/resume` | `{mode?:delegated}` ->202 job | refreshPackageIdentityDetails/retained API recovery | resume_package_refresh | V |
-| `POST /api/agents/refresh-jobs/:id/cancel` | `{mode?:delegated}` ->job | retained cancellation API | cancel_package_refresh | V |
+| `POST /api/agents/refresh-jobs` | `{mode?:application,ids?:1..5000}`; Idempotency-Key? ->202 job | startPackageRefresh/explicit catalog | refresh_packages | V; graph.package.read.application |
+| `POST /api/agents/:id/refresh-jobs` | `{mode?:application}` exact package path ->202 exact job | startExactPackageRefresh/access editor | refresh_package | V |
+| `POST /api/agents/refresh-selection` | `{selectionId,ids?,recordIds?}` key? ->202 selected job | refreshPackageIdentityDetails/bulk preparation | refresh_selected_packages | V; graph.package.read.application |
+| `GET /api/agents/refresh-jobs` | J,mode=application ->job list | getPackageRefreshJobs/initial discovery | list_package_refresh_jobs | V |
+| `GET /api/agents/refresh-jobs/:id` | mode=application ->job | getPackageRefreshJob | get_package_refresh_job | V |
+| `GET /api/agents/refresh-jobs/:id/targets` | mode=application,revision?,cursor?,limit=50<=100 ->targets | getPackageRefreshTargets | list_package_refresh_targets | V |
+| `POST /api/agents/refresh-jobs/:id/resume` | `{mode?:application}` ->202 job | refreshPackageIdentityDetails/API recovery | resume_package_refresh | V |
+| `POST /api/agents/refresh-jobs/:id/cancel` | `{mode?:application}` ->job | cancel_package_refresh | cancel_package_refresh | V |
 | `POST /api/inventory/refresh-jobs` | `{environmentId?,types?:allowlisted agents/environments}`,key? ->202 job | refreshInventory | refresh_studio_inventory | V; powerPlatform.inventory.read |
 | `GET /api/inventory/refresh-jobs` | J ->job list | getInventoryRefreshJobs | list_studio_refresh_jobs | V |
 | `GET /api/inventory/refresh-jobs/:id` | UUID ->job | getInventoryRefreshJob | get_studio_refresh_job | V |
@@ -971,6 +983,8 @@ sources exclude manual usage. `clearSavedData=true` requires full and omitted
 sources and clears users/inventory, **never reports**. MCP start_sync does not
 expose clearSavedData or manual upload source. This is narrowed adapter input,
 not a second server route/default. Browser retains its confirmed reset action.
+MCP `start_sync` and `retry_sync` accept only distinct source names; omit
+`sources` to retain the API's default source selection.
 
 ### Package controls and explicit Studio controls
 
@@ -1010,8 +1024,8 @@ target/receipt/current authorization, not a claim of human/scheduled intent.
 | `POST /api/quarantine/canary-approvals` | `{action,nativeId,poststate,prestate,prestateProviderUpdatedAt,snapshotId}` ->201 approval | optional operator API | — | A |
 | `GET /api/quarantine/canary-approvals` | limit=50<=100 ->approvals | optional operator API | — | A |
 | `POST /api/quarantine/canary-approvals/:id/execute` | `{confirmed:true,restorationApprovalId}` ->result | optional restoration cycle | — | A; powerPlatform.quarantine.manage |
-| `GET /api/directory/principals` | search2..120,limit<=50 (service default25) ->bounded `{value}`; **not exhaustive** | searchDirectoryPrincipals/access editor | search_access_principals | V; graph.directory.read |
-| `POST /api/directory/principals/resolve` | `{principals:[1..500 typed exact UUIDs]}` ->`{value}` | resolveDirectoryPrincipals/access validation | resolve_access_principals | V; graph.directory.read |
+| `GET /api/directory/principals` | search2..120,limit<=50 (service default25) ->bounded `{value}`; **not exhaustive** | searchDirectoryPrincipals/access editor | search_access_principals | V; application graph.users.read for users; delegated graph.directory.read for groups |
+| `POST /api/directory/principals/resolve` | `{principals:[1..500 typed exact UUIDs]}` ->`{value}` | resolveDirectoryPrincipals/access validation | resolve_access_principals | V; application graph.users.read for user IDs; delegated graph.directory.read for group IDs; require only the supplied types |
 
 Receipts bind exact user/action/provider/source/current inventory/prestate/revision/
 expiry. Package stage expiry10min; Studio preview validity is provider-specific,
@@ -1053,10 +1067,12 @@ silent provider refreshes.
 | `DELETE /api/hunting/jobs/:id` | `{confirmation:<id>,...H}` ->204 local cache deletion | deleteDefenderHunt | delete_hunting_cache | V |
 | `GET /api/hunting/jobs/:id/rows` | limit=100<=200,offset=0<=100000,H ->rows/snapshot/job | getDefenderHuntingRows | list_hunting_rows | V |
 | `GET /api/hunting/jobs/:id/export.csv` | UUID,H ->CSV,max200rows/2MB/15s | downloadDefenderHuntingCsv | — | V |
-| `GET /api/audit/events` | A ->`{value:AuditEvent[],count}` | getAuditEvents/AuditLogView/filter/details | list_administrative_audit | V |
-| `POST /api/audit/events/export.csv` | `{ids:[1..100 unique event IDs]}` ->CSV,max1MB/15s | downloadAdministrativeAuditCsv | — | V |
+| `GET /api/audit/events` | A ->`{value:AuditEvent[],count}` | getAuditEvents/AuditLogView/filter/details | list_administrative_audit | A |
+| `POST /api/audit/events/export.csv` | `{ids:[1..100 unique event IDs]}` ->CSV,max1MB/15s | downloadAdministrativeAuditCsv | — | A |
 
 AF/HF are structured presets/time ranges and supported exact filters only.
+Purview UTC timestamps accept whole seconds or exactly three fractional digits;
+hunting additionally accepts one or two fractional digits. Both require `Z`.
 Purview maximum window168h,20pages/5000rows/8MB,6polls/activation,
 64provider requests/12activations; records retain metadata/message IDs, not
 prompts. Defender maximum168h,200rows/2MB,12requests/4activations, curated
@@ -1388,8 +1404,8 @@ the real user-source parser, identity verification, staged publication and
 authorization fences; no success markers are fabricated. CSV desktop/mobile
 scenarios use their existing isolated synthetic tenants, retaining selection
 admission bounds. Import success is verified before closing the current
-`Close` control back to Sync. Saved audit remains readable for the already
-initialized Viewer while a permission-check outage is explicitly observed.
+`Close` control back to Sync. Saved tenant data remains readable for Viewer
+during a permission-check outage; local Audit remains Admin-only.
 
 CSV acceptance preserves the current report choice, including no active set
 after earlier history. The first-ever accepted set becomes active; an empty
@@ -1404,14 +1420,13 @@ or an invented synchronization error.
 Responsive tests retain all controls. At761–900px the bulk-selection
 and Columns controls wrap below the inline query row without overlap; wider
 desktops retain their compact row. Mobile agent tabs retain44px touch targets.
-Loading skeletons are decorative under the existing busy-state semantics;
-user Logs retains a complete heading hierarchy.
+Loading skeletons are decorative under the existing busy-state semantics.
 
 | Existing page / feature | Canonical rows above / transport | Actual consumer -> backend authority | Regression proof / executable manual check for04C |
 | --- | --- | --- | --- |
 | Setup/sign-in, callback errors, sign-out, session recovery | auth/status, auth/login GET/POST, callback, me, logout; P/C | App/startSignIn/getCurrentUser/signOut -> auth.ts, flows, MSAL, sessions | routes/authHttp, mcpApiAuth; App.signIn/App.session; signIn.spec.ts. Open configured origin, sign in/out, reopen an existing saved session after restart; no stale authority recovery. |
-| `permissions`: roles, partial grants, retry, blocked/unknown help, shared application setup | capabilities/check/check-progress/probe/configuration; D except C configuration | PermissionCenter/useCapabilities -> capabilities route/service | routes/capabilities, services/capabilities; PermissionCenter/PermissionDetails; permissions/permissionLayout.spec.ts. Viewer/Admin denial, explicit Retry, technical details/focus/Escape, no automatic consent/hunt. Configuration API has no current UI adapter. |
-| Navigation, history and unavailable/error gates across all5 pages | workbench/metadata/jobs, SPA deep links; C metadata, D jobs, P SPA | App/workbenchRouting/savedQueries -> workbench.ts | workbenchJobs, workbenchRouting/App.session; cacheNavigation/layout/dialogFocus.spec.ts. Back/forward preserves filters, retained-tab state and focus without repeating provider work. |
+| `permissions`: Issues, App-defined roles, App registration permissions | capabilities/check/check-progress/probe/configuration; D except C configuration | PermissionCenter/useCapabilities -> capabilities route/service | routes/capabilities, services/capabilities; PermissionCenter/PermissionDetails; permissions/permissionLayout.spec.ts. Inline diagnostics, Check status, purple directly assigned roles, four groups/11 API entries, no shortcut bar or automatic consent/hunt. Microsoft API guidance excludes local app-role requirements; deferred investigations are hidden. Configuration API has no current UI adapter. |
+| Navigation, history and unavailable/error gates across workbench pages | workbench/metadata/jobs, SPA deep links; C metadata, D jobs, P SPA | App/workbenchRouting/savedQueries -> workbench.ts | workbenchJobs, workbenchRouting/App.session; cacheNavigation/layout/dialogFocus.spec.ts. Back/forward preserves filters, retained-tab state and focus without repeating provider work. |
 | `agents`: catalog/additional/all selection, search/sort/facets/creation/access/management/platform filters and authoritative cards | agent-inventory selections/list/health/summary/facets; D | agentInventoryQueries/useInventoryHealth/AgentInventoryOverview -> inventoryData/InventoryQueries | largeTenantInventory, mcpReadContracts; agentInventoryQueries/LargeTenantInventory; agentCatalog/agentFilters/unifiedAgents/inventoryAcceptance.spec.ts. Browse all pages, exact cutoff stable, admin-permitted is not maker sharing, unknown is not zero. Summary API is retained; cards consume selected page summary. |
 | Saved detail/About/environment/responsibility/configuration/versions/connector operations | detail/members/children/sections/about; D | UnifiedAgentDetailModal/AgentOverview/SavedAgentAbout/SavedAgentConfiguration/InventoryMembers -> inventoryData, savedReadContracts, saved facts | mcpReadContracts/inventoryExports; AgentOverview/SavedAgentAbout/AgentDetailPaging; agentContext/agentExperience.spec.ts. Read complete Unicode About, source-pinned continuation, explicit missing/partial and real technical IDs; hidden retained tabs do not duplicate visible fields. |
 | Exact people resolution/directory access picker | agent-inventory/people/resolve, directory/principals and resolve; D | useAgentPeople/PrincipalPicker -> agentPeople/directory, existing capability/provider adapters | agentPeople/agentInvestigationHttp; useAgentPeople/PrincipalPicker; agentPeople.spec.ts. Saved view is provider-free; click Look up people explicitly, check unresolved identities and permission failures. |
@@ -1430,9 +1445,9 @@ user Logs retains a complete heading hierarchy.
 | Explicit package availability/installation access | package access PATCH, bulk access/preview, directory lookup; D | AgentAccessManagement/AccessAssignmentModal/PrincipalPicker -> inventoryMutations/packageInventory | packageAccessPreservation/packageCanaryAuthorization; PackageManagement/AccessAssignmentModal; inlineAgentManage.spec.ts. Opening editor is read-only preparation; preserve unselected existing principals, specific/none semantics and exact prestate. |
 | Explicit native Studio quarantine/unquarantine/status/audit/reconcile | quarantine preview/jobs/status/cancel/resume/reconcile/audit; D | CopilotStudioQuarantineControls -> copilotStudioQuarantineControl/Jobs/Repository | sharedAgentControls/copilotStudioQuarantineJobs; CopilotStudioQuarantineControls; permissions.spec.ts plus API provider fixtures. No package dispatch is silently added; unknown identity/status denies. |
 | Generic exact controls (API-only; no generic UI) | agent-controls preview/execute/status; D | AgentControls and existing child authorities; no browser adapter | sharedAgentControls/agentControlReceiptsSchema; exact receipt/expiry/partial/idempotency and initiator provenance through API fixtures |
-| Agent/user Purview investigations and recovery | investigations/context/resolve, audit-search jobs/records/resume/cancel/delete; transport policy remains current-source authority | AgentInvestigationsPanel/UserPurviewAudit/PurviewAuditView -> agentIdentityResolution/purviewAudit | agentInvestigationHttp/purviewAudit; explicit curated query, exact typed identity, private delegated or configured application sharing. Saved reads make no provider calls. |
-| Defender hunting/history/rows/recovery | hunting jobs/rows/catalog and lifecycle; transport policy remains current-source authority | DefenderHuntingView/AgentInvestigationsPanel -> defenderHunting/GraphHuntingClient/repository | defenderHunting/agentInvestigationHttp; current identity/configuration/owner scope, explicit hunts, partial/unobserved ranges and direct Viewer shared reads. |
-| `audit`: search/action/status/Origin/caller filters/details/selected CSV | audit/events, export.csv; D | AuditLogView/workbenchRouting/getAuditEvents -> audit/AuditLog | auditOriginHttp/actionOrigin/auditOrigin; AuditLogView/workbenchRouting/client; auditOrigin.spec.ts. Historical unknown, reported labels inert, initiating origin immutable, current lifecycle separate; CSV matches displayed selection and escapes formulas. |
+| Retained Purview investigations and identity resolution (UI/setup hidden) | investigations/context/resolve, audit-search jobs/records/resume/cancel/delete; transport policy remains current-source authority | Retained AgentInvestigationsPanel/UserPurviewAudit/PurviewAuditView -> agentIdentityResolution/purviewAudit | agentInvestigationHttp/purviewAudit; explicit curated query, exact typed identity, private delegated or configured application sharing. Not current Permissions prerequisites; saved reads make no provider calls. |
+| Retained Defender hunting/history/rows/recovery (UI/setup hidden) | hunting jobs/rows/catalog and lifecycle; transport policy remains current-source authority | Retained DefenderHuntingView/AgentInvestigationsPanel -> defenderHunting/GraphHuntingClient/repository | defenderHunting/agentInvestigationHttp; current identity/configuration/owner scope, explicit hunts, partial/unobserved ranges and Viewer-capable shared reads. Not current Permissions prerequisites. |
+| `audit`: Admin-only tab/page, search/action/status/Origin/caller filters/details/selected CSV | audit/events: Admin read; export.csv: browser-only Admin with CSRF | AuditLogView/workbenchRouting/getAuditEvents -> audit/AuditLog | auditOriginHttp/actionOrigin/auditOrigin; AuditLogView/workbenchRouting/client; auditOrigin.spec.ts. Viewer/Uploader have no UI/API access. Historical unknown, reported labels inert, initiating origin immutable, current lifecycle separate; CSV matches displayed selection and escapes formulas. Recording is unchanged. |
 | Operational metadata, canaries and API-only boundaries | diagnostics, package/native canaries, capabilities/configuration, native related/quarantine-selection; C where declared | current policy/services | policy/mcpApiAuth/packageCanaryAuthorization; command mocks. Diagnose without provider work; optional canaries require exact target authority. |
 
 Current canonical registrations are not aliases. Presentation-only formatting, ranking displays,

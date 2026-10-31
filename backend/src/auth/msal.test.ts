@@ -5,6 +5,9 @@ import { acquireApplicationToken, acquireDelegatedToken, capabilityScopes, creat
 import { AppError } from "../errors.js";
 import { inventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { capabilityDefinitions } from "../services/capabilityRegistry.js";
+import { createBearerCredentials } from "./delegatedCredentials.js";
+import { withAuthority } from "./authorityContext.js";
+import { epochAuthority, oboFetcher, tenant as foundationTenant, verifiedBearer } from "./authFoundationTestSupport.js";
 
 const { tenant, otherTenant } = vi.hoisted(() => {
   const tenant: TenantConfiguration = { tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-2222-2222-222222222222", clientSecret: "fixture", domains: ["example.invalid"], displayName: "First tenant" };
@@ -26,6 +29,34 @@ function futureExpiry() {
   return new Date(Date.now() + 60_000);
 }
 
+function nativeClient(selectedTenant = tenant) {
+  const authority = `https://login.microsoftonline.com/${selectedTenant.tenantId}`;
+  return new ConfidentialClientApplication({
+    auth: {
+      clientId: selectedTenant.clientId, clientSecret: selectedTenant.clientSecret, authority,
+      knownAuthorities: ["login.microsoftonline.com"],
+      authorityMetadata: JSON.stringify({
+        authorization_endpoint: `${authority}/oauth2/v2.0/authorize`, token_endpoint: `${authority}/oauth2/v2.0/token`,
+        issuer: `${authority}/v2.0`, jwks_uri: `${authority}/discovery/v2.0/keys`,
+      }),
+      cloudDiscoveryMetadata: JSON.stringify({ tenant_discovery_endpoint: `${authority}/v2.0/.well-known/openid-configuration`, metadata: [{
+        preferred_network: "login.microsoftonline.com", preferred_cache: "login.windows.net",
+        aliases: ["login.microsoftonline.com", "login.windows.net"],
+      }] }),
+    },
+    system: { networkClient: msalNetworkClient },
+  });
+}
+
+function nativeApplicationToken() {
+  const native = nativeClient();
+  const { client } = fakeClient({
+    acquireTokenByClientCredential: () => native.acquireTokenByClientCredential({ scopes: ["https://graph.microsoft.com/.default"] }),
+  });
+  replaceMsalClientForTest(tenantId, client);
+  return acquireApplicationToken(tenantId, "graph.package.read.application");
+}
+
 function fakeClient(overrides: Partial<MsalClient> = {}, selectedTenant = tenant) {
   const removeAccount = vi.fn(async () => undefined);
   const selectedAccount = { ...account, tenantId: selectedTenant.tenantId, username: `fixture@${selectedTenant.domains[0]}` };
@@ -38,7 +69,9 @@ function fakeClient(overrides: Partial<MsalClient> = {}, selectedTenant = tenant
         idTokenClaims: { tid: selectedTenant.tenantId, aud: selectedTenant.clientId, roles: ["AgentControl.Viewer"] } } as never;
     }),
     acquireTokenByClientCredential: vi.fn(async () => {
-      return { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: selectedTenant.tenantId, idtyp: "app", azp: selectedTenant.clientId, roles: ["CopilotPackages.Read.All"], exp: Math.floor(futureExpiry().getTime() / 1000) }), scopes: ["https://graph.microsoft.com/.default"], tenantId: selectedTenant.tenantId, expiresOn: futureExpiry() } as never;
+      return { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: selectedTenant.tenantId, idtyp: "app", azp: selectedTenant.clientId, roles: ["CopilotPackages.Read.All"], exp: Math.floor(futureExpiry().getTime() / 1000) }),
+        authority: `https://login.microsoftonline.com/${selectedTenant.tenantId}/`, account: null,
+        scopes: ["https://graph.microsoft.com/.default"], tenantId: "", expiresOn: futureExpiry() } as never;
     }),
     getTokenCache: () => ({ getAccountByHomeId: vi.fn(async id => id === account.homeAccountId ? selectedAccount : null), removeAccount }),
     ...overrides,
@@ -53,6 +86,89 @@ afterEach(() => {
   config.tenants = originalTenants;
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+it.each(["opaque", "readable"] as const)("accepts real MSAL client-credential metadata for %s Graph tokens", async format => {
+  for (const selected of [tenant, otherTenant]) {
+    const authority = `https://login.microsoftonline.com/${selected.tenantId}`;
+    const token = format === "opaque" ? "opaque-graph-application-token" : jwt({
+      aud: "https://graph.microsoft.com", tid: selected.tenantId, idtyp: "app", appid: selected.clientId,
+      roles: ["CopilotPackages.Read.All", "User.Read.All", "LicenseAssignment.Read.All", "Reports.Read.All"],
+      exp: Math.floor(futureExpiry().getTime() / 1000),
+    });
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const endpoint = new URL(String(url));
+      expect(endpoint.origin).toBe("https://login.microsoftonline.com");
+      expect(endpoint.pathname).toBe(`/${selected.tenantId}/oauth2/v2.0/token`);
+      return Response.json({ access_token: token, token_type: "Bearer", expires_in: 3600, ext_expires_in: 3600 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const native = nativeClient(selected);
+    const { client } = fakeClient({
+      acquireTokenByClientCredential: vi.fn(async () => {
+        const result = await native.acquireTokenByClientCredential({ authority, scopes: ["https://graph.microsoft.com/.default"] });
+        expect(result).toMatchObject({ tenantId: "", account: null, authority: `${authority}/` });
+        return result;
+      }),
+    }, selected);
+    replaceMsalClientForTest(selected.tenantId, client);
+    for (const capability of ["graph.package.read.application", "graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"] as const) {
+      await expect(acquireApplicationToken(selected.tenantId, capability)).resolves.toBe(token);
+    }
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(client.acquireTokenSilent).not.toHaveBeenCalled();
+    expect(client.getAuthCodeUrl).not.toHaveBeenCalled();
+  }
+});
+
+it("permits same-tenant application user reads for an authenticated bearer Viewer without a delegated user token", async () => {
+  config.tenants = [{ ...tenant, integration: foundationTenant.integration }, otherTenant];
+  const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher() });
+  const token = jwt({ aud: "https://graph.microsoft.com", tid: tenantId, idtyp: "app", azp: tenant.clientId,
+    roles: ["User.Read.All"], exp: Math.floor(futureExpiry().getTime() / 1000) });
+  const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => ({
+    accessToken: token, account: null, tenantId, scopes: ["https://graph.microsoft.com/.default"], expiresOn: futureExpiry(),
+  } as never)) });
+  replaceMsalClientForTest(tenantId, client);
+  await expect(withAuthority(source, () => acquireApplicationToken(tenantId, "graph.users.read"))).resolves.toBe(token);
+  expect(client.acquireTokenByClientCredential).toHaveBeenCalledOnce();
+  expect(client.acquireTokenSilent).not.toHaveBeenCalled();
+});
+
+it("rejects cross-tenant application reads before acquiring credentials in bearer authority", async () => {
+  config.tenants = [{ ...tenant, integration: foundationTenant.integration }, otherTenant];
+  const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher() });
+  const { client } = fakeClient({}, otherTenant);
+  replaceMsalClientForTest(otherTenantId, client);
+  await expect(withAuthority(source, () => acquireApplicationToken(otherTenantId, "graph.users.read")))
+    .rejects.toMatchObject({ status: 401, code: "authorization_required" });
+  expect(client.acquireTokenByClientCredential).not.toHaveBeenCalled();
+});
+
+it("retains delegated authorization for bearer investigations", async () => {
+  config.tenants = [{ ...tenant, integration: foundationTenant.integration }, otherTenant];
+  const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher: oboFetcher() });
+  const { client } = fakeClient();
+  replaceMsalClientForTest(tenantId, client);
+  await expect(withAuthority(source, () => acquireApplicationToken(tenantId, "defender.hunting.application")))
+    .rejects.toMatchObject({ status: 403, code: "invalid_token_mode" });
+  expect(client.acquireTokenByClientCredential).not.toHaveBeenCalled();
+});
+
+it.each([
+  undefined, "", "not-an-authority", `https://login.microsoftonline.com/${otherTenantId}/`,
+  "https://login.microsoftonline.com/common/", "https://login.microsoftonline.com/organizations/",
+  `https://example.invalid/${tenantId}/`, `https://login.microsoftonline.com/${tenantId}/?override=true`,
+  `https://login.microsoftonline.com/${tenantId}/#override`, `https://user@login.microsoftonline.com/${tenantId}/`,
+])("rejects empty-tenant application metadata without its exact trusted authority: %s", async authority => {
+  const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => ({
+    accessToken: "opaque", tenantId: "", account: null, authority,
+    scopes: ["https://graph.microsoft.com/.default"], expiresOn: futureExpiry(),
+  } as never)) });
+  replaceMsalClientForTest(tenantId, client);
+  await expect(acquireApplicationToken(tenantId, "graph.package.read.application")).rejects.toMatchObject({
+    status: 502, code: authority && URL.canParse(authority) ? "application_authorization_failed" : "identity_provider_error",
+  });
 });
 
 it("reads identity-provider retry evidence without invoking accessors or proxy traps", () => {
@@ -87,7 +203,7 @@ describe("token error normalization", () => {
 
   it("ignores every own and inherited accessor without replacing the provider failure", async () => {
     const getter = vi.fn(() => { throw new Error("replacement accessor failure"); });
-    for (const field of ["errorCode", "subError", "errorNo", "errorMessage", "correlationId", "status"]) {
+    for (const field of ["errorCode", "subError", "errorNo", "errorMessage", "correlationId", "status", "retryAfterSeconds"]) {
       for (const inherited of [false, true]) {
         const error = new Error("private provider failure");
         const target = inherited ? Object.create(Error.prototype) : error;
@@ -161,7 +277,12 @@ describe("token error normalization", () => {
       const original = new AppError(401, "authorization_expired", "Sign in again.", { correlationId: "original-id" });
       const getter = vi.fn(() => { throw new Error("replacement provider metadata"); });
       Object.defineProperty(original, "errorCode", { get: getter });
-      await expect(rejectToken(original, operation)).rejects.toBe(original);
+      if (operation === "application") {
+        await expect(rejectToken(original, operation)).rejects.toMatchObject({
+          status: 502, code: "application_authorization_failed", details: { correlationId: "original-id" },
+          message: expect.not.stringMatching(/Sign in again|MFA/),
+        });
+      } else await expect(rejectToken(original, operation)).rejects.toBe(original);
       await expect(rejectToken(Object.defineProperty(new Error("private"), "errorCode", { get: getter }), operation))
         .rejects.toMatchObject({ status: 502, code: "identity_provider_error", details: {} });
       expect(getter).not.toHaveBeenCalled();
@@ -212,7 +333,7 @@ describe("authentication scopes", () => {
     for (const definition of capabilityDefinitions.filter(value => value.mode !== "local")) {
       for (const scope of capabilityScopes(definition.id)) expect(flow.scopes).not.toContain(scope);
     }
-    expect(capabilityScopes("graph.package.read.delegated")).toEqual(["https://graph.microsoft.com/CopilotPackages.Read.All"]);
+    expect(capabilityScopes("graph.package.read.delegated")).toEqual(["https://graph.microsoft.com/CopilotPackages.ReadWrite.All"]);
     expect(capabilityScopes("powerPlatform.inventory.read")).toEqual(["https://api.powerplatform.com/ResourceQuery.Resources.Read"]);
     expect(capabilityScopes("powerPlatform.quarantine.manage")).toEqual(["https://api.powerplatform.com/CopilotStudio.AdminActions.Invoke"]);
     expect(capabilityScopes("reports.copilotUsage.read")).toEqual(["https://graph.microsoft.com/Reports.Read.All"]);
@@ -372,7 +493,8 @@ describe("authentication scopes", () => {
           : { acquireTokenSilent: vi.fn(async () => result as never) });
         replaceMsalClientForTest(tenantId, client);
         await expect(mode === "application" ? acquireApplicationToken(tenantId, "graph.package.read.application")
-          : acquireDelegatedToken(tenantId, account.homeAccountId, "graph.package.read.delegated")).rejects.toMatchObject({ code: "unauthorized" });
+          : acquireDelegatedToken(tenantId, account.homeAccountId, "graph.package.read.delegated"))
+          .rejects.toMatchObject({ code: mode === "application" ? "application_authorization_failed" : "unauthorized" });
       }
     });
 
@@ -384,9 +506,9 @@ describe("authentication scopes", () => {
         await expect(acquireApplicationToken(selected.tenantId, "graph.package.read.application")).resolves.toBe(result.accessToken);
         expect(client.acquireTokenByClientCredential).toHaveBeenCalledWith(expect.objectContaining({ authority: `https://login.microsoftonline.com/${selected.tenantId}` }));
         vi.mocked(client.acquireTokenByClientCredential).mockResolvedValue({ ...result, tenantId: "unconfigured" } as never);
-        await expect(acquireApplicationToken(selected.tenantId, "graph.package.read.application")).rejects.toMatchObject({ code: "unauthorized" });
+        await expect(acquireApplicationToken(selected.tenantId, "graph.package.read.application")).rejects.toMatchObject({ code: "application_authorization_failed" });
         vi.mocked(client.acquireTokenByClientCredential).mockResolvedValue({ ...result, idTokenClaims: { aud: "another-client" } } as never);
-        await expect(acquireApplicationToken(selected.tenantId, "graph.package.read.application")).rejects.toMatchObject({ code: "unauthorized" });
+        await expect(acquireApplicationToken(selected.tenantId, "graph.package.read.application")).rejects.toMatchObject({ code: "application_authorization_failed" });
       }
     });
 
@@ -528,7 +650,7 @@ describe("authentication scopes", () => {
     replaceMsalClientForTest(tenantId, client);
     await acquireDelegatedToken(tenantId, "account-a", "graph.package.read.delegated");
     await acquireDelegatedToken(tenantId, "account-a", "powerPlatform.inventory.read");
-    expect(client.acquireTokenSilent).toHaveBeenNthCalledWith(1, expect.objectContaining({ account, scopes: ["https://graph.microsoft.com/CopilotPackages.Read.All"] }));
+    expect(client.acquireTokenSilent).toHaveBeenNthCalledWith(1, expect.objectContaining({ account, scopes: ["https://graph.microsoft.com/CopilotPackages.ReadWrite.All"] }));
     expect(client.acquireTokenSilent).toHaveBeenNthCalledWith(2, expect.objectContaining({ account, scopes: ["https://api.powerplatform.com/ResourceQuery.Resources.Read"] }));
     await expect(acquireDelegatedToken(tenantId, "missing", "graph.package.read.delegated")).rejects.toMatchObject({ code: "interaction_required" });
   });
@@ -663,7 +785,7 @@ describe("authentication scopes", () => {
       { mode: "delegated", result: { accessToken: "opaque", scopes: ["https://graph.microsoft.com/CopilotPackages.Read.All"], account, tenantId: otherTenantId, expiresOn: futureExpiry() }, code: "unauthorized" },
       { mode: "delegated", result: { accessToken: "opaque", scopes: ["https://graph.microsoft.com/CopilotPackages.Read.All"], account: { ...account, homeAccountId: "account-b" }, tenantId, expiresOn: futureExpiry() }, code: "unauthorized" },
       { mode: "delegated", result: { accessToken: "opaque", scopes: ["https://api.powerplatform.com/CopilotPackages.Read.All"], account, tenantId, expiresOn: futureExpiry() }, code: "unauthorized" },
-      { mode: "delegated", result: { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, idtyp: "app", roles: ["CopilotPackages.Read.All"] }), scopes: ["https://graph.microsoft.com/CopilotPackages.Read.All"], account, tenantId, expiresOn: futureExpiry() }, code: "invalid_token_mode" },
+      { mode: "delegated", result: { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, idtyp: "app", roles: ["CopilotPackages.ReadWrite.All"] }), scopes: capabilityScopes("graph.package.read.delegated"), account, tenantId, expiresOn: futureExpiry() }, code: "invalid_token_mode" },
       { mode: "application", result: { accessToken: "opaque", scopes: ["https://graph.microsoft.com/.default"], account, tenantId, expiresOn: futureExpiry() }, code: "invalid_token_mode" },
       { mode: "application", result: { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, scp: "CopilotPackages.Read.All" }), scopes: ["https://graph.microsoft.com/.default"], tenantId, expiresOn: futureExpiry() }, code: "invalid_token_mode" },
       { mode: "application", result: { accessToken: jwt({ aud: "https://graph.microsoft.com", tid: tenantId, idtyp: "app", azp: "33333333-3333-3333-3333-333333333333", roles: ["CopilotPackages.Read.All"] }), scopes: ["https://graph.microsoft.com/.default"], tenantId, expiresOn: futureExpiry() }, code: "unauthorized" },
@@ -677,7 +799,7 @@ describe("authentication scopes", () => {
       const operation = value.mode === "delegated"
         ? acquireDelegatedToken(tenantId, "account-a", "graph.package.read.delegated")
         : acquireApplicationToken(tenantId, "graph.package.read.application");
-      await expect(operation).rejects.toMatchObject({ code: value.code });
+      await expect(operation).rejects.toMatchObject({ code: value.mode === "application" ? "application_authorization_failed" : value.code });
     }
   });
 
@@ -772,12 +894,14 @@ describe("authentication scopes", () => {
 
   it("preserves provider JSON responses and safely normalizes native JSON parse failures", async () => {
     const body = { error: "temporarily_unavailable", error_description: "private provider failure" };
-    vi.stubGlobal("fetch", vi.fn(async () => Response.json(body, { status: 429, headers: { "x-ms-request-id": "safe-correlation" } })));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(body, { status: 400, headers: { "x-ms-request-id": "safe-correlation" } })));
     await expect(msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture")).resolves.toMatchObject({
-      body, status: 429, headers: { "x-ms-request-id": "safe-correlation" },
+      body, status: 400, headers: { "x-ms-request-id": "safe-correlation" },
     });
     vi.stubGlobal("fetch", vi.fn(async () => new Response("not JSON")));
-    await expect(msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture")).rejects.toBeInstanceOf(SyntaxError);
+    await expect(msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture")).rejects.toMatchObject({
+      errorCode: "token_parsing_error",
+    });
     const { client } = fakeClient({ acquireTokenByClientCredential: vi.fn(async () => {
       await msalNetworkClient.sendGetRequestAsync("https://login.microsoftonline.com/fixture");
       return null;
@@ -786,6 +910,67 @@ describe("authentication scopes", () => {
     await expect(acquireApplicationToken(tenantId, "graph.package.read.application")).rejects.toMatchObject({
       status: 502, code: "identity_provider_error", details: {},
     });
+  });
+
+  it.each(["", "private non-JSON throttle", JSON.stringify({ error: "temporarily_unavailable" })])(
+    "preserves throttling cooldowns through native MSAL regardless of body format: %s", async body => {
+      const fetcher = vi.fn(async () => new Response(body, { status: 429, headers: { "retry-after": "120" } }));
+      vi.stubGlobal("fetch", fetcher);
+      const error: unknown = await nativeApplicationToken().catch((failure: unknown) => failure);
+      expect(error).toMatchObject({
+        status: 429, code: "provider_throttled", retryAfterSeconds: 120, details: { httpStatus: 429 },
+      });
+      expect(isRetryableIdentityProviderError(error)).toBe(false);
+      expect(JSON.stringify(error)).not.toContain("private");
+      expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("does not read a throttled response body before preserving its cooldown", async () => {
+    const cancel = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({ cancel }), {
+      status: 429, headers: { "retry-after": "120" },
+    })));
+    vi.useFakeTimers();
+    const pending = expect(nativeApplicationToken()).rejects.toMatchObject({
+      status: 429, code: "provider_throttled", retryAfterSeconds: 120,
+    });
+    await vi.advanceTimersByTimeAsync(msalNetworkTimeoutMs);
+    await pending;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("keeps malformed successful JSON non-retryable through native MSAL", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("private malformed JSON")));
+    const error: unknown = await nativeApplicationToken().catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 502, code: "identity_provider_error" });
+    expect(isRetryableIdentityProviderError(error)).toBe(false);
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
+
+  it("retains a non-JSON server failure's HTTP status through native MSAL", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("private maintenance page", { status: 503 })));
+    const error: unknown = await nativeApplicationToken().catch((failure: unknown) => failure);
+    expect(error).toMatchObject({
+      status: 502, code: "identity_provider_error", details: { httpStatus: 503, retryable: true },
+    });
+    expect(isRetryableIdentityProviderError(error)).toBe(true);
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
+
+  it.each([0, 1])("bounds native MSAL token response bodies at 128 KiB: excess %i", async excess => {
+    const response = { access_token: "opaque-graph-application-token", token_type: "Bearer", expires_in: 3600, padding: "" };
+    response.padding = "x".repeat(128 * 1024 + excess - Buffer.byteLength(JSON.stringify(response)));
+    const body = JSON.stringify(response);
+    expect(Buffer.byteLength(body)).toBe(128 * 1024 + excess);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    if (excess === 0) {
+      await expect(nativeApplicationToken()).resolves.toBe(response.access_token);
+    } else {
+      const error: unknown = await nativeApplicationToken().catch((failure: unknown) => failure);
+      expect(error).toMatchObject({ status: 502, code: "identity_provider_error" });
+      expect(isRetryableIdentityProviderError(error)).toBe(false);
+    }
   });
 
   it("evicts only the selected account", async () => {
@@ -804,5 +989,21 @@ describe("authentication scopes", () => {
     expect(first.codeVerifier).not.toBe(second.codeVerifier);
     expect(first.returnTo).toBe("/settings?tab=permissions");
     expect(() => createAuthFlow("login", { tenantId, username: account.username, returnTo: "//evil.invalid" })).toThrow("local application path");
+  });
+
+  it.each([
+    "/.//outside.invalid", "/%2e//outside.invalid",
+    "/agents/..//outside.invalid", "/agents/%2e%2e//outside.invalid/path?tab=all#top",
+  ])("rejects return paths that normalize into network-path redirects: %s", returnTo => {
+    expect(() => createAuthFlow("login", { tenantId, username: account.username, returnTo }))
+      .toThrow(expect.objectContaining({ status: 400, code: "invalid_return_url" }));
+  });
+
+  it.each([
+    { returnTo: undefined, expected: "/" }, { returnTo: "", expected: "/" },
+    { returnTo: "/settings/../agents?tab=all#top", expected: "/agents?tab=all#top" },
+    { returnTo: "/agents//details?tab=all#top", expected: "/agents//details?tab=all#top" },
+  ])("preserves safe normalized local returns: $returnTo", ({ returnTo, expected }) => {
+    expect(createAuthFlow("login", { tenantId, username: account.username, returnTo }).returnTo).toBe(expected);
   });
 });

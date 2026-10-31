@@ -4,8 +4,9 @@ import { capabilityDefinitions } from "../../backend/src/services/capabilityRegi
 import type { CapabilityId, CapabilityStatus, CapabilityView } from "./api/client";
 import { capabilityExplanation, currentOperationFailure, currentVerification, evidenceIsFresh, evidenceIsStale, providerActionAllowed, queryReadAllowed, operationAccessLabel, statusLabels } from "./capabilityState";
 
-function view(status: CapabilityStatus): CapabilityView {
-  return { enabled: true, definition: capabilityDefinitions[0], decision: { capabilityId: capabilityDefinitions[0].id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
+function view(status: CapabilityStatus, id: CapabilityId = "graph.package.read.application"): CapabilityView {
+  const definition = capabilityDefinitions.find(candidate => candidate.id === id)!;
+  return { enabled: true, definition, decision: { capabilityId: id, status, authorized: status === "available", fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60000).toISOString(), previewQualification: "not_required", remediation: [] } };
 }
 
 const onDemandIds = capabilityDefinitions.filter(definition => definition.probe.kind === "on_demand").map(definition => definition.id);
@@ -103,7 +104,7 @@ describe("capability UX decisions", () => {
       expect(evidenceIsFresh(ready)).toBe(false);
       expect(evidenceIsStale(ready)).toBe(false);
       expect(operationAccessLabel(ready)).toBe("Microsoft validates permission when the operation is requested");
-      expect(capabilityExplanation(ready)).toContain("Microsoft validates delegated permissions and provider roles on the actual operation");
+      expect(capabilityExplanation(ready)).toContain("Microsoft validates application permissions and provider roles on the actual operation");
       expect(capabilityExplanation(ready)).not.toMatch(/confirm|submitting a change|Not checked|provider request succeeded/);
     },
   );
@@ -121,7 +122,7 @@ describe("capability UX decisions", () => {
     { checkedAt: new Date(0).toISOString() },
     { expiresAt: new Date(0).toISOString() },
     { lastSuccessAt: new Date(0).toISOString() },
-    { capabilityId: "graph.package.read.delegated" },
+    { capabilityId: "graph.package.read.application" },
   ] satisfies Partial<CapabilityView["decision"]>[])("rejects inconsistent on-demand decisions: %j", override => {
     for (const id of onDemandIds) {
       const ready = onDemandView(id);
@@ -196,15 +197,15 @@ describe("capability UX decisions", () => {
     expect(currentVerification(candidate, now + 1)).toBeUndefined();
     expect(providerActionAllowed(candidate, false, now + 1)).toBe(true);
   });
-  it("retains application-scope expiry requirements and rejects malformed or denied delegated decisions", () => {
+  it("requires explicit investigation scope and rejects malformed or denied read decisions", () => {
     const candidate = view("available");
     const now = Date.now();
     candidate.decision.expiresAt = new Date(now - 1).toISOString();
     expect(providerActionAllowed(candidate, false, now)).toBe(true);
-    candidate.definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
+    candidate.definition = capabilityDefinitions.find(item => item.id === "defender.hunting.application")!;
     candidate.decision.capabilityId = candidate.definition.id;
     expect(providerActionAllowed(candidate, false, now)).toBe(false);
-    candidate.definition = capabilityDefinitions[0];
+    candidate.definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
     candidate.decision.capabilityId = candidate.definition.id;
     candidate.decision.expiresAt = candidate.decision.checkedAt;
     expect(providerActionAllowed(candidate, false, now)).toBe(false);
@@ -245,7 +246,7 @@ describe("capability UX decisions", () => {
     },
   );
   it("names backend permissions and independent roles exactly", () => {
-    expect(capabilityExplanation(view("missing_permission"))).toContain("delegated CopilotPackages.Read.All");
+    expect(capabilityExplanation(view("missing_permission"))).toContain("application CopilotPackages.Read.All");
     expect(capabilityExplanation(view("missing_internal_role"))).toContain("AgentControl.Viewer");
   });
   it("provides stale-evidence recovery without claiming an automatic check is pending", () => {
@@ -324,11 +325,11 @@ describe("capability UX decisions", () => {
     },
   );
   it("uses evidence categories for interactive authorization states", () => {
-    const interaction = view("unknown");
+    const interaction = view("unknown", "powerPlatform.inventory.read");
     interaction.decision.evidence = { category: "interaction_required" };
     expect(capabilityExplanation(interaction)).toContain("Sign in again for MFA or Conditional Access");
 
-    const expired = view("unknown");
+    const expired = view("unknown", "powerPlatform.inventory.read");
     expired.decision.evidence = { category: "authorization_expired" };
     expect(capabilityExplanation(expired)).toContain("Sign in again");
   });
@@ -452,7 +453,7 @@ describe("capability UX decisions", () => {
     },
   );
   it.each([
-    "graph.package.read.application", "purview.audit.search.application", "defender.hunting.application",
+    "graph.package.read.delegated", "purview.audit.search.application", "defender.hunting.application",
     "graph.licenses.read", "reports.copilotUsage.read",
   ] as const)("never directs excluded capability %s to automatic checks for recovery", id => {
     const candidate = view("unknown");

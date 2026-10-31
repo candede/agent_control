@@ -103,6 +103,13 @@ UtcInstant = Annotated[
     ),
     AfterValidator(utc_instant),
 ]
+PurviewInstant = Annotated[
+    str,
+    StringConstraints(
+        max_length=64, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$"
+    ),
+    AfterValidator(utc_instant),
+]
 
 
 class Input(WireModel):
@@ -316,7 +323,15 @@ class NativeActivityInput(Input):
 
 class StudioTargetsInput(Input):
     snapshotId: Guid
-    selected: Annotated[list[ExactId], Field(max_length=25)] | None = None
+    selected: Annotated[
+        list[ExactId], Field(min_length=1, max_length=25, json_schema_extra={"uniqueItems": True})
+    ]
+
+    @model_validator(mode="after")
+    def distinct_targets(self) -> Self:
+        if len(set(self.selected)) != len(self.selected):
+            raise ValueError("Select distinct exact native identities.")
+        return self
 
 
 class ReportBase(Paging):
@@ -540,31 +555,29 @@ class JobList(Input):
     limit: Annotated[int, Field(ge=1, le=50)] | None = None
 
 
+SyncSource = Literal["users", "graph_packages", "power_platform"]
+
+
+def distinct_sync_sources(value: list[SyncSource]) -> list[SyncSource]:
+    if len(set(value)) != len(value):
+        raise ValueError("Sources must be unique.")
+    return value
+
+
+SyncSources = Annotated[
+    list[SyncSource],
+    Field(min_length=1, max_length=3, json_schema_extra={"uniqueItems": True}),
+    AfterValidator(distinct_sync_sources),
+]
+
+
 class StartSync(Input):
     mode: Literal["initial", "incremental", "full"]
-    sources: (
-        Annotated[
-            list[Literal["users", "graph_packages", "power_platform"]],
-            Field(min_length=1, max_length=3),
-        ]
-        | None
-    ) = None
-
-    @model_validator(mode="after")
-    def distinct(self) -> Self:
-        if self.sources and len(set(self.sources)) != len(self.sources):
-            raise ValueError("Sources must be unique.")
-        return self
+    sources: SyncSources | None = None
 
 
 class RetrySync(JobId):
-    sources: (
-        Annotated[
-            list[Literal["users", "graph_packages", "power_platform"]],
-            Field(min_length=1, max_length=3),
-        ]
-        | None
-    ) = None
+    sources: SyncSources | None = None
 
 
 class Submission(Input):
@@ -572,13 +585,13 @@ class Submission(Input):
 
 
 class RefreshPackages(Submission):
-    mode: Literal["delegated"] | None = None
+    mode: Literal["application"] | None = None
     ids: Annotated[list[ExactId], Field(min_length=1, max_length=5000)] | None = None
 
 
 class RefreshPackage(Submission):
     id: ExactId
-    mode: Literal["delegated"] | None = None
+    mode: Literal["application"] | None = None
 
 
 class RefreshSelected(Submission):
@@ -594,11 +607,11 @@ class RefreshSelected(Submission):
 
 
 class PackageJobId(JobId):
-    mode: Literal["delegated"] | None = None
+    mode: Literal["application"] | None = None
 
 
 class PackageJobs(JobList):
-    mode: Literal["delegated"] | None = None
+    mode: Literal["application"] | None = None
 
 
 class PackageTargets(PackageJobId, Paging):
@@ -670,8 +683,8 @@ class AgentPurviewInput(InvestigationInput):
 class PurviewSearchFilters(Input):
     presetId: PresetId
     operations: Annotated[list[PurviewOperation], Field(min_length=1, max_length=100)]
-    startDateTime: UtcInstant
-    endDateTime: UtcInstant
+    startDateTime: PurviewInstant
+    endDateTime: PurviewInstant
     userPrincipalNames: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
     ipAddresses: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
     objectIds: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)

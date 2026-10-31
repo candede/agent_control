@@ -65,9 +65,14 @@ export async function capacityInitialSync(database: pg.Pool, user: Authenticated
   const { InventoryRuntime } = await import("../src/services/inventoryRuntime.js");
   const { DataGenerations } = await import("../src/db/dataGenerations.js");
   const { beginAccountSessionValidation,assertAccountSessionValidation } = await import("../src/db/sessions.js");
+  const { findTenantConfiguration } = await import("../src/config.js");
   type Authorization = Pick<NonNullable<ConstructorParameters<typeof PackageInventoryService>[1]>,
-    "delegatedToken"|"revalidateUser"|"requireAvailable"|"observeOperation"|"beginOperationValidation">;
+    "applicationToken"|"revalidateUser"|"requireAvailable"|"observeOperation"|"beginOperationValidation">
+    & Pick<NonNullable<ConstructorParameters<typeof PowerPlatformInventoryService>[1]>, "delegatedToken">;
   const authorization: Authorization = {
+    applicationToken: async tenant => {
+      assert.equal(tenant,user.tenantId); return "synthetic-capacity";
+    },
     delegatedToken: async () => "synthetic-capacity",
     revalidateUser: async (tenant,principal) => {
       assert.equal(tenant,user.tenantId); assert.equal(principal,user.homeAccountId); return user;
@@ -85,9 +90,12 @@ export async function capacityInitialSync(database: pg.Pool, user: Authenticated
   const provider = fixtureFetch(count), streams = (pool: pg.Pool) => new StreamedInventory(pool,
     new GraphPackagesClient(provider,packageInventoryReadPolicy),new PowerPlatformResourceQueryClient(provider));
   const packages = new PackageInventoryService(new PackageRefreshJobs(database),{
-    ...authorization,streams,applicationPrincipalId: () => undefined,
-    applicationToken: async () => { throw new Error("capacity_initial_sync_application_token"); },
-    requireApplicationDataScope: async () => { throw new Error("capacity_initial_sync_application_scope"); },
+    ...authorization,streams,applicationPrincipalId: tenant => findTenantConfiguration(tenant)?.clientId,
+    requireApplicationDataScope: async (capability,actor) => {
+      assert.equal(capability,"graph.package.read.application");
+      assert.equal(actor.tenantId,user.tenantId); assert.equal(actor.homeAccountId,user.homeAccountId);
+      return { enabled: true,sharedDataScope: true,previewQualified: false,revision: 1 };
+    },
     wait: (milliseconds,signal) => delay(milliseconds,undefined,{ signal }),
   });
   const powerPlatform = new PowerPlatformInventoryService(new PowerPlatformRefreshJobs(database),{ ...authorization,streams });

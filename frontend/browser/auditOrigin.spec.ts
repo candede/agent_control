@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { layoutTime, mockLayoutApi } from "./layoutFixtures";
 import { unknownOrigin } from "../../backend/src/types/actionOrigin";
+import { reportPage } from "../src/test/reportDataFixture";
 
 const event = { id: "origin-browser", operationId: "origin-operation", scope: "single", action: "block",
   agentId: "managed-target", agentDisplayName: "Managed target, not caller", status: "succeeded", targetBlockedState: true,
@@ -13,6 +14,33 @@ const event = { id: "origin-browser", operationId: "origin-operation", scope: "s
     callingAgent: { id: { value: "agent-a", evidence: "reported" }, name: { value: "<script>inert</script>", evidence: "reported" } },
     requestId: "11111111-1111-1111-1111-111111111111", mcpCallId: "call-1" } };
 test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "wait" }); });
+for (const role of ["AgentControl.Viewer", "AgentControl.UsageReportUploader"] as const) {
+  test(`Audit navigation and direct URLs are hidden for ${role}`, async ({ page }) => {
+    const unexpected = await mockLayoutApi(page);
+    await page.route(url => url.pathname === "/api/official-usage/history/adoption",
+      route => route.fulfill({ json: reportPage([]) }));
+    await page.route("**/api/me", route => route.fulfill({ json: {
+      user: { homeAccountId: "layout-principal", tenantId: "layout-tenant", username: "reader@example.invalid",
+        displayName: "Synthetic reader", roles: [role] },
+      csrfToken: "layout-csrf", roleAssignmentRequired: false,
+    } }));
+    const auditRequests: string[] = [];
+    page.on("request", request => {
+      if (new URL(request.url()).pathname.startsWith("/api/audit/events")) auditRequests.push(request.url());
+    });
+    await page.goto("/audit");
+    await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Audit", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "Audit evidence" })).toHaveCount(0);
+    await page.getByRole("button", { name: "Permissions", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Permissions", exact: true })).toBeVisible();
+    await page.evaluate(() => { history.pushState({}, "", "/audit"); dispatchEvent(new PopStateEvent("popstate")); });
+    await expect(page.getByRole("button", { name: "Audit", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "Audit evidence" })).toHaveCount(0);
+    expect(auditRequests).toEqual([]);
+    expect(unexpected).toEqual([]);
+  });
+}
 test("Origin filters preserve URL/page/selection and inert evidence is accessible on the current compiled frontend", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page), queries: URLSearchParams[] = [];
   await page.route("**/api/audit/events?**", async route => {

@@ -1,5 +1,5 @@
 import { requestUser } from "../middleware/requestAuthentication.js";
-import { Router } from "express";
+import { Router, type Request } from "express";
 import type pg from "pg";
 import { randomUUID } from "node:crypto";
 import { AppError } from "../errors.js";
@@ -29,6 +29,20 @@ import { AgentIdentityResolutionService } from "../services/agentIdentityResolut
 import { decodeInventoryFacet } from "../types/inventoryFacets.js";
 import { capabilities } from "../services/capabilities.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
+import { hasAppRole } from "../types/capability.js";
+
+function unifiedAgentReadAuthority(request: Request) {
+  const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  return { scope, assertCurrent: () => {
+    assertAccountSessionValidation(validation);
+    const currentScope = requestScope(request);
+    if (currentScope.tenantId !== scope.tenantId || currentScope.principalId !== scope.principalId
+      || !hasAppRole(requestUser(request).roles, "AgentControl.Viewer")) {
+      throw AppError.unauthorized();
+    }
+  } };
+}
 
 export function createUnifiedAgentsRouter(database: pg.Pool = pool, dependencies: Partial<{
   inventory: LiveInventory; investigations: Pick<AgentInvestigationsService, "resolve">;
@@ -54,10 +68,15 @@ policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/investigations/resolv
     throw new AppError(400, "invalid_agent_investigation", "Identity resolution accepts only a saved recordId.");
   }
   const recordId = investigationRecordId(request.body.recordId);
+  const { assertCurrent } = unifiedAgentReadAuthority(request);
   const controller = new AbortController();
   const abort = () => { controller.abort(); };
   response.once("close", abort);
-  try { response.json(await agentIdentityResolution.resolve(requestUser(request), recordId, controller.signal)); }
+  try {
+    const result = await agentIdentityResolution.resolve(requestUser(request), recordId, controller.signal);
+    assertCurrent();
+    response.json(result);
+  }
   finally { response.removeListener("close", abort); }
 });
 
@@ -66,7 +85,10 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/context
 }, async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   if (Object.keys(request.query).some(key => key !== "recordId")) throw new AppError(400, "invalid_agent_investigation", "Select an exact saved agent record.");
-  response.json((await agentInvestigations.resolve(requestScope(request), investigationRecordId(request.query.recordId))).context);
+  const { scope, assertCurrent } = unifiedAgentReadAuthority(request);
+  const result = await agentInvestigations.resolve(scope, investigationRecordId(request.query.recordId));
+  assertCurrent();
+  response.json(result.context);
 });
 
 policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview", {
@@ -74,15 +96,14 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview
 }, async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
   const { recordId, query } = agentPurviewQuery(request.query);
-  const scope = requestScope(request);
-  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const { scope, assertCurrent } = unifiedAgentReadAuthority(request);
   const audit = new AuditLog(scope, database);
   const event = await audit.startEvent({ operationId: `view-audit-search:${randomUUID()}`, scope: "single", action: "view-audit-search", agentId: recordId,
     actor: requestUser(request), requestPath: request.path, metadata: { source: "microsoft_purview_audit" } });
   try {
     const result = await purviewAudit.agentRecords(requestUser(request), recordId, query, agentInvestigations.resolve.bind(agentInvestigations),
       result => audit.completeEvent(event.id, { status: "succeeded", metadata: { source: "microsoft_purview_audit", resultingCount: result.count } }).then(() => undefined));
-    assertAccountSessionValidation(validation);
+    assertCurrent();
     response.json(result);
   } catch (error) {
     await audit.completeEvent(event.id, { status: "failed", errorCode: error instanceof AppError ? error.code : "audit_read_failed" });
@@ -92,16 +113,15 @@ policyRoute(unifiedAgentsRouter, "get", "/agent-inventory/investigations/purview
 
 policyRoute(unifiedAgentsRouter, "post", "/agent-inventory/people/resolve", {
   access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"],
-  capabilityId: "graph.directory.read", csrf: true,
+  capabilityId: "graph.users.read", csrf: true,
 }, async (request, response) => {
   const input = agentPeopleResolveInput(request.body);
-  const scope = requestScope(request);
-  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", requestUser(request));
+  const { scope, assertCurrent: validateAuthority } = unifiedAgentReadAuthority(request);
+  const validateCapability = capabilities.beginOperationValidation("graph.users.read", requestUser(request));
   const controller = new AbortController();
   const assertCurrent = () => {
     controller.signal.throwIfAborted();
-    assertAccountSessionValidation(validation);
+    validateAuthority();
     validateCapability();
     requireProviderAdmissions();
   };

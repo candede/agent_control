@@ -424,7 +424,7 @@ function failureCode(error: unknown) {
 
 function safeFailureMessage(error: unknown) {
   if (error instanceof AppError && error.code === "missing_internal_role") {
-    return "The Agent Control Viewer or Admin application role is required. Review application role assignments; Microsoft provider consent does not grant this role. Saved data is unchanged.";
+    return "The Agent Control Viewer, UsageReportUploader or Admin application role is required. Review application role assignments; Microsoft provider consent does not grant this role. Saved data is unchanged.";
   }
   if (error instanceof AppError && dataSyncFailureStatus(error.code, error.status) === "permission_required") {
     return "Required Microsoft read permission or provider role is unavailable. Review Permissions; signing in again does not grant permissions. Saved data is unchanged.";

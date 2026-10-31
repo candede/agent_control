@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import re
 from contextlib import suppress
 from urllib.parse import parse_qs, quote
 
@@ -74,6 +75,7 @@ SOURCE_TYPES = {
     "Agent": "agent",
     "Responsibility": "responsibility",
     "NativeActivity": "native",
+    "StudioTargets": "studioTargets",
     "ReportPage[CombinedUser]": "users",
     "ReportDetail[CombinedUser]": "user",
     "ReportPage[ServicePlan]": "plans",
@@ -226,21 +228,11 @@ def response_for(operation, source_fixtures):
                 }
             ]
         }
-    if model is jobs.StudioTargets:
-        return {
-            "value": [],
-            "snapshot": {
-                "id": GUID,
-                "observedAt": "2026-10-16T00:00:00Z",
-                "expiresAt": "2026-10-16T00:10:00Z",
-                "current": True,
-            },
-        }
     if model is jobs.PackageRefreshJob or model.__name__ == "RefreshJobs[PackageRefreshJob]":
         job = {
             "id": GUID,
             "authorizationPrincipalId": OTHER,
-            "tokenMode": "delegated",
+            "tokenMode": "application",
             "scopeKind": "exact",
             "targetCount": 101,
             "resultRevision": "revision-1",
@@ -347,6 +339,56 @@ def test_inventory_updating_status_keeps_strict_partial_verification_checks():
     assert verification.model_dump(mode="json") == body
 
 
+@pytest.mark.parametrize("count", [1, 25])
+def test_studio_target_selection_bounds_and_exact_identities(count):
+    payload = {"snapshotId": GUID, "selected": [f"Native/Case%{index}" for index in range(count)]}
+    assert i.StudioTargetsInput.model_validate(payload).model_dump(exclude_unset=True) == payload
+    schema = i.StudioTargetsInput.model_json_schema()
+    assert "selected" in schema["required"]
+    assert schema["properties"]["selected"]["minItems"] == 1
+    assert schema["properties"]["selected"]["maxItems"] == 25
+    assert schema["properties"]["selected"]["uniqueItems"] is True
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [{}, {"selected": []}, {"selected": ["Native", "Native"]}, {"selected": ["Native"] * 26}],
+)
+async def test_invalid_studio_target_selections_never_dispatch(selection, rpc, entra):
+    result = await rpc("resolve_studio_targets", {"snapshotId": GUID, **selection})
+    assert result["isError"]
+    assert not entra.api_calls
+
+
+async def test_studio_target_resolution_preserves_native_resources(rpc, entra, source_fixtures):
+    body = copy.deepcopy(source_fixtures["complete"]["studioTargets"])
+    resource = body["value"][0]
+    resource["nativeId"] = "Native/Case%Exact"
+    resource["environmentId"] = None
+    resource["displayName"] = None
+    resource["details"]["isQuarantined"] = False
+    resource["details"].pop("quarantinedAt", None)
+    resource["quarantineIdentity"] = None
+    other = copy.deepcopy(resource)
+    other["nativeId"] = "Other/Case%Exact"
+    body["value"].append(other)
+    entra.api_responses.append(httpx2.Response(200, json=body))
+    result = await rpc(
+        "resolve_studio_targets",
+        {"snapshotId": GUID, "selected": ["Native/Case%Exact", "Other/Case%Exact"]},
+    )
+    assert not result.get("isError"), result
+    assert result["structuredContent"] == body
+    assert len(entra.api_calls) == 1
+    sent = entra.api_calls[0]
+    assert sent.method == "GET"
+    assert sent.url.path == "/api/inventory/quarantine-selection"
+    assert parse_qs(sent.url.query.decode()) == {
+        "snapshotId": [GUID],
+        "selected": ["Native/Case%Exact", "Other/Case%Exact"],
+    }
+
+
 @pytest.mark.parametrize("operation", OPERATIONS, ids=lambda operation: operation.name)
 @pytest.mark.parametrize("complete", [False, True], ids=["minimal", "nested-optional-evidence"])
 async def test_every_registered_tool_is_callable_over_real_sdk(
@@ -413,6 +455,25 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
     ):
         result = await rpc(name)
         assert result["isError"]
+
+
+async def test_uploader_assignment_does_not_add_browser_only_import_tools(browser, rpc, entra):
+    entra.response_claims = {"roles": ["AgentControl.UsageReportUploader"]}
+    entra.api_responses.append(httpx2.Response(200, json={"value": []}))
+    assert not (await rpc("list_capabilities")).get("isError")
+    response = await browser.post(
+        "/mcp",
+        headers=rpc.headers,
+        json={"jsonrpc": "2.0", "id": 501, "method": "tools/list"},
+    )
+    tools = response.json()["result"]["tools"]
+    assert {tool["name"] for tool in tools} == {operation.name for operation in OPERATIONS}
+    assert not any(
+        operation.path.startswith("/api/official-usage/")
+        and operation.method in {"POST", "DELETE"}
+        for operation in OPERATIONS
+    )
+    assert (await rpc("import_reports"))["isError"]
 
 
 async def test_canonical_input_method_path_query_body_and_defaults(rpc, entra, source_fixtures):
@@ -482,6 +543,13 @@ async def test_canonical_input_method_path_query_body_and_defaults(rpc, entra, s
         ),
         ("start_sync", {"mode": "incremental"}, "/api/data-sync/runs", {}, {"mode": "incremental"}),
         (
+            "retry_sync",
+            {"id": GUID, "sources": ["users", "graph_packages"]},
+            f"/api/data-sync/runs/{GUID}/retry",
+            {},
+            {"sources": ["users", "graph_packages"]},
+        ),
+        (
             "refresh_packages",
             {"ids": ["Case/Package?#"], "idempotencyKey": "exact-key"},
             "/api/agents/refresh-jobs",
@@ -549,6 +617,18 @@ async def test_explicit_delegated_search_hunt_and_local_recovery_body_parity(
                     "templateId": "agent_activity",
                     "userObjectId": GUID.upper(),
                     "operations": ["InvokeAgent"],
+                },
+            },
+        ),
+        (
+            "start_purview_search",
+            {
+                "tokenMode": "delegated",
+                "filters": {
+                    "startDateTime": "2026-10-16T00:00:00.123Z",
+                    "endDateTime": "2026-10-16T01:00:00.456Z",
+                    "presetId": "copilot_interactions",
+                    "operations": ["CopilotInteraction"],
                 },
             },
         ),
@@ -882,6 +962,12 @@ async def test_missing_reports_incomparable_history_source_gaps_are_not_zero(
         (i.ResolveUser, {"username": "Guest", "selectionId": GUID, "setId": SOURCE}),
         (i.StartSync, {"mode": "full", "clearSavedData": True}),
         (i.StartSync, {"mode": "full", "sources": ["usage_reports"]}),
+        (i.StartSync, {"mode": "full", "sources": ["users", "users"]}),
+        (i.RetrySync, {"id": GUID, "sources": ["users", "users"]}),
+        (i.RefreshPackages, {"mode": "delegated"}),
+        (i.RefreshPackage, {"id": "Exact-Package", "mode": "delegated"}),
+        (i.PackageJobs, {"mode": "delegated"}),
+        (i.PackageJobId, {"id": GUID, "mode": "delegated"}),
         (i.StartPurview, {"tokenMode": "application", "filters": {}}),
         (i.StartHunt, {"tokenMode": "application", "filters": {}}),
         (i.DeleteCache, {"id": GUID, "confirmation": SOURCE}),
@@ -910,6 +996,77 @@ async def test_missing_reports_incomparable_history_source_gaps_are_not_zero(
 def test_finite_inputs_reject_unsupported_or_unpinned_work(model, payload):
     with pytest.raises(ValidationError):
         model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "sources", [None, ["users"], ["users", "graph_packages", "power_platform"]]
+)
+@pytest.mark.parametrize(
+    "model,required", [(i.StartSync, {"mode": "full"}), (i.RetrySync, {"id": GUID})]
+)
+def test_sync_sources_preserve_omission_and_distinct_subsets(model, required, sources):
+    payload = required if sources is None else {**required, "sources": sources}
+    assert model.model_validate(payload).model_dump(exclude_unset=True) == payload
+
+
+@pytest.mark.parametrize("model", [i.StartSync, i.RetrySync])
+def test_sync_source_schemas_require_unique_values(model):
+    schema = model.model_json_schema()["properties"]["sources"]
+    sources = next(part for part in schema["anyOf"] if part["type"] == "array")
+    assert sources["uniqueItems"] is True
+    assert sources["minItems"] == 1
+    assert sources["maxItems"] == 3
+
+
+@pytest.mark.parametrize("fraction", ["", ".1", ".12", ".123"])
+@pytest.mark.parametrize("model", [i.PurviewSearchFilters, i.HuntFilters])
+@pytest.mark.parametrize("field", ["startDateTime", "endDateTime"])
+def test_investigation_timestamp_precision_matches_canonical_api(model, fraction, field):
+    payload = {
+        "startDateTime": "2026-10-16T00:00:00Z",
+        "endDateTime": "2026-10-16T01:00:00Z",
+        **(
+            {"presetId": "copilot_interactions", "operations": ["CopilotInteraction"]}
+            if model is i.PurviewSearchFilters
+            else {"templateId": "agents_inventory"}
+        ),
+    }
+    payload[field] = payload[field].replace("Z", fraction + "Z")
+    supported = model is i.HuntFilters or fraction not in {".1", ".12"}
+    pattern = model.model_json_schema()["properties"][field]["pattern"]
+    assert bool(re.fullmatch(pattern, payload[field])) is supported
+    if not supported:
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+    else:
+        request = model.model_validate(payload)
+        assert request.startDateTime == payload["startDateTime"]
+        assert request.endDateTime == payload["endDateTime"]
+
+
+@pytest.mark.parametrize(
+    "name,payload",
+    [
+        ("start_sync", {"mode": "full", "sources": ["users", "users"]}),
+        ("retry_sync", {"id": GUID, "sources": ["users", "users"]}),
+        (
+            "start_purview_search",
+            {
+                "tokenMode": "delegated",
+                "filters": {
+                    "presetId": "copilot_interactions",
+                    "operations": ["CopilotInteraction"],
+                    "startDateTime": "2026-10-16T00:00:00.1Z",
+                    "endDateTime": "2026-10-16T01:00:00.12Z",
+                },
+            },
+        ),
+    ],
+)
+async def test_invalid_sync_sources_and_purview_precision_never_dispatch(name, payload, rpc, entra):
+    result = await rpc(name, payload)
+    assert result["isError"]
+    assert not entra.api_calls
 
 
 def test_source_references_preserve_opaque_case_and_normalize_only_canonical_uuids():

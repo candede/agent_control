@@ -16,7 +16,7 @@ describe("streamed package refresh contract", () => {
     await verifySchema(fixture.runtime);
     const scope = { tenantId: randomUUID(), principalId: randomUUID() };
     const jobs = new PackageRefreshJobs(fixture.runtime);
-    const job = await jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: scope.principalId,
+    const job = await jobs.submit(scope, { tokenMode: "application", authorizationPrincipalId: scope.principalId,
       idempotencyKey: randomUUID() });
     expect(job.snapshotId).toBeNull();
     expect(await jobs.markRunning(scope, job.id)).toBe(true);

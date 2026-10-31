@@ -20,7 +20,7 @@ afterEach(async () => {
   for (const selected of selections.splice(0)) await selected.queries.selections.invalidate(selected.selection.id, selected.identity);
 });
 afterAll(async () => { await fixture?.close(); });
-const scope = (): PackageDataScope => ({ tenantId: randomUUID(), principalId: randomUUID() });
+const scope = (): PackageDataScope => ({ tenantId: randomUUID(), principalId: randomUUID(), tokenMode: "application" });
 const summary = (id = "one", version = "1") => allowlistedPackage({
   id, displayName: `Catalog ${id}`, isBlocked: false, version, lastModifiedDateTime: "2026-09-24T08:00:00Z",
   manifestId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", availableTo: "some", deployedTo: "none",
@@ -52,7 +52,7 @@ async function collect(owner: PackageDataScope, job: Job, values: CopilotPackage
     : stream.exactJob(input, "synthetic", job.autoDetails, hooks);
 }
 async function publish(owner: PackageDataScope, values: CopilotPackageDetail[], requestedIds?: string[]) {
-  const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated",
+  const job = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "application",
     idempotencyKey: randomUUID(), requestedIds });
   expect(await jobs.markRunning(owner, job.id)).toBe(true);
   return collect(owner, job, values);
@@ -240,7 +240,7 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
   });
   it("does not reset provider backoff on an unchanged catalog but admits a changed revision and prioritizes it above stale evidence", async () => {
     const owner = scope();
-    const initial = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "delegated",
+    const initial = await jobs.submit(owner, { authorizationPrincipalId: owner.principalId, tokenMode: "application",
       idempotencyKey: randomUUID(), requestedIds: ["changed", "old"] });
     await jobs.markRunning(owner, initial.id);
     await collect(owner, initial, [detail("changed"), detail("old")], { observedAt: new Date(Date.now() - automaticDataSyncIntervalMs - 1000) });
@@ -366,7 +366,7 @@ describe("streamed catalog and bounded automatic detail enrichment", () => {
     expect((await read(owner)).children.total).toBe(0);
   });
   it("persists one unambiguous broad/exact request shape and rejects a mismatched idempotent replay", async () => {
-    const owner = scope(), input = { authorizationPrincipalId: owner.principalId, tokenMode: "delegated" as const, idempotencyKey: randomUUID() };
+    const owner = scope(), input = { authorizationPrincipalId: owner.principalId, tokenMode: "application" as const, idempotencyKey: randomUUID() };
     const broad = await jobs.submit(owner, input);
     expect(broad).toMatchObject({ scopeKind: "broad", targetCount: 0 });
     await expect(jobs.submit(owner, { ...input, requestedIds: ["one"] })).rejects.toMatchObject({ code: "idempotency_mismatch" });

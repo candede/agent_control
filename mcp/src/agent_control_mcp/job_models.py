@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from .inventory_models import ResourceType
+from .inventory_models import NativeResource, ResourceType
 from .models import SafeInteger, WireModel
 from .report_models import Counts, Page
 
@@ -128,7 +128,7 @@ class RefreshJob(WireModel):
 
 class PackageRefreshJob(RefreshJob):
     authorizationPrincipalId: str
-    tokenMode: Literal["delegated"]
+    tokenMode: Literal["application"]
     scopeKind: Literal["broad", "exact"]
     targetCount: SafeInteger
     resultRevision: str
@@ -738,18 +738,6 @@ class NativeActivity(WireModel):
     security: RelatedAvailable[RelatedSecurityRecord] | RelatedUnavailable
 
 
-class StudioTarget(WireModel):
-    resourceNativeId: str
-    displayName: str
-    snapshotId: str
-    inventoryObservedAt: str
-    inventoryExpiresAt: str
-    environmentId: str
-    botId: str
-    inventoryQuarantineState: bool | None
-    inventoryQuarantinedAt: str | None
-
-
 class NativeSnapshot(WireModel):
     id: str
     observedAt: str
@@ -758,7 +746,7 @@ class NativeSnapshot(WireModel):
 
 
 class StudioTargets(WireModel):
-    value: list[StudioTarget]
+    value: list[NativeResource]
     snapshot: NativeSnapshot
 
 

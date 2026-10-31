@@ -160,6 +160,38 @@ for (const destination of ["Sync", "Permissions"]) {
   });
 }
 
+for (const dismiss of ["Continue to workspace", "Escape"] as const) {
+  test(`first-sync application failures allow ${dismiss} without cancelling work or requiring sign-in`, async ({ page }) => {
+    const sources = initial.sources.map(source => source.source === "power_platform"
+      ? { ...source, status: "succeeded" as const, count: 1658, lastSuccessAt: "2026-10-30T10:00:00.000Z" }
+      : source.source === "usage_reports" ? source
+        : { ...source, status: "failed" as const, canRetry: true, message: "The configured tenant application could not be authorized. Verify its registration, credentials and consent." });
+    const run: DataSyncRun = {
+      id: "55555555-5555-4555-8555-555555555555", mode: "initial", automatic: true, status: "partial",
+      startedAt: "2026-10-30T10:00:00.000Z", updatedAt: "2026-10-30T10:01:00.000Z", completedAt: "2026-10-30T10:01:00.000Z",
+      sources: sources.filter(source => source.source !== "usage_reports"),
+    };
+    const fixture = await mockSync(page, { ...initial, sources, run });
+    const cancellations: string[] = [];
+    page.on("request", request => {
+      if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/cancel")) cancellations.push(request.url());
+    });
+    await page.goto("/agents");
+    const notice = firstSyncNotice(page);
+    await expect(notice.getByRole("heading", { name: "First sync needs attention" })).toBeVisible();
+    await expect(notice).toContainText("1,658 resources saved");
+    await expect(notice.getByRole("link", { name: "Sign in again" })).toHaveCount(0);
+    if (dismiss === "Escape") await page.keyboard.press("Escape");
+    else await notice.getByRole("button", { name: dismiss }).click();
+    await expectReadableAgents(page);
+    await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: "Users", exact: true }).click();
+    await expectReadableUsers(page);
+    expect(fixture.starts).toEqual([]);
+    expect(cancellations).toEqual([]);
+    expect(fixture.unexpected).toEqual([]);
+  });
+}
+
 test("automatic first sync keeps its modal across reloads and opens Users on completion", async ({ page }, info) => {
   const running: DataSyncRun = {
     id: "55555555-5555-4555-8555-555555555555", mode: "incremental", automatic: true, status: "running",
@@ -177,12 +209,12 @@ test("automatic first sync keeps its modal across reloads and opens Users on com
   const notice = firstSyncNotice(page);
   await expect(notice.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
   await expect(notice.getByRole("progressbar")).toHaveAttribute("max", "3");
-  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(notice.getByRole("button", { name: "Continue to workspace" })).toBeVisible();
   await expect(notice.locator(".first-sync-actions")).toHaveCount(0);
   await expectFirstSyncModal(page);
   await page.reload();
   await expect(notice.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
-  await expect(notice.getByRole("button")).toHaveCount(0);
+  await expect(notice.getByRole("button", { name: "Continue to workspace" })).toBeVisible();
   await expect(page).toHaveURL(/\/users$/);
   await expectFirstSyncModal(page);
   await page.goto("/audit");
@@ -193,7 +225,6 @@ test("automatic first sync keeps its modal across reloads and opens Users on com
   await expectFirstSyncModal(page);
   await page.keyboard.press("Tab");
   await expectFirstSyncModal(page);
-  await page.keyboard.press("Escape");
   await page.mouse.click(2, 2);
   await expect(notice).toBeVisible();
   await expectFirstSyncModal(page);
@@ -332,7 +363,7 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   const firstSync = firstSyncNotice(page);
   await expect(firstSync.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
   await expect(firstSync.getByRole("list", { name: "First sync sources" }).getByRole("listitem")).toHaveCount(3);
-  await expect(firstSync.getByText(/Your workspace will open automatically when all three sources are saved/)).toBeVisible();
+  await expect(firstSync.getByText(/You can use saved tenant data while sources sync or need attention/)).toBeVisible();
   await expectFirstSyncModal(page);
   expect((await new AxeBuilder({ page }).include(".first-sync-dialog").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -350,7 +381,7 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   expect(await page.evaluate(() => document.body.style.overflow)).toBe("hidden");
   expect(fixture.starts).toEqual([]);
   expect(fixture.automaticStarts).toHaveLength(1);
-  await expect(firstSync.getByRole("button")).toHaveCount(0);
+  await expect(firstSync.getByRole("button", { name: "Continue to workspace" })).toBeVisible();
   await page.goto("/sync");
   await expect(page).toHaveURL(/\/sync$/);
   await expect(syncButton).toHaveAttribute("aria-current", "page");
@@ -615,6 +646,68 @@ test("clean resync is separate from refresh and requires an informed confirmatio
   expect(fixture.starts).toEqual([{ mode: "full", clearSavedData: true }]);
   expect(fixture.unexpected).toEqual([]);
 });
+
+for (const status of ["completed", "cancelled", "running", "partial"] as const) {
+  test(`Sync summaries and run details stay readable for ${status} at responsive widths`, async ({ page }, info) => {
+    const state = completedState();
+    if (!state.run) throw new Error("Expected the completed sync fixture to include a run.");
+    const run: DataSyncRun = {
+      ...state.run, status, completedAt: status === "running" ? null : state.run.completedAt,
+      sources: state.run.sources.filter(source => source.source !== "usage_reports").map(source => ({
+        ...source,
+        status: source.source === "users" || status === "completed" ? "succeeded"
+          : status === "partial" ? "failed" : status,
+        canRetry: source.source !== "users" && (status === "partial" || status === "cancelled"),
+      })),
+    };
+    const fixture = await mockSync(page, { ...state, run });
+    await page.goto("/sync");
+    const inventory = page.getByRole("region", { name: "Inventory health", exact: true });
+    const heading = inventory.getByRole("heading", { name: "Inventory health", exact: true });
+    const diagnostics = inventory.getByRole("button", { name: "View diagnostics", exact: true });
+    const panel = page.getByRole("region", { name: "Data sync", exact: true });
+    const terminal = status === "completed" || status === "cancelled";
+    const summary = terminal ? panel.locator(".data-sync-last-run") : panel.getByRole("region", { name: "Current sync", exact: true });
+    const detailsButton = summary.getByRole("button", { name: "View run details", exact: true });
+    for (const width of [360, 600, 601, 738, 760, 761, 1024, 1440]) {
+      await test.step(`${width}px viewport`, async () => {
+        await page.setViewportSize({ width, height: 900 });
+        await expect(heading).toBeVisible();
+        await expect(diagnostics).toBeEnabled();
+        for (const label of terminal ? [heading, summary.locator("strong")] : [heading]) {
+          const lines = await label.evaluate(element => {
+            const range = element.ownerDocument.createRange();
+            range.selectNodeContents(element);
+            return range.getClientRects().length;
+          });
+          expect(lines, await label.textContent() ?? "").toBe(1);
+        }
+        expect(await inventory.locator(".sync-inventory-summary > div").evaluate(element => element.getBoundingClientRect().width))
+          .toBeGreaterThan(200);
+        const runText = terminal ? summary.locator(":scope > div")
+          : summary.getByRole("group", { name: "Current sync actions", exact: true }).locator(".data-sync-run-meta");
+        expect(await runText.evaluate(element => element.getBoundingClientRect().width)).toBeGreaterThan(200);
+        for (const region of [inventory, summary]) {
+          expect(await region.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+        }
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+        await detailsButton.click();
+        const dialog = page.getByRole("dialog", { name: "Sync run details", exact: true });
+        await expect(dialog.getByText(run.id, { exact: true })).toBeVisible();
+        expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+        await dialog.getByRole("button", { name: "Back to workspace", exact: true }).click();
+        await expect(dialog).toHaveCount(0);
+        await expect(detailsButton).toBeFocused();
+        if (width === 738) {
+          await summary.scrollIntoViewIfNeeded();
+          await page.screenshot({ path: info.outputPath("sync-tablet-layout.png") });
+        }
+      });
+    }
+    expect(fixture.starts).toEqual([]);
+    expect(fixture.unexpected).toEqual([]);
+  });
+}
 
 test("direct Sync navigation keeps diagnostics optional and history restricted to sync sources", async ({ page }) => {
   const fixture = await mockSync(page, initial);

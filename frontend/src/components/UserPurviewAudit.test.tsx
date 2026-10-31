@@ -51,7 +51,7 @@ beforeEach(() => {
 afterEach(() => vi.resetAllMocks());
 
 describe("user audit entry point", () => {
-  it("uses the verified report-to-directory link for both identities in user-on-agent logs", async () => {
+  it("does not mount user-on-agent logs from a deferred report-user deep link", async () => {
     const directory = combinedUser();
     const report = reportUser(1, { username: "report-alias@example.invalid" });
     vi.mocked(readReportDetail).mockImplementation(async path => ({
@@ -60,9 +60,10 @@ describe("user audit entry point", () => {
     render(<CapabilityContext value={capability}><UserDetailModal kind="report" identity={report.username}
       selectionId={selectionId} initialTab="purview" investigationAgent={{ recordId: "agent:saved", name: "Selected agent" }}
       closeLabel="Close logs" returnFocusTo={createRef<HTMLInputElement>()} onClose={vi.fn()} /></CapabilityContext>);
-    const scoped = await screen.findByLabelText("Scoped user on agent");
-    expect(scoped).toHaveTextContent(`agent:saved / ${directory.directory.objectId} / ${directory.directory.userPrincipalName}`);
-    expect(scoped).not.toHaveTextContent(report.username);
+    await screen.findByRole("region", { name: "Saved directory organization" });
+    expect(screen.getByRole("tabpanel")).toHaveAccessibleName("Overview");
+    expect(screen.queryByLabelText("Scoped user on agent")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
   });
 
   it("switches a verified user's Logs to the exact directory-object hunting scope", async () => {
@@ -80,7 +81,7 @@ describe("user audit entry point", () => {
     const element = await screen.findByRole("dialog", { name: "Ada" });
     const dialog = within(element);
     expect(dialog.getAllByRole("tab").map(tab => tab.textContent)).toEqual([
-      "Overview", "Usage & agents", "Licenses", "Responsibility", "Logs",
+      "Overview", "Usage & agents", "Licenses", "Responsibility",
     ]);
     expect(dialog.getByRole("tabpanel")).toHaveAccessibleName("Overview");
     expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
@@ -96,9 +97,8 @@ describe("user audit entry point", () => {
     expect(dialog.getByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
     dialog.getByRole("tab", { name: "Usage & agents" }).focus();
     await userEvent.keyboard("{End}");
-    expect(dialog.getByRole("tab", { name: "Logs" })).toHaveFocus();
-    expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
-    expect(dialog.getByLabelText("Scoped user search").closest("details")).toBeNull();
+    expect(dialog.getByRole("tab", { name: "Responsibility" })).toHaveFocus();
+    expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
     await userEvent.keyboard("{Home}");
     expect(overview).toHaveFocus();
     expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
@@ -112,21 +112,21 @@ describe("user audit entry point", () => {
     expect(replacement.getByRole("tabpanel")).toHaveAccessibleName("Overview");
     await userEvent.click(replacement.getByRole("tab", { name: "Usage & agents" }));
     expect(await replacement.findByRole("searchbox", { name: "Search this user's agents" })).toHaveValue("research");
-    await userEvent.click(replacement.getByRole("tab", { name: "Logs" }));
-    expect(replacement.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    expect(replacement.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
   });
 
-  it("starts in the paid-user details modal and passes its verified directory identity", async () => {
+  it("starts in paid-user details without exposing security entry points", async () => {
     render(<CapabilityContext value={capability}><CopilotUsersView /></CapabilityContext>);
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole("button", { name: "Ada" }));
     const dialog = within(await screen.findByRole("dialog", { name: "Ada" }));
-    await userEvent.click(dialog.getByRole("tab", { name: "Logs" }));
-    expect(dialog.getByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    expect(dialog.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
+    expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
+    expect(dialog.getByRole("tab", { name: "Usage & agents" })).toBeVisible();
     expect(window.location.pathname).not.toBe("/audit");
   });
 
-  it("uses the verified directory link in reported-user details and blocks unlinked report identities", async () => {
+  it("keeps logs hidden for linked and unlinked reported identities", async () => {
     const directory = combinedUser();
     directory.directory.displayName = "Ada"; directory.directory.userPrincipalName = "ada@example.invalid";
     const user = reportUser(1, { username: "ada@example.invalid", displayName: "Ada" });
@@ -140,15 +140,16 @@ describe("user audit entry point", () => {
     };
     const view = render(<CapabilityContext value={capability}><UserDetailModal {...props} kind="report" /></CapabilityContext>);
     const dialog = within(await screen.findByRole("dialog", { name: "Ada" }));
-    await userEvent.click(dialog.getByRole("tab", { name: "Logs" }));
-    expect(await dialog.findByLabelText("Scoped user search")).toHaveTextContent("ada@example.invalid");
+    expect(dialog.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
+    expect(dialog.queryByLabelText("Scoped user search")).not.toBeInTheDocument();
     const unlinked = reportUser(2, { username: "opaque-report-identity", objectId: null });
     vi.mocked(readReportDetail).mockResolvedValue({
       value: unlinked, reports, sources: reportPage([]).sources, selection: reportPage([]).selection,
     });
     view.rerender(<CapabilityContext value={capability}><UserDetailModal {...props} kind="report" identity={unlinked.username} /></CapabilityContext>);
     await waitFor(() => expect(screen.queryByLabelText("Scoped user search")).not.toBeInTheDocument());
-    expect(await screen.findByText(/verified directory user is required/)).toBeVisible();
+    expect(await screen.findByRole("dialog", { name: unlinked.displayName })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
     expect(vi.mocked(readReportDetail).mock.calls.filter(([path]) => path.includes("opaque-report-identity") && path.endsWith("/directory"))).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Open Purview audit search" })).not.toBeInTheDocument();
   });

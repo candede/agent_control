@@ -1369,10 +1369,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     : authorizedViews;
   const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
-  const canImportReports = hasRole(user, "AgentControl.Admin");
+  const canImportReports = hasRole(user, "AgentControl.UsageReportUploader");
   const automaticAction = findWorkbenchAction(workbenchMetadata?.actions, "data-sync.auto-refresh");
   const automaticCapabilities = capabilityState.views.filter(view =>
-    ["graph.package.read.delegated", "powerPlatform.inventory.read", "graph.directory.read", "reports.copilotUsage.read"].includes(view.definition.id));
+    ["graph.package.read.application", "powerPlatform.inventory.read", "graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"].includes(view.definition.id));
   const automaticRefresh = useAutomaticRefresh({
     principalKey,
     authorizationKey: JSON.stringify(automaticCapabilities.map(view => [
@@ -1708,7 +1708,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setRequestedDataSyncRunId(undefined);
     setSyncReportRoute(undefined);
     selectPowerPlatformJob(undefined);
-    setRequestedPackageRefreshMode("delegated");
+    setRequestedPackageRefreshMode("application");
     setAgentPageIndex(0);
     setUsersRoute(current => ({
       ...current, detailId: undefined, detailTab: undefined, agentId: undefined, reportSetId: undefined, page: 0,
@@ -1979,10 +1979,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
 
     try {
-      const existingJobs = idempotencyKey ? await getPackageRefreshJobs("delegated", 20, { signal: controller.signal }) : undefined;
+      const existingJobs = idempotencyKey ? await getPackageRefreshJobs("application", 20, { signal: controller.signal }) : undefined;
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       let job = existingJobs?.value.find(candidate => candidate.scopeKind === "broad" && candidate.status === "running")
-        ?? await startPackageRefresh("delegated", { idempotencyKey, signal: controller.signal });
+        ?? await startPackageRefresh("application", { idempotencyKey, signal: controller.signal });
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       setLinkedPackageRefreshJob(job);
       handleSyncRunsChanged();
@@ -1996,7 +1996,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       if (job.status !== "succeeded") {
         throw new Error(job.message ?? (job.status === "waiting_authorization"
-          ? "Package refresh requires current delegated read authorization. Open Permissions to request consent or retry the probe."
+          ? "Package refresh requires current Microsoft Graph application authorization. Open Permissions to review the application's permissions and credentials, then retry."
           : "Package refresh failed without replacing the last complete saved observation."));
       }
       if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
@@ -2039,7 +2039,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       }
       if (job.status !== "succeeded") {
         throw new Error(job.message ?? (job.status === "waiting_authorization"
-          ? "Matching-detail refresh requires current delegated package-read authorization."
+          ? "Matching-detail refresh requires current Microsoft Graph application authorization. Open Permissions to review the application's permissions and credentials, then retry."
           : "Matching-detail refresh failed without replacing the last complete saved observations."));
       }
       if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
@@ -2067,7 +2067,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setError(undefined);
     setAgentDetailError(undefined);
     try {
-      let job = await startExactPackageRefresh(id, "delegated", { signal: controller.signal });
+      let job = await startExactPackageRefresh(id, "application", { signal: controller.signal });
       if (!ownsPackageRefreshRequest(requestId, owner)) return;
       while (job.status === "running") {
         await wait(packageRefreshPollIntervalMs);
@@ -2075,7 +2075,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         job = await getPackageRefreshJob(job.id, job.tokenMode, { signal: controller.signal });
         if (!ownsPackageRefreshRequest(requestId, owner)) return;
       }
-      if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current delegated package-read authorization.");
+      if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current Microsoft Graph application authorization. Open Permissions to review the application's permissions and credentials, then retry.");
       setRequestedAgentDetailId(id);
       if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
     } catch (requestError) {
@@ -2195,7 +2195,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     }
     const controller = new AbortController();
     agentDetailAbortController.current = controller;
-    let job = await startExactPackageRefresh(id, "delegated", { signal: controller.signal });
+    let job = await startExactPackageRefresh(id, "application", { signal: controller.signal });
     if (agentDetailRequestId.current !== requestId) return;
     while (job.status === "running") {
       await wait(packageRefreshPollIntervalMs);
@@ -2203,7 +2203,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       job = await getPackageRefreshJob(job.id, job.tokenMode, { signal: controller.signal });
       if (agentDetailRequestId.current !== requestId) return;
     }
-    if (job.status !== "succeeded") throw new Error(job.message ?? "Microsoft Graph could not load current package access. Check delegated permissions and retry.");
+    if (job.status !== "succeeded") throw new Error(job.message ?? "Microsoft Graph could not load current package access. Check application permissions and credentials and retry.");
     const page = await getAgents({ recordId: `graph_packages:${encodeURIComponent(id)}`, limit: 1 }, { signal: controller.signal });
     if (agentDetailRequestId.current !== requestId) return;
     const detail = await getAgentDetails(page.selection.id, id, { signal: controller.signal });
@@ -3286,7 +3286,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </li>
               <li>
                 <span className="signin-capability-icon"><ShieldCheck size={20} aria-hidden="true" /></span>
-                <div><h3>Manage access and investigate</h3><p>Control agent access and investigate activity with Purview and Defender.</p></div>
+                <div><h3>Manage agent access</h3><p>Control agent availability, installation assignments, and quarantine.</p></div>
               </li>
             </ul>
           </section>
@@ -3366,7 +3366,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("audit") ? (
-              <CapabilityGate roles={["AgentControl.Viewer"]}>
+              <CapabilityGate roles={["AgentControl.Admin"]}>
               <button
                 type="button"
                 className={
@@ -3492,7 +3492,8 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           key={`usage-reports:${principalKey}`}
           route={visibleActiveView === "sync" ? syncReportRoute : undefined}
           onRouteChange={handleSyncReportRouteChange}
-          canManage={canImportReports}
+          canImport={canImportReports}
+          canManage={canOperate}
           revision={officialUsageDashboardRevision}
           onChanged={handleOfficialUsageChanged}
         />
@@ -3577,7 +3578,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             reportPending={inventoryReportRevision !== officialUsageDashboardRevision}
             loadingInventory={agentInventoryPending}
             inventoryScope={agentInventoryScope}
-            reportSelector={canImportReports ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
+            reportSelector={canOperate ? <OfficialUsageReportSelector key={`agent-reports:${principalKey}`}
               principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
             allSelected={!hasActiveAgentFilters} onClearFilters={handleClearAgentFilters}
             endUserAccess={endUserAccess} reportedUsage={reportedUsage}
@@ -3755,7 +3756,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           dataRevision={copilotUsersDataRevision}
           route={usersRoute}
           onRouteChange={handleUsersRouteChange}
-          reportSelector={canImportReports ? <OfficialUsageReportSelector key={`user-reports:${principalKey}`}
+          reportSelector={canOperate ? <OfficialUsageReportSelector key={`user-reports:${principalKey}`}
             principalKey={principalKey} revision={officialUsageDashboardRevision} onChanged={handleReportSetSelected} /> : undefined}
           onOpenAgent={id => {
             if (!ownsAgentScope(principalKey)) return;
@@ -3773,7 +3774,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
             setRequestedAgentDetailId(id);
           }}
         />
-      ) : visibleActiveView === "audit" ? (
+      ) : visibleActiveView === "audit" && canOperate ? (
         <AuditLogView key={principalKey} agents={agents} />
       ) : visibleActiveView === "sync" ? null : <div className="screen-state">No Agent Control app role is assigned.</div>}
 

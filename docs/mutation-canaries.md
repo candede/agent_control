@@ -203,7 +203,13 @@ Before creating either application approval, record change approval outside the 
 - Time window, stop conditions, and an expiry no more than 30 days away.
 - Current capability contract hash and configuration revision.
 
-Do not use a production package merely to satisfy validation. Do not authorize a general batch, owner reassignment, or an application token. Package writes require delegated `CopilotPackages.ReadWrite.All` and a Microsoft Agent 365 license; the operation pages name no additional human Entra administrator role.
+Do not use a production package merely to satisfy validation. Do not authorize a
+general batch, owner reassignment, or an application token. Package writes require
+delegated `CopilotPackages.ReadWrite.All`, tenant admin consent and a Microsoft
+Agent 365 license. Recommend **AI Administrator** for the signed-in executor;
+**Global Administrator** is a broader alternative. This follows Microsoft's
+Microsoft 365 admin-center role guidance, not a confirmed exclusive API role
+minimum. See the [role recommendation and its scope](user-roles-and-permissions.md#package-management-administrator-roles).
 
 ## Reversible procedure
 

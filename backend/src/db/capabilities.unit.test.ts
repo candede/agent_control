@@ -7,9 +7,16 @@ import { AppError } from "../errors.js";
 import { CapabilityRepository } from "./capabilities.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "./sessions.js";
 
+vi.hoisted(() => {
+  process.env.TENANTS_JSON = JSON.stringify([
+    { tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-2222-2222-222222222222",
+      clientSecret: "synthetic-capability-transactions", domains: ["example.invalid"] },
+  ]);
+});
+
 afterEach(() => vi.restoreAllMocks());
 
-const capabilityId = "graph.package.read.application";
+const capabilityId = "purview.audit.search.application";
 
 function deferred() {
   let resolve!: () => void;
@@ -147,7 +154,7 @@ type EvidencePublication = "readiness" | "operation" | "audit" | "hunting";
 
 function evidenceFixture(kind: EvidencePublication) {
   const actor: AuthenticatedUser = {
-    tenantId: "synthetic-evidence-tenant", homeAccountId: `evidence-${kind}-${randomUUID()}`,
+    tenantId: "11111111-1111-1111-1111-111111111111", homeAccountId: `evidence-${kind}-${randomUUID()}`,
     username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"],
   };
   const observedAt = new Date();
@@ -189,11 +196,11 @@ function evidenceFixture(kind: EvidencePublication) {
   vi.spyOn(database, "query").mockImplementation(async (statement, values) => query(statement, values, false));
   const clientQuery = vi.spyOn(client, "query").mockImplementation(async (statement, values) => query(statement, values, true));
   const service = new CapabilityService(new CapabilityRepository(database), {
-    delegatedToken: async () => "synthetic-token", packageProbe: async () => [],
+    delegatedToken: async () => "synthetic-token", inventoryProbe: async () => [],
   });
   const controller = new AbortController();
   const publish = () => kind === "readiness"
-    ? service.refresh("graph.package.read.delegated", actor, controller.signal)
+    ? service.refresh("powerPlatform.inventory.read", actor, controller.signal)
     : kind === "operation"
       ? service.observeOperation("graph.licenses.read", actor, async () => "business-result", { signal: controller.signal })
       : kind === "audit"

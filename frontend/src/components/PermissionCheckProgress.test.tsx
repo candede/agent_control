@@ -1,16 +1,19 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../../backend/src/services/capabilityRegistry";
+import * as api from "../api/client";
 import { getCurrentUser, type CapabilityCheckProgress, type CapabilityView } from "../api/client";
 import { PermissionCheckProgress } from "./PermissionCheckProgress";
 
-const views: CapabilityView[] = capabilityDefinitions.map(definition => ({ enabled: true, definition, decision: {
+const views: CapabilityView[] = capabilityDefinitions.map(definition => ({ enabled: true, definition,
+  ...(definition.mode === "application" ? { configuration: { enabled: true, sharedDataScope: true, revision: 1 } } : {}),
+  decision: {
   capabilityId: definition.id, status: "unknown", authorized: false, fresh: false, previewQualification: "not_required", remediation: [],
 } }));
 const activeCheck = { id: 1, retryFailed: true };
 const initial: CapabilityCheckProgress = { checks: [
-  { capabilityId: "graph.package.read.delegated", state: "checking" },
-  { capabilityId: "graph.directory.read", state: "complete" },
+  { capabilityId: "graph.package.read.application", state: "checking" },
+  { capabilityId: "powerPlatform.quarantine.read", state: "complete" },
   { capabilityId: "powerPlatform.inventory.read", state: "reviewing" },
 ] };
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
@@ -60,6 +63,22 @@ it("retries a brief progress transport failure without presenting an early warni
   await act(() => vi.advanceTimersByTimeAsync(1000));
   expect(screen.getByText("1 of 3 reviewed")).toBeVisible();
   expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it("omits deferred security checks from progress names and counts", async () => {
+  vi.useFakeTimers();
+  const progress: CapabilityCheckProgress = { checks: [
+    ...initial.checks,
+    ...views.filter(view => /^(purview\.|defender\.|graph\.agentIdentity\.)/.test(view.definition.id))
+      .map(view => ({ capabilityId: view.definition.id, state: "checking" as const })),
+  ] };
+  vi.spyOn(api, "getCapabilityCheckProgress").mockResolvedValue({ progress });
+  render(<PermissionCheckProgress loading={false} activeCheck={activeCheck} views={views} />);
+  await act(() => vi.advanceTimersByTimeAsync(500));
+  expect(screen.getByRole("status")).toHaveTextContent("1 of 3 reviewed");
+  expect(screen.getByRole("progressbar")).toHaveAttribute("max", "3");
+  expect(screen.getByRole("list")).not.toHaveTextContent(/Purview|Defender|log identity/);
+  expect(screen.getByText("Agent inventory")).toBeVisible();
 });
 
 it("reports unavailable live details without claiming the permission checks failed", async () => {

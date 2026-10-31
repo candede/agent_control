@@ -489,6 +489,64 @@
 .dashboard-bar-6 { --bar-color: #50afb3; }
 .dashboard-bar-7 { --bar-color: #8398bb; }
 
+.dashboard-department-results {
+  position: relative;
+}
+
+.dashboard-department-loading {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid #cee7e1;
+  border-radius: 20px;
+  background: #f9fcfb;
+  color: #166c61;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.dashboard-department-placeholder .dashboard-department-name,
+.dashboard-department-placeholder .dashboard-department-value small,
+.dashboard-department-placeholder .dashboard-department strong {
+  color: transparent;
+  background: #dce7e5;
+  border-radius: 3px;
+}
+
+.dashboard-department-placeholder .dashboard-department-name {
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.dashboard-department-placeholder .dashboard-department-bar > span {
+  background: #c2d4d0;
+}
+
+.dashboard-department-placeholder .dashboard-departments {
+  animation: dashboard-department-pulse 1.4s ease-in-out infinite;
+}
+
+.dashboard-department-placeholder .dashboard-panel-note,
+.dashboard-department-placeholder nav {
+  visibility: hidden;
+}
+
+@keyframes dashboard-department-pulse {
+  50% { opacity: 0.45; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-department-placeholder .dashboard-departments {
+    animation: none;
+  }
+}
+
 .dashboard-department-value {
   text-align: right;
   font-size: 12px;

@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { config } from "../config.js";
 import { requireUserPublication, type UserSourcePublication } from "../db/dataSync.js";
 import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
@@ -26,7 +26,7 @@ export type CopilotUsageRefreshResult = {
 };
 type Dependencies = {
   provider: UserSourceProvider; revalidateUser: typeof revalidateAuthorizedUser;
-  delegatedToken: typeof acquireAuthorizedToken;
+  applicationToken: typeof acquireApplicationToken;
   requireAvailable: (capability: CapabilityId, user: AuthenticatedUser) => Promise<unknown>; observeOperation: typeof capabilities.observeOperation;
   beginOperationValidation: typeof capabilities.beginOperationValidation;
   admissions: typeof requireProviderAdmissions;
@@ -41,7 +41,7 @@ export class CopilotUsageService {
     this.reports = new LargeTenantUsersReports(database, config.sessionSecret, config.officialUsageStaleDays);
     this.sources = this.reports.sources;
     this.dependencies = { provider: new UserSourceProvider(), revalidateUser: revalidateAuthorizedUser,
-      delegatedToken: acquireAuthorizedToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
+      applicationToken: acquireApplicationToken, requireAvailable: capabilities.requireAvailable.bind(capabilities),
       observeOperation: capabilities.observeOperation.bind(capabilities),
       beginOperationValidation: capabilities.beginOperationValidation.bind(capabilities), admissions: requireProviderAdmissions, ...dependencies };
   }
@@ -90,7 +90,7 @@ export class CopilotUsageService {
             || !hasAppRole(fresh.roles, "AgentControl.Viewer")) throw AppError.unauthorized();
           await this.dependencies.requireAvailable(capability, fresh);
           sourceFence(); providerSignal.throwIfAborted();
-          const token = await this.dependencies.delegatedToken(scope.tenantId, scope.principalId, capability);
+          const token = await this.dependencies.applicationToken(scope.tenantId, capability);
           sourceFence(); providerSignal.throwIfAborted();
           return token;
         });

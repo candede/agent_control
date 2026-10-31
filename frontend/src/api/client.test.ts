@@ -430,7 +430,7 @@ describe("username sign-in API client", () => {
 
 describe("access API client", () => {
   it.each([false, true])("reads live permission progress without starting checks (retry=%s)", async retryFailed => {
-    const progress = { checks: [{ capabilityId: "graph.directory.read", state: "checking" }] };
+    const progress = { checks: [{ capabilityId: "graph.package.read.application", state: "checking" }] };
     const fetchMock = mockJsonResponse({ progress });
     const controller = new AbortController();
     await expect(getCapabilityCheckProgress({ retryFailed, signal: controller.signal })).resolves.toEqual({ progress });
@@ -844,16 +844,16 @@ describe("access API client", () => {
     unsubscribe();
   });
 
-  it("starts and polls an explicit delegated package refresh", async () => {
+  it("starts and polls an explicit application package refresh", async () => {
     const fetchMock = mockJsonResponse({ id: "job-1", status: "succeeded" });
     const controller = new AbortController();
-    await startPackageRefresh("delegated", { signal: controller.signal });
-    await startExactPackageRefresh("package/one", "delegated", { signal: controller.signal });
-    await getPackageRefreshJob("job/1", "delegated", { signal: controller.signal });
-    await getPackageRefreshJobs("delegated", 20, { signal: controller.signal });
-    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
-    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/package%2Fone/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }) }));
-    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=delegated", expect.objectContaining({ credentials: "include" }));
+    await startPackageRefresh("application", { signal: controller.signal });
+    await startExactPackageRefresh("package/one", "application", { signal: controller.signal });
+    await getPackageRefreshJob("job/1", "application", { signal: controller.signal });
+    await getPackageRefreshJobs("application", 20, { signal: controller.signal });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "application" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/package%2Fone/refresh-jobs", expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "application" }) }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, "/api/agents/refresh-jobs/job%2F1?mode=application", expect.objectContaining({ credentials: "include" }));
     expect(fetchMock.mock.calls.every(([, init]) => init?.signal === controller.signal)).toBe(true);
   });
 
@@ -895,10 +895,10 @@ describe("access API client", () => {
 
   it("uses a stable idempotency key when collecting missing agent identities", async () => {
     const fetchMock = mockJsonResponse({ id: "identity-job", status: "running" });
-    await startPackageRefresh("delegated", { idempotencyKey: "agent-identities-snapshot-one" });
+    await startPackageRefresh("application", { idempotencyKey: "agent-identities-snapshot-one" });
     expect(fetchMock).toHaveBeenCalledWith("/api/agents/refresh-jobs", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ mode: "delegated" }),
+      body: JSON.stringify({ mode: "application" }),
     }));
     expect(new Headers(fetchMock.mock.lastCall?.[1]?.headers).get("Idempotency-Key")).toBe("agent-identities-snapshot-one");
   });
@@ -1042,8 +1042,8 @@ describe("access API client", () => {
 
   it("stages a server-filtered refresh and separately reauthorizes its start without downloading targets", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({
-      id: "selected-refresh", status: "waiting_authorization", tokenMode: "delegated", targetCount: 5000,
-    })).mockResolvedValueOnce(Response.json({ id: "selected-refresh", status: "running", tokenMode: "delegated", targetCount: 5000 }));
+      id: "selected-refresh", status: "waiting_authorization", tokenMode: "application", targetCount: 5000,
+    })).mockResolvedValueOnce(Response.json({ id: "selected-refresh", status: "running", tokenMode: "application", targetCount: 5000 }));
     vi.stubGlobal("fetch", fetchMock);
     const controller = new AbortController();
     expect(await refreshPackageIdentityDetails({ selectionId: "selected-root" }, { signal: controller.signal }))
@@ -1051,7 +1051,7 @@ describe("access API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/agents/refresh-selection",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ selectionId: "selected-root" }), signal: controller.signal }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/agents/refresh-jobs/selected-refresh/resume",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "delegated" }), signal: controller.signal }));
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ mode: "application" }), signal: controller.signal }));
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1065,7 +1065,7 @@ describe("access API client", () => {
         queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => {
           replacement = getCurrentUser();
         })));
-        return { id: "selected-refresh", status, tokenMode: "delegated", targetCount: 2 };
+        return { id: "selected-refresh", status, tokenMode: "application", targetCount: 2 };
       };
       const fetchMock = vi.fn().mockResolvedValueOnce(response)
         .mockResolvedValueOnce(Response.json({ csrfToken: "replacement-csrf" }))
@@ -1156,7 +1156,7 @@ describe("access API client", () => {
         expect.objectContaining({ credentials: "include" }));
       await startExactPackageRefresh(id);
       expect(fetchMock).toHaveBeenLastCalledWith(`/api/agents/${encodeURIComponent(id)}/refresh-jobs`, expect.objectContaining({
-        method: "POST", body: JSON.stringify({ mode: "delegated" }),
+        method: "POST", body: JSON.stringify({ mode: "application" }),
       }));
       await previewPackageMutation({ action: "block", ids: [id], mutationScope: "single" });
       expect(fetchMock).toHaveBeenLastCalledWith("/api/agents/mutation-preview", expect.objectContaining({

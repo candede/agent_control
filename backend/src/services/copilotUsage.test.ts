@@ -67,9 +67,9 @@ describe("live Users orchestration and publication boundary", () => {
       ? Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] })
       : String(url).includes("/users?") ? Response.json({ value: [graphUser()], "@odata.count": 1 }) : activity());
     const provider = new UserSourceProvider(fetcher);
-    const revalidateUser = vi.fn(async () => user), delegatedToken = vi.fn(async () => "synthetic-token");
+    const revalidateUser = vi.fn(async () => user), applicationToken = vi.fn(async () => "synthetic-token");
     const requireAvailable = vi.fn<(capability: CapabilityId, user: AuthenticatedUser) => Promise<unknown>>(async () => {}), admissions = vi.fn(() => {});
-    const service = new CopilotUsageService(fixture.runtime, { provider, revalidateUser, delegatedToken, requireAvailable, admissions,
+    const service = new CopilotUsageService(fixture.runtime, { provider, revalidateUser, applicationToken, requireAvailable, admissions,
       observeOperation: async (_capability, _user, operation) => operation(() => {}) });
     const sources = new UserSourcesRepository(fixture.runtime, "synthetic-source-secret-never-production");
     const status = () => sources.refreshStatus(identity);
@@ -78,7 +78,7 @@ describe("live Users orchestration and publication boundary", () => {
       actorPrincipalId: identity.principalId,
       sessionEpoch: identity.sessionEpoch, observedAt, ...(expiresAt ? { expiresAt } : {}),
     }), { authorize: async () => "synthetic-token" });
-    return { service, user, identity, repository, publication, fetcher, provider, revalidateUser, delegatedToken, requireAvailable, admissions, sources, status, seed };
+    return { service, user, identity, repository, publication, fetcher, provider, revalidateUser, applicationToken, requireAvailable, admissions, sources, status, seed };
   }
   it("publishes both real sources but leaves the shared Users job running for the orchestrator's people phase", async () => {
     const h = await harness(), progress = vi.fn(async () => {});
@@ -88,7 +88,7 @@ describe("live Users orchestration and publication boundary", () => {
     expect((await h.repository.getRun(h.identity, h.publication.runId))?.sources[0]).toMatchObject({ status: "running", count: 1, jobId: h.publication.jobId });
     expect(progress).toHaveBeenCalledWith(1, expect.any(Function));
     expect(h.revalidateUser).toHaveBeenCalledTimes(4);
-    expect(h.delegatedToken).toHaveBeenCalledTimes(4);
+    expect(h.applicationToken).toHaveBeenCalledTimes(4);
     const selected = await h.sources.capture(h.identity);
     const people = await h.sources.people(selected.id, h.identity, [objectId]);
     expect(people).toHaveLength(1);
@@ -245,7 +245,7 @@ describe("live Users orchestration and publication boundary", () => {
     const h = await harness();
     h.admissions.mockImplementation(() => { throw new AppError(503, "provider_admissions_disabled", "Disabled after restore"); });
     await expect(h.service.refreshUsers(h.user, undefined, { publication: h.publication })).rejects.toMatchObject({ code: "provider_admissions_disabled" });
-    expect(h.delegatedToken).not.toHaveBeenCalled(); expect(h.fetcher).not.toHaveBeenCalled();
+    expect(h.applicationToken).not.toHaveBeenCalled(); expect(h.fetcher).not.toHaveBeenCalled();
   });
   it.each(["directory", "app_activity"] as const)("transactionally rejects %s publication after job cancellation", async cancelled => {
     const h = await harness(), original = h.fetcher.getMockImplementation()!;
@@ -284,14 +284,14 @@ describe("live Users orchestration and publication boundary", () => {
       const cancel = () => controller.abort(reason);
       if (boundary === "revalidation") h.revalidateUser.mockImplementationOnce(async () => { cancel(); return h.user; });
       if (boundary === "capability") h.requireAvailable.mockImplementationOnce(async () => { cancel(); });
-      if (boundary === "token") h.delegatedToken.mockImplementationOnce(async () => { cancel(); return "late-token"; });
+      if (boundary === "token") h.applicationToken.mockImplementationOnce(async () => { cancel(); return "late-token"; });
       if (boundary === "provider") h.fetcher.mockImplementationOnce(async () => { cancel(); return Response.json({ value: [] }); });
       if (boundary === "publication-revalidation") h.revalidateUser.mockResolvedValueOnce(h.user).mockImplementationOnce(async () => { cancel(); return h.user; });
       if (boundary === "publication-capability") h.requireAvailable.mockResolvedValueOnce(undefined).mockImplementationOnce(async () => { cancel(); });
       await expect(h.service.refreshUsers(h.user, controller.signal, { publication: h.publication, incompleteOnly: true,
         onDirectoryProgress: async () => { if (boundary === "progress") cancel(); } })).rejects.toBe(reason);
       expect((await h.status()).sources.directory.generationId).toBeNull();
-      expect(h.delegatedToken).toHaveBeenCalledTimes(boundary === "revalidation" || boundary === "capability" ? 0 : 1);
+      expect(h.applicationToken).toHaveBeenCalledTimes(boundary === "revalidation" || boundary === "capability" ? 0 : 1);
     },
   );
   it.each(["capability", "token", "provider"] as const)("fences revoked sessions during %s even without an AbortSignal", async boundary => {
@@ -302,7 +302,7 @@ describe("live Users orchestration and publication boundary", () => {
       await new DataGenerations(fixture.runtime).revokePrincipal(h.identity.tenantId, h.identity.principalId);
     }); };
     if (boundary === "capability") h.requireAvailable.mockImplementationOnce(async () => { revoke(); });
-    if (boundary === "token") h.delegatedToken.mockImplementationOnce(async () => { revoke(); return "late-token"; });
+    if (boundary === "token") h.applicationToken.mockImplementationOnce(async () => { revoke(); return "late-token"; });
     if (boundary === "provider") h.fetcher.mockImplementationOnce(async () => { revoke(); await revocation; return Response.json({ value: [] }); });
     try {
       await expect(h.service.refreshUsers(h.user, undefined, { publication: h.publication, incompleteOnly: true })).rejects.toMatchObject({ status: 401 });

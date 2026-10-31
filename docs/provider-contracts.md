@@ -5,32 +5,91 @@ The [capability registry](../backend/src/services/capabilityRegistry.ts) is the
 current capability-ID and Microsoft source-reference inventory. Local fixtures
 establish implementation behavior, not live consent, licensing or data visibility.
 
-## Permissions and scope
+## App registration permissions
 
-| Feature | API/mode | Permission | Additional requirement |
-| --- | --- | --- | --- |
-| Package inventory collection | Graph delegated/application | `CopilotPackages.Read.All` | Agent 365 licensing; configured credentials and provider application consent for application collection. Saved tenant reads require no Graph permission. |
-| Package access/block/unblock | Graph delegated | `CopilotPackages.ReadWrite.All` | Agent Control Admin and Agent 365 licensing |
-| User/group lookup | Graph delegated | `User.ReadBasic.All`, `Group.Read.All` | Authorized directory visibility |
-| User/license sync | Graph delegated | `User.Read.All`, `LicenseAssignment.Read.All` | Directory Readers or Global Reader |
-| Copilot app activity | Graph delegated | `Reports.Read.All` | Supported reporting role and report privacy settings |
-| Agent identity resolution | Graph delegated | `AgentIdentity.Read.All` | Agent ID Administrator for nonowners |
-| Power Platform inventory | Power Platform delegated | `ResourceQuery.Resources.Read` | Supported Power Platform/AI administrator or reader role |
-| Studio quarantine | Power Platform delegated | `CopilotStudio.AdminActions.Invoke` | Agent Control Admin for changes; supported current target |
-| Purview Audit Search | Graph delegated/application | `AuditLogsQuery.Read.All` | Purview Audit enabled and applicable role/entitlement |
-| Defender hunting | Graph delegated/application | `ThreatHunting.Read.All` | Defender RBAC/data-source visibility, connectivity and applicable licensing |
-| Official report import | Local | No Microsoft token | Admin import of supported CSVs |
+This is the current Permissions page's **11-entry, four-group** reference.
+App-defined roles are documented separately in the
+[role guide](user-roles-and-permissions.md#app-defined-roles); these tables describe
+Microsoft access only.
 
-App roles do not grant provider access. Application mode requires configured
-tenant/client credentials, enabled application access and configured shared
-scope. Viewer/Admin may submit ordinary authorized shared reads directly.
+### Microsoft Graph / Application
+
+Configured application credentials and tenant admin consent support automatic
+reads without signed-in Microsoft directory/reporting roles.
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `CopilotPackages.Read.All` | Published agent/package inventory, metadata and sharing details; applicable Microsoft Agent 365 licensing, application credentials and tenant admin consent. |
+| `User.Read.All` | Directory users, Copilot license assignments, exact creators/owners, management user search and user-ID validation. |
+| `LicenseAssignment.Read.All` | Tenant product SKUs and service-plan catalog. |
+| `Reports.Read.All` | 28-day per-user Copilot Office-app activity; not the three imported agent-usage CSV reports. |
+
+### Microsoft Graph / Delegated
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `CopilotPackages.ReadWrite.All` | Package block/unblock, availability/installation assignments and control readback. Requires delegated tenant admin consent and a Microsoft Agent 365 license. Recommended signed-in administrator role: **AI Administrator**; **Global Administrator** is a broader alternative. Package writes support delegated work or school accounts only. |
+| `Group.Read.All` | Management group search/resolution using the signed-in user's delegated directory visibility. |
+
+Microsoft defines both application and delegated forms of the package permission,
+but the application form does not authorize these writes. Configure **Microsoft
+Graph > Delegated permissions** for package controls. The role recommendation
+follows Microsoft's agent-management guidance for the Microsoft 365 admin center.
+The package API does not publish an explicit role minimum; this is not a
+confirmed exclusive API role requirement. See the
+[recommended administrator role and API support](user-roles-and-permissions.md#package-management-administrator-roles).
+
+### Power Platform / Delegated
+
+Power Platform is separate from Graph and uses the signed-in user's Microsoft
+privileges.
+
+| Permission | Feature and required Microsoft access |
+| --- | --- |
+| `ResourceQuery.Resources.Read` | Studio agents and environment inventory. Recommend **AI Reader**, the least-privileged supported Entra inventory role for this sync; **no application permission equivalent**. Saved tenant data remains readable without sync access. |
+| `CopilotStudio.AdminActions.Invoke` | Studio quarantine status and quarantine/restore. Both status and changes require **AI Administrator**, **Power Platform Administrator** or **Global Administrator**. |
+
+A **Privileged Role Administrator** assigns AI Reader through **Microsoft Entra
+admin center > Identity > Roles & admins > AI Reader > Add assignments**. The
+viewer signs out/in and first activates a PIM-eligible role. Inventory API consent
+is separate from role assignment and grants no quarantine status or changes.
+Global Reader, AI Administrator, Power Platform Administrator, Dynamics 365
+Administrator and Global Administrator also work if already assigned; do not
+grant broader roles solely for sync. AI roles cover AI-scoped resources.
+These are inventory-feature roles, not a separately published REST API minimum.
+See the [full assignment instructions](user-roles-and-permissions.md#assign-ai-reader-to-a-viewer).
+
+### Sign-in / OpenID Connect
+
+Sign-in scopes do not authorize inventory reads or administrative changes.
+`User.Read` is not used.
+
+| Scope | Purpose |
+| --- | --- |
+| `openid` | Authenticate the account with an ID token; no provider-data access. |
+| `profile` | Display the account's name and username. |
+| `offline_access` | Renew delegated tokens when Microsoft policy allows; no additional API permissions. |
+
+## Authorization and saved scope
+
+App roles do not grant provider access. Every provider change requires the
+current Admin app role, delegated permission and applicable Microsoft role/license.
+Application read grants do not authorize changes. Standard collection starts
+automatically after permitted sign-in while visible and online; no app-owned
+enable, prior approval or qualification is required.
+Viewer, UsageReportUploader and Admin can read shared saved tenant data without
+source-read permission. Local Audit read/export is Admin-only; recording is
+unchanged. CSV import uses no Microsoft token; downloading original user-level
+reports requires Reports Reader or AI Administrator, not Usage Summary Reports
+Reader.
+
 Inventory observations are tenant-owned regardless of the collector's token mode;
 private hunt and Audit Search results retain their existing actor/sharing scope.
 Directory/activity and inventory refreshes preserve unseen saved records and
 their original observation dates. Power Platform query type/environment filters
 do not create separate datasets. Catalog absence is not authoritative deletion;
 verified exact absence still removes the corresponding supported target.
-Saved inventory reads require Viewer/Admin authority, not source-read permissions.
+Saved inventory reads require Viewer-capable authority, not source-read permissions.
 No earlier per-query approval,
 qualification job or retained qualified scope is required.
 
@@ -56,7 +115,7 @@ Duplicate exact identities, unsupported declared resource types and malformed
 security fields reject collection. Access principals require user/group type
 (case-insensitive validation) and a bounded nonblank control-free identity;
 provider ID spelling is retained without imposing directory GUID rules.
-Delegated read accepts the documented read grant or accepted read/write grant.
+Delegated control readback uses the administrator's read/write grant.
 Beta mutations remain exact one-shot operations with current prestate/readback;
 read support does not imply general write support.
 
@@ -115,7 +174,19 @@ requires fresh catalog and identity-detail observations. When a separate
 identity-detail observation is explicitly missing, catalog freshness alone
 cannot substitute for it.
 
-## Purview and Defender
+## Retained backend investigations
+
+Purview, Defender and investigation-only identity setup are hidden from the
+current UI. The permissions below belong only to retained backend contracts;
+they are **not** additions to the Permissions page or ordinary deployment setup.
+Saved evidence and provider authorization have not been removed or broadened.
+These contracts are separate from Agent Control's Admin-only local Audit logs.
+
+| Retained capability | Microsoft permission | Provider requirement |
+| --- | --- | --- |
+| Agent log identity resolution | Delegated `AgentIdentity.Read.All` | Agent ID Administrator for identities the user does not own. |
+| Purview Audit Search | Delegated/application `AuditLogsQuery.Read.All` | Purview Audit enabled and applicable role/entitlement. |
+| Defender hunting | Delegated/application `ThreatHunting.Read.All` | Defender RBAC, data-source visibility, connectivity and applicable licensing. |
 
 Purview uses the selected Graph v1.0 query lifecycle, singular `serviceFilter`,
 strict direct/collection response shapes and validated continuation URLs.

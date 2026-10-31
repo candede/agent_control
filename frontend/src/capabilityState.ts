@@ -1,4 +1,4 @@
-import { supportsAutomaticCapabilityCheck } from "../../backend/src/types/capability";
+import { isApplicationCollectionCapability, supportsAutomaticCapabilityCheck } from "../../backend/src/types/capability";
 import type { CapabilityStatus, CapabilityView } from "./api/client";
 
 export const statusLabels: Record<CapabilityStatus, string> = {
@@ -29,7 +29,8 @@ export function providerActionAllowed(view: CapabilityView | undefined, _write?:
   const expiresAt = Date.parse(decision.expiresAt ?? "");
   // Expired diagnostics are not a revoked grant. Submitted operations enforce current authorization.
   return (definition.mode === "delegated" || definition.mode === "application"
-    && definition.probe.kind === "on_demand" && view.configuration?.sharedDataScope === true)
+    && (isApplicationCollectionCapability(definition.id)
+      || definition.probe.kind === "on_demand" && view.configuration?.sharedDataScope === true))
     && (decision.verification === "provider" || decision.verification === "token")
     && Number.isFinite(checkedAt) && checkedAt <= now && expiresAt > checkedAt && expiresAt <= now;
 }
@@ -37,13 +38,13 @@ export function providerActionAllowed(view: CapabilityView | undefined, _write?:
 function hasCurrentAuthorization(view: CapabilityView) {
   return view.definition.probe.adapterRegistered && view.decision.capabilityId === view.definition.id
     && capabilityModeEnabled(view) && view.decision.authorized && view.decision.status === "available"
-    && (view.definition.mode !== "application" || view.configuration?.sharedDataScope === true);
+    && applicationScopeAllowed(view);
 }
 
 function isOnDemandDecision(view: CapabilityView) {
   const { definition, decision } = view;
   return definition.probe.kind === "on_demand"
-    && (definition.mode === "delegated" || definition.mode === "application" && view.configuration?.sharedDataScope === true)
+    && (definition.mode === "delegated" || definition.mode === "application" && applicationScopeAllowed(view))
     && definition.probe.adapterRegistered
     && decision.capabilityId === definition.id
     && decision.status === "available" && decision.authorized === true && decision.fresh === true
@@ -53,6 +54,11 @@ function isOnDemandDecision(view: CapabilityView) {
 
 export function capabilityModeEnabled(view: CapabilityView) {
   return view.enabled;
+}
+
+function applicationScopeAllowed(view: CapabilityView) {
+  return view.definition.mode !== "application" || isApplicationCollectionCapability(view.definition.id)
+    || view.configuration?.sharedDataScope === true;
 }
 
 export function evidenceIsStale(view: CapabilityView, now = Date.now()) {
@@ -83,10 +89,10 @@ export function operationAccessLabel(view: CapabilityView, now = Date.now()) {
 }
 
 function capabilityCheckGuidance(view: CapabilityView) {
+  if (supportsAutomaticCapabilityCheck(view.definition.id)) return "Use Check status to retry.";
   if (view.definition.mode === "application") {
     return "Request the operation from its feature. Microsoft validates the configured application identity when it runs.";
   }
-  if (supportsAutomaticCapabilityCheck(view.definition.id)) return "Use Check status to retry.";
   if (view.definition.probe.kind === "on_demand") return "Request the read from the dashboard; Check status does not run this capability.";
   if (view.definition.mode === "local") return "Local policy does not run provider checks.";
   return "This adapter is not implemented; permission checks cannot make it available.";

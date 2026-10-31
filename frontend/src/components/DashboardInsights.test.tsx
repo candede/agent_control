@@ -131,6 +131,73 @@ describe("dashboard insights", () => {
     expect(missing.searchParams.get("company")).toBe("~null");
   });
 
+  it("shows a ten-row skeleton during the first department read", async () => {
+    const { fetcher } = fixture(), base = fetcher.getMockImplementation()!;
+    const pending = deferred<Response>();
+    fetcher.mockImplementation(input => new URL(input, "http://localhost").pathname.endsWith("/departments")
+      ? pending.promise : base(input));
+    render(<DashboardInsights snapshot={adoptionSnapshot()} revision={0} onCompanyChange={vi.fn()} />);
+    const panel = screen.getByRole("region", { name: "Adoption by department" });
+    expect(within(panel).getByText("Loading departments...")).toBeVisible();
+    expect(panel.querySelectorAll(".dashboard-department")).toHaveLength(10);
+    expect(within(panel).queryByRole("list", { name: "Department adoption" })).not.toBeInTheDocument();
+    await act(async () => pending.resolve(await base("/api/copilot-usage/adoption/departments")));
+    expect(await within(panel).findByRole("link", { name: /Finance/ })).toBeVisible();
+    expect(within(panel).queryByText("Loading departments...")).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, "Contoso"])("keeps the previous row layout as an inaccessible skeleton while changing company from %s", async company => {
+    const { fetcher } = fixture(), base = fetcher.getMockImplementation()!;
+    const pending = deferred<Response>();
+    fetcher.mockImplementation(input => new URL(input, "http://localhost").searchParams.get("company") === "~string:Fabrikam"
+      ? pending.promise : base(input));
+    const props = { snapshot: adoptionSnapshot(), revision: 0, onCompanyChange: vi.fn() };
+    const view = render(<DashboardInsights {...props} company={company} />);
+    const panel = screen.getByRole("region", { name: "Adoption by department" });
+    await within(panel).findByRole("link", { name: /Finance/ });
+    const list = within(panel).getByRole("list", { name: "Department adoption" });
+    const previousRows = list.textContent;
+    const rowCount = within(list).getAllByRole("listitem").length;
+    view.rerender(<DashboardInsights {...props} company="Fabrikam" />);
+    const skeleton = panel.querySelector(".dashboard-department-placeholder");
+    expect(skeleton).toHaveAttribute("aria-hidden", "true");
+    expect(skeleton).toHaveAttribute("inert");
+    expect(skeleton?.querySelector(".dashboard-departments")?.textContent).toBe(previousRows);
+    expect(skeleton?.querySelectorAll(".dashboard-department")).toHaveLength(rowCount);
+    expect(within(panel).getByText("Loading departments...")).toBeVisible();
+    expect(within(panel).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("navigation", { name: "departments pages" })).not.toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "People and engagement" })).getByText("40,000")).toBeVisible();
+    await act(async () => pending.resolve(await base("/api/copilot-usage/adoption/departments?company=~string:Fabrikam")));
+    expect(await within(panel).findByText("25%")).toBeVisible();
+    expect(panel.querySelector(".dashboard-department-placeholder")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("link", { name: /Finance/ })).not.toBeInTheDocument();
+    expect(within(panel).getByRole("navigation", { name: "departments pages" })).toHaveAttribute("aria-busy", "false");
+    expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/summary"))).toHaveLength(1);
+  });
+
+  it.each([503, 409])("removes the company-change skeleton and exposes a failed read (%s) instead of stale results", async status => {
+    const { fetcher } = fixture(), base = fetcher.getMockImplementation()!;
+    const pending = deferred<Response>();
+    fetcher.mockImplementation(input => new URL(input, "http://localhost").searchParams.get("company") === "~string:Fabrikam"
+      ? pending.promise : base(input));
+    const props = { snapshot: adoptionSnapshot(), revision: 0, onCompanyChange: vi.fn() };
+    const view = render(<DashboardInsights {...props} />);
+    await screen.findByRole("link", { name: /Finance/ });
+    view.rerender(<DashboardInsights {...props} company="Fabrikam" />);
+    const panel = screen.getByRole("region", { name: "Adoption by department" });
+    expect(within(panel).getByText("Loading departments...")).toBeVisible();
+    await act(async () => pending.resolve(Response.json({
+      code: status === 409 ? "selection_invalidated" : "temporarily_unavailable",
+      detail: "Saved departments could not be read.",
+    }, { status })));
+    expect(await within(panel).findByRole("alert")).toBeVisible();
+    expect(within(panel).getByRole("button", { name: status === 409 ? "Restart selection" : "Retry saved data" })).toBeVisible();
+    expect(panel.querySelector(".dashboard-department-placeholder")).not.toBeInTheDocument();
+    expect(within(panel).queryByText("Loading departments...")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("link")).not.toBeInTheDocument();
+  });
+
   it("shows ten departments and jumps directly between numbered pages, resetting for company and sort changes", async () => {
     const value = Array.from({ length: 571 }, (_, index) => ({
       id: `department-${index + 1}`, company: index >= 560 ? "Fabrikam" : "Contoso",

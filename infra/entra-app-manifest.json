@@ -15,7 +15,18 @@
       "allowedMemberTypes": [
         "User"
       ],
-      "description": "Allowed member types: Users/Groups. All Viewer access plus supported provider changes, imports and app configuration. Microsoft provider permissions still apply.",
+      "description": "Allowed member types: Users/Groups. All Viewer access plus upload, validation and publication of new official CSV report sets and cleanup of own drafts. Correcting or deleting published sets requires Admin. Downloading Microsoft CSVs still requires provider roles.",
+      "displayName": "Agent Control Usage Report Uploader",
+      "id": "fdc127ee-2377-4708-a5d4-0ddc4f46d83b",
+      "isEnabled": true,
+      "origin": "Application",
+      "value": "AgentControl.UsageReportUploader"
+    },
+    {
+      "allowedMemberTypes": [
+        "User"
+      ],
+      "description": "Allowed member types: Users/Groups. All Viewer and Usage Report Uploader access plus correcting or deleting published report sets, supported provider changes and app configuration. Microsoft provider permissions still apply.",
       "displayName": "Agent Control Admin",
       "id": "9feab889-b807-4a97-a504-944ab53a380b",
       "isEnabled": true,

@@ -182,7 +182,7 @@ $script:OperationNames = @(
     'approval_checkpoint', 'resume_verify', 'resource_deploy', 'network_reconcile', 'enter_maintenance',
     'drain_verify', 'managed_backup', 'backup_health_verify', 'database_preflight', 'database_initialize',
     'package_deploy', 'runtime_access_verify', 'monitoring_verify', 'start_contained', 'contained_smoke',
-    'authentication_smoke_verify', 'database_reopen', 'open_and_verify',
+    'database_reopen', 'open_and_verify',
     'pitr_restore', 'pitr_validate_review', 'recovery_switch', 'contain_runtime', 'cleanup',
     'mcp_preflight','mcp_what_if','mcp_stop','mcp_apply','mcp_start','mcp_verify','mcp_resume_verify'
 )
@@ -250,6 +250,7 @@ function Add-RuntimeCommands {
 
 function New-Fixture {
     param($Target, [switch]$FreshResourcesExist, [switch]$ResumeDatabaseInitialized, [switch]$Pitr, [switch]$Recovery)
+    $origin = $Target.canonicalOrigin.TrimEnd('/')
     $commands = [ordered]@{}
     foreach ($name in $script:OperationNames) { $commands[$name] = @() }
     $fixture = [ordered]@{ fixtureVersion = 2; rejectUnexpected = $true; commands = $commands }
@@ -415,14 +416,14 @@ function New-Fixture {
         @{ path = '/api/agents'; code = 401; body = '{"code":"authentication_required"}' },
         @{ path = '/api/auth/status'; code = 200; body = "{`"authConfigured`":true,`"callback`":`"$($Target.callbackUri)`"}" }
     )) {
-        Add-Command $fixture contained_smoke __http_get__ @("$($Target.canonicalOrigin)$($http.path)") -Output $http.body -ExitCode $http.code
+        Add-Command $fixture contained_smoke __http_get__ @("$origin$($http.path)") -Output $http.body -ExitCode $http.code
     }
     Add-DatabaseCommand $fixture database_reopen $Target @('backend/scripts/azure-database.ts', 'reopen') `
         -Server $(if ($Recovery) { "$($Target.resources.postgresFlexibleServer.name)-restore-{{RUN_ID_8}}" } else { $Target.resources.postgresFlexibleServer.name })
     Add-Az $fixture open_and_verify @('webapp', 'config', 'appsettings', 'delete', '--ids', $Target.expectedResourceIds.appService,
         '--setting-names', 'MAINTENANCE_MODE') -Json @{}
-    Add-Command $fixture open_and_verify __http_get__ @("$($Target.canonicalOrigin)/api/ready") -Output '{"ok":true}' -ExitCode 200
-    Add-Command $fixture open_and_verify __http_get__ @("$($Target.canonicalOrigin)/api/auth/status") `
+    Add-Command $fixture open_and_verify __http_get__ @("$origin/api/ready") -Output '{"ok":true}' -ExitCode 200
+    Add-Command $fixture open_and_verify __http_get__ @("$origin/api/auth/status") `
         -Output "{`"authConfigured`":true,`"callback`":`"$($Target.callbackUri)`"}" -ExitCode 200
     if ($Pitr -or $Recovery) {
         Add-Az $fixture pitr_restore @('postgres', 'flexible-server', 'restore', '--subscription', $Target.subscriptionId,
@@ -594,33 +595,6 @@ function Add-McpFixture {
     }
 }
 
-function New-SmokeReceipt {
-    param($Context, [string]$Name = 'auth-smoke.json')
-    $path = Join-Path $scratch $Name
-    $artifact = Test-ReleaseArtifact $Context.ArtifactPath
-    Save-Json ([ordered]@{
-        receiptVersion = 1; isApproval = $true; evidenceType = 'synthetic_fixture'; deploymentRunId = $Context.RunId
-        targetApprovalDigest = Get-TargetApprovalDigest $Context.Target; canonicalOrigin = $Context.Target.canonicalOrigin
-        callbackUri = $Context.Target.callbackUri; artifactSha256 = $artifact.checksum
-        loginCallbackSessionVerified = $true; performedAt = [DateTimeOffset]::UtcNow.ToString('o')
-        approvedBy = 'fixture-auth-operator'; reference = 'fixture-auth-smoke'
-    }) $Name | Out-Null
-    $Context.AuthenticationSmokeReceiptPath = $path
-    return $path
-}
-function Save-SmokeReceiptForRun {
-    param($Target, [string]$RunId, [string]$Name)
-    $path = Join-Path $scratch $Name
-    $artifactPath = Join-Path $root 'artifacts/release/agent-control-linux-x64.zip'
-    Save-Json ([ordered]@{
-        receiptVersion = 1; isApproval = $true; evidenceType = 'synthetic_fixture'; deploymentRunId = $RunId
-        targetApprovalDigest = Get-TargetApprovalDigest $Target; canonicalOrigin = $Target.canonicalOrigin
-        callbackUri = $Target.callbackUri; artifactSha256 = (Test-ReleaseArtifact $artifactPath).checksum
-        loginCallbackSessionVerified = $true; performedAt = [DateTimeOffset]::UtcNow.ToString('o')
-        approvedBy = 'fixture-auth-operator'; reference = 'fixture-auth-smoke'
-    }) $Name | Out-Null
-    return $path
-}
 function Set-SyntheticBootstrapSecrets {
     param($Context)
     $Context.SecretValues = @{
@@ -642,7 +616,6 @@ function New-Context {
         -ReceiptPath $(if ($ResumeReceiptPath) { $ResumeReceiptPath } else { Join-Path $scratch "$Name-receipt.json" }) `
         -ResumeReceiptPath $ResumeReceiptPath -RequestedAction $Action -QualificationTargets $null -Component $Component
     $script:Contexts.Add($context)
-    if ($Action -in @('Deploy', 'Recover') -and $Component -ne 'Mcp') { New-SmokeReceipt $context "$Name-auth-smoke.json" | Out-Null }
     return $context
 }
 
@@ -884,9 +857,9 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
 
     $registration = New-Context $target (New-Fixture $target) 'registration'
     $registrationEvidence = Invoke-DeploymentOperation $registration registration_verify
-    Assert-True ($registrationEvidence.roleCount -eq 2 -and $registrationEvidence.administratorAssignmentCount -eq 1) 'Two-role registration with a portal-created Admin ID was rejected.'
+    Assert-True ($registrationEvidence.roleCount -eq 3 -and $registrationEvidence.administratorAssignmentCount -eq 1) 'Three-role registration with a portal-created Admin ID was rejected.'
     foreach ($case in @(
-        @{ name = 'unknown-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'Unrecognized.Role' }; error = 'two-role' },
+        @{ name = 'unknown-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'Unrecognized.Role' }; error = 'three-role' },
         @{ name = 'application-members'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].allowedMemberTypes = @('User','Application') }; error = 'Users/Groups' },
         @{ name = 'unrestricted-signin'; mutate = { param($f) $f.commands.registration_verify[1].json[0].appRoleAssignmentRequired = $false }; error = 'Assignment required' },
         @{ name = 'no-admin'; mutate = { param($f) $f.commands.registration_verify[2].json.value = @() }; error = 'AgentControl.Admin assignment' }
@@ -902,7 +875,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $qualification.canonicalOrigin = $target.canonicalOrigin
     $qualification.expiresAt = [DateTimeOffset]::UtcNow.AddDays(1).ToString('o')
     $qualification.personas[0].principalObjectId = '88888888-8888-4888-8888-888888888888'
-    foreach ($role in @('AgentControl.Viewer','AgentControl.Admin')) {
+    foreach ($role in @('AgentControl.Viewer','AgentControl.UsageReportUploader','AgentControl.Admin')) {
         $qualification.personas[0].appRoles = @($role)
         Assert-True ((Test-ApprovedQualificationTargets $qualification $target).approved) 'A current role persona was rejected.'
     }
@@ -935,19 +908,18 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     Assert-True ((Invoke-DeploymentOperation $backupDefault backup_health_verify).status -eq 'completed') 'Default release-backup health proof failed.'
 
     $context = New-Context $target (New-Fixture $target) 'existing'
-    Assert-True ((Test-AuthenticationSmokeReceipt $context '').authentication -eq 'human-approved-contract') 'Synthetic authentication receipt contract was rejected.'
     $receipt = Invoke-AzureDeployment $context Deploy
     Assert-True ($receipt.status -eq 'deployed') 'Command-level existing did not complete.'
     $calls = @($context.Calls)
     foreach ($required in @('enter_maintenance', 'managed_backup', 'backup_health_verify', 'resource_deploy', 'database_initialize', 'start_contained',
-        'contained_smoke', 'authentication_smoke_verify', 'database_reopen', 'open_and_verify', 'cleanup')) {
+        'contained_smoke', 'database_reopen', 'open_and_verify', 'cleanup')) {
         Assert-True ($required -in $calls) "Existing deployment omitted $required."
     }
     Assert-True ($receipt.evidence.resource_deploy.admission -eq 'closed' -and $receipt.evidence.resource_deploy.app -eq 'stopped' -and
         $receipt.evidence.backup_health_verify.status -eq 'completed') 'Resource deployment or release backup was not proven contained.'
     Assert-True ([array]::IndexOf($calls, 'contained_smoke') -lt [array]::IndexOf($calls, 'database_reopen') -and
         [array]::IndexOf($calls, 'database_reopen') -lt [array]::IndexOf($calls, 'open_and_verify')) 'Public admission opened before contained/auth/database sequencing.'
-    Assert-True ($receipt.evidence.open_and_verify.loginProof -eq 'human-approved-receipt') 'Liveness was mislabeled as login proof.'
+    Assert-True ($receipt.evidence.open_and_verify.loginProof -eq 'not_verified_by_deployment_checks') 'Liveness was mislabeled as login proof.'
     Assert-True (@($context.Owned).Count -eq 0) 'Existing deployment left an owned resource.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "artifacts/azure-bootstrap/$($context.RunId)"))) 'Bootstrap secrets were not cleaned.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $root "artifacts/azure-parameters/$($context.RunId)"))) 'Parameter files were not cleaned.'
@@ -1124,7 +1096,6 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
         "Fresh resume accepted an uncontained app or failed to restore containment: $($uncontainedReceipt.evidence | ConvertTo-Json -Depth 5 -Compress)"
     $resumeFixture = New-Fixture $freshTarget -FreshResourcesExist
     $resume = New-Context $freshTarget $resumeFixture 'fresh-resume-before-bootstrap' 'Deploy' $firstReceiptPath
-    New-SmokeReceipt $resume 'fresh-resume-before-bootstrap-auth.json' | Out-Null
     Assert-True ((Invoke-AzureDeployment $resume Deploy).status -eq 'deployed') 'Receipt-bound fresh pre-bootstrap resume failed.'
     Assert-True ('resume-skip:resource_deploy' -in @($resume.Calls)) 'Fresh resume replayed resource deployment.'
 
@@ -1138,7 +1109,6 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     Assert-True ('database_initialize' -in @($postReceipt.completedSteps) -and 'package_deploy' -in @($postReceipt.completedSteps)) 'Post-bootstrap interruption lost completed write evidence.'
     $postResumeFixture = New-Fixture $freshTarget -FreshResourcesExist -ResumeDatabaseInitialized
     $postResume = New-Context $freshTarget $postResumeFixture 'fresh-post-bootstrap-resume' 'Deploy' $postBootstrapReceiptPath
-    New-SmokeReceipt $postResume 'fresh-post-bootstrap-resume-auth.json' | Out-Null
     Assert-True ((Invoke-AzureDeployment $postResume Deploy).status -eq 'deployed') 'Receipt-bound post-bootstrap resume failed.'
     Assert-True ('resume-skip:database_initialize' -in @($postResume.Calls) -and 'resume-skip:package_deploy' -in @($postResume.Calls)) 'Post-bootstrap resume replayed completed writes.'
 
@@ -1155,17 +1125,14 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
             -TargetFile $processTargetPath -MockFixturePath $processFailurePath `
             -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processReceiptPath 2>$null | Out-Null
         Assert-True ($LASTEXITCODE -eq 1) "$($processCase.name) did not stop at its injected process failure."
-        $processFailureReceipt = Get-Content -LiteralPath $processReceiptPath -Raw | ConvertFrom-Json
         $processResumeFixture = New-Fixture $freshTarget -FreshResourcesExist -ResumeDatabaseInitialized:$processCase.initialized
         $processCommandLog = Join-Path $scratch "$($processCase.name)-commands.jsonl"
         $processResumeFixture.commandLogPath = $processCommandLog
         $processResumePath = Save-Json $processResumeFixture "$($processCase.name)-resume-fixture.json"
-        $processValidatedTarget = Read-ApprovedAzureTarget $processTargetPath Mock
-        $processAuthPath = Save-SmokeReceiptForRun $processValidatedTarget $processFailureReceipt.runId "$($processCase.name)-auth.json"
         & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
             -TargetFile $processTargetPath -MockFixturePath $processResumePath `
             -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processReceiptPath `
-            -ResumeReceiptPath $processReceiptPath -AuthenticationSmokeReceiptPath $processAuthPath | Out-Null
+            -ResumeReceiptPath $processReceiptPath | Out-Null
         Assert-True ($LASTEXITCODE -eq 0 -and (Get-Content -LiteralPath $processReceiptPath -Raw | ConvertFrom-Json).status -eq 'deployed') `
             "$($processCase.name) did not resume across process invocations."
         $processLog = Get-Content -LiteralPath $processCommandLog -Raw

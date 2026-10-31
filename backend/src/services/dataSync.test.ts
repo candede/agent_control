@@ -315,6 +315,21 @@ describe("DataSyncService", () => {
     },
   );
 
+  it.each(["users", "graph_packages"] as const)(
+    "reports application authorization failure for %s without asking the user to sign in", async sourceId => {
+      const harness = serviceHarness();
+      const failure = new AppError(502, "application_authorization_failed",
+        "The configured tenant application could not be authorized. An administrator must verify its registration, credentials and consent, then retry.");
+      if (sourceId === "users") harness.copilotUsage.refreshUsers.mockRejectedValue(failure);
+      else harness.packages.start.mockRejectedValue(failure);
+      await harness.service.start(user, { mode: "initial", sources: [sourceId] });
+      await vi.waitFor(() => expect(harness.run.sources[0].status).toBe("failed"));
+      await harness.service.drain();
+      expect(harness.run.sources[0]).toMatchObject({ status: "failed", canRetry: true, message: failure.message });
+      expect(harness.run.sources[0].message).not.toMatch(/sign in|MFA|delegated/i);
+    },
+  );
+
   it.each(["graph_packages", "power_platform"] as const)(
     "retains failed automatic %s terminal cleanup so shutdown retries it",
     async sourceId => {
@@ -574,7 +589,7 @@ describe("DataSyncService", () => {
       expect(harness.copilotUsage.refreshUsers).toHaveBeenCalled();
     });
     expect(harness.packages.submit).toHaveBeenCalledWith(user, expect.objectContaining({
-      tokenMode: "delegated",
+      tokenMode: "application",
       requestedIds: [],
     }));
     expect(harness.powerPlatform.submit).toHaveBeenCalledWith(user, expect.objectContaining({
@@ -778,7 +793,7 @@ describe("DataSyncService", () => {
           failure.code === "provider_timeout" ? "timed out" : "deadline expired",
         );
         expect(provider.cancel).toHaveBeenCalledWith(
-          user, jobId, ...(sourceId === "graph_packages" ? ["delegated", "sync_cleanup"] : ["sync_cleanup"]),
+          user, jobId, ...(sourceId === "graph_packages" ? ["application", "sync_cleanup"] : ["sync_cleanup"]),
         );
       }
     },
@@ -1133,7 +1148,7 @@ describe("DataSyncService", () => {
       return harness.run;
     });
     await harness.service.cancel(user, harness.run.id);
-    expect(harness.packages.cancel).toHaveBeenCalledWith(user, graph.jobId, "delegated");
+    expect(harness.packages.cancel).toHaveBeenCalledWith(user, graph.jobId, "application");
     await harness.service.waitForPrincipalAuthorization({ tenantId: user.tenantId!, principalId: user.homeAccountId });
     expect(harness.packages.waitForPrincipalAuthorization).toHaveBeenCalled();
     expect(harness.powerPlatform.waitForPrincipalAuthorization).toHaveBeenCalled();
@@ -1167,7 +1182,7 @@ describe("DataSyncService", () => {
       const retry = harness.service.retry(user, harness.run.id, [sourceId]);
       try {
         await vi.waitFor(() => expect(provider.cancel).toHaveBeenCalledWith(
-          user, previousJobId, ...(sourceId === "graph_packages" ? ["delegated", "sync_cleanup"] : ["sync_cleanup"]),
+          user, previousJobId, ...(sourceId === "graph_packages" ? ["application", "sync_cleanup"] : ["sync_cleanup"]),
         ));
         expect(harness.repository.retry).not.toHaveBeenCalled();
         expect(harness.packages.submit).not.toHaveBeenCalled();
@@ -1181,7 +1196,7 @@ describe("DataSyncService", () => {
       );
       await vi.waitFor(() => expect(source.status).toBe("succeeded"));
       expect(provider.start).toHaveBeenCalledWith(
-        user, expect.any(String), ...(sourceId === "graph_packages" ? ["delegated", { retryFailed: true }] : [{ retryFailed: true }]),
+        user, expect.any(String), ...(sourceId === "graph_packages" ? ["application", { retryFailed: true }] : [{ retryFailed: true }]),
       );
       expect(provider.submit).toHaveBeenCalledTimes(1);
     },
@@ -1219,7 +1234,7 @@ describe("DataSyncService", () => {
       expect(provider.cancel).toHaveBeenCalledWith(
         user,
         jobId,
-        ...(source === "graph_packages" ? ["delegated" as const] : []),
+        ...(source === "graph_packages" ? ["application" as const] : []),
       );
     },
   );
@@ -1296,7 +1311,7 @@ describe("DataSyncService", () => {
       expect(provider.cancel).toHaveBeenCalledWith(
         user,
         jobId,
-        ...(source === "graph_packages" ? ["delegated", "sync_cleanup"] : ["sync_cleanup"]),
+        ...(source === "graph_packages" ? ["application", "sync_cleanup"] : ["sync_cleanup"]),
       );
     },
   );
@@ -1791,7 +1806,7 @@ function packageJob(id: string, status: "waiting_authorization" | "running" | "s
   return {
     id,
     authorizationPrincipalId: user.homeAccountId,
-    tokenMode: "delegated" as const,
+    tokenMode: "application" as const,
     scopeKind: "broad" as const,
     requestedIds: [],
     targetCount: 0,

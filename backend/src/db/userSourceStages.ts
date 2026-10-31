@@ -104,9 +104,9 @@ export class UserSourceStages {
         const code = typeof errorCode === "string" && /^[a-z][a-z0-9_]{0,127}$/.test(errorCode) ? errorCode : "user_source_failed";
         await this.generations.connections.run(async client => {
           const message = status === "permission_required" ? input.scope.source === "directory"
-            ? "Directory requires User.Read.All, LicenseAssignment.Read.All and the corresponding provider role."
-            : "App activity requires Reports.Read.All and the corresponding provider role."
-            : status === "waiting_authorization" ? "Renew Microsoft authorization and explicitly resume this source."
+            ? "Directory collection requires administrator-consented application User.Read.All and LicenseAssignment.Read.All."
+            : "App activity requires administrator-consented application Reports.Read.All."
+            : status === "waiting_authorization" ? "Check the configured application credentials and Microsoft authorization, then retry this source."
               : status === "cancelled" ? "The source refresh was cancelled." : userSourceFailureMessage(applicationError);
           await client.query(`UPDATE user_source_attempts SET status=$2,error_code=$3,message=$4
             WHERE generation_id=$1 AND status='running'`, [lease.id, status, code, message]);
@@ -132,6 +132,7 @@ export class UserSourceStages {
         SELECT old.identity,to_jsonb(old)-ARRAY['generation_id','scope_id','tenant_id','schema_version','content_hash'] AS value
         FROM ${table} old WHERE old.generation_id=$1 AND old.identity COLLATE "C">$3
           AND NOT EXISTS(SELECT 1 FROM ${table} incoming WHERE incoming.generation_id=$2
+            AND NOT incoming.residual ? 'retainedObservedAt'
             AND incoming.${source === "directory" ? "identity" : "upn_key"}=old.${source === "directory" ? "identity" : "upn_key"})
         ORDER BY old.identity COLLATE "C" LIMIT 100), sized AS (
           SELECT *,sum(octet_length(value::text)) OVER(ORDER BY identity COLLATE "C") AS bytes FROM candidates)
@@ -448,6 +449,8 @@ function userSourceFailureMessage(error: AppError | undefined) {
       ? Object.getOwnPropertyDescriptor(details, "httpStatus")?.value : undefined;
     reason = `Microsoft 365 Copilot app activity report download failed${typeof status === "number"
       && Number.isInteger(status) && status >= 400 && status <= 599 ? ` (HTTP ${status})` : ""}. Retry Users sync; if this persists, check Microsoft 365 service health.`;
+  } else if (code === "application_authorization_failed") {
+    reason = "The configured application could not be authorized. An administrator must verify its registration, credentials and consent, then retry Users sync.";
   } else if (code === "identity_provider_error") {
     reason = "Microsoft Entra ID could not renew authorization. Retry Users sync; if this persists, review the Entra sign-in logs and application configuration.";
   }

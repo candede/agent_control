@@ -38,7 +38,7 @@ async function savedReadbackInventory(owner: { tenantId: string; principalId: st
   const environmentId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const manifestId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const refresh = await packages.submit(owner, {
-    authorizationPrincipalId: owner.principalId, tokenMode: "delegated", idempotencyKey: randomUUID(),
+    authorizationPrincipalId: owner.principalId, tokenMode: "application", idempotencyKey: randomUUID(),
   });
   await packages.markRunning(owner, refresh.id);
   const baseline = await refreshInventoryFixture(fixture.runtime, owner, refresh.id, "packages",

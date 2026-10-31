@@ -88,7 +88,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await audit.startEvent({operationId:"fixture-operation",scope:"single",action:"block",targetBlockedState:true,agentId:"fixture-package",actor:{tenantId:"fixture-tenant",homeAccountId:"fixture-principal",displayName:"Fixture",username:"fixture@example.invalid"},requestPath:"/fixture"});
   const packages = new PackageRefreshJobs(fixture.runtime);
   const packageScope={tenantId:"fixture-tenant",principalId:"fixture-principal"};
-  const packageJob=await packages.submit(packageScope,{authorizationPrincipalId:packageScope.principalId,tokenMode:"delegated",idempotencyKey:"backup-fixture"});
+  const packageJob=await packages.submit(packageScope,{authorizationPrincipalId:packageScope.principalId,tokenMode:"application",idempotencyKey:"backup-fixture"});
   await packages.markRunning(packageScope,packageJob.id);
   const packageRoot = await refreshInventoryFixture(fixture.runtime,packageScope,packageJob.id,"packages",[
     packageInventoryRecord(allowlistedPackage({id:"fixture-package",displayName:"Fixture package",isBlocked:false,

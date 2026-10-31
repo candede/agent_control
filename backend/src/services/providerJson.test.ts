@@ -13,6 +13,8 @@ import { observePeakMemory } from "./peakMemory.js";
 import { AppError } from "../errors.js";
 import { GraphAgentIdentityClient } from "./graphAgentIdentity.js";
 
+const directoryTokens = { user: "token", group: "token" };
+
 async function readActivity(fetcher: FetchLike, signal = new AbortController().signal) {
   const database = new pg.Pool({ max: 4 });
   const stages = new UserSourceStages(database);
@@ -435,9 +437,9 @@ describe("bounded provider observations", () => {
     const fetcher = vi.fn(async () => Response.json({ value: [{ id: "P_1", displayName: "Package", isBlocked: false }], "@odata.nextLink": "https://other.invalid/collect" }));
     await expect(tinyGraphCatalog(new GraphPackagesClient(fetcher), "private-token")).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledTimes(1);
-    await expect(new DirectoryPrincipalsClient(async () => Response.json({ value: Array.from({ length: 51 }, () => ({ id: "fixture" })) })).search("token", "fi")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new DirectoryPrincipalsClient(async () => Response.json({ value: Array.from({ length: 51 }, () => ({ id: "fixture" })) })).search(directoryTokens, "fi")).rejects.toMatchObject({ code: "provider_schema" });
     const bounded = vi.fn(async () => new Response("x".repeat(2_000_001)));
-    await expect(new DirectoryPrincipalsClient(bounded).resolve("token", [{ resourceId: "11111111-1111-4111-8111-111111111111", resourceType: "user" }])).rejects.toMatchObject({ code: "provider_result_limit" });
+    await expect(new DirectoryPrincipalsClient(bounded).resolve(directoryTokens, [{ resourceId: "11111111-1111-4111-8111-111111111111", resourceType: "user" }])).rejects.toMatchObject({ code: "provider_result_limit" });
     expect(bounded.mock.calls[0]).toBeDefined();
   });
 
@@ -456,7 +458,7 @@ describe("bounded provider observations", () => {
     '{"value":[{"id":"11111111-1111-4111-8111-111111111111"}],"value":[]}',
   ])("rejects overwritten principal search evidence", async text => {
     const fetcher = vi.fn<FetchLike>(async () => new Response(text));
-    await expect(new DirectoryPrincipalsClient(fetcher).search("token", "fi")).rejects.toMatchObject({ code: "provider_schema" });
+    await expect(new DirectoryPrincipalsClient(fetcher).search(directoryTokens, "fi")).rejects.toMatchObject({ code: "provider_schema" });
   });
 
   it.each([

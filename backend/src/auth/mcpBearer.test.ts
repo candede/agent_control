@@ -12,6 +12,11 @@ beforeEach(() => { config.tenants = [tenant]; });
 afterEach(() => { config.tenants = originalTenants; vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("dormant Entra delegated API verification", () => {
+  it("recognizes a single Usage Report Uploader API role without manufacturing additional assignments", async () => {
+    const verified = await new McpBearerVerifier(signingFetcher()).verify(apiToken({ roles: ["AgentControl.UsageReportUploader"] }));
+    expect(verified.roles).toEqual(["AgentControl.UsageReportUploader"]);
+  });
+
   it("verifies real RSA signatures and exact issuer, tenant, API audience and calling application", async () => {
     const fetcher = signingFetcher();
     const verifier = new McpBearerVerifier(fetcher);

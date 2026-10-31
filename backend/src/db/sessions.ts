@@ -6,7 +6,7 @@ import { AppError } from "../errors.js";
 import { isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { operationalLog } from "../services/telemetry.js";
-import type { AppRole } from "../types/capability.js";
+import { appRoles, hasAppRole, type AppRole } from "../types/capability.js";
 import { DataGenerations } from "./dataGenerations.js";
 import { currentAuthority } from "../auth/authorityContext.js";
 import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
@@ -150,9 +150,8 @@ export async function assertCurrentStoredSession(
   const result = await database.query(`SELECT 1 FROM sessions
     WHERE sid=$1 AND tenant_id=$2 AND principal_id=$3 AND expire>clock_timestamp()
       AND sess->>'clientId'=$5 AND sess->'user'->>'tenantId'=$2 AND sess->'user'->>'homeAccountId'=$3
-      AND (jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),$4)
-        OR ($4='AgentControl.Viewer' AND jsonb_exists(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),'AgentControl.Admin')))`,
-  [sessionId, tenantId, principalId, requiredRole, tenant.clientId]);
+      AND jsonb_exists_any(COALESCE((sess->'user'->'roles')::jsonb,'[]'::jsonb),$4::text[])`,
+  [sessionId, tenantId, principalId, appRoles.filter(role => hasAppRole([role], requiredRole)), tenant.clientId]);
   if (result.rowCount !== 1) throw AppError.unauthorized("The export session or required role is no longer current.");
 }
 

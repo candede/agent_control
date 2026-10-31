@@ -530,7 +530,7 @@ export class DataSyncService {
       const attempt = await this.dependencies.repository.getSourceAttempt(scope, runId, "graph_packages");
       assertCurrentSync(activeRun);
       const job = await this.dependencies.packages.submit(user, {
-        tokenMode: "delegated",
+        tokenMode: "application",
         requestedIds: [],
         idempotencyKey: childIdempotencyKey(runId, "graph-packages", attempt),
       });
@@ -543,13 +543,13 @@ export class DataSyncService {
         status: "running",
         jobId,
         count: job.observedCount,
-        message: "Checking delegated authorization to collect the agent list. Package details refresh separately.",
+        message: "Checking application authorization to collect the tenant agent list. Package details refresh separately.",
         canRetry: false,
       }, () => assertCurrentSync(activeRun));
       assertCurrentSync(activeRun);
       requireRunningSource(current, "graph_packages", jobId);
       const started = job.status === "waiting_authorization"
-        ? await this.dependencies.packages.start(user, job.id, "delegated", { retryFailed })
+        ? await this.dependencies.packages.start(user, job.id, "application", { retryFailed })
         : job;
       assertCurrentSync(activeRun);
       const catalogPublished = await this.trackPackageJob(user, scope, runId, started, activeRun);
@@ -629,7 +629,7 @@ export class DataSyncService {
       requireRunningSource(current, "graph_packages", job.id);
       await this.dependencies.wait(childPollIntervalMs, signal);
       assertCurrentSync(authorization);
-      job = await this.dependencies.packages.get(user, job.id, "delegated");
+      job = await this.dependencies.packages.get(user, job.id, "application");
     }
     await commitSync(authorization, async () => this.reconcilePackageJob(scope, runId, job, () => assertCurrentSync(authorization)));
     return job.status === "succeeded";
@@ -704,7 +704,7 @@ export class DataSyncService {
       if (!source.jobId || !["queued", "running", "waiting_authorization"].includes(source.status)) continue;
       if (source.source === "graph_packages") {
         try {
-          const job = await this.dependencies.packages.get(user, source.jobId, "delegated");
+          const job = await this.dependencies.packages.get(user, source.jobId, "application");
           await this.reconcilePackageJob(scope, run.id, job);
         } catch (error) {
           if (!(error instanceof AppError) || error.status !== 404) throw error;
@@ -818,8 +818,8 @@ export class DataSyncService {
   private async cancelChild(user: AuthenticatedUser, child: TrackedChild, cleanup = false) {
     try {
       if (child.source === "graph_packages") {
-        if (cleanup) await this.dependencies.packages.cancel(user, child.jobId, "delegated", "sync_cleanup");
-        else await this.dependencies.packages.cancel(user, child.jobId, "delegated");
+        if (cleanup) await this.dependencies.packages.cancel(user, child.jobId, "application", "sync_cleanup");
+        else await this.dependencies.packages.cancel(user, child.jobId, "application");
       } else {
         if (cleanup) await this.dependencies.powerPlatform.cancel(user, child.jobId, "sync_cleanup");
         else await this.dependencies.powerPlatform.cancel(user, child.jobId);
@@ -943,6 +943,7 @@ function safeSyncFailure(error: unknown) {
   if (status === "waiting_authorization") return "Explicit resume with renewed Microsoft authorization is required.";
   if (status === "permission_required") return "Required delegated Microsoft read permission or provider role is unavailable.";
   if (error instanceof AppError && [
+    "application_authorization_failed",
     "provider_error", "provider_timeout", "provider_throttled", "provider_schema", "provider_result_limit",
     "provider_response_size_limit", "provider_count_mismatch", "report_download_failed",
     "inventory_job_expired", "package_refresh_timeout", "package_refresh_expired",

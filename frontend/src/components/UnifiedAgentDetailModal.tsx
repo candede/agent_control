@@ -19,18 +19,16 @@ import { CopilotStudioQuarantineControls } from "./CopilotStudioQuarantineContro
 import { AgentOverview } from "./AgentOverview";
 import { AgentAccessManagement } from "./AgentAccessManagement";
 import { AgentUsagePanel } from "./AgentUsagePanel";
-import { AgentInvestigationsPanel } from "./AgentInvestigationsPanel";
 import { WorkbenchActionGate, useWorkbenchAction } from "../workbenchActionContext";
 import { AgentPublishedVersions } from "./AgentPublishedVersions";
 import "./agentInsights.css";
 
-const tabs = ["identities", "reports", "users", "controls", "audit-security"] as const;
+const tabs = ["identities", "reports", "users", "controls"] as const;
 type DetailTab = typeof tabs[number];
 const tabLabels: Record<DetailTab, string> = {
   identities: "Overview",
   reports: "Usage",
   users: "Users",
-  "audit-security": "Activity",
   controls: "Manage",
 };
 type Props = {
@@ -330,9 +328,6 @@ export function UnifiedAgentDetailModal({
           inventorySelectionId={selectionId} onReloadInventory={onRetryInventory}
           canRemoveReviewedAssociations={canManage}
           disabled={packageActionsBusy || packageInventoryPending || Boolean(inventoryError)} onChanged={onUsageChanged} /> : null}
-        {selectedTab === "audit-security" ?
-          <AgentInvestigationsPanel recordId={record.id} agentName={record.displayName} roles={roles}
-            revision={JSON.stringify([selectionId, inventoryRevision, dataRevision, record.observations.powerPlatform?.snapshotId])} /> : null}
         {selectedTab === "controls" ? <>
           <h3>Manage</h3>
           {!canManage ? <p className="association-status">An AgentControl.Admin role is required to make changes.</p> : null}

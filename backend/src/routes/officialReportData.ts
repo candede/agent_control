@@ -22,6 +22,7 @@ import { readAdoptionHistory } from "../services/adoptionHistory.js";
 import { readAdoptionDepartments, readAdoptionSummary } from "../services/adoptionDepartments.js";
 import { SavedReadContracts } from "../services/savedReadContracts.js";
 import type { AgentRelationship } from "../types/savedReadContracts.js";
+import { hasAppRole } from "../types/capability.js";
 
 type ReportHandlerIdentity = { identity: SelectionIdentity };
 export type ReportHandlerOptions = {
@@ -77,12 +78,13 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       ) throw AppError.unauthorized();
     return who;
   } };
-  const router = Router(), reports = options.reports, imports = new OfficialReportImports(reports.database), usage = new OfficialAgentUsage(reports);
+  const router = Router(), reports = options.reports, usage = new OfficialAgentUsage(reports);
+  const imports = (request: Request) => new OfficialReportImports(reports.database, hasAppRole(requestUser(request).roles, "AgentControl.Admin"));
   const inventoryUsage = new OfficialAgentUsage(reports, options.inventory ?? new InventoryQueries(reports.database,
     config.sessionSecret, reports.staleAfterDays, { source: "inventory_canonical" }));
   const savedReads = new SavedReadContracts(reports, inventoryUsage.inventory!);
   router.use((_request, response, next) => { response.setHeader("Cache-Control", "private, no-store"); next(); });
-  const route = (method: RouteMethod, path: string, access: "read" | "admin" | "browser-read" | "browser-admin", ...handlers: RequestHandler[]) => {
+  const route = (method: RouteMethod, path: string, access: "read" | "admin" | "browser-read" | "browser-admin" | "browser-uploader", ...handlers: RequestHandler[]) => {
     const dataClass = path.startsWith("/copilot-usage/") ? "licensed_copilot_usage"
       : path.startsWith("/data-exports") ? "data_export"
         : path.startsWith("/agent-inventory/") ? path.endsWith("/usage-candidates") ? "official_usage_association_candidates" : "official_usage_association"
@@ -92,7 +94,8 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
                 : /^\/official-usage\/(?:staging|bundles)(?:\/|$)/.test(path) ? "official_usage_import"
                   : /^\/official-usage\/(?:sets|confirmations)\//.test(path) ? "official_usage_metadata" : "official_usage_user";
     policyRoute(router, method, path, { access: "authenticated", dataClass, ...(access.startsWith("browser-") ? { browserOnly: true } : {}),
-      roles: [access.endsWith("read") ? "AgentControl.Viewer" : "AgentControl.Admin"], ...(method === "get" ? {} : { csrf: true }) }, ...handlers);
+      roles: [access.endsWith("read") ? "AgentControl.Viewer" : access === "browser-uploader" ? "AgentControl.UsageReportUploader" : "AgentControl.Admin"],
+      ...(method === "get" ? {} : { csrf: true }) }, ...handlers);
   };
   const failSafe = (handler: RequestHandler): RequestHandler => async (request, response, next) => {
     try { response.setHeader("Cache-Control", "private, no-store"); await handler(request, response, next); }
@@ -298,39 +301,39 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
       childQuery: context.childQuery }));
   }));
 
-  route("post", "/official-usage/staging", "browser-admin",
+  route("post", "/official-usage/staging", "browser-uploader",
     officialReportMultipart(imports, async request => (await options.identity(request)).identity));
-  route("get", "/official-usage/staging/:id", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports.preview((await options.identity(request)).identity, reportUuid(request.params.id)));
+  route("get", "/official-usage/staging/:id", "browser-uploader", failSafe(async (request, response) => {
+    response.json(await imports(request).preview((await options.identity(request)).identity, reportUuid(request.params.id)));
   }));
-  route("post", "/official-usage/bundles/:id/preview", "browser-admin", failSafe(async (request, response) => {
+  route("post", "/official-usage/bundles/:id/preview", "browser-uploader", failSafe(async (request, response) => {
     const forDiscard = request.body?.forDiscard;
     if (forDiscard !== undefined && typeof forDiscard !== "boolean") {
       throw new AppError(400, "invalid_import_intent", "Bundle cleanup inspection must be a boolean.");
     }
-    response.json(await imports.bundle((await options.identity(request)).identity, reportUuid(request.params.id), { forDiscard }));
+    response.json(await imports(request).bundle((await options.identity(request)).identity, reportUuid(request.params.id), { forDiscard }));
   }));
-  route("post", "/official-usage/bundles/:id/accept", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports.acceptBundle((await options.identity(request)).identity, reportUuid(request.params.id), request.body));
+  route("post", "/official-usage/bundles/:id/accept", "browser-uploader", failSafe(async (request, response) => {
+    response.json(await imports(request).acceptBundle((await options.identity(request)).identity, reportUuid(request.params.id), request.body));
   }));
-  route("post", "/official-usage/staging/:id/accept", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports.accept((await options.identity(request)).identity, { ...request.body, stagingId: reportUuid(request.params.id) }));
+  route("post", "/official-usage/staging/:id/accept", "browser-uploader", failSafe(async (request, response) => {
+    response.json(await imports(request).accept((await options.identity(request)).identity, { ...request.body, stagingId: reportUuid(request.params.id) }));
   }));
-  route("delete", "/official-usage/staging/:id", "browser-admin", failSafe(async (request, response) => {
+  route("delete", "/official-usage/staging/:id", "browser-uploader", failSafe(async (request, response) => {
     const who = await options.identity(request);
     const id = reportUuid(request.params.id);
-    await imports.discard(who.identity, id);
+    await imports(request).discard(who.identity, id);
     response.status(204).end();
   }));
-  route("get", "/official-usage/staging/:id/diagnostics", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports.diagnostics((await options.identity(request)).identity, reportUuid(request.params.id), pageOptions(request.query), reports.codec));
+  route("get", "/official-usage/staging/:id/diagnostics", "browser-uploader", failSafe(async (request, response) => {
+    response.json(await imports(request).diagnostics((await options.identity(request)).identity, reportUuid(request.params.id), pageOptions(request.query), reports.codec));
   }));
   route("post", "/official-usage/sets/:id/preview", "browser-admin", failSafe(async (request, response) => {
-    response.json(await imports.confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
+    response.json(await imports(request).confirmPreview((await options.identity(request)).identity, reportUuid(request.params.id), request.body?.operation));
   }));
   route("post", "/official-usage/confirmations/:id", "browser-admin", failSafe(async (request, response) => {
     if (reportUuid(request.body?.id) !== reportUuid(request.params.id)) throw new AppError(400, "invalid_identifier", "Confirmation ID mismatch.");
-    response.json(await imports.confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
+    response.json(await imports(request).confirm((await options.identity(request)).identity, request.body as ReportConfirmation));
   }));
   route("get", "/agent-inventory/:recordId/usage", "read", failSafe(async (request, response) => {
     const recordId = scalar(request.params.recordId, 10000); parseRecordId(recordId);

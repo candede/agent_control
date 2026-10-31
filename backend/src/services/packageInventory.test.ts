@@ -33,11 +33,11 @@ function deferred<T>() {
   const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
   return { promise, resolve, reject };
 }
-function fixture(options: { autoDetails?: boolean; exact?: boolean; application?: boolean } = {}) {
+function fixture(options: { autoDetails?: boolean; exact?: boolean } = {}) {
   const owner: AuthenticatedUser = { tenantId: "synthetic-package-tenant", homeAccountId: randomUUID(),
     displayName: "Reader", username: "synthetic@example.invalid", roles: ["AgentControl.Viewer"] };
   const job = {
-    id: randomUUID(), authorizationPrincipalId: owner.homeAccountId, tokenMode: options.application ? "application" as const : "delegated" as const,
+    id: randomUUID(), authorizationPrincipalId: owner.homeAccountId, tokenMode: "application" as const,
     scopeKind: options.exact || options.autoDetails ? "exact" as const : "broad" as const,
     autoDetails: options.autoDetails ?? false, targetCount: options.exact || options.autoDetails ? 20 : 0,
     status: "waiting_authorization", pageCount: 0, observedCount: 0, totalRecords: null as number | null,
@@ -208,7 +208,7 @@ describe("streamed package refresh service", () => {
     try {
       await f.service.startDetailSync(f.owner);
       await vi.waitFor(() => expect(f.dependencies.wait).toHaveBeenCalledOnce());
-      await f.service.cancel(f.owner, f.job.id, "delegated");
+      await f.service.cancel(f.owner, f.job.id, "application");
       const authorizations = f.dependencies.revalidateUser.mock.calls.length;
       await expect(f.service.refreshDueDetails(f.owner, undefined, withSignal ? new AbortController().signal : undefined))
         .resolves.toMatchObject({ id: f.job.id, status: "cancelled" });
@@ -232,7 +232,7 @@ describe("streamed package refresh service", () => {
     await f.service.startDetailSync(f.owner);
     await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
     await expect(f.service.detailSyncState(f.owner)).resolves.toMatchObject({ status: "complete", pending: 0 });
-    expect(f.dependencies.delegatedToken).toHaveBeenCalledOnce();
+    expect(f.dependencies.applicationToken).toHaveBeenCalledOnce();
     expect(f.streams.exactJob).toHaveBeenCalledOnce();
   });
 
@@ -263,7 +263,7 @@ describe("streamed package refresh service", () => {
       await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
       expect(f.dependencies.revalidateUser).toHaveBeenCalledTimes(3);
       expect(f.dependencies.requireAvailable).toHaveBeenCalledTimes(3);
-      expect(f.dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.delegated", f.owner, { retryFailed: true });
+      expect(f.dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.application", f.owner, { retryFailed: true });
       expect(f.repository.markRunning).toHaveBeenCalledBefore(f.collection);
       expect(f.collection).toHaveBeenCalledOnce();
       expect(f.collection.mock.calls[0][1].retryThrottlingUntilAborted).toBe(!mode.autoDetails);
@@ -275,9 +275,9 @@ describe("streamed package refresh service", () => {
     },
   );
 
-  it.each([false, true])("renews %s-mode tokens through the fenced page callback", async application => {
-    const f = fixture({ application });
-    const token = application ? f.dependencies.applicationToken : f.dependencies.delegatedToken;
+  it("renews application tokens through the fenced page callback without acquiring delegated tokens", async () => {
+    const f = fixture();
+    const token = f.dependencies.applicationToken;
     token.mockResolvedValueOnce("initial").mockResolvedValue("renewed");
     f.collection.mockImplementation(async (initial, options) => {
       expect(initial).toBe("initial");
@@ -287,10 +287,8 @@ describe("streamed package refresh service", () => {
     await f.start();
     await vi.waitFor(() => expect(f.repository.complete).toHaveBeenCalledOnce());
     expect(token).toHaveBeenCalledTimes(3);
-    if (application) {
-      expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
-      expect(f.dependencies.requireApplicationDataScope).toHaveBeenCalledTimes(3);
-    }
+    expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
+    expect(f.dependencies.requireApplicationDataScope).toHaveBeenCalledTimes(3);
     expect(inventoryRuntime).toHaveBeenCalledOnce();
   });
 
@@ -332,7 +330,7 @@ describe("streamed package refresh service", () => {
     pendingCollection(f);
     if (action === "start") f.repository.getJob.mockResolvedValueOnce(f.job).mockResolvedValueOnce(undefined);
     else f.repository.cancel.mockResolvedValueOnce(undefined);
-    await expect(action === "start" ? f.start() : f.service.cancel(f.owner, f.job.id, "delegated"))
+    await expect(action === "start" ? f.start() : f.service.cancel(f.owner, f.job.id, "application"))
       .rejects.toMatchObject({ status: 409, code: "package_refresh_expired" });
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
@@ -366,7 +364,7 @@ describe("streamed package refresh service", () => {
     vi.spyOn(performance, "now").mockImplementation(() => elapsed);
     vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
     const f = fixture();
-    f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+    f.dependencies.applicationToken.mockImplementationOnce(async () => {
       elapsed = 30_001;
       return "late-token";
     });
@@ -423,7 +421,7 @@ describe("streamed package refresh service", () => {
     f.collection.mockReturnValueOnce(pending.promise);
     await f.start();
     await vi.waitFor(() => expect(f.collection).toHaveBeenCalledOnce());
-    await f.service.cancel(f.owner, f.job.id, "delegated");
+    await f.service.cancel(f.owner, f.job.id, "application");
     vi.spyOn(performance, "now").mockReturnValue(performance.now() + packageRefreshExecutionDeadlineMs + 1);
     pending.reject(new Error("Late collection failure."));
     await f.service.drain();
@@ -691,7 +689,7 @@ describe("streamed package refresh service", () => {
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
 
-  it.each(["revalidateUser", "requireAvailable", "delegatedToken"] as const)(
+  it.each(["revalidateUser", "requireAvailable", "applicationToken"] as const)(
     "persists admission permission failure at %s without starting provider reads", async stage => {
       const f = fixture();
       f.dependencies[stage].mockRejectedValueOnce(new AppError(403, "missing_permission", "Consent."));
@@ -713,7 +711,7 @@ describe("streamed package refresh service", () => {
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
 
-  const admissionStages = ["getJob", "revalidateUser", "requireAvailable", "delegatedToken", "markRunning"] as const;
+  const admissionStages = ["getJob", "revalidateUser", "requireAvailable", "applicationToken", "markRunning"] as const;
   it.each(admissionStages.flatMap(stage => (["cancel", "logout", "shutdown", "replace"] as const).map(action => ({ stage, action }))))(
     "fences $stage admission on $action without running a late provider request", async ({ stage, action }) => {
       const f = fixture(), pending = deferred<unknown>();
@@ -817,7 +815,7 @@ describe("streamed package refresh service", () => {
     const f = fixture(), reason = new AppError(401, "authorization_expired", "Capability authority changed.");
     let current = true;
     f.dependencies.beginOperationValidation.mockReturnValue(() => { if (!current) throw reason; });
-    if (stage === "token") f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+    if (stage === "token") f.dependencies.applicationToken.mockImplementationOnce(async () => {
       current = false;
       return "late-token";
     });
@@ -827,18 +825,18 @@ describe("streamed package refresh service", () => {
       await f.start();
       await vi.waitFor(() => expect(f.repository.markWaitingAuthorization).toHaveBeenCalledOnce());
     }
-    expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.delegated", f.owner);
+    expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.application", f.owner);
     expect(f.repository.complete).not.toHaveBeenCalled();
     expect(f.collection).toHaveBeenCalledTimes(stage === "token" ? 0 : 1);
   });
 
   it("settles cancelled non-cooperative token acquisition without retaining the admission lane", async () => {
     const f = fixture(), pending = deferred<string>();
-    f.dependencies.delegatedToken.mockReturnValueOnce(pending.promise);
+    f.dependencies.applicationToken.mockReturnValueOnce(pending.promise);
     const starting = f.start();
     const assertion = expect(starting).rejects.toMatchObject({ code: "read_job_cancelled" });
-    await vi.waitFor(() => expect(f.dependencies.delegatedToken).toHaveBeenCalledOnce());
-    await f.service.cancel(f.owner, f.job.id, "delegated");
+    await vi.waitFor(() => expect(f.dependencies.applicationToken).toHaveBeenCalledOnce());
+    await f.service.cancel(f.owner, f.job.id, "application");
     await assertion;
     expect(f.repository.markRunning).not.toHaveBeenCalled();
     expect(f.collection).not.toHaveBeenCalled();
@@ -851,22 +849,22 @@ describe("streamed package refresh service", () => {
     pendingCollection(f);
     f.repository.getJob.mockImplementation(async (_scope, id = f.job.id) => ({ ...f.job, id, autoDetails: automatic.has(id) }));
     const foreground = Array.from({ length: 4 }, () => randomUUID());
-    for (const id of foreground) await f.service.start(f.owner, id, "delegated");
-    await expect(f.service.start(f.owner, randomUUID(), "delegated")).rejects.toMatchObject({ code: "package_refresh_capacity" });
-    for (const id of automatic) await f.service.start(f.owner, id, "delegated");
+    for (const id of foreground) await f.service.start(f.owner, id, "application");
+    await expect(f.service.start(f.owner, randomUUID(), "application")).rejects.toMatchObject({ code: "package_refresh_capacity" });
+    for (const id of automatic) await f.service.start(f.owner, id, "application");
     await vi.waitFor(() => expect(f.collection).toHaveBeenCalledTimes(6));
-    await expect(f.service.start(f.owner, randomUUID(), "delegated")).rejects.toMatchObject({ code: "package_refresh_capacity" });
-    await expect(f.service.start(f.owner, foreground[0].toUpperCase(), "delegated")).rejects.toMatchObject({ code: "package_refresh_state" });
+    await expect(f.service.start(f.owner, randomUUID(), "application")).rejects.toMatchObject({ code: "package_refresh_capacity" });
+    await expect(f.service.start(f.owner, foreground[0].toUpperCase(), "application")).rejects.toMatchObject({ code: "package_refresh_state" });
     for (const other of [{ ...f.owner, tenantId: "other" }, { ...f.owner, homeAccountId: "other" }]) {
-      await expect(f.service.start(other, foreground[0], "delegated")).rejects.toMatchObject({ code: "not_found", status: 404 });
+      await expect(f.service.start(other, foreground[0], "application")).rejects.toMatchObject({ code: "not_found", status: 404 });
     }
-    await f.service.cancel(f.owner, foreground[0].toUpperCase(), "delegated");
+    await f.service.cancel(f.owner, foreground[0].toUpperCase(), "application");
     await vi.waitFor(() => expect(f.repository.cancel).toHaveBeenCalledTimes(2));
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
 
   it.each(["requireApplicationDataScope", "applicationToken"] as const)("does not hold the account mutation lock while application %s waits", async stage => {
-    const f = fixture({ application: true }), pending = deferred<void>();
+    const f = fixture(), pending = deferred<void>();
     f.dependencies[stage].mockImplementationOnce(async () => { await pending.promise; return "synthetic" as never; });
     const starting = f.start();
     const stopped = expect(starting).rejects.toMatchObject({ code: "interaction_required" });
@@ -904,11 +902,11 @@ describe("streamed package refresh service", () => {
       if (branch === "capacity") {
         pendingCollection(f);
         await f.start();
-        await f.service.start(f.owner, randomUUID(), "delegated");
+        await f.service.start(f.owner, randomUUID(), "application");
         await vi.waitFor(() => expect(f.collection).toHaveBeenCalledTimes(2));
         f.dependencies.revalidateUser.mockClear();
         f.dependencies.requireAvailable.mockClear();
-        f.dependencies.delegatedToken.mockClear();
+        f.dependencies.applicationToken.mockClear();
         f.repository.markRunning.mockClear();
         f.collection.mockClear();
       }
@@ -959,7 +957,7 @@ describe("streamed package refresh service", () => {
         if (stage === "claim") generation++;
         return f.job;
       });
-      if (stage === "token") f.dependencies.delegatedToken.mockImplementationOnce(async () => {
+      if (stage === "token") f.dependencies.applicationToken.mockImplementationOnce(async () => {
         generation++;
         return "replacement-token";
       });
@@ -974,7 +972,7 @@ describe("streamed package refresh service", () => {
         await vi.waitFor(() => expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id,
           "interaction_required", expect.stringContaining("renewed")));
       } else await expect(f.service.refreshDueDetails(f.owner)).rejects.toBe(reason);
-      expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.delegated", f.owner);
+      expect(f.dependencies.beginOperationValidation).toHaveBeenCalledExactlyOnceWith("graph.package.read.application", f.owner);
       expect(f.dependencies.beginOperationValidation).toHaveBeenCalledBefore(f.repository.claimDueDetails);
       expect(f.repository.markRunning).toHaveBeenCalledTimes(stage === "publication" ? 1 : 0);
       expect(f.collection).toHaveBeenCalledTimes(stage === "publication" ? 1 : 0);
@@ -984,7 +982,7 @@ describe("streamed package refresh service", () => {
         expect(f.dependencies.requireAvailable).not.toHaveBeenCalled();
         expect(f.dependencies.delegatedToken).not.toHaveBeenCalled();
         expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "authorization_expired",
-          expect.stringContaining("renewed"), f.job.resultRevision);
+          expect.stringContaining("application's Microsoft permissions and credentials"), f.job.resultRevision);
       }
     },
   );
@@ -995,7 +993,7 @@ describe("streamed package refresh service", () => {
     f.dependencies.requireAvailable.mockRejectedValueOnce(new AppError(status, status === 401 ? "interaction_required" : "missing_permission", "Denied."));
     await f.service.refreshDueDetails(f.owner);
     expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id,
-      status === 401 ? "interaction_required" : "missing_permission", expect.stringContaining(status === 401 ? "renewed" : "permission"),
+      status === 401 ? "interaction_required" : "missing_permission", expect.stringContaining("permission"),
       f.job.resultRevision);
     expect(f.repository.complete).not.toHaveBeenCalled();
   });
@@ -1003,26 +1001,24 @@ describe("streamed package refresh service", () => {
   it("preserves role inheritance, exact submission, shared application admission, retry intent and cleanup reasons", async () => {
     const f = fixture();
     const admin = { ...f.owner, roles: ["AgentControl.Admin" as const] };
-    for (const tokenMode of ["delegated", "application"] as const) {
-      await f.service.submit(admin, { tokenMode, requestedIds: ["exact"], idempotencyKey: randomUUID() });
-      expect(f.repository.submit).toHaveBeenLastCalledWith({ tenantId: f.owner.tenantId,
-        principalId: tokenMode === "application" ? "synthetic-application-id" : f.owner.homeAccountId },
-      expect.objectContaining({ tokenMode, authorizationPrincipalId: f.owner.homeAccountId }), expect.any(Function));
-    }
-    await expect(f.service.submit({ ...f.owner, roles: [] }, { tokenMode: "delegated", idempotencyKey: randomUUID() }))
+    await f.service.submit(admin, { tokenMode: "application", requestedIds: ["exact"], idempotencyKey: randomUUID() });
+    expect(f.repository.submit).toHaveBeenLastCalledWith({ tenantId: f.owner.tenantId,
+      principalId: "synthetic-application-id", tokenMode: "application" },
+    expect.objectContaining({ tokenMode: "application", authorizationPrincipalId: f.owner.homeAccountId }), expect.any(Function));
+    await expect(f.service.submit({ ...f.owner, roles: [] }, { tokenMode: "application", idempotencyKey: randomUUID() }))
       .rejects.toMatchObject({ code: "missing_internal_role" });
-    await expect(f.service.cancel({ ...f.owner, roles: [] }, f.job.id, "delegated")).rejects.toMatchObject({ code: "missing_internal_role" });
+    await expect(f.service.cancel({ ...f.owner, roles: [] }, f.job.id, "application")).rejects.toMatchObject({ code: "missing_internal_role" });
     f.dependencies.requireAvailable.mockRejectedValueOnce(new AppError(504, "provider_timeout", "Retry."));
-    await expect(f.service.start(f.owner, f.job.id, "delegated", { retryFailed: true })).rejects.toMatchObject({ code: "provider_timeout" });
-    expect(f.dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.delegated", f.owner, { retryFailed: true });
-    await f.service.cancel(f.owner, f.job.id, "delegated", "sync_cleanup");
+    await expect(f.service.start(f.owner, f.job.id, "application", { retryFailed: true })).rejects.toMatchObject({ code: "provider_timeout" });
+    expect(f.dependencies.requireAvailable).toHaveBeenLastCalledWith("graph.package.read.application", f.owner, { retryFailed: true });
+    await f.service.cancel(f.owner, f.job.id, "application", "sync_cleanup");
     expect(f.repository.cancel).toHaveBeenLastCalledWith(expect.anything(), f.job.id, f.owner.homeAccountId, "sync_cleanup");
     await f.service.recover();
     expect(f.repository.recoverInterrupted).toHaveBeenCalledOnce();
   });
 
   it.each(["logout", "replace", "capability"] as const)("rejects stale application submission on %s before creating a job", async action => {
-    const f = fixture({ application: true }), pending = deferred<void>();
+    const f = fixture(), pending = deferred<void>();
     const reason = new AppError(401, "authorization_expired", "Capability authority changed.");
     let current = true;
     f.dependencies.beginOperationValidation.mockReturnValue(() => { if (!current) throw reason; });

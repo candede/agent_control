@@ -1,4 +1,4 @@
-import { acquireApplicationToken, acquireAuthorizedToken, isRetryableIdentityProviderError, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, isRetryableIdentityProviderError, revalidateAuthorizedUser } from "../auth/msal.js";
 import { setTimeout as delay } from "node:timers/promises";
 import { findTenantConfiguration } from "../config.js";
 import { PackageRefreshJobs, type PackageDataScope, type PackageRefreshInput } from "../db/packageRefreshJobs.js";
@@ -20,7 +20,6 @@ import { PackageScanDiagnostics } from "./packageScanDiagnostics.js";
 import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
 
 type PackageRefreshDependencies = {
-  delegatedToken: typeof acquireAuthorizedToken;
   applicationToken: typeof acquireApplicationToken;
   revalidateUser: typeof revalidateAuthorizedUser;
   requireAvailable: typeof capabilities.requireAvailable;
@@ -33,7 +32,6 @@ type PackageRefreshDependencies = {
 };
 
 const defaultDependencies: PackageRefreshDependencies = {
-  delegatedToken: acquireAuthorizedToken,
   applicationToken: acquireApplicationToken,
   revalidateUser: revalidateAuthorizedUser,
   requireAvailable: capabilities.requireAvailable.bind(capabilities),
@@ -97,13 +95,14 @@ export class PackageInventoryService {
 
   async refreshDueDetails(user: AuthenticatedUser, signedInAt?: number, signal?: AbortSignal) {
     requireRefreshRole(user);
-    const scope = dataScope(user, "delegated", this.dependencies.applicationPrincipalId(user.tenantId!));
-    const collectionKey = detailCollectionKey(scope);
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const actor = actorScope(user);
+    const scope = dataScope(user, "application", this.dependencies.applicationPrincipalId(user.tenantId!));
+    const collectionKey = detailCollectionKey(actor);
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
     signal?.throwIfAborted();
     assertAccountSessionValidation(validation);
-    if (!this.draining) await inventoryRuntime(this.repository.database).enqueue(scope, true, signal);
-    const validateCapability = this.dependencies.beginOperationValidation("graph.package.read.delegated", user);
+    if (!this.draining) await inventoryRuntime(this.repository.database).enqueue(actor, true, signal);
+    const validateCapability = this.dependencies.beginOperationValidation("graph.package.read.application", user);
     if (this.detailCancelledAt.has(collectionKey)) {
       signal?.throwIfAborted();
       assertAccountSessionValidation(validation);
@@ -145,7 +144,7 @@ export class PackageInventoryService {
     try {
       assertCurrent();
       signal?.addEventListener("abort", abort, { once: true });
-      const started = await this.startWithAuthority(user, job.id, "delegated", {}, { validation, validateCapability });
+      const started = await this.startWithAuthority(user, job.id, "application", {}, { validation, validateCapability });
       assertCurrent();
       return started;
     } catch (error) {
@@ -156,7 +155,7 @@ export class PackageInventoryService {
       }
       operationalLog("warn", "package_detail_admission_failed", { jobId: job.id, ...graphErrorTelemetry(error) });
       const failed = await this.repository.markFailed(scope, job.id, syncFailureCode(error),
-        isAuthorizationFailure(error) && !isAdmissionPause(error) ? "Automatic detail enrichment requires renewed Microsoft authorization. Sign in again."
+        isAuthorizationFailure(error) && !isAdmissionPause(error) ? "Verify the application's Microsoft permissions and credentials, and renew the initiating session if it expired."
           : safeFailureMessage(error), job.resultRevision);
       assertCurrent();
       if (failed) return failed;
@@ -168,15 +167,16 @@ export class PackageInventoryService {
 
   async detailSyncState(user: AuthenticatedUser): Promise<PackageDetailSyncState> {
     requireRefreshRole(user);
-    const scope = actorScope(user);
-    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const actor = actorScope(user);
+    const scope = dataScope(user, "application", this.dependencies.applicationPrincipalId(user.tenantId!));
+    const validation = beginAccountSessionValidation(actor.tenantId, actor.principalId);
     assertAccountSessionValidation(validation);
     const [coverage, latest] = await Promise.all([
       this.repository.detailCoverage(scope),
-      this.repository.latestAutomaticDetailsJob(scope, scope.principalId),
+      this.repository.latestAutomaticDetailsJob(scope, actor.principalId),
     ]);
     assertAccountSessionValidation(validation);
-    const key = detailCollectionKey(scope);
+    const key = detailCollectionKey(actor);
     const pending = coverage.total - coverage.fresh;
     const failure = this.detailFailures.get(key);
     let status: PackageDetailSyncState["status"];
@@ -245,7 +245,8 @@ export class PackageInventoryService {
           await this.dependencies.wait(250, controller.signal);
           assertCurrent();
           const jobId = batch.id;
-          const next = await currentPackageWork(() => this.repository.getJob(actor, jobId), controller.signal, assertCurrent);
+          const next = await currentPackageWork(() => this.repository.getJob(
+            dataScope(user, "application", this.dependencies.applicationPrincipalId(user.tenantId!)), jobId), controller.signal, assertCurrent);
           assertCurrent();
           if (!next) throw new AppError(409, "package_refresh_expired", "The package detail job expired. Recheck status before retrying.");
           batch = next;
@@ -274,9 +275,10 @@ export class PackageInventoryService {
     const collection = this.detailCollections.get(key);
     this.detailCancelledAt.set(key, Date.now());
     collection?.controller.abort(new AppError(409, "read_job_cancelled", "Package detail collection was cancelled."));
-    const latest = await this.repository.latestAutomaticDetailsJob(actor, actor.principalId);
+    const latest = await this.repository.latestAutomaticDetailsJob(
+      dataScope(user, "application", this.dependencies.applicationPrincipalId(user.tenantId!)), actor.principalId);
     assertAccountSessionValidation(validation);
-    if (latest && ["running", "waiting_authorization"].includes(latest.status)) await this.cancel(user, latest.id, "delegated");
+    if (latest && ["running", "waiting_authorization"].includes(latest.status)) await this.cancel(user, latest.id, "application");
     if (collection) await collection.operation;
     this.detailFailures.delete(key);
     return this.detailSyncState(user);
@@ -357,9 +359,9 @@ export class PackageInventoryService {
       assertCurrent();
       await currentPackageWork(() => this.dependencies.requireAvailable(capabilityId, freshUser, options), signal, assertCurrent, 120_000);
       assertCurrent();
-      token = await currentPackageWork(() => this.dependencies.observeOperation(capabilityId, freshUser, () => tokenMode === "delegated"
-        ? this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
-        : this.dependencies.applicationToken(actor.tenantId, capabilityId), { signal, clearOnSuccess: false }), signal, assertCurrent);
+      token = await currentPackageWork(() => this.dependencies.observeOperation(capabilityId, freshUser,
+        () => this.dependencies.applicationToken(actor.tenantId, capabilityId),
+        { signal, clearOnSuccess: false }), signal, assertCurrent);
       assertCurrent();
       // Fence the admission write without making sign-out wait for provider calls.
       await commitAccountSessionValidation(validation, async () => {
@@ -555,9 +557,7 @@ export class PackageInventoryService {
         getAccessToken: async () => {
           assertCurrent();
           const capabilityId = capabilityForMode(current.tokenMode);
-          const value = current.tokenMode === "delegated"
-            ? await this.dependencies.delegatedToken(actor.tenantId, actor.principalId, capabilityId)
-            : await this.dependencies.applicationToken(actor.tenantId, capabilityId);
+          const value = await this.dependencies.applicationToken(actor.tenantId, capabilityId);
           assertCurrent();
           return value;
         },
@@ -687,13 +687,15 @@ function publicationReadinessRetryDelay(error: AppError, attempt: number) {
 }
 
 function capabilityForMode(mode: RefreshInput["tokenMode"]): CapabilityId {
-  return mode === "delegated" ? "graph.package.read.delegated" : "graph.package.read.application";
+  if (mode !== "application") throw new AppError(400, "invalid_token_mode", "Package collection requires application authentication.");
+  return "graph.package.read.application";
 }
 
 function dataScope(user: AuthenticatedUser, mode: RefreshInput["tokenMode"], applicationPrincipalId: string | undefined): PackageDataScope {
   if (!user.tenantId) throw AppError.unauthorized("The current session does not have a tenant scope.");
-  if (mode === "application" && !applicationPrincipalId) throw new AppError(503, "not_configured", "Application package reads require configured tenant and client identity.");
-  return { tenantId: user.tenantId, principalId: mode === "application" ? applicationPrincipalId! : user.homeAccountId };
+  capabilityForMode(mode);
+  if (!applicationPrincipalId) throw new AppError(503, "not_configured", "Application package reads require configured tenant and client identity.");
+  return { tenantId: user.tenantId, principalId: applicationPrincipalId, tokenMode: "application" };
 }
 
 function actorScope(user: AuthenticatedUser): PackageDataScope {

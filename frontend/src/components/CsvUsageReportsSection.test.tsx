@@ -56,7 +56,7 @@ describe("CSV usage reports section", () => {
       expect(props.onOpenUsageImport).toHaveBeenCalledOnce();
     } else {
       expect(screen.queryByRole("button", { name: "Add CSV reports" })).not.toBeInTheDocument();
-      expect(screen.getByText("An AgentControl.Admin can import reports.")).toBeVisible();
+      expect(screen.getByText("An AgentControl.UsageReportUploader or AgentControl.Admin can import reports.")).toBeVisible();
     }
   });
   it("preserves observed dates with mixed or entirely missing reporting windows", async () => {

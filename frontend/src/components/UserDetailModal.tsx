@@ -21,9 +21,8 @@ import { CopilotLicenseStatus } from "./CopilotLicenseStatus";
 import { CopilotServiceDetails } from "./CopilotServiceDetails";
 import { ReportedUserAgents, type UserRelationshipFilters, type UserRelationshipQuery } from "./ReportedUserAgents";
 import { UserAgentResponsibility } from "./UserAgentResponsibility";
-import { UserPurviewAudit } from "./UserPurviewAudit";
 
-const tabs = [["overview", "Overview"], ["usage", "Usage & agents"], ["licenses", "Licenses"], ["responsibility", "Responsibility"], ["purview", "Logs"]] as const;
+const tabs = [["overview", "Overview"], ["usage", "Usage & agents"], ["licenses", "Licenses"], ["responsibility", "Responsibility"]] as const;
 const defaultRelationshipQuery: UserRelationshipQuery = { search: "", showAll: false, sort: "responses", order: "desc" };
 const appLabels = {
   copilotChatLastActivityDate: "Copilot Chat", microsoftTeamsCopilotLastActivityDate: "Teams",
@@ -38,13 +37,13 @@ type Props = { identity: string; selectionId?: string; reportSetId?: string; kin
   onRestartSelection?: () => void; onSelectionInvalidated?: () => void;
   onOpenAdoption?: (route: UsersRouteState) => void;
   onFocusAgent?: (agentId: string, reportSetId: string) => void; onOpenAgent?: (id: string) => void; dataRevision?: number; agentInventoryRevision?: number };
-export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, reportSetId, kind, filters, investigationAgent, initialTab = "overview", activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, onOpenAdoption, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
+export function UserDetailModal({ identity: requestedIdentity, selectionId: requestedSelectionId, reportSetId, kind, filters, initialTab = "overview", activeTab, onTabChange, returnFocusTo, closeLabel, onClose, onFocusAgent, onOpenAgent, onOpenAdoption, dataRevision, agentInventoryRevision, onRestartSelection, onSelectionInvalidated }: Props) {
   const identity = kind === "directory" ? requestedIdentity.toLowerCase() : requestedIdentity;
   const selectionId = requestedSelectionId?.toLowerCase();
   const setId = selectionId ? undefined : reportSetId?.toLowerCase();
   const dialog = useRef<HTMLDialogElement>(null), close = useRef<HTMLButtonElement>(null), id = useId();
   const [internalTab, setTab] = useState<UserDetailTab>(initialTab);
-  const tab = activeTab ?? internalTab;
+  const tab = tabs.find(([value]) => value === (activeTab ?? internalTab))?.[0] ?? "overview";
   const [visited, setVisited] = useState<readonly UserDetailTab[]>([tab]);
   const [relationshipQuery, setRelationshipQuery] = useState<UserRelationshipQuery>(defaultRelationshipQuery);
   const [responsibilityPerson, setResponsibilityPerson] = useState<ResponsibilityPerson>();
@@ -311,9 +310,6 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
           </> : directoryLoading ? null : <p>Office app activity is unavailable for this user. Check Users sync and reporting permissions.</p>}</section></> : null}
         {panel === "licenses" ? directory ? <CopilotServiceDetails path={`${path}/service-plans`} selectionId={detail.selection.id}
           copilotServiceState={directory.copilotServiceState} current={current} onRestartSelection={restartSelection} onSelectionInvalidated={rejectSelection} /> : directoryLoading ? null : <p>Detailed license assignments are unavailable for this report identity.</p> : null}
-        {panel === "purview" && !directoryLoading ? <UserPurviewAudit active={tab === "purview"}
-          userPrincipalName={current ? directory?.directory.userPrincipalName : undefined}
-          userObjectId={current ? directory?.directory.objectId : undefined} agent={investigationAgent} /> : null}
       </> : null}
       {(visited.includes(panel) || tab === panel) && panel === "responsibility" && !directoryLoading && (detail || directUser) ? <>
         {identityNotice ? <p className="reported-users-note">{identityNotice}</p> : null}

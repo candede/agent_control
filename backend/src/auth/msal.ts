@@ -1,5 +1,7 @@
 import {
+  AuthError,
   ConfidentialClientApplication,
+  ServerError,
   type AccountInfo,
   type AuthenticationResult,
   type INetworkModule,
@@ -13,9 +15,10 @@ import { AppError, isApplicationError } from "../errors.js";
 import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, assertTenantConfiguration, authenticationScopes, authFlowLifetimeMs, tenantConfigurationFingerprint } from "./flows.js";
 import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
-import type { CapabilityId } from "../types/capability.js";
+import { isApplicationCollectionCapability, type CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser, AuthFlow } from "../types/session.js";
 import { authorityUser, currentAuthority, requireAuthority } from "./authorityContext.js";
+import { boundedAuthBody, identityThrottled } from "./boundedAuth.js";
 
 type TokenCache = {
   getAccountByHomeId(homeAccountId: string): Promise<AccountInfo | null>;
@@ -199,7 +202,11 @@ export async function acquireDelegatedTokenResult(tenantId: string, homeAccountI
 }
 
 export async function acquireApplicationToken(tenantId: string, capabilityId: CapabilityId) {
-  if (currentAuthority()?.principal.transport === "bearer") throw new AppError(403, "invalid_token_mode", "Integration operations require delegated authorization.");
+  const source = currentAuthority();
+  if (source) requireAuthority(tenantId);
+  if (source?.principal.transport === "bearer" && !isApplicationCollectionCapability(capabilityId)) {
+    throw new AppError(403, "invalid_token_mode", "Integration investigations require delegated authorization.");
+  }
   const definition = getCapabilityDefinition(capabilityId);
   if (!definition || definition.mode !== "application" || definition.provider !== "Microsoft Graph") {
     throw new AppError(400, "invalid_token_mode", "The capability does not support application tokens.");
@@ -213,7 +220,13 @@ export async function acquireApplicationToken(tenantId: string, capabilityId: Ca
     validateTokenResult(tenant, result, "application", definition.audience, definition.permissions, definition.acceptedPermissions);
     return result!.accessToken;
   } catch (error) {
-    throw normalizeTokenError(error);
+    const normalized = normalizeTokenError(error);
+    if (normalized.status === 401) {
+      throw new AppError(502, "application_authorization_failed",
+        "The configured tenant application could not be authorized. An administrator must verify its registration, credentials and consent, then retry.",
+        normalized.details);
+    }
+    throw normalized;
   }
 }
 
@@ -287,7 +300,7 @@ export function safeReturnPath(value: unknown) {
     throw new AppError(400, "invalid_return_url", "Return URL must be a local application path.");
   }
   const parsed = new URL(value, config.frontendOrigin);
-  if (parsed.origin !== config.frontendOrigin) throw new AppError(400, "invalid_return_url", "Return URL must be a local application path.");
+  if (parsed.origin !== config.frontendOrigin || parsed.pathname.startsWith("//")) throw new AppError(400, "invalid_return_url", "Return URL must be a local application path.");
   return `${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
@@ -340,7 +353,19 @@ export function validateTokenResult(tenant: TenantConfiguration, result: Authent
       "Microsoft Entra ID did not return an application token. An administrator must verify the existing app registration and its credentials.");
     throw interactionRequired();
   }
-  if (result.tenantId !== tenant.tenantId) throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  if (result.tenantId !== tenant.tenantId && (mode !== "application" || result.tenantId !== "")) {
+    throw AppError.unauthorized("Microsoft Entra ID returned a token for a different tenant.");
+  }
+  if (mode === "application" && (result.tenantId === "" || result.authority !== undefined)) {
+    if (typeof result.authority !== "string" || !URL.canParse(result.authority)) {
+      throw new AppError(502, "identity_provider_error", "Microsoft Entra ID returned invalid application authority metadata.");
+    }
+    const authority = new URL(result.authority);
+    if (authority.origin !== "https://login.microsoftonline.com" || authority.username || authority.password
+      || authority.search || authority.hash || authority.pathname.replace(/\/$/, "").toLowerCase() !== `/${tenant.tenantId.toLowerCase()}`) {
+      throw AppError.unauthorized("Microsoft Entra ID returned an application token from a different tenant authority.");
+    }
+  }
   const identityClaims = result.idTokenClaims as Record<string, unknown> | undefined;
   validateOptionalIdentityClaims(tenant, identityClaims);
   validateOptionalIdentityClaims(tenant, result.account?.idTokenClaims);
@@ -453,8 +478,31 @@ async function sendMsalRequest<T>(url: string, method: "GET" | "POST", options: 
   const timer = setTimeout(() => controller.abort(new Error("Microsoft Entra ID request timed out.")), timeout);
   try {
     const response = await fetch(url, { method, headers: options?.headers, body: method === "POST" ? options?.body : undefined, redirect: "manual", signal: controller.signal });
-    const text = await response.text();
-    return { headers: Object.fromEntries(response.headers.entries()), body: (text ? JSON.parse(text) : {}) as T, status: response.status };
+    if (response.status === 429) {
+      const { retryAfterSeconds } = identityThrottled(response.headers.get("retry-after"));
+      await response.body?.cancel().catch(() => undefined);
+      // MSAL replaces non-AuthError transport failures with a generic network error.
+      throw Object.assign(new ServerError("temporarily_unavailable", "", "Microsoft Entra ID throttled token acquisition.", undefined, undefined, 429), { retryAfterSeconds });
+    }
+    let text: string;
+    try { text = await boundedAuthBody(response, 128 * 1024, controller.signal); }
+    catch (error) {
+      if (isApplicationError(error) && error.code === "invalid_identity_response") {
+        throw new AuthError("token_parsing_error", "", "Microsoft Entra ID returned an oversized response.");
+      }
+      throw error;
+    }
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : {};
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("Invalid identity response.");
+    } catch {
+      if (response.status >= 500) {
+        throw new ServerError("server_error", "", "Microsoft Entra ID returned a non-JSON error response.", undefined, undefined, response.status);
+      }
+      throw new AuthError("token_parsing_error", "", "Microsoft Entra ID returned malformed JSON.");
+    }
+    return { headers: Object.fromEntries(response.headers.entries()), body: body as T, status: response.status };
   } finally {
     clearTimeout(timer);
   }
@@ -483,6 +531,7 @@ export function normalizeTokenError(error: unknown) {
   const errorMessage = ownErrorField(error, "errorMessage");
   const errorCorrelationId = ownErrorField(error, "correlationId");
   const errorStatus = ownErrorField(error, "status");
+  const retryAfterSeconds = ownErrorField(error, "retryAfterSeconds");
   const code = typeof errorCode === "string" ? errorCode.toLowerCase() : "";
   const subError = typeof errorSubCode === "string" ? errorSubCode.toLowerCase() : "";
   const errorNo = typeof errorNumber === "string" ? errorNumber
@@ -509,7 +558,14 @@ export function normalizeTokenError(error: unknown) {
     || ["50076", "50079", "50158", "53000", "53001", "53003"].includes(errorNo ?? "")) {
     return new AppError(401, "interaction_required", "Sign in again to complete MFA or account verification. Contact your administrator if Conditional Access blocks sign-in; this is not a request for API permissions.", details);
   }
-  if (httpStatus === 429) return new AppError(429, "provider_throttled", "Microsoft Entra ID throttled token acquisition. Wait for the provider cooldown before retrying.", details);
+  if (httpStatus === 429) {
+    const throttled = identityThrottled(null);
+    throttled.details = details;
+    if (typeof retryAfterSeconds === "number" && Number.isSafeInteger(retryAfterSeconds) && retryAfterSeconds > 0) {
+      throttled.retryAfterSeconds = retryAfterSeconds;
+    }
+    return throttled;
+  }
   return new AppError(502, "identity_provider_error", "Microsoft Entra ID could not complete token acquisition.", details);
 }
 

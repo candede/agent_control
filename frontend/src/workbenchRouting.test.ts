@@ -25,6 +25,17 @@ describe("workbench routing", () => {
     expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
     expect(parseAuditRoute("origin=spoof&client=bad%00label")).toMatchObject({ originChannel: "all", originClientId: undefined });
   });
+  it.each(["client", "callingAgent"] as const)("preserves 256 Unicode characters in exact %s origin filters", key => {
+    const label = "🤖".repeat(256);
+    const query = new URLSearchParams({ [key]: label });
+    const field = key === "client" ? "originClientId" : "originCallingAgentId";
+    const route = parseAuditRoute(query.toString());
+    expect(route[field]).toBe(label);
+    expect(auditRouteSearch(route).get(key)).toBe(label);
+    expect(parseAuditRoute(auditRouteSearch(route).toString())).toEqual(route);
+    expect(parseAuditRoute(new URLSearchParams({ [key]: `${label}x` }).toString())[field]).toBeUndefined();
+    expect(auditRouteSearch({ ...route, [field]: `${label}x` }).has(key)).toBe(false);
+  });
   it("round trips server-owned 5000-target selection without member IDs in the URL", () => {
     const query = agentRouteSearch({ ...parseAgentRoute("status=blocked"), selectedIds: [],
       selectionStorage: "session", selectionCount: 5_000 });
@@ -98,7 +109,7 @@ describe("workbench routing", () => {
     expect(route).toEqual({ powerPlatformJobId: "exact-source-job", syncRunId: "retained-run", refreshJobId: "exact-package-job", refreshMode: "application", reports: undefined });
     expect(workbenchUrl("sync", dataSyncRouteSearch(route))).toBe("/sync?powerPlatformJob=exact-source-job&syncRun=retained-run&refreshJob=exact-package-job&mode=application");
     expect(parseDataSyncRoute(`?syncRun=${"x".repeat(513)}&mode=invalid`).syncRunId).toBeUndefined();
-    expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "delegated" }).toString()).toBe("");
+    expect(dataSyncRouteSearch({ syncRunId: "bad\nid", refreshMode: "application" }).toString()).toBe("");
   });
 
   it("canonicalizes Power Platform source-job UUIDs for exact reads and poll ownership", () => {
@@ -131,7 +142,7 @@ describe("workbench routing", () => {
         expect(agentSearch.get(key)).toBe(id.toLowerCase());
       }
       expect(agentSearch.getAll("selected")).toEqual([id]);
-      const syncSearch = dataSyncRouteSearch({ refreshMode: "delegated", syncRunId: id, refreshJobId: id,
+      const syncSearch = dataSyncRouteSearch({ refreshMode: "application", syncRunId: id, refreshJobId: id,
         reports: { view: "import", stagingId: id, reportSetId: id, activityWindowDays: 30 } });
       for (const key of ["syncRun", "refreshJob", "staging", "correction"]) expect(syncSearch.get(key)).toBe(id.toLowerCase());
       expect(usersRouteSearch({ view: "activity", search: "", page: 0, reportSetId: id, agentId: id }).get("snapshot")).toBe(id.toLowerCase());
@@ -184,7 +195,7 @@ describe("workbench routing", () => {
       sortDirection: "asc",
       page: 0,
       selectedIds: ["native-1", "native-1", "native-2"],
-      refreshMode: "delegated",
+      refreshMode: "application",
       environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
@@ -209,7 +220,7 @@ describe("workbench routing", () => {
       detailTab: undefined,
       selectedIds: ["native-1", "native-2"],
       refreshJobId: undefined,
-      refreshMode: "delegated",
+      refreshMode: "application",
       controlJobId: undefined,
       environmentId: undefined,
       inventorySnapshotId: undefined,
@@ -270,7 +281,7 @@ describe("workbench routing", () => {
   it.each([NaN, Infinity, 1.5])("does not serialize invalid numeric route state %s", value => {
     expect(agentRouteSearch({ ...parseAgentRoute(""), page: value, createdWithinDays: String(value) }).toString()).toBe("");
     expect(auditRouteSearch({ ...parseAuditRoute(""), page: value }).toString()).toBe("");
-    const search = dataSyncRouteSearch({ refreshMode: "delegated", reports: { view: "snapshot", activityWindowDays: value } });
+    const search = dataSyncRouteSearch({ refreshMode: "application", reports: { view: "snapshot", activityWindowDays: value } });
     expect(search.toString()).toBe("reports=snapshot");
     expect(parseSyncReportRoute(search.toString())?.activityWindowDays).toBe(30);
   });
@@ -312,7 +323,7 @@ describe("workbench routing", () => {
       sortDirection: "asc",
       page: 0,
       selectedIds,
-      refreshMode: "delegated",
+      refreshMode: "application",
       environmentId: undefined,
       selectedPowerPlatformIds: [],
     });
@@ -442,7 +453,7 @@ describe("workbench routing", () => {
       .toEqual({ view: "snapshot", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
     expect(parseSyncReportRoute("reports=manage&snapshot=retained&staging=draft&window=90"))
       .toEqual({ view: "manage", stagingId: undefined, reportSetId: undefined, activityWindowDays: 30 });
-    const search = dataSyncRouteSearch({ refreshMode: "delegated", reports: {
+    const search = dataSyncRouteSearch({ refreshMode: "application", reports: {
       view: "snapshot", reportSetId: "bad\nid", activityWindowDays: 365,
     } });
     expect(search.has("snapshot")).toBe(false);
@@ -450,7 +461,7 @@ describe("workbench routing", () => {
   });
 
   it.each([undefined, "owned-stage"])("round trips correction intent with staging link %s", stagingId => {
-    const state = { refreshMode: "delegated" as const, reports: {
+    const state = { refreshMode: "application" as const, reports: {
       view: "import" as const, reportSetId: "11111111-1111-4111-8111-111111111111", stagingId, activityWindowDays: 30,
     } };
     const search = dataSyncRouteSearch(state);
@@ -510,7 +521,7 @@ describe("workbench routing", () => {
       reportSetId,
       activityWindowDays: 365,
     });
-    expect(dataSyncRouteSearch({ refreshMode: "delegated", reports: historical }).toString()).toBe(`reports=snapshot&snapshot=${reportSetId}`);
+    expect(dataSyncRouteSearch({ refreshMode: "application", reports: historical }).toString()).toBe(`reports=snapshot&snapshot=${reportSetId}`);
     expect(parseSyncReportRoute("reports=snapshot")).toEqual({
       view: "snapshot",
       stagingId: undefined,
@@ -524,6 +535,16 @@ describe("workbench routing", () => {
       expect(dataSyncRouteSearch(parseDataSyncRoute(search)).toString()).toBe(search);
     }
     expect(parseSyncReportRoute("reports=snapshot&window=90")).toMatchObject({ view: "snapshot", activityWindowDays: 90 });
+  });
+
+  it("falls back from deferred user Purview deep links while retaining adoption state", () => {
+    const detailId = "11111111-1111-4111-8111-111111111111";
+    const search = usersRouteSearch({ view: "licenses", section: "adoption", company: "Contoso", detailId, search: "", page: 0 });
+    search.set("tab", "purview");
+    const route = parseUsersRoute(search.toString());
+    expect(route).toMatchObject({ section: "adoption", company: "Contoso", detailId, detailTab: "overview" });
+    expect(usersRouteSearch({ ...route, detailTab: "purview" }).get("tab")).toBeNull();
+    expect(parseUsersRoute(usersRouteSearch(route).toString())).toMatchObject({ company: "Contoso" });
   });
 
   it("drops obsolete provider source, job and user parameters from local Audit", () => {

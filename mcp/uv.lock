@@ -13,6 +13,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "fastmcp" },
     { name = "httpx2" },
+    { name = "joserfc" },
     { name = "py-key-value-aio", extra = ["filetree"] },
     { name = "pydantic" },
     { name = "starlette" },
@@ -21,7 +22,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "joserfc" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -36,6 +36,7 @@ requires-dist = [
     { name = "cryptography", specifier = "==48.0.1" },
     { name = "fastmcp", specifier = "==4.1.0" },
     { name = "httpx2", specifier = "==2.13.1" },
+    { name = "joserfc", specifier = "==1.7.5" },
     { name = "py-key-value-aio", extras = ["filetree"], specifier = "==0.4.6" },
     { name = "pydantic", specifier = "==2.14.0" },
     { name = "starlette", specifier = "==1.7.0" },
@@ -44,7 +45,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "joserfc", specifier = "==1.7.5" },
     { name = "mypy", specifier = "==1.20.2" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "pytest-asyncio", specifier = "==1.4.0" },

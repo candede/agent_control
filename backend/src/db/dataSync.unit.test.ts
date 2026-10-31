@@ -7,6 +7,46 @@ import { activateAccountSession, assertAccountSessionValidation, beginAccountSes
 
 afterEach(() => vi.restoreAllMocks());
 
+describe("provider source job authority", () => {
+  it.each((["graph_packages", "power_platform"] as const).flatMap(source =>
+    [true, false].map(authorized => ({ source, authorized })),
+  ))("checks the initiating actor for $source (authorized=$authorized)", async ({ source, authorized }) => {
+    const database = new pg.Pool({ max: 4 });
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(database, "connect").mockImplementation(async () => client);
+    vi.spyOn(database, "query").mockRejectedValue(new Error("Unit tests must not access a database."));
+    const query = vi.spyOn(client, "query").mockImplementation(async sql => {
+      if (typeof sql !== "string") throw new Error("Unexpected query shape.");
+      const guard = sql.startsWith("SELECT 1 FROM package_refresh_jobs") || sql.startsWith("SELECT 1 FROM power_platform_refresh_jobs");
+      const rows = guard && !authorized ? [] : [{ attempt: 1 }];
+      return { command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows };
+    });
+    const scope = { tenantId: "synthetic-tenant", principalId: "signed-in-viewer" };
+    const runId = randomUUID(), jobId = randomUUID();
+    try {
+      const association = new DataSyncRepository(database).attachJob(scope, runId, source, jobId);
+      if (authorized) await expect(association).resolves.toBeUndefined();
+      else await expect(association).rejects.toMatchObject({ status: 409, code: "data_sync_source_job_scope" });
+      const guard = query.mock.calls.find(([sql]) => typeof sql === "string" && sql.startsWith("SELECT 1 FROM"));
+      expect(guard?.[1]).toEqual([jobId, scope.tenantId, scope.principalId, runId, source]);
+      expect(guard?.[0]).toContain(source === "graph_packages"
+        ? "tenant_id=$2 AND authorization_principal_id=$3 AND token_mode='application'"
+        : "tenant_id=$2 AND principal_id=$3");
+      expect(guard?.[0]).not.toContain("token_mode='delegated'");
+      if (authorized) {
+        expect(query).toHaveBeenCalledWith(
+          expect.stringContaining("INSERT INTO data_sync_source_jobs"),
+          [runId, scope.tenantId, scope.principalId, source, 1, jobId],
+        );
+        expect(query).toHaveBeenCalledWith("COMMIT");
+      } else {
+        expect(query.mock.calls.some(([sql]) => typeof sql === "string" && sql.includes("INSERT INTO data_sync_source_jobs"))).toBe(false);
+        expect(query).toHaveBeenCalledWith("ROLLBACK");
+      }
+    } finally { await database.end(); }
+  });
+});
+
 describe("data sync run completion", () => {
   it.each([
     { status: "succeeded", aggregate: "completed", terminal: true },

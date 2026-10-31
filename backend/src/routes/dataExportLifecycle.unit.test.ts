@@ -78,7 +78,8 @@ afterEach(() => {
 function transport(method = "get", path = "/data-exports/:id/download") {
   const body: Record<string, unknown> = { selectionId: id, kind: "official_users" };
   const request = Object.assign(new EventEmitter(), { path: path.replace(":id", id), params: { id },
-    body, aborted: false, session: { user: {} } });
+    body, aborted: false, session: { user: { tenantId: identity.tenantId, homeAccountId: identity.principalId,
+      username: "admin@example.invalid", displayName: "Admin", roles: ["AgentControl.Admin"] } } });
   const response = Object.assign(new EventEmitter(), {
     headersSent: false, destroyed: false, writableEnded: false, writableFinished: false,
     headers: new Map<string, string>(), writes: [] as Buffer[],

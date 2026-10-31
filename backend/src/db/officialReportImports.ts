@@ -87,9 +87,15 @@ export function reportUuid(value: unknown): string {
 export class OfficialReportImports {
   readonly connections;
   readonly history;
-  constructor(readonly database: pg.Pool) {
+  constructor(readonly database: pg.Pool, private readonly correctionsAllowed = true) {
     this.connections = dataConnections(database);
     this.history = new OfficialReportHistory(database);
+  }
+
+  private requireCorrectionAccess(correctionOf: unknown) {
+    if (correctionOf != null && !this.correctionsAllowed) {
+      throw new AppError(403, "missing_internal_role", "AgentControl.Admin is required to correct a published report set.");
+    }
   }
 
   private async authorize(client: pg.PoolClient, identity: SelectionIdentity) {
@@ -130,6 +136,7 @@ export class OfficialReportImports {
     intent = { bundleId: reportUuid(supplied.bundleId),
       ...(supplied.correctionOfSetId === undefined ? {} : { correctionOfSetId: reportUuid(supplied.correctionOfSetId) }),
       rejectDuplicateKind: supplied.rejectDuplicateKind ?? false };
+    this.requireCorrectionAccess(intent.correctionOfSetId);
     await this.history.ensure(identity.tenantId);
     const lease: Lease = { id: randomUUID(), owner: randomUUID(), identity, origin: currentActionOrigin() };
     await this.connections.run(async client => {
@@ -149,7 +156,11 @@ export class OfficialReportImports {
       if (drafts.tenant >= 30 || drafts.actor >= 9) throw new AppError(429, "staging_count_limit", "Discard or accept an existing draft.");
       if ((await client.query(`SELECT 1 FROM official_usage_ingestions WHERE tenant_id=$1 AND bundle_id=$2 AND principal_id<>$3
         UNION ALL SELECT 1 FROM official_usage_sets WHERE tenant_id=$1 AND bundle_id=$2 AND actor_principal_id<>$3 LIMIT 1`,
-      [identity.tenantId, intent.bundleId, identity.principalId])).rowCount) throw new AppError(409, "bundle_owner_mismatch", "The draft belongs to another administrator.");
+      [identity.tenantId, intent.bundleId, identity.principalId])).rowCount) throw new AppError(409, "bundle_owner_mismatch", "The draft belongs to another user.");
+      if (!this.correctionsAllowed && (await client.query(`SELECT 1 FROM official_usage_ingestions
+        WHERE tenant_id=$1 AND bundle_id=$2 AND correction_of IS NOT NULL AND state NOT IN ('cancelled','failed')
+        UNION ALL SELECT 1 FROM official_usage_sets WHERE tenant_id=$1 AND bundle_id=$2 AND supersedes_set_id IS NOT NULL LIMIT 1`,
+      [identity.tenantId, intent.bundleId])).rowCount) this.requireCorrectionAccess(intent.bundleId);
       if (intent.correctionOfSetId && !(await client.query(`SELECT 1 FROM official_usage_sets WHERE id=$1 AND tenant_id=$2 AND complete AND deleted_at IS NULL`,
         [intent.correctionOfSetId, identity.tenantId])).rowCount) throw new AppError(409, "invalid_correction", "Correction target is unavailable.");
       await this.quotas(client, identity, intent.bundleId, 0);
@@ -332,6 +343,7 @@ export class OfficialReportImports {
         WHERE s.id=$1 AND s.tenant_id=$2 AND s.actor_principal_id=$3 AND s.expires_at>clock_timestamp()
           AND i.session_epoch=$4 AND i.state IN ('ready','accepted')`, [reportUuid(stagingId), identity.tenantId, identity.principalId, identity.sessionEpoch])).rows[0];
       if (!row) throw unavailable();
+      this.requireCorrectionAccess(row.correction_of_set_id);
       const examples = (await client.query(`SELECT row_data FROM official_usage_staged_rows WHERE staging_id=$1 ORDER BY ordinal LIMIT 20`, [stagingId])).rows.map(value => value.row_data);
       return { id: row.id as string, revision: row.revision as number, kind: row.kind as OfficialUsageReportKind,
         bundleId: row.bundle_id as string, contentHash: row.content_hash as string, fileHash: row.file_hash as string,
@@ -355,14 +367,17 @@ export class OfficialReportImports {
       await this.authorize(client, identity);
       const state = (await client.query("SELECT revision::text FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0];
       const rows = (await client.query(`SELECT s.id,s.kind,s.revision,s.content_hash,s.row_count,s.reconciliation,
-        s.period_provenance,s.source_as_of_provenance,s.source_as_of,s.reporting_start,s.reporting_end
+        s.period_provenance,s.source_as_of_provenance,s.source_as_of,s.reporting_start,s.reporting_end,s.correction_of_set_id
         FROM official_usage_staging s JOIN official_usage_ingestions i ON i.staging_id=s.id
         WHERE s.tenant_id=$1 AND s.actor_principal_id=$2 AND s.bundle_id=$3
           AND ((s.status='active' AND i.state IN ('ready','accepting')) OR (s.status='accepted' AND i.state='accepted'))
           AND i.session_epoch=$4 AND s.expires_at>clock_timestamp() ORDER BY s.kind LIMIT 4`,
       [identity.tenantId, identity.principalId, bundleId, identity.sessionEpoch])).rows;
       if (rows.length > 3) throw unavailable();
-      if (forDiscard !== true) compatible(rows);
+      if (forDiscard !== true) {
+        for (const row of rows) this.requireCorrectionAccess(row.correction_of_set_id);
+        compatible(rows);
+      }
       const stages = rows.map(row => ({ stagingId: row.id as string, kind: row.kind as OfficialUsageReportKind,
         revision: row.revision as number, contentHash: row.content_hash as string, rowCount: row.row_count as number,
         reconciliation: row.reconciliation as Record<string, unknown> }));
@@ -388,13 +403,14 @@ export class OfficialReportImports {
   private async acceptReviewedBundle(identity: SelectionIdentity, bundleId: string, input: OfficialReportBundleAcceptance, signal?: AbortSignal) {
     const receipt = await this.connections.selectedRead(async client => {
       await this.authorize(client, identity);
-      return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at FROM official_usage_bundle_receipts r
+      return (await client.query(`SELECT r.result_set_id,r.result_active_revision::text,s.deleted_at,r.correction_of_set_id FROM official_usage_bundle_receipts r
         JOIN official_usage_sets s ON s.id=r.result_set_id AND s.tenant_id=r.tenant_id
         WHERE r.tenant_id=$1 AND r.actor_principal_id=$2 AND r.bundle_id=$3 AND r.bundle_hash=$4
           AND r.expected_active_revision=$5 AND r.expires_at>clock_timestamp()`,
       [identity.tenantId, identity.principalId, reportUuid(bundleId), input.bundleHash, input.expectedActiveRevision])).rows[0];
     });
     if (receipt) {
+      this.requireCorrectionAccess(receipt.correction_of_set_id);
       if (receipt.deleted_at) throw new AppError(409, "deleted_report_duplicate", "This accepted report was deleted.");
       return { setId: receipt.result_set_id as string, activeRevision: receipt.result_active_revision as string, complete: true };
     }
@@ -436,10 +452,10 @@ export class OfficialReportImports {
       await this.audit(client, identity, "accepted", stage.kind, stage.version, stage.row_count);
     }
     if (bundle) await client.query(`INSERT INTO official_usage_bundle_receipts(tenant_id,bundle_id,actor_principal_id,bundle_hash,
-      expected_active_revision,result_set_id,result_version_id,result_active_revision,result_complete)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      expected_active_revision,result_set_id,result_version_id,result_active_revision,result_complete,correction_of_set_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
     [identity.tenantId, bundle.bundleId, identity.principalId, bundle.hash, bundle.expectedRevision, result.setId,
-      stages.at(-1)!.version, result.activeRevision, result.complete]);
+      stages.at(-1)!.version, result.activeRevision, result.complete, stages[0].correction_of_set_id]);
   }
 
   private async acceptStages(identity: SelectionIdentity, inputs: readonly ReportAcceptance[], parent?: AbortSignal, bundle?: { bundleId: string; hash: string; preserveSelection?: boolean }) {
@@ -461,6 +477,7 @@ export class OfficialReportImports {
             AND i.session_epoch=$4 AND i.state IN ('ready','accepting','accepted') FOR UPDATE OF s,i`,
         [reportUuid(input.stagingId), identity.tenantId, identity.principalId, identity.sessionEpoch])).rows[0];
         if (!stage || stage.revision !== input.revision || stage.content_hash !== input.contentHash) throw unavailable();
+        this.requireCorrectionAccess(stage.correction_of_set_id);
         if (stage.ingestion_state === "accepting") {
           if (stage.lease_until <= new Date()) throw unavailable();
           throw new AcceptancePending(Math.min(stage.deadline_at.getTime(), stage.expires_at.getTime()));
@@ -516,6 +533,7 @@ export class OfficialReportImports {
       const first = stages[0];
       let set = (await client.query(`SELECT * FROM official_usage_sets WHERE tenant_id=$1 AND bundle_id=$2 FOR UPDATE`,
         [identity.tenantId, first.bundle_id])).rows[0];
+      this.requireCorrectionAccess(set?.supersedes_set_id);
       const companions = set ? (await client.query(`SELECT v.* FROM official_usage_set_versions m JOIN official_usage_versions v ON v.id=m.version_id
         WHERE m.set_id=$1 AND m.tenant_id=$2`, [set.id, identity.tenantId])).rows : [];
       compatible([...stages, ...companions]);
@@ -791,6 +809,7 @@ export class OfficialReportImports {
           AND s.expires_at>clock_timestamp() AND i.session_epoch=$4 AND i.expires_at>clock_timestamp()`,
       [stagingId, identity.tenantId, identity.principalId, identity.sessionEpoch])).rows[0];
       if (!stage) throw unavailable();
+      this.requireCorrectionAccess(stage.correction_of_set_id);
       const expected = { identity, endpoint: "/official-usage/staging/diagnostics", selectionId: stage.id,
         revision: String(stage.revision), queryHash: digest(stage.content_hash) };
       const cursor = options.cursor ? codec.decode(options.cursor, expected) : undefined, previous = cursor?.direction === "previous";

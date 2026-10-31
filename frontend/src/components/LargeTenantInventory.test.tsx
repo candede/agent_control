@@ -186,7 +186,7 @@ describe("large inventory outcome consumers", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Restart the selection");
   });
   it("renders one refresh target page, uses scalar 5000 totals, and aborts old revisions", async () => {
-    const refresh: PackageRefreshJob = { id: "refresh", authorizationPrincipalId: "principal", tokenMode: "delegated", scopeKind: "exact",
+    const refresh: PackageRefreshJob = { id: "refresh", authorizationPrincipalId: "principal", tokenMode: "application", scopeKind: "exact",
       targetCount: 5000, resultRevision: "1", status: "running", pageCount: 0, observedCount: 25, totalRecords: 5000,
       snapshotId: null, createdAt: "2026-01-01", updatedAt: "2026-01-01", attemptedAt: null, finishedAt: null };
     vi.mocked(getPackageRefreshTargets).mockResolvedValue({ value: [{ id: "selected target", ordinal: 0, status: "observed_unpublished" }],

@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import { ArrowDownWideNarrow, ArrowUpNarrowWide, ArrowUpRight, Bot, Building2, CircleAlert, MessageSquareText, Trophy, UserRound, Users, type LucideIcon } from "lucide-react";
+import { ArrowDownWideNarrow, ArrowUpNarrowWide, ArrowUpRight, Bot, Building2, CircleAlert, LoaderCircle, MessageSquareText, Trophy, UserRound, Users, type LucideIcon } from "lucide-react";
 import type { AdoptionDepartment, AdoptionDepartmentPage, AdoptionSnapshot, AdoptionSummary, AdoptionSummaryPage } from "../../../backend/src/types/adoptionDashboard";
 import { adoptionChange, adoptionSnapshotLabel } from "../adoptionTrends";
 import { useReportPage } from "../useReportPage";
@@ -90,6 +90,12 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
     setId: snapshot.id, company, sort: "adoptionRate", order, limit: 10,
   }, revision);
   const data = read.data;
+  const [retainedLayout, setRetainedLayout] = useState<{ data: AdoptionDepartmentPage; company?: string | null }>();
+  if (data && retainedLayout?.data !== data) setRetainedLayout({ data, company });
+  const skeleton = read.loading && !data;
+  const layoutData = data ?? (skeleton ? retainedLayout?.data : undefined);
+  const layoutCompany = skeleton && retainedLayout ? retainedLayout.company : company;
+  const departments = layoutData?.value ?? (skeleton ? Array.from({ length: 10 }, () => undefined) : []);
   const SortIcon = order === "desc" ? ArrowDownWideNarrow : ArrowUpNarrowWide;
   return <section className="dashboard-panel dashboard-panel-teal" aria-labelledby={title}>
     <div className="dashboard-department-heading">
@@ -106,23 +112,29 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
         Active / saved people <SortIcon size={15} aria-hidden="true" />
       </button>
     </div>
-    <ReportReadStatus read={{ ...read, data }} quietLoading />
+    <ReportReadStatus read={read} quietLoading />
     {read.loading && data ? <span className="sr-only" role="status">Updating departments...</span> : null}
-    {data ? <>
-      {data.value.length ? <ul className="dashboard-departments" aria-label="Department adoption" aria-busy={read.loading}>
-        {data.value.map((department, index) => {
-          const percentage = department.activePeople !== null && department.people > 0
+    <div className="dashboard-department-results" aria-busy={read.loading}>
+      {skeleton ? <span className="dashboard-department-loading" aria-hidden="true">
+        <LoaderCircle size={16} className="agent-refresh-spinner" /> Loading departments...
+      </span> : null}
+      <div className={skeleton ? "dashboard-department-placeholder" : undefined} aria-hidden={skeleton || undefined} inert={skeleton}>
+      {layoutData || skeleton ? <>
+      {departments.length ? <ul className="dashboard-departments" aria-label="Department adoption" aria-busy={read.loading}>
+        {departments.map((department, index) => {
+          const percentage = department?.activePeople != null && department.people > 0
             ? department.activePeople / department.people * 100 : null;
-          const label = department.department ?? "Department not provided";
-          const href = workbenchUrl("users", usersRouteSearch({ section: "adoption", view: "licenses", search: "", page: 0,
-            reportSetId: snapshot.id, company: department.company, department: department.department }));
-          return <li key={department.id} className={`dashboard-department dashboard-bar-${index % 8}`}>
-            <a href={href} title={`${department.company ?? "Company not provided"} / ${label}`}>{label}
-              {company === undefined ? <small>{department.company ?? "Company not provided"}</small> : null}</a>
-            <span className="dashboard-department-bar" aria-hidden="true"><span style={{ width: `${percentage ?? 0}%` }} /></span>
+          const label = department?.department ?? "Department not provided";
+          const href = department && !skeleton ? workbenchUrl("users", usersRouteSearch({ section: "adoption", view: "licenses", search: "", page: 0,
+            reportSetId: snapshot.id, company: department.company, department: department.department })) : undefined;
+          return <li key={department?.id ?? index} className={`dashboard-department dashboard-bar-${index % 8}`}>
+            <a href={href} title={skeleton ? undefined : `${department?.company ?? "Company not provided"} / ${label}`}>
+              <span className="dashboard-department-name">{label}</span>
+              {layoutCompany === undefined ? <small><span className="dashboard-department-name">{department?.company ?? "Company not provided"}</span></small> : null}</a>
+            <span className="dashboard-department-bar" aria-hidden="true"><span style={{ width: `${percentage ?? (skeleton ? 65 - index % 5 * 10 : 0)}%` }} /></span>
             <span className="dashboard-department-value">
               <strong>{percentage === null ? "Unknown" : `${percentage.toLocaleString(undefined, { maximumFractionDigits: 1 })}%`}</strong>
-              <small>{department.activePeople === null ? "Unknown" : usageCount(department.activePeople)} / {usageCount(department.people)}</small>
+              <small>{department?.activePeople == null ? "Unknown" : usageCount(department.activePeople)} / {usageCount(department?.people)}</small>
             </span>
           </li>;
         })}
@@ -130,9 +142,11 @@ function DepartmentAdoption({ snapshot, revision, company, onCompanyChange, base
         Choose another company or allow automatic user synchronization to finish.</p>}
       <p className="dashboard-panel-note">Positive agent responses among unambiguously matched saved directory members,
         not the full workforce. Missing or ambiguous identities are not assigned to a department.
-        {" "}Directory observed: {usageDate(data.directory.observedAt)}. Report: {adoptionSnapshotLabel(snapshot)}.</p>
+        {" "}Directory observed: {usageDate(layoutData?.directory.observedAt)}. Report: {adoptionSnapshotLabel(snapshot)}.</p>
     </> : null}
-    <ReportPageControls data={data} previous={read.previous} next={read.next} loading={read.loading}
+    <ReportPageControls data={layoutData} previous={read.previous} next={read.next} loading={read.loading}
       leaseEnded={read.leaseEnded} goToPage={read.goToPage} label="departments" compact showPageNumbers />
+      </div>
+    </div>
   </section>;
 }

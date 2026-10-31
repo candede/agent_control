@@ -18,14 +18,14 @@ vi.mock("./pool.js", () => ({
 }));
 vi.mock("../services/operationalState.js", () => ({ requireProviderAdmissions: vi.fn() }));
 
-const scope = { tenantId: "tenant-package-admission", principalId: "reader-package-admission" };
-const input = { authorizationPrincipalId: scope.principalId, tokenMode: "delegated" as const, idempotencyKey: "new-refresh" };
+const scope = { tenantId: "tenant-package-admission", principalId: "application-package-admission", tokenMode: "application" as const };
+const input = { authorizationPrincipalId: scope.principalId, tokenMode: "application" as const, idempotencyKey: "new-refresh" };
 const emptyResult = { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] };
 const query = vi.mocked(pool.query);
 const job = {
   id: "11111111-1111-4111-8111-111111111111",
   authorization_principal_id: scope.principalId,
-  token_mode: "delegated",
+  token_mode: "application",
   scope_kind: "broad",
   target_count: 0,
   result_revision: "2026-09-22 00:00:00+00",
@@ -165,8 +165,8 @@ describe("package refresh admission", () => {
     expect(statement).toContain("WITH recent_detail_attempts AS MATERIALIZED");
     expect(statement).toContain("SELECT DISTINCT t.target_id,t.catalog_revision_hash");
     expect(statement).toContain("attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details");
-    expect(statement).toContain("attempted.status IN ('succeeded','running','waiting_authorization') OR attempted.authorization_principal_id=$2");
-    expect(statement).not.toContain("attempted.principal_id=$2");
+    expect(statement).toContain("attempted.principal_id=$2");
+    expect(statement).not.toContain("attempted.authorization_principal_id=$2");
     expect(statement).toContain("LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id");
     expect(statement).toContain("attempted.catalog_revision_hash=");
     expect(statement).toContain("r.native_id=ANY($3::text[]) OR attempted.target_id IS NULL");
@@ -373,7 +373,7 @@ describe("package refresh admission", () => {
     const selectionId = job.id;
     const selectedQueryHash = createHash("sha256").update(JSON.stringify({ selectionId, ids: null, recordIds: null })).digest("hex");
     const selectedRequestHash = createHash("sha256").update(JSON.stringify({
-      authorizationPrincipalId: scope.principalId, queryHash: selectedQueryHash, tokenMode: "delegated", scopeKind: "exact",
+      authorizationPrincipalId: scope.principalId, queryHash: selectedQueryHash, tokenMode: "application", scopeKind: "exact",
     })).digest("hex");
     let current = true;
     query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult).mockImplementationOnce(async () => {

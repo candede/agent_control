@@ -117,7 +117,7 @@ type PackageListQuery = {
 export type PackageRefreshJob = {
   id: string;
   authorizationPrincipalId: string;
-  tokenMode: "delegated" | "application";
+  tokenMode: "application";
   scopeKind: "broad" | "exact";
   targetCount: number;
   resultRevision: string;
@@ -602,7 +602,7 @@ export function getAgentResponsibility(query: AgentResponsibilityQuery = {}, opt
   return request<AgentResponsibilityPage>(`/api/agent-responsibility${params.size ? `?${params}` : ""}`, { signal: options.signal });
 }
 
-export function startPackageRefresh(mode: "delegated" | "application" = "delegated", options: { idempotencyKey?: string; signal?: AbortSignal } = {}) {
+export function startPackageRefresh(mode: "application" = "application", options: { idempotencyKey?: string; signal?: AbortSignal } = {}) {
   return request<PackageRefreshJob>("/api/agents/refresh-jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(options.idempotencyKey ? { "Idempotency-Key": options.idempotencyKey } : {}) },
@@ -632,7 +632,7 @@ export async function refreshPackageIdentityDetails(
 
 export function startExactPackageRefresh(
   id: string,
-  mode: "delegated" | "application" = "delegated",
+  mode: "application" = "application",
   options: { signal?: AbortSignal } = {},
 ) {
   return request<PackageRefreshJob>(`/api/agents/${encodeURIComponent(id)}/refresh-jobs`, {
@@ -645,13 +645,13 @@ export function startExactPackageRefresh(
 
 export function getPackageRefreshJob(
   id: string,
-  mode: "delegated" | "application" = "delegated",
+  mode: "application" = "application",
   options: { signal?: AbortSignal } = {},
 ) {
   return request<PackageRefreshJob>(`/api/agents/refresh-jobs/${encodeURIComponent(id)}?mode=${mode}`, { signal: options.signal });
 }
 
-export function getPackageRefreshJobs(mode: "delegated" | "application" = "delegated", limit = 20, options: { signal?: AbortSignal } = {}) {
+export function getPackageRefreshJobs(mode: "application" = "application", limit = 20, options: { signal?: AbortSignal } = {}) {
   return request<{ value: PackageRefreshJob[]; lastAttemptAt: string | null; lastSuccessAt: string | null }>(
     `/api/agents/refresh-jobs?mode=${mode}&limit=${limit}`,
     { signal: options.signal },

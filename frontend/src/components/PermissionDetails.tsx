@@ -7,18 +7,20 @@ export function PermissionDetails({ view, now }: { view: CapabilityView; now: nu
   const { definition } = view;
   const decision = issue?.decision ?? view.decision;
   const evidence = decision.evidence;
+  const applicationAuthorizationFailure = definition.mode === "application"
+    && ["interaction_required", "authorization_expired"].includes(evidence?.category ?? "");
   return <>
     {issue ? <p className="permission-detail-explanation">{issue.message}</p> : null}
     <section className="permission-detail-section" aria-label="Required setup">
-      <h3>Required setup</h3>
+      <h5>Required setup</h5>
       <dl className="permission-metadata">
         {definition.permissions.length ? <Metadata name="API permissions" value={`${definition.provider} / ${definition.mode}: ${definition.permissions.join(" and ")}`} /> : null}
         {definition.providerRoles.length ? <Metadata name="Microsoft roles" value={definition.providerRoles.join(" or ")} /> : null}
         {definition.licenses.length ? <Metadata name="Licenses" value={definition.licenses.join("; ")} /> : null}
       </dl>
     </section>
-    <details className="permission-technical">
-      <summary>Technical details</summary>
+    <section className="permission-technical" aria-label="Technical details">
+      <h5>Check details</h5>
       <dl className="permission-metadata">
         <Metadata name="Resource audience" value={definition.audience} />
         <Metadata name="Cloud / API" value={`${definition.cloud} / ${definition.maturity}`} />
@@ -30,12 +32,16 @@ export function PermissionDetails({ view, now }: { view: CapabilityView; now: nu
         {evidence?.correlationId ? <Metadata name="Provider request / correlation ID" value={evidence.correlationId} /> : null}
       </dl>
       {issue && decision.remediation.length ? <ul>{decision.remediation.map(text => <li key={text}>{text}</li>)}</ul> : null}
-    </details>
+    </section>
     <section className="permission-detail-section" aria-label="Setup and documentation">
-      <h3>Setup links</h3>
-      <p>Administrator: App registrations &gt; this app &gt; API permissions &gt; Grant admin consent. {definition.mode === "application"
-        ? "Verify the application's credentials, then retry the explicit application-scope operation. User sign-in does not repair app-only authorization."
-        : "Then sign in again."}</p>
+      <h5>Setup links</h5>
+      {issue && (decision.status === "missing_permission" || applicationAuthorizationFailure) ? <p>
+        Administrator: {applicationAuthorizationFailure
+          ? "Review the existing application grants in App registrations > this app > API permissions."
+          : "App registrations > this app > API permissions > Grant admin consent."} {definition.mode === "application"
+          ? "Verify the application's credentials, then retry the application read. User sign-in does not repair app-only authorization."
+          : "Then sign in again."}
+      </p> : null}
       <div className="permission-actions">
         <a href="https://entra.microsoft.com/" target="_blank" rel="noreferrer">Entra admin center <ExternalLink size={14} aria-hidden="true" /></a>
         <a href="https://admin.microsoft.com/" target="_blank" rel="noreferrer">Microsoft admin center <ExternalLink size={14} aria-hidden="true" /></a>

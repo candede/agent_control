@@ -12,7 +12,7 @@ vi.mock("../api/client", async original => ({
 }));
 
 const job: PackageRefreshJob = {
-  id: "job", authorizationPrincipalId: "principal", tokenMode: "delegated", scopeKind: "exact",
+  id: "job", authorizationPrincipalId: "principal", tokenMode: "application", scopeKind: "exact",
   targetCount: 5000, resultRevision: "1", status: "running", pageCount: 0, observedCount: 0,
   totalRecords: 5000, snapshotId: null, createdAt: "2026-10-01", updatedAt: "2026-10-01",
   attemptedAt: null, finishedAt: null,
@@ -46,7 +46,7 @@ describe("revision-scoped refresh target paging", () => {
     expect(getPackageRefreshTargets).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["owner", "mode", "job", "revision"] as const)("resets the cursor and cancels obsolete pages when the %s changes", async boundary => {
+  it.each(["owner", "job", "revision"] as const)("resets the cursor and cancels obsolete pages when the %s changes", async boundary => {
     const obsolete = deferred<PackageRefreshTargetPage>(), current = deferred<PackageRefreshTargetPage>();
     const view = render(<InventoryRefreshTargets job={job} owner="session" />);
     await screen.findByText("First target");
@@ -54,7 +54,6 @@ describe("revision-scoped refresh target paging", () => {
     await userEvent.click(screen.getByRole("button", { name: "Next targets" }));
     const signal = vi.mocked(getPackageRefreshTargets).mock.calls[1][1]!.signal!;
     const replacement = { ...job, id: boundary === "job" ? "other-job" : job.id,
-      tokenMode: boundary === "mode" ? "application" as const : job.tokenMode,
       resultRevision: boundary === "revision" ? "2" : job.resultRevision };
     view.rerender(<InventoryRefreshTargets job={replacement} owner={boundary === "owner" ? "other-session" : "session"} />);
     expect(signal.aborted).toBe(true);

@@ -97,16 +97,34 @@ pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <approved-target.json>
 Deployment requires the approved target to match the preview. Keep the generated
 receipt with the release records.
 
+After contained smoke and database integrity checks pass, deployment reopens the
+application automatically; no separate login receipt or application-enable
+approval is required. Deployment checks verify authentication configuration, not
+the interactive sign-in journey, which remains a post-deployment check below.
+The canonical origin may include a final root slash; smoke checks always request
+the exact `/api/...` and application paths, without duplicate slashes.
+
+For isolated, in-process deployment regressions without Azure, Docker or HTTP
+requests, run `pwsh -NoProfile -NonInteractive -File scripts/azure-deployment.unit.tests.ps1`.
+It uses synthetic release data and exact command fixtures, not a deployment
+entrypoint or the full CLI-process test suite.
+
 ## Verify the release
 
 After deployment:
 
 1. Confirm `/api/health` and `/api/ready` return success.
-2. Sign in with an assigned Viewer account and an assigned Admin account.
+2. Verify assigned Viewer, Usage Report Uploader and Admin access using the
+   [current role and permission reference](user-roles-and-permissions.md).
 3. Confirm initial read-only synchronization starts automatically after sign-in.
 4. Review **Sync** source progress; use **Permissions** for actual access failures.
-5. Verify saved inventory, users, reports, and activity.
-6. Test each approved write with an exact reviewed target.
+5. Verify shared saved inventory, users, reports and activity, including when
+   the signed-in user lacks Microsoft source-read access.
+6. Confirm only Admin can see Audit and read/export local administrative logs;
+   Viewer/Uploader must be denied through direct URLs/APIs. Verify Uploader can
+   import new CSV sets but cannot correct/select/delete published reports.
+   Test provider changes only with an exact reviewed target and current Admin
+   plus Microsoft permission/role/license.
 7. Confirm monitoring, backup retention, budget alerts, and network rules.
 
 ## Operate the deployment

@@ -12,6 +12,7 @@ type OfficialUsageImportModalProps = {
   route?: SyncReportRouteState;
   onRouteChange: (route: SyncReportRouteState | undefined) => void;
   canManage: boolean;
+  canImport: boolean;
   revision: number;
   onChanged: () => void;
   onImported?: () => void;
@@ -20,14 +21,14 @@ type ImportSession = { sequence: number; owner: object; initialStagingId?: strin
   routeStage?: string; pending?: { from?: string; to?: string } };
 
 export function OfficialUsageImportModal({
-  route, onRouteChange, canManage, revision, onChanged, onImported,
+  route, onRouteChange, canManage, canImport, revision, onChanged, onImported,
 }: OfficialUsageImportModalProps) {
   const open = Boolean(route);
-  const importDenied = route?.view === "import" && !canManage;
+  const importDenied = route?.view === "import" && (!canImport || Boolean(route.reportSetId) && !canManage);
   const view = importDenied ? "manage" : route?.view;
   const [importSession, setImportSession] = useState<ImportSession>();
   const importOwner = useRef<object | undefined>(undefined);
-  const importing = open && canManage && view === "import";
+  const importing = open && !importDenied && view === "import";
   let draft = importSession;
   if (!importing && draft) { setImportSession(undefined); draft = undefined; }
   if (importing) {
@@ -122,11 +123,12 @@ export function OfficialUsageImportModal({
         <div>
           <h2 ref={title} tabIndex={-1} id="usage-import-modal-title">{view === "import" ? "Add CSV reports" : view === "snapshot" ? "Report details" : "Manage reports"}</h2>
           {importDenied ? <p id="usage-import-modal-description">
-            An administrator is required to import CSV reports. You can view saved reports below.
+            {route?.reportSetId ? "Admin access is required to replace saved reports."
+              : "UsageReportUploader or Admin access is required to import CSV reports."} You can view saved reports below.
           </p> : null}
         </div>
         {view === "manage" ? <div className="usage-modal-header-actions">
-          {canManage ? <button type="button" onClick={() => navigate("import")}>Add CSV reports</button> : null}
+          {canImport ? <button type="button" onClick={() => navigate("import")}>Add CSV reports</button> : null}
           <button ref={closeButton} type="button" className="icon-button" aria-label="Close reports" onClick={dismiss}><X size={20} /></button>
         </div> : null}
       </header>

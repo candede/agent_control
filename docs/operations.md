@@ -53,13 +53,20 @@ step. Saved reads and explicit cancellation retain their normal authorization.
 ## First sign-in and synchronization
 
 Users, Graph packages, Power Platform and their saved inventory are shared within
-each tenant. Viewer/Admin app roles can read those records without permission to
+each tenant. Viewer, UsageReportUploader and Admin can read those records without permission to
 collect them from Microsoft. Signing in with a different account does not create
 another copy or require a personal first sync.
 
-Eligible signed-in Viewer/Admin sessions start read-only collection
-automatically while visible and online, using their own current provider
-authorization. Freshness and collection admission are shared per tenant/source,
+Eligible signed-in Viewer-capable sessions start read-only collection
+automatically while visible and online. Graph reads use configured application
+credentials and consent, not the user's Microsoft reader roles; Power Platform
+uses the initiating user's delegated permission and inventory role.
+Recommend **AI Reader** for read-only Studio/environment sync, assigned by a
+Privileged Role Administrator through **Identity > Roles & admins > AI Reader >
+Add assignments**. The viewer signs out/in and activates PIM eligibility first.
+No administrator session or application-owned enable/approval step is needed.
+See the [permission reference](user-roles-and-permissions.md#app-registration-permissions).
+Freshness and collection admission are shared per tenant/source,
 so different accounts do not independently download the same source. The tenant's
 initial sync uses the first-sync modal, which closes automatically when all three
 inventory sources are saved. It is not repeated for each account. Subsequent
@@ -144,9 +151,10 @@ revalidation failures still invalidate the request authority.
   and current sign-in.
 - Use **Permissions > Check status** to inspect actual provider diagnostics.
   Token readiness is not proof of complete provider role, licensing or data scope.
-- A configured application hunt/audit search runs directly for an authorized
-  Viewer/Admin within its current tenant/client/configuration/shared scope.
-  Delegated results remain private. No prior qualification query is required.
+- Purview, Defender and investigation-only identity setup are hidden from the
+  current UI and are not ordinary synchronization prerequisites. Their retained
+  backend jobs keep their own authorization/private or configured shared scope;
+  see [provider contracts](provider-contracts.md#retained-backend-investigations).
 - Correct consent, provider role, licensing, connectivity or sharing settings
   when the actual operation reports that limitation.
 - Restart/expired credentials can leave accepted jobs waiting for authorization.
@@ -232,6 +240,11 @@ installation settings; it is not an access grant. Studio quarantine remains a
 separate effect.
 
 ### Administrative audit provenance
+
+Only Admin can see the Audit tab/page or read/export local administrative audit
+logs. Viewer and Usage Report Uploader are denied through direct URLs and APIs
+as well. Audit recording continues regardless of read access; this local history
+is distinct from Microsoft Purview Audit Search.
 
 Origin identifies authenticated `webapp|mcp|unknown` provenance, not provider
 source or authorization. Reported labels are displayed as reported. Unknown

@@ -8,12 +8,23 @@ function user(role: AppRole): SessionUser {
 }
 
 describe("role-aware views", () => {
-  const observationalViews = ["dashboard", "agents", "users", "sync", "audit", "permissions"];
+  const observationalViews = ["dashboard", "agents", "users", "sync", "permissions"];
+  const adminViews = ["dashboard", "agents", "users", "sync", "audit", "permissions"];
 
-  it("allows Viewer and Admin to every observational view", () => {
+  it("reserves Audit for Admin while keeping ordinary data views available to Viewer", () => {
     expect(allowedViews(user("AgentControl.Viewer"))).toEqual(observationalViews);
-    expect(allowedViews(user("AgentControl.Admin"))).toEqual(observationalViews);
+    expect(allowedViews(user("AgentControl.Admin"))).toEqual(adminViews);
     expect(hasRole(user("AgentControl.Admin"), "AgentControl.Viewer")).toBe(true);
+  });
+
+  it("lets a standalone Uploader view data and upload without administrative authority", () => {
+    const uploader = user("AgentControl.UsageReportUploader");
+    expect(allowedViews(uploader)).toEqual(observationalViews);
+    expect(hasRole(uploader, "AgentControl.Viewer")).toBe(true);
+    expect(hasRole(uploader, "AgentControl.UsageReportUploader")).toBe(true);
+    expect(hasRole(uploader, "AgentControl.Admin")).toBe(false);
+    expect(hasRole(user("AgentControl.Admin"), "AgentControl.UsageReportUploader")).toBe(true);
+    expect(hasRole(user("AgentControl.Viewer"), "AgentControl.UsageReportUploader")).toBe(false);
   });
 
   it("denies protected views to unassigned and legacy-role sessions", () => {
@@ -48,6 +59,6 @@ describe("role-aware views", () => {
     const views = allowedViews(principal);
     views.pop();
     principal.roles.reverse();
-    expect(allowedViews(principal)).toEqual(observationalViews);
+    expect(allowedViews(principal)).toEqual(adminViews);
   });
 });

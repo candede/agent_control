@@ -350,14 +350,15 @@ describe.sequential("Data sync repository", () => {
     await expect(repository.retry(scope, run.id, ["usage_reports"])).rejects.toMatchObject({ code: "data_sync_source_complete" });
     expect(await repository.retry(scope, run.id, ["graph_packages"])).toEqual(["graph_packages"]);
     const packages = new PackageRefreshJobs(fixture.runtime);
-    const firstJob = (await packages.submit(scope, { tokenMode: "delegated",
+    const packageScope = { ...scope, principalId: "fixture-application", tokenMode: "application" as const };
+    const firstJob = (await packages.submit(packageScope, { tokenMode: "application",
       authorizationPrincipalId: scope.principalId, idempotencyKey: `${run.id}-first` })).id;
     await repository.attachJob(scope, run.id, "graph_packages", firstJob);
     await repository.updateSource(scope, run.id, "graph_packages", {
       status: "failed", jobId: firstJob, message: "Failed again.", canRetry: true,
     });
     expect(await repository.retry(scope, run.id, ["graph_packages"])).toEqual(["graph_packages"]);
-    const secondJob = (await packages.submit(scope, { tokenMode: "delegated",
+    const secondJob = (await packages.submit(packageScope, { tokenMode: "application",
       authorizationPrincipalId: scope.principalId, idempotencyKey: `${run.id}-second` })).id;
     await repository.attachJob(scope, run.id, "graph_packages", secondJob);
     const associations = await fixture.runtime.query<{ job_id: string }>(

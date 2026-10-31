@@ -1,6 +1,7 @@
 import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router } from "express";
 import { randomUUID } from "node:crypto";
+import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { getAuditLog } from "../services/auditLog.js";
@@ -9,6 +10,7 @@ import { createExportPublicationValidator, publishBoundedCsv } from "../services
 import { operationalLog } from "../services/telemetry.js";
 import type { AuditScope, AuditStatus, LocalAuditAction } from "../types/audit.js";
 import { auditMaximumOffset, auditMaximumSearchLength, isAuditOperationPrefix } from "../types/audit.js";
+import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 import { originCsv, parseOriginFilters, unknownOrigin } from "../services/actionOrigin.js";
 
@@ -49,20 +51,21 @@ const auditStatuses = new Set<AuditStatus>([
 ]);
 const auditScopes = new Set<AuditScope>(["single", "bulk"]);
 
-policyRoute(auditRouter, "get", "/audit/events", { access: "authenticated", dataClass: "local_audit", roles: ["AgentControl.Viewer"] }, async (request, response, next) => {
+policyRoute(auditRouter, "get", "/audit/events", { access: "authenticated", dataClass: "local_audit", roles: ["AgentControl.Admin"] }, async (request, response, next) => {
   try {
-    const auditLog = getAuditLog(requestScope(request));
+    const scope = requestScope(request);
+    const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+    const auditLog = getAuditLog(scope);
     const query = parseAuditEventsQuery(request.query);
-
-    if (!auditLog) {
-      response.json({ value: [], count: 0 });
-      return;
+    const value = await auditLog.listEvents(query);
+    const count = await auditLog.countEvents(query);
+    assertAccountSessionValidation(validation);
+    const currentScope = requestScope(request);
+    if (currentScope.tenantId !== scope.tenantId || currentScope.principalId !== scope.principalId
+      || !hasAppRole(requestUser(request).roles, "AgentControl.Admin")) {
+      throw AppError.unauthorized();
     }
-
-    response.json({
-      value: await auditLog.listEvents(query),
-      count: await auditLog.countEvents(query),
-    });
+    response.json({ value, count });
   } catch (error) {
     next(error);
   }
@@ -86,7 +89,7 @@ export function parseAuditEventsQuery(query: Record<string, unknown>) {
 }
 
 policyRoute(auditRouter, "post", "/audit/events/export.csv", { browserOnly: true,
-  access: "authenticated", dataClass: "local_audit_export", roles: ["AgentControl.Viewer"], csrf: true,
+  access: "authenticated", dataClass: "local_audit_export", roles: ["AgentControl.Admin"], csrf: true,
 }, async (request, response) => {
   const ids: unknown = request.body?.ids;
   if (!Array.isArray(ids) || !ids.length || ids.length > 100
@@ -96,7 +99,7 @@ policyRoute(auditRouter, "post", "/audit/events/export.csv", { browserOnly: true
   }
   const deadlineAt = Date.now() + 15_000;
   const audit = getAuditLog(requestScope(request));
-  const validateSession = createExportPublicationValidator(request, "AgentControl.Viewer");
+  const validateSession = createExportPublicationValidator(request, "AgentControl.Admin");
   const receipt = await audit.startEvent({ operationId: `export-administrative-audit:${randomUUID()}`, action: "export-administrative-audit",
     scope: "bulk", agentId: "local-administrative-audit", actor: requestUser(request), requestPath: request.path,
     metadata: { source: "local_administrative_audit" } });

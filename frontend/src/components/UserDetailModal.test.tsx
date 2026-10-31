@@ -46,6 +46,19 @@ beforeEach(() => {
 });
 
 describe("user detail lifecycle", () => {
+  it.each(["initial", "controlled"] as const)("falls back to Overview for a deferred %s Purview tab without mounting log readers", async mode => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      render(<UserDetailModal {...props(mode === "initial" ? { initialTab: "purview" } : { activeTab: "purview" })} />);
+      await screen.findByRole("region", { name: "Saved directory organization" });
+      expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Overview", "Usage & agents", "Licenses", "Responsibility"]);
+      expect(screen.queryByRole("tab", { name: "Logs" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("combobox", { name: "Source" })).not.toBeInTheDocument();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
   it.each(["Company", "Department"] as const)("links %s to a clean, report-scoped Adoption route", async field => {
     const saved = evidence(combinedUser());
     saved.value.directory.companyName = "  H\u00f4pital & Health / +  ";

@@ -361,7 +361,7 @@ describe("inventory HTTP selected-read boundary", () => {
     const response = await post({ selectionId: page.selection.id });
     expect(response.status, await response.clone().text()).toBe(202);
     const job = await response.json();
-    expect(job).toMatchObject({ status: "waiting_authorization", tokenMode: "delegated", targetCount: 101 });
+    expect(job).toMatchObject({ status: "waiting_authorization", tokenMode: "application", targetCount: 101 });
     expect(job.requestedIds).toBeUndefined();
     expect(job.detailTargets).toBeUndefined();
     expect(Buffer.byteLength(JSON.stringify(job))).toBeLessThan(4096);
@@ -374,7 +374,7 @@ describe("inventory HTTP selected-read boundary", () => {
     expect(one.status, await one.clone().text()).toBe(202);
     expect((await one.json()).targetCount).toBe(1);
     expect((await fixture.runtime.query("SELECT count(*)::int AS total FROM data_generations")).rows[0].total).toBe(generations);
-    const targets = await fetch(`${base}/agents/refresh-jobs/${job.id}/targets?mode=delegated&limit=50`, { headers: { cookie } });
+    const targets = await fetch(`${base}/agents/refresh-jobs/${job.id}/targets?mode=application&limit=50`, { headers: { cookie } });
     expect(targets.status, await targets.clone().text()).toBe(200);
     const items = await targets.json();
     expect(items.value).toHaveLength(50);
@@ -590,7 +590,7 @@ describe("inventory HTTP selected-read boundary", () => {
   it("commits the real source head and refresh job together and recovers canonical work off GET", async () => {
     const scope = { tenantId: config.tenants[0].tenantId, principalId };
     const jobs = new PackageRefreshJobs(fixture.runtime);
-    const job = await jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: principalId,
+    const job = await jobs.submit(scope, { tokenMode: "application", authorizationPrincipalId: principalId,
       idempotencyKey: randomUUID() });
     await jobs.markRunning(scope, job.id);
     const input = await inventoryJobInput(fixture.runtime, scope, "packages", job.id);
@@ -612,9 +612,9 @@ describe("inventory HTTP selected-read boundary", () => {
   });
 
   it("stages 5000 refresh targets without metadata arrays and serves current revision-bound HTTP pages", async () => {
-    const scope = { tenantId: config.tenants[0].tenantId, principalId }, jobs = new PackageRefreshJobs(fixture.runtime);
+    const scope = { tenantId: config.tenants[0].tenantId, principalId: config.tenants[0].clientId }, jobs = new PackageRefreshJobs(fixture.runtime);
     const requestedIds = Array.from({ length: 5000 }, (_, index) => `opaque-Target-${String(index).padStart(4, "0")}`);
-    const job = await jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: principalId, requestedIds, idempotencyKey: randomUUID() });
+    const job = await jobs.submit(scope, { tokenMode: "application", authorizationPrincipalId: principalId, requestedIds, idempotencyKey: randomUUID() });
     expect(job.targetCount).toBe(5000);
     expect(job).not.toHaveProperty("requestedIds");
     expect(Buffer.byteLength(JSON.stringify(job))).toBeLessThan(16384);
@@ -632,14 +632,14 @@ describe("inventory HTTP selected-read boundary", () => {
     expect(previous.value).toEqual(first.value);
     await jobs.markRunning(scope, job.id);
     expect((await fetch(`${base}/agents/refresh-jobs/${job.id}/targets?${query}`, { headers: { cookie } })).status).toBe(409);
-    await expect(jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: principalId,
+    await expect(jobs.submit(scope, { tokenMode: "application", authorizationPrincipalId: principalId,
       requestedIds: [...requestedIds, "over-limit"], idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 400 });
   });
 
   it("streams more than twenty exact targets through one fenced generation and commits only the complete job", async () => {
     const scope = { tenantId: config.tenants[0].tenantId, principalId }, jobs = new PackageRefreshJobs(fixture.runtime);
     const ids = Array.from({ length: 21 }, (_, index) => `Exact-${index}`);
-    const job = await jobs.submit(scope, { tokenMode: "delegated", authorizationPrincipalId: principalId,
+    const job = await jobs.submit(scope, { tokenMode: "application", authorizationPrincipalId: principalId,
       requestedIds: ids, idempotencyKey: randomUUID() });
     await jobs.markRunning(scope, job.id);
     const input = await inventoryJobInput(fixture.runtime, scope, "packages", job.id);

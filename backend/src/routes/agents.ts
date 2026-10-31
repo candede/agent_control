@@ -2,7 +2,7 @@ import { requestUser } from "../middleware/requestAuthentication.js";
 import { Router, type Request, type Response } from "express";
 import type pg from "pg";
 import { randomUUID } from "node:crypto";
-import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { getTenantConfiguration } from "../config.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "../db/jobs.js";
 import { PackageRefreshJobs, type PackageDataScope } from "../db/packageRefreshJobs.js";
@@ -12,7 +12,7 @@ import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import { requestScope } from "../middleware/auth.js";
 import { bulkJobs, launchBulkJob, reconcileBulkJob, runTrackedBulkJob } from "../services/bulkJobs.js";
 import { capabilities } from "../services/capabilities.js";
-import { DirectoryPrincipalsClient } from "../services/directoryPrincipals.js";
+import { DirectoryPrincipalsClient, type DirectoryTokens } from "../services/directoryPrincipals.js";
 import { packageInventory } from "../services/packageInventory.js";
 import { GraphPackagesClient } from "../services/graphPackages.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
@@ -30,19 +30,20 @@ const packageRepository = new PackageRefreshJobs();
 const mutationQualifications = new PackageMutationQualificationRepository();
 const graphPackages = new GraphPackagesClient();
 
-policyRoute(agentsRouter, "get", "/directory/principals", { access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], capabilityId: "graph.directory.read" }, async (request, response) => {
+policyRoute(agentsRouter, "get", "/directory/principals", { access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   const search = firstQueryValue(request.query.search) ?? "";
   const limit = parseDirectorySearchLimit(firstQueryValue(request.query.limit));
-  await withDirectoryRequest(request, response, async (token, signal, assertCurrent) => {
-    const value = await directory.search(token, search, limit, signal, assertCurrent);
+  await withDirectoryRequest(request, response, ["user", "group"], async (tokens, signal, assertCurrent) => {
+    if (!tokens.user || !tokens.group) throw new AppError(401, "authorization_required", "Directory search authorization is unavailable.");
+    const value = await directory.search({ user: tokens.user, group: tokens.group }, search, limit, signal, assertCurrent);
     assertCurrent();
     response.json({ value });
   });
 });
-policyRoute(agentsRouter, "post", "/directory/principals/resolve", { access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], capabilityId: "graph.directory.read", csrf: true }, async (request, response) => {
+policyRoute(agentsRouter, "post", "/directory/principals/resolve", { access: "authenticated", dataClass: "directory", roles: ["AgentControl.Viewer"], csrf: true }, async (request, response) => {
   const principals = parsePackageAccessEntities(request.body?.principals, true);
-  await withDirectoryRequest(request, response, async (token, signal, assertCurrent) => {
-    const value = await directory.resolve(token, principals, signal, assertCurrent);
+  await withDirectoryRequest(request, response, principals.map(principal => principal.resourceType), async (tokens, signal, assertCurrent) => {
+    const value = await directory.resolve(tokens, principals, signal, assertCurrent);
     assertCurrent();
     response.json({ value });
   });
@@ -61,15 +62,12 @@ policyRoute(agentsRouter, "post", "/agents/:id/refresh-jobs", { access: "authent
   response.status(202).json(job.status === "waiting_authorization" ? await startPackageRefreshOrWaiting(request, job.id, tokenMode) : job);
 });
 policyRoute(agentsRouter, "get", "/agents/refresh-jobs", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const owner = requestScope(request);
-  const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-  assertAccountSessionValidation(validation);
-  const mode = packageMode(firstQueryValue(request.query.mode));
-  const scope = await savedPackageScope(request, mode);
-  assertAccountSessionValidation(validation);
-  const result = await packageRepository.listJobs(scope, requestUser(request).homeAccountId, positiveInteger(firstQueryValue(request.query.limit), 20, 50));
-  assertAccountSessionValidation(validation);
-  response.json(result);
+  await respondWithCurrentJobRead(request, response, async (owner, assertCurrent) => {
+    const mode = packageMode(firstQueryValue(request.query.mode));
+    const scope = await savedPackageScope(request, mode);
+    assertCurrent();
+    return packageRepository.listJobs(scope, owner.principalId, positiveInteger(firstQueryValue(request.query.limit), 20, 50));
+  });
 });
 policyRoute(agentsRouter, "get", "/agents/refresh-jobs/:id", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.json(await packageInventory.get(requestUser(request), jobId(request), packageMode(firstQueryValue(request.query.mode))));
@@ -77,16 +75,17 @@ policyRoute(agentsRouter, "get", "/agents/refresh-jobs/:id", { access: "authenti
 export function createAgentRefreshTargetsRouter(database: pg.Pool) {
   const router = Router(), repository = new PackageRefreshJobs(database);
   policyRoute(router, "get", "/agents/refresh-jobs/:id/targets", { access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-    const owner = requestScope(request);
-    const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-    assertAccountSessionValidation(validation);
-    const mode = packageMode(firstQueryValue(request.query.mode));
-    if (Object.keys(request.query).some(key => !["mode", "limit", "revision", "cursor"].includes(key))
-      || request.query.limit !== undefined && (typeof request.query.limit !== "string" || !/^[1-9]\d{0,2}$/.test(request.query.limit))) throw new SelectionError("invalid_cursor");
-    const result = await repository.targets(await savedPackageScope(request, mode), await reportIdentity(database, requestUser(request)), jobId(request),
-      { limit: request.query.limit === undefined ? 50 : Number(request.query.limit), revision: firstQueryValue(request.query.revision), cursor: firstQueryValue(request.query.cursor) });
-    assertAccountSessionValidation(validation);
-    response.json(result);
+    await respondWithCurrentJobRead(request, response, async (_owner, assertCurrent) => {
+      const mode = packageMode(firstQueryValue(request.query.mode));
+      if (Object.keys(request.query).some(key => !["mode", "limit", "revision", "cursor"].includes(key))
+        || request.query.limit !== undefined && (typeof request.query.limit !== "string" || !/^[1-9]\d{0,2}$/.test(request.query.limit))) throw new SelectionError("invalid_cursor");
+      const scope = await savedPackageScope(request, mode);
+      assertCurrent();
+      const identity = await reportIdentity(database, requestUser(request));
+      assertCurrent();
+      return repository.targets(scope, identity, jobId(request),
+        { limit: request.query.limit === undefined ? 50 : Number(request.query.limit), revision: firstQueryValue(request.query.revision), cursor: firstQueryValue(request.query.cursor) });
+    });
   });
   return router;
 }
@@ -99,10 +98,11 @@ policyRoute(agentsRouter, "post", "/agents/refresh-jobs/:id/cancel", { access: "
 export function createAgentJobReadRouter(database: pg.Pool) {
 const router = Router(), repository = new JobRepository(database);
 policyRoute(router, "get", "/agents/bulk-jobs/:id", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const scope = requestScope(request);
-  const job = await repository.get(jobId(request), scope);
-  if (!job) throw new AppError(404,"not_found","Job was not found.");
-  response.json(job);
+  await respondWithCurrentJobRead(request, response, async scope => {
+    const job = await repository.get(jobId(request), scope);
+    if (!job) throw new AppError(404,"not_found","Job was not found.");
+    return job;
+  });
 });
 policyRoute(router, "get", "/agents/bulk-jobs/:id/items", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
   response.setHeader("Cache-Control", "private, no-store");
@@ -111,13 +111,16 @@ policyRoute(router, "get", "/agents/bulk-jobs/:id/items", { access: "authenticat
   const query = request.query as Record<string, string>;
   if (query.limit !== undefined && !/^[1-9]\d*$/.test(query.limit)
     || query.revision !== undefined && !/^\d+$/.test(query.revision)) throw new SelectionError("invalid_cursor");
-  response.json(await repository.items(jobId(request), await reportIdentity(database, requestUser(request)), {
-    revision: query.revision, cursor: query.cursor, limit: query.limit === undefined ? 50 : Number(query.limit),
-  }));
+  await respondWithCurrentJobRead(request, response, async (_scope, assertCurrent) => {
+    const identity = await reportIdentity(database, requestUser(request));
+    assertCurrent();
+    return repository.items(jobId(request), identity, {
+      revision: query.revision, cursor: query.cursor, limit: query.limit === undefined ? 50 : Number(query.limit),
+    });
+  });
 });
 policyRoute(router, "get", "/agents/bulk-jobs", { access: "authenticated", dataClass: "private_job", roles: ["AgentControl.Viewer"] }, async (request, response) => {
-  const scope = requestScope(request);
-  response.json(await repository.list(scope, positiveInteger(firstQueryValue(request.query.limit), 20, 50)));
+  await respondWithCurrentJobRead(request, response, scope => repository.list(scope, positiveInteger(firstQueryValue(request.query.limit), 20, 50)));
 });
 return router;
 }
@@ -130,15 +133,20 @@ policyRoute(agentsRouter, "post", "/agents/bulk-jobs/:id/resume", { access: "aut
   if (request.body?.confirmed !== true) throw new AppError(400,"confirmation_required","Explicit confirmation is required to resume unsent work.");
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  assertAccountSessionValidation(validation);
   const id = jobId(request);
   let job = await bulkJobs.get(id, scope);
+  assertAccountSessionValidation(validation);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (job.tokenMode !== "delegated") throw new AppError(409,"invalid_token_mode","This route can resume delegated jobs only.");
   if (job.isCanary) throw new AppError(409, "canary_cycle_authorization_required", "Package canary jobs cannot be resumed outside their original approved cycle.");
   await capabilities.requireAvailable(job.capabilityId, requestUser(request));
+  assertAccountSessionValidation(validation);
   await acquireAuthorizedToken(scope.tenantId, scope.principalId, job.capabilityId);
-  await bulkJobs.recover(scope.tenantId, true, id);
+  await commitAccountSessionValidation(validation, () => bulkJobs.recover(scope.tenantId, true, id));
+  assertAccountSessionValidation(validation);
   job = await bulkJobs.get(id, scope);
+  assertAccountSessionValidation(validation);
   if (!job) throw new AppError(404,"not_found","Job was not found.");
   if (!job.canResume) throw new AppError(409,"not_resumable","No authorized unsent work can be resumed.");
   await commitAccountSessionValidation(validation, async () => launchBulkJob(id, scope, true));
@@ -247,8 +255,8 @@ export function parseMutationScope(value: unknown): "single" | "bulk" {
 
 export async function requireResolvedPrincipals(request: Request, update: PackageAccessUpdate) {
   if (!update.principals.length) return;
-  await withDirectoryRequest(request, request.res, async (token, signal, assertCurrent) => {
-    const resolved = await directory.resolve(token, update.principals, signal, assertCurrent);
+  await withDirectoryRequest(request, request.res, update.principals.map(principal => principal.resourceType), async (tokens, signal, assertCurrent) => {
+    const resolved = await directory.resolve(tokens, update.principals, signal, assertCurrent);
     assertCurrent();
     if (resolved.length !== update.principals.length || resolved.some(principal => principal.principalKind === "unknown")) {
       throw new AppError(409, "unresolved_principal", "Every package access principal must resolve to a current user, security group, or Microsoft 365 group before confirmation.");
@@ -259,17 +267,23 @@ export async function requireResolvedPrincipals(request: Request, update: Packag
 async function withDirectoryRequest(
   request: Request,
   response: Response | undefined,
-  operation: (token: string, signal: AbortSignal, assertCurrent: () => void) => Promise<void>,
+  kinds: readonly PackageAccessEntity["resourceType"][],
+  operation: (tokens: DirectoryTokens, signal: AbortSignal, assertCurrent: () => void) => Promise<void>,
 ) {
   const scope = requestScope(request);
   const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
-  const validateCapability = capabilities.beginOperationValidation("graph.directory.read", requestUser(request));
+  const resourceTypes = [...new Set(kinds.map(kind => {
+    if (kind !== "user" && kind !== "group") throw new AppError(400, "invalid_principal", "Directory lookup requires a user or group.");
+    return kind;
+  }))];
+  const directoryCapabilities = { user: "graph.users.read", group: "graph.directory.read" } as const;
+  const validateCapabilities = resourceTypes.map(kind => capabilities.beginOperationValidation(directoryCapabilities[kind], requestUser(request)));
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]);
   const assertCurrent = () => {
     signal.throwIfAborted();
     assertAccountSessionValidation(validation);
-    validateCapability();
+    for (const validateCapability of validateCapabilities) validateCapability();
     requireProviderAdmissions();
   };
   const disconnected = () => {
@@ -287,11 +301,16 @@ async function withDirectoryRequest(
     const work = async () => {
       try {
         assertCurrent();
-        await capabilities.requireAvailable("graph.directory.read", requestUser(request));
-        assertCurrent();
-        const token = await acquireAuthorizedToken(scope.tenantId, scope.principalId, "graph.directory.read");
-        assertCurrent();
-        await operation(token, signal, assertCurrent);
+        const tokens: DirectoryTokens = {};
+        for (const kind of resourceTypes) {
+          await capabilities.requireAvailable(directoryCapabilities[kind], requestUser(request));
+          assertCurrent();
+          tokens[kind] = kind === "user"
+            ? await acquireApplicationToken(scope.tenantId, "graph.users.read")
+            : await acquireAuthorizedToken(scope.tenantId, scope.principalId, "graph.directory.read");
+          assertCurrent();
+        }
+        await operation(tokens, signal, assertCurrent);
       } catch (error) {
         assertCurrent();
         throw error;
@@ -378,17 +397,17 @@ export function parsePackageRefreshIds(value: unknown) {
   return value === undefined ? undefined : parseIds(value, 5000);
 }
 
-async function savedPackageScope(request: Request, mode: "delegated" | "application"): Promise<PackageDataScope> {
+async function savedPackageScope(request: Request, mode: "application"): Promise<PackageDataScope> {
   const owner = requestScope(request);
-  if (mode === "delegated") return { ...owner, tokenMode: mode };
   await capabilities.requireApplicationDataScope("graph.package.read.application", requestUser(request));
   return { tenantId: owner.tenantId, principalId: getTenantConfiguration(owner.tenantId).clientId, tokenMode: mode };
 }
 
 function packageMode(value: unknown) {
-  if (value === undefined || value === null || value === "") return "delegated" as const;
-  if (value !== "delegated" && value !== "application") throw new AppError(400, "invalid_token_mode", "Package read mode must be delegated or application.");
-  return value;
+  if (value !== undefined && value !== "application") {
+    throw new AppError(400, "invalid_token_mode", "Package collection requires application authentication.");
+  }
+  return "application" as const;
 }
 
 function positiveInteger(value: string | undefined, fallback: number, maximum: number, allowZero = false) {
@@ -528,7 +547,26 @@ function canaryId(value: string) {
   return value.toLowerCase();
 }
 
-async function startPackageRefreshOrWaiting(request: Request, id: string, tokenMode: "delegated" | "application") {
+async function respondWithCurrentJobRead<T>(
+  request: Request,
+  response: Response,
+  read: (scope: ReturnType<typeof requestScope>, assertCurrent: () => void) => Promise<T>,
+) {
+  const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  const assertCurrent = () => assertAccountSessionValidation(validation);
+  assertCurrent();
+  try {
+    const result = await read(scope, assertCurrent);
+    assertCurrent();
+    response.json(result);
+  } catch (error) {
+    assertCurrent();
+    throw error;
+  }
+}
+
+async function startPackageRefreshOrWaiting(request: Request, id: string, tokenMode: "application") {
   try {
     return await packageInventory.start(requestUser(request), id, tokenMode);
   } catch (error) {

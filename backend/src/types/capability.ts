@@ -2,13 +2,15 @@ import type { AuditAction } from "./audit.js";
 
 export const appRoles = [
   "AgentControl.Viewer",
+  "AgentControl.UsageReportUploader",
   "AgentControl.Admin",
 ] as const;
 
 export type AppRole = (typeof appRoles)[number];
 
 export function hasAppRole(roles: readonly AppRole[], role: AppRole): boolean {
-  return roles.includes(role) || (role === "AgentControl.Viewer" && roles.includes("AgentControl.Admin"));
+  return roles.includes(role) || roles.includes("AgentControl.Admin")
+    || (role === "AgentControl.Viewer" && roles.includes("AgentControl.UsageReportUploader"));
 }
 
 export const capabilityIds = [
@@ -18,6 +20,7 @@ export const capabilityIds = [
   "graph.package.block.manage",
   "graph.package.reassign.manage",
   "graph.directory.read",
+  "graph.users.read",
   "graph.agentIdentity.read",
   "graph.licenses.read",
   "powerPlatform.inventory.read",
@@ -33,6 +36,10 @@ export const capabilityIds = [
 
 export type CapabilityId = (typeof capabilityIds)[number];
 
+export function isApplicationCollectionCapability(id: CapabilityId): boolean {
+  return ["graph.package.read.application", "graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"].includes(id);
+}
+
 export function packageMutationCapability(action: AuditAction): "graph.package.block.manage" | "graph.package.access.manage" | "graph.package.reassign.manage" {
   return action === "block" || action === "unblock" ? "graph.package.block.manage" : action === "reassign" ? "graph.package.reassign.manage" : "graph.package.access.manage";
 }
@@ -42,10 +49,9 @@ export type CapabilityCheckProgress = {
 };
 
 const automaticCapabilityIds = new Set<CapabilityId>([
-  "graph.package.read.delegated",
+  "graph.package.read.application",
   "graph.package.access.manage",
   "graph.package.block.manage",
-  "graph.directory.read",
   "powerPlatform.inventory.read",
   "powerPlatform.quarantine.read",
   "powerPlatform.quarantine.manage",

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { join } from "node:path";
-import { acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
+import { acquireApplicationToken, acquireAuthorizedToken, revalidateAuthorizedUser } from "../auth/msal.js";
 import { config } from "../config.js";
 import { AppError, errorTelemetry } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
@@ -114,7 +114,7 @@ export class TemporaryAgentSharingDiagnostic {
             let stage: "request" | "save_page" = "request";
             try {
               const authority = await this.dependencies.authorize(user,
-                graph ? "graph.package.read.delegated" : "powerPlatform.inventory.read",
+                graph ? "graph.package.read.application" : "powerPlatform.inventory.read",
                 { signal: execution.signal, assertCurrent });
               const readAssertCurrent = () => { assertCurrent(); authority.assertCurrent(); };
               readAssertCurrent();
@@ -180,7 +180,7 @@ export class TemporaryAgentSharingDiagnostic {
       const text = accessToken ? value.replaceAll(accessToken, "[REDACTED]") : value;
       const trimmed = text.trimStart();
       // Provider definitions can contain another JSON document inside a string.
-      if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && /token|secret|password|authorization|cookie|api[_-]?key|connection[_-]?string/i.test(text)) {
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
         let embedded: unknown;
         try { embedded = JSON.parse(text); }
         catch (error) { if (!(error instanceof SyntaxError)) throw error; return text; }
@@ -218,7 +218,9 @@ async function authorize(user: AuthenticatedUser, capabilityId: CapabilityId, co
   }
   await interruptible(() => capabilities.requireAvailable(capabilityId, fresh), context.signal);
   assertCurrent();
-  const token = await interruptible(() => acquireAuthorizedToken(tenant, user.homeAccountId, capabilityId), context.signal);
+  const token = await interruptible(() => capabilityId === "graph.package.read.application"
+    ? acquireApplicationToken(tenant, capabilityId)
+    : acquireAuthorizedToken(tenant, user.homeAccountId, capabilityId), context.signal);
   assertCurrent();
   return { token, assertCurrent };
 }

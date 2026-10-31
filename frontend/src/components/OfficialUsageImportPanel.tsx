@@ -24,8 +24,11 @@ const kinds = ["agents", "userAgents", "users"] as const;
 
 export function OfficialUsageImportPanel(props: Props) {
   const capability = useContext(CapabilityContext), principal = useReportPrincipalScope();
-  if (capability && !hasRole(capability.user, "AgentControl.Admin")) return <section className="official-usage-import" aria-label="Import CSV reports">
-    <div className="usage-import-body"><p role="alert">Current Admin access is required to import reports.</p></div>
+  const correctionDenied = Boolean(props.correctionOfSetId) && !hasRole(capability?.user, "AgentControl.Admin");
+  if (capability && (!hasRole(capability.user, "AgentControl.UsageReportUploader") || correctionDenied)) return <section className="official-usage-import" aria-label="Import CSV reports">
+    <div className="usage-import-body"><p role="alert">{correctionDenied
+      ? "Current Admin access is required to replace saved reports."
+      : "Current UsageReportUploader or Admin access is required to import reports."}</p></div>
     <footer className="usage-import-footer"><button type="button" onClick={props.onCancel}>Back to Sync</button></footer></section>;
   const initialStagingId = props.initialStagingId?.toLowerCase(), initialBundleId = props.initialBundleId?.toLowerCase(),
     correctionOfSetId = props.correctionOfSetId?.toLowerCase();

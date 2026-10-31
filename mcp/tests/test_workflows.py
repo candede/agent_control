@@ -990,7 +990,7 @@ async def test_explicit_refresh_and_investigation_do_not_hide_inside_saved_reads
     assert [request.method for request in entra.api_calls] == ["GET", "GET"]
     await workflow(
         "refresh_packages",
-        {"mode": "delegated", "idempotencyKey": "explicit-refresh"},
+        {"mode": "application", "idempotencyKey": "explicit-refresh"},
         job,
         status=202,
     )

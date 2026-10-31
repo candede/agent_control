@@ -48,6 +48,25 @@ beforeEach(() => {
 });
 
 describe("AuditLogView routing", () => {
+  it.each([
+    ["Calling client ID", "client", "originClientId"],
+    ["Calling agent ID", "callingAgent", "originCallingAgentId"],
+  ] as const)("preserves a 256-character Unicode %s through input and history restoration", async (name, key, field) => {
+    window.history.replaceState({}, "", "/audit");
+    render(<AuditLogView agents={[]} />);
+    const input = await screen.findByRole("textbox", { name });
+    const label = "🤖".repeat(256);
+    const user = userEvent.setup();
+    await user.click(input);
+    await user.paste(label);
+    expect(input).toHaveValue(label);
+    await waitFor(() => expect(getAuditEvents).toHaveBeenLastCalledWith(expect.objectContaining({ [field]: label }), expect.anything()));
+    expect(new URLSearchParams(window.location.search).get(key)).toBe(label);
+    fireEvent.popState(window);
+    await waitFor(() => expect(input).toHaveValue(label));
+    fireEvent.change(input, { target: { value: `${label}x` } });
+    expect(input).toHaveValue(label);
+  });
   it("renders origin independently of managed target and displays inert per-field evidence with keyboard focus", async () => {
     window.history.replaceState({}, "", "/audit");
     vi.mocked(getAuditEvents).mockResolvedValue({ count: 1, value: [originEvent] });

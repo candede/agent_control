@@ -92,7 +92,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const saved = [];
     for (const scope of scopes) {
       const job = await repository.submit(scope, {
-        authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "shared-refresh",
+        authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: "shared-refresh",
       });
       await repository.markRunning(scope, job.id);
       const root = await refreshInventoryFixture(fixture.runtime, scope, job.id, "packages", [
@@ -297,7 +297,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const saved = [];
     for (const scope of partitions(`${source}-lineage`, true)) {
       const job = source === "graph_packages"
-        ? await packages.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "same-child" })
+        ? await packages.submit(scope, { authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: "same-child" })
         : await powerPlatform.submit(scope, { roleScope: "full", requestedTypes: [agentType], idempotencyKey: "same-child" });
       const { run } = await repository.submit(scope, { mode: "incremental", sources: [source] });
       saved.push({ scope, run, job });
@@ -324,7 +324,7 @@ describe("multi-tenant repositories with overlapping provider and principal iden
     const [scope, other] = partitions(`${source}-retention`);
     const job = source === "graph_packages"
       ? await new PackageRefreshJobs(fixture.runtime).submit(scope, {
-        authorizationPrincipalId: scope.principalId, tokenMode: "delegated", idempotencyKey: "retained-child",
+        authorizationPrincipalId: scope.principalId, tokenMode: "application", idempotencyKey: "retained-child",
       })
       : await new PowerPlatformRefreshJobs(fixture.runtime).submit(scope, {
         roleScope: "full", requestedTypes: [agentType], idempotencyKey: "retained-child",

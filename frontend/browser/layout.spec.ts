@@ -15,10 +15,10 @@ const cases = [
     fields: [".report-filters"] },
   { name: "audit-local", path: "/audit", ready: ".audit-table-shell tbody tr",
     fields: [".audit-controls"] },
-  { name: "user-purview", path: "/users", ready: ".copilot-users-table tbody tr",
-    fields: [".purview-search-primary"] },
-  { name: "agent-investigation", path: "/agents?detail=graph_packages%3Alayout-package-1&detailTab=audit-security", ready: ".hunting-history-table tbody tr",
-    fields: [".hunting-primary-fields"] },
+  { name: "user-details", path: "/users", ready: ".copilot-users-table tbody tr",
+    fields: [] },
+  { name: "agent-details", path: "/agents?detail=graph_packages%3Alayout-package-1&detailTab=audit-security", ready: ".unified-agent-detail-modal",
+    fields: [] },
   { name: "permissions", path: "/permissions", ready: ".permission-issue-list > li",
     fields: [] },
   { name: "sync-history", path: "/sync", ready: ".sync-history-table tbody tr",
@@ -44,25 +44,22 @@ for (const scenario of cases) {
     const unexpectedRequests = await mockLayoutApi(page);
     await page.goto(scenario.path);
     await expect(page.locator(scenario.ready).first()).toBeVisible();
-    if (scenario.name !== "agent-investigation") {
+    if (scenario.name !== "agent-details") {
       const permissions = page.getByRole("button", { name: "Permissions", exact: true, includeHidden: scenario.name === "report-snapshot" });
       await expect(permissions).toHaveCount(1);
       await expect(permissions).toBeVisible();
       await expect(permissions).toHaveAccessibleDescription(/^Permissions: \d+ issues?$/);
     }
 
-    if (scenario.name === "user-purview") {
+    if (scenario.name === "user-details") {
       await page.getByRole("button", { name: "Ada", exact: true }).click();
-      await page.getByRole("tab", { name: "Logs", exact: true }).click();
-      await expect(page.locator(".purview-history-table tbody tr")).toBeVisible();
-      await expect(page.getByRole("textbox", { name: "User principal names", exact: true })).toHaveCount(0);
-      await page.locator(".purview-history-table").getByRole("button", { name: /View/ }).click();
-      await expect(page.locator(".purview-results tbody tr").first()).toBeVisible();
+      await expect(page.getByRole("tab", { name: "Logs", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("region", { name: "Saved directory organization" })).toBeVisible();
     }
-    if (scenario.name === "agent-investigation") {
-      await expect(page.getByLabel("Agent IDs", { exact: true })).toHaveCount(0);
-      await page.getByRole("button", { name: /View hunt/ }).click();
-      await expect(page.getByText("Saved service desk security observation", { exact: true })).toBeVisible();
+    if (scenario.name === "agent-details") {
+      await expect(page.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute("aria-selected", "true");
+      await expect(page.getByRole("tab", { name: "Activity", exact: true })).toHaveCount(0);
+      await expect(page.getByRole("combobox", { name: "Source", exact: true })).toHaveCount(0);
       await expect(page).toHaveURL(/\/agents\?.*detailTab=audit-security/);
     }
     if (scenario.name === "permissions") {
@@ -71,10 +68,8 @@ for (const scenario of cases) {
       await prerequisites.getByText("Required API permissions", { exact: true }).click();
       await prerequisites.getByText("Optional application permissions", { exact: true }).click();
       await expect(prerequisites.getByRole("region", { name: "Microsoft Graph / Application", exact: true })).toBeVisible();
-      const logs = page.getByRole("region", { name: "Log setup" });
-      await logs.getByText("Log collection setup", { exact: true }).click();
-      await logs.getByText("Steps & permissions", { exact: true }).nth(2).click();
-      await expect(logs.getByText(/Get-AdminAuditLogConfig \| Format-List UnifiedAuditLogIngestionEnabled/)).toBeVisible();
+      await expect(page.getByRole("region", { name: "Log setup" })).toHaveCount(0);
+      await expect(page.getByRole("link", { name: "Log setup", exact: true })).toHaveCount(0);
     }
     if (scenario.name === "report-snapshot") {
       await expect(page.locator(".usage-report-context")).toContainText("2026-08-30");
@@ -117,14 +112,6 @@ for (const scenario of cases) {
           expect.soft(columns, `${selector} column contract at ${width}px`).toBe(expectedColumns);
           await page.keyboard.press("Escape");
           await expect(page.getByRole("button", { name: "Filters", exact: true })).toBeFocused();
-        }
-        if (scenario.name === "agent-investigation") {
-          await expect(page.getByRole("region", { name: "Defender log coverage and setup" })).toHaveCount(0);
-          await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agent_activity");
-          await expect(page.getByLabel("Actor object IDs", { exact: true })).toHaveCount(0);
-          await page.screenshot({ path: info.outputPath(`agent-investigation-${width}-activity-filters.png`), fullPage: true, animations: "disabled" });
-          await assertLayout(page, scenario.fields, `agent-scoped activity form at ${width}px`);
-          await page.getByRole("combobox", { name: "Log type", exact: true }).selectOption("agents_inventory");
         }
         if (scenario.name === "report-snapshot") {
           const totals = page.getByRole("region", { name: "Snapshot tenant totals" });

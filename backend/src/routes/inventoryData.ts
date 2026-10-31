@@ -1,7 +1,7 @@
 import { requestUser } from "../middleware/requestAuthentication.js";
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import type pg from "pg";
-import { config } from "../config.js";
+import { config, getTenantConfiguration } from "../config.js";
 import { InventoryQueries, type InventoryQuery } from "../db/inventoryQueries.js";
 import type { SelectionIdentity } from "../services/dataSelections.js";
 import { AppError } from "../errors.js";
@@ -17,6 +17,7 @@ import { assertAccountSessionValidation, beginAccountSessionValidation, commitAc
 import { requestScope } from "../middleware/auth.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
 import type { UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
+import { hasAppRole } from "../types/capability.js";
 
 function scalar(value: unknown, name: string, maximum = 4096) {
   if (typeof value !== "string" || !value || value.length > maximum || /[\0\r\n]/.test(value)) {
@@ -27,6 +28,20 @@ function scalar(value: unknown, name: string, maximum = 4096) {
 
 function searchScalar(value: unknown) {
   return value === "" ? value : scalar(value, "search", 256);
+}
+
+function inventoryPublication(request: Request, response: Response) {
+  const scope = requestScope(request);
+  const validation = beginAccountSessionValidation(scope.tenantId, scope.principalId);
+  return (value: unknown, status = 200) => {
+    assertAccountSessionValidation(validation);
+    const currentScope = requestScope(request);
+    if (currentScope.tenantId !== scope.tenantId || currentScope.principalId !== scope.principalId
+      || !hasAppRole(requestUser(request).roles, "AgentControl.Viewer")) {
+      throw AppError.unauthorized();
+    }
+    response.status(status).json(value);
+  };
 }
 
 export function createInventoryDataRouter(database: pg.Pool) {
@@ -94,18 +109,20 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "post", "/agent-inventory/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const query = capturedQuery(request);
     const result = await capture(await reportIdentity(database, requestUser(request)), query);
-    response.status("state" in result ? 200 : 201).json(result);
+    publish(result, "state" in result ? 200 : 201);
   });
   policyRoute(router, "get", "/agent-inventory/health", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     if (Object.keys(request.query).length) throw new AppError(400, "invalid_inventory_query", "Workspace health does not accept selection IDs or filters.");
     const identity = await reportIdentity(database, requestUser(request));
     const selected = await capture(identity, {});
     response.setHeader("Cache-Control", "no-store");
-    if ("state" in selected) { response.json(selected); return; }
+    if ("state" in selected) { publish(selected); return; }
     let receipt: UnifiedAgentInventoryHealth;
     try {
       const { freshness, summary, verification, identityCollection, sources, partial, errors } =
@@ -114,17 +131,19 @@ export function createInventoryDataRouter(database: pg.Pool) {
     } finally {
       await inventory.selections.invalidate(selected.id, identity);
     }
-    response.json(receipt);
+    publish(receipt);
   });
   policyRoute(router, "post", "/agents/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const query = capturedQuery(request);
-    response.status(201).json(await capturePackages(await packageReader(request), query));
+    publish(await capturePackages(await packageReader(request), query), 201);
   });
   policyRoute(router, "post", "/agents/refresh-selection", {
     access: "authenticated", dataClass: "private_inventory_job", roles: ["AgentControl.Viewer"], csrf: true,
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const body = request.body;
     if (Object.keys(request.query).length || !body || typeof body !== "object" || Array.isArray(body)
       || Object.keys(body).some(key => !["selectionId", "ids", "recordIds"].includes(key))) {
@@ -132,7 +151,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     }
     const user = requestUser(request), owner = requestScope(request);
     const validation = beginAccountSessionValidation(owner.tenantId, owner.principalId);
-    const validateCapability = capabilities.beginOperationValidation("graph.package.read.delegated", user);
+    const validateCapability = capabilities.beginOperationValidation("graph.package.read.application", user);
     const assertCurrent = () => {
       assertAccountSessionValidation(validation);
       validateCapability();
@@ -142,12 +161,12 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const identity = await reportIdentity(database, requestUser(request));
     assertCurrent();
     const job = await commitAccountSessionValidation(validation, () => new PackageRefreshJobs(database).submitSelected(
-      { tenantId: identity.tenantId, principalId: identity.principalId, tokenMode: "delegated" }, identity, {
+      { tenantId: identity.tenantId, principalId: getTenantConfiguration(identity.tenantId).clientId, tokenMode: "application" }, identity, {
         selectionId: scalar(body.selectionId, "selectionId", 36), ids: body.ids, recordIds: body.recordIds,
         idempotencyKey: request.get("Idempotency-Key") ?? randomUUID(),
       }, assertCurrent));
     assertCurrent();
-    response.status(202).json(job);
+    publish(job, 202);
   });
   async function selected(request: Request, dependent = false, extra: string[] = [], unfiltered = false) {
     const identity = await reportIdentity(database, requestUser(request));
@@ -180,40 +199,45 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "get", "/agent-inventory", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request);
-    response.json(inventoryPresentation(await inventory.page(read.id, read.identity, read.options)));
+    publish(inventoryPresentation(await inventory.page(read.id, read.identity, read.options)));
   });
   policyRoute(router, "get", "/agent-inventory/summary", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true);
-    response.json(await inventory.summary(read.id, read.identity));
+    publish(await inventory.summary(read.id, read.identity));
   });
   policyRoute(router, "get", "/agent-responsibility", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const query = agentResponsibilityQuery(request.query);
     const read = await selected(request, false, ["objectId"], true);
     const { sourceRows, selected: person, ...result } = await inventory.responsibility(read.id, read.identity, query);
     const sources = inventorySourceStatuses(sourceRows, result.selection.evaluatedAt);
-    response.json({ ...result, sources, selected: person ? { ...person,
+    publish({ ...result, sources, selected: person ? { ...person,
       state: sources.powerPlatform.state === "unavailable" ? "unavailable" : person.count ? "reported" : "no_reported_relationships" } : null });
   });
   policyRoute(router, "get", "/agent-inventory/facets", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true, ["field", "search", "selected"]);
     if (request.query.selected !== undefined && request.query.selected !== "true" && request.query.selected !== "false") {
       throw new AppError(400, "invalid_inventory_query", "Use a boolean selected facet flag.");
     }
     const field = scalar(request.query.field, "field", 32) as Parameters<InventoryQueries["facets"]>[2];
-    response.json(await inventory.facets(read.id, read.identity, field, { ...read.options,
+    publish(await inventory.facets(read.id, read.identity, field, { ...read.options,
       search: request.query.search === undefined ? undefined : searchScalar(request.query.search),
       selected: request.query.selected === "true" }));
   });
   policyRoute(router, "get", "/agents/:id/detail", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     for (const key of Object.keys(request.query)) {
       if (key !== "selectionId") throw new AppError(400, "invalid_inventory_query", `Unsupported detail field: ${key}.`);
     }
@@ -223,11 +247,12 @@ export function createInventoryDataRouter(database: pg.Pool) {
     }
     const identity = await reportIdentity(database, requestUser(request));
     const selectedPackages = new InventoryQueries(database, config.sessionSecret, config.officialUsageStaleDays);
-    response.json(await selectedPackages.packageDetail(selectionId, identity, scalar(request.params.id, "package ID", 512)));
+    publish(await selectedPackages.packageDetail(selectionId, identity, scalar(request.params.id, "package ID", 512)));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/detail", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true);
     const page = inventoryPresentation(await inventory.page(read.id, read.identity, {
       limit: 2, recordId: scalar(request.params.recordId, "recordId", queryFieldMaximums.recordId),
@@ -236,16 +261,17 @@ export function createInventoryDataRouter(database: pg.Pool) {
     if (page.value.length > 1 || page.page?.nextCursor) throw new AppError(409, "inventory_identity_ambiguous", "The exact source reference has multiple selected memberships.");
     const record = page.value[0], bytes = Buffer.byteLength(JSON.stringify(record));
     if (bytes > 524288) throw dataLimitError("inventory_detail_bytes", 524288, bytes);
-    response.json(record);
+    publish(record);
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/children", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true, ["kind", "sourceScopeId", "sourceIdentity", "value"]);
     if (request.query.sourceScopeId !== undefined && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(String(request.query.sourceScopeId))) {
       throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     }
-    response.json(await inventory.children(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.children(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
       { ...read.options, kind: scalar(request.query.kind, "kind", 128),
         sourceScopeId: request.query.sourceScopeId === undefined ? undefined : scalar(request.query.sourceScopeId, "sourceScopeId", 36),
         sourceIdentity: request.query.sourceIdentity === undefined ? undefined : scalar(request.query.sourceIdentity, "sourceIdentity", 512),
@@ -254,32 +280,36 @@ export function createInventoryDataRouter(database: pg.Pool) {
   policyRoute(router, "get", "/agent-inventory/:recordId/members", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true);
-    response.json(await inventory.members(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""), read.options));
+    publish(await inventory.members(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""), read.options));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/sections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true, ["sourceScopeId", "sourceIdentity"]);
     const sourceScopeId = scalar(request.query.sourceScopeId, "sourceScopeId", 36);
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
-    response.json(await inventory.sections(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.sections(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
       { ...read.options, sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512) }));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/about", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const read = await selected(request, true, ["sourceScopeId", "sourceIdentity", "field"]);
     const sourceScopeId = scalar(request.query.sourceScopeId, "sourceScopeId", 36);
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     const field = scalar(request.query.field, "field", 16);
     if (field !== "long" && field !== "short" && field !== "native") throw new AppError(400, "invalid_inventory_query", "Use long, native or short About text.");
-    response.json(await inventory.about(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.about(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
       { sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512), field, cursor: read.options.cursor }));
   });
   policyRoute(router, "get", "/agents", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
+    const publish = inventoryPublication(request, response);
     const allowed = ["selectionId", "cursor", "limit", ...filterFields];
     for (const [key, value] of Object.entries(request.query)) {
       if (!allowed.includes(key)) throw new AppError(400, "invalid_inventory_query", `Unsupported package query field: ${key}.`);
@@ -301,7 +331,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     }
     const page = await packages.page(id, identity, { limit, cursor,
       expectedQuery: Object.fromEntries(Object.entries(filters).filter(([key]) => Object.hasOwn(request.query, key))) });
-    response.json({ value: page.value.map(row => ({ ...row.residual, columns: row.columns, sourceIdentity: row.id })),
+    publish({ value: page.value.map(row => ({ ...row.residual, columns: row.columns, sourceIdentity: row.id })),
       selection: page.selection, counts: page.counts, page: page.page, freshness: page.freshness });
   });
   return router;

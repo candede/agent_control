@@ -29,17 +29,17 @@ const admin: AppRole[] = ["AgentControl.Admin"];
 
 export const capabilityDefinitions: readonly CapabilityDefinition[] = [
   {
-    id: "graph.package.read.delegated", displayName: "Package catalog read", purpose: "Read the Microsoft 365 Copilot package catalog on behalf of the signed-in user.",
+    id: "graph.package.read.delegated", displayName: "Package control readback", purpose: "Reconcile an administrator's exact package-control result using the administrator's delegated authority; ordinary collection uses application access.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
-    permissions: ["CopilotPackages.Read.All"], acceptedPermissions: ["CopilotPackages.ReadWrite.All"], providerRoles: [], licenses: ["Microsoft Agent 365"],
-    configuration: ["Single-tenant Entra application", "Delegated consent"], sources: [packageListSource, packageDetailSource], dataClass: "inventory", internalRoles: viewer,
-    consentGroup: "graph.package.read", probe: { kind: "provider_read", adapterRegistered: true, description: "Response-size/time-bounded package catalog first-page read using the documented filter, without following pagination." },
+    permissions: ["CopilotPackages.ReadWrite.All"], providerRoles: [], licenses: ["Microsoft Agent 365"],
+    configuration: ["Delegated consent"], sources: [packageDetailSource], dataClass: "package_control", internalRoles: admin,
+    consentGroup: "graph.package.manage", probe: { kind: "on_demand", adapterRegistered: true, description: "Reconcile an exact previously submitted control. Microsoft authorizes the delegated request when it runs." },
   },
   {
-    id: "graph.package.read.application", displayName: "Package catalog application read", purpose: "Run an explicitly requested shared package catalog read using the application identity.",
+    id: "graph.package.read.application", displayName: "Package inventory", purpose: "Collect tenant-shared packages and package details using the application identity.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "application",
     permissions: ["CopilotPackages.Read.All"], acceptedPermissions: ["CopilotPackages.ReadWrite.All"], providerRoles: [], licenses: ["Microsoft Agent 365"],
-    configuration: ["Admin-enabled application mode", "Admin-approved shared data scope"], sources: [packageListSource, packageDetailSource], dataClass: "inventory", internalRoles: viewer,
+    configuration: ["Tenant application credentials", "Application admin consent"], sources: [packageListSource, packageDetailSource], dataClass: "inventory", internalRoles: viewer,
     probe: { kind: "provider_read", adapterRegistered: true, description: "Response-size/time-bounded package catalog first-page read using an application token and the documented filter, without following pagination." },
   },
   {
@@ -64,11 +64,19 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "not_registered", adapterRegistered: false, description: "The beta POST contract is documented, but package detail exposes no owner field for required provider readback." },
   },
   {
-    id: "graph.directory.read", displayName: "Directory lookup", purpose: "Resolve agent people and users or groups for exact package access assignments.",
+    id: "graph.directory.read", displayName: "Management group lookup", purpose: "Find and validate groups for exact administrative package access assignments.",
     provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
-    permissions: ["User.ReadBasic.All", "Group.Read.All"], providerRoles: [], licenses: [], configuration: ["Delegated consent"],
+    permissions: ["Group.Read.All"], providerRoles: [], licenses: [], configuration: ["Delegated consent"],
     sources: [directorySource], dataClass: "directory", internalRoles: viewer, consentGroup: "graph.directory.read",
-    probe: { kind: "provider_read", adapterRegistered: true, description: "Bounded directory lookup through the existing adapter." },
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Explicit management group lookup. Microsoft authorizes the delegated request when it runs." },
+  },
+  {
+    id: "graph.users.read", displayName: "User lookup", purpose: "Find and validate management user recipients and resolve exact agent creators and owners using read-only application access.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "application",
+    permissions: ["User.Read.All"], providerRoles: [], licenses: [],
+    configuration: ["Tenant application credentials", "Application admin consent"],
+    sources: [directorySource], dataClass: "directory", internalRoles: viewer,
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Exact user resolution uses application permissions; no signed-in user's Microsoft directory role is required." },
   },
   {
     id: "graph.agentIdentity.read", displayName: "Agent identity resolution", purpose: "Explicitly verify one saved Copilot Studio Entra agent identity for scoped investigations.",
@@ -83,11 +91,11 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "on_demand", adapterRegistered: true, description: "Only an explicit resolve action reads the typed agentIdentity endpoint; context reads use saved mappings. Microsoft authorizes the delegated request when it runs." },
   },
   {
-    id: "graph.licenses.read", displayName: "M365 Copilot licenses", purpose: "Read Copilot-capable product assignments and verify active paid Microsoft 365 Copilot features, separately from basic Copilot Chat access.",
-    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
-    permissions: ["User.Read.All", "LicenseAssignment.Read.All"], providerRoles: ["Directory Readers", "Global Reader"], licenses: [], configuration: ["Delegated consent"],
-    sources: ["https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0", "https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0"], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "graph.licenses.read",
-    probe: { kind: "on_demand", adapterRegistered: true, description: "Explicit Users sync checks filtered directory candidates and paid-feature evidence in bulk; a containing product assignment alone is not Copilot entitlement. Microsoft authorizes the delegated request when it runs." },
+    id: "graph.licenses.read", displayName: "M365 Copilot licenses", purpose: "Read Copilot-capable product assignments and verify active paid Microsoft 365 Copilot features using application access, separately from basic Copilot Chat access.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "application",
+    permissions: ["User.Read.All", "LicenseAssignment.Read.All"], providerRoles: [], licenses: [], configuration: ["Tenant application credentials", "Application admin consent"],
+    sources: ["https://learn.microsoft.com/en-us/graph/api/user-list?view=graph-rest-1.0", "https://learn.microsoft.com/en-us/graph/api/subscribedsku-list?view=graph-rest-1.0"], dataClass: "licensed_usage", internalRoles: viewer,
+    probe: { kind: "on_demand", adapterRegistered: true, description: "Explicit Users sync checks filtered directory candidates and paid-feature evidence in bulk; a containing product assignment alone is not Copilot entitlement. Microsoft authorizes the application request when it runs." },
   },
   {
     id: "powerPlatform.inventory.read", displayName: "Power Platform inventory", purpose: "Read tenant Power Platform resource inventory on explicit request.",
@@ -139,17 +147,17 @@ export const capabilityDefinitions: readonly CapabilityDefinition[] = [
     probe: { kind: "on_demand", adapterRegistered: true, description: "Run the requested hunt with an application token in the configured shared data scope." },
   },
   {
-    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot usage", purpose: "Read the D28 per-user Microsoft 365 Copilot app activity report during Users sync.",
-    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "delegated",
-    permissions: ["Reports.Read.All"], providerRoles: ["Company Administrator", "AI Administrator", "Exchange Administrator", "SharePoint Administrator", "Lync Administrator", "Teams Service Administrator", "Teams Communications Administrator", "Reports Reader"], licenses: [],
-    configuration: ["Delegated consent", "Microsoft 365 usage report privacy settings can conceal user identities"],
-    sources: [copilotUsageReportSource], dataClass: "licensed_usage", internalRoles: viewer, consentGroup: "reports.copilotUsage.read",
+    id: "reports.copilotUsage.read", displayName: "Microsoft 365 Copilot app activity", purpose: "Read the D28 per-user Microsoft 365 Copilot app activity report using application access; this does not replace the three agent-usage CSV reports.",
+    provider: "Microsoft Graph", maturity: "v1.0", cloud: "global", audience: graphAudience, mode: "application",
+    permissions: ["Reports.Read.All"], providerRoles: [], licenses: [],
+    configuration: ["Tenant application credentials", "Application admin consent", "Microsoft 365 usage report privacy settings can conceal user identities"],
+    sources: [copilotUsageReportSource], dataClass: "licensed_usage", internalRoles: viewer,
     probe: { kind: "on_demand", adapterRegistered: true, description: "Users sync validates the bounded report request; saved dashboard reads and background capability checks never scan the report." },
   },
   {
-    id: "reports.official.import", displayName: "Import reports", purpose: "Validate and import administrator-supplied Microsoft 365 usage CSV reports in Sync > Import reports; manage retained reports in Sync > Manage reports.",
+    id: "reports.official.import", displayName: "Import reports", purpose: "Upload, validate and publish new Microsoft 365 usage CSV report sets. Replacing and deleting saved reports requires Admin.",
     provider: "Local", maturity: "local", cloud: "local", audience: "agent-control", mode: "local", permissions: [], providerRoles: [], licenses: [],
-    configuration: ["Admin-submitted files", "Tenant-shared aggregate and user-level data"], sources: [reportsSource], dataClass: "report_import", internalRoles: admin,
+    configuration: ["UsageReportUploader or Admin-submitted files", "Tenant-shared aggregate and user-level data"], sources: [reportsSource], dataClass: "report_import", internalRoles: ["AgentControl.UsageReportUploader"],
     probe: { kind: "local_policy", adapterRegistered: true, description: "Local authorization policy only; no Microsoft token or probe." },
   },
 ] as const;

@@ -7,13 +7,22 @@ import { CapabilityService } from "../services/capabilities.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { CapabilityRepository } from "./capabilities.js";
 
+vi.hoisted(() => {
+  process.env.TENANTS_JSON = JSON.stringify([
+    { tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-2222-2222-222222222222",
+      clientSecret: "synthetic-operation-evidence-a", domains: ["example.invalid"] },
+    { tenantId: "33333333-3333-3333-3333-333333333333", clientId: "44444444-4444-4444-4444-444444444444",
+      clientSecret: "synthetic-operation-evidence-b", domains: ["other.example.invalid"] },
+  ]);
+});
+
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { fixture = await testDatabase(); });
 afterAll(async () => { await fixture?.close(); });
 
 const capabilityId = "graph.licenses.read";
 function user(): AuthenticatedUser {
-  return { tenantId: randomUUID(), homeAccountId: randomUUID(), displayName: "Fixture",
+  return { tenantId: "11111111-1111-1111-1111-111111111111", homeAccountId: randomUUID(), displayName: "Fixture",
     username: "fixture@example.invalid", roles: ["AgentControl.Viewer"] };
 }
 function service() {
@@ -59,7 +68,7 @@ describe("persistent latest operation evidence", () => {
   it("isolates principals and tenants and invalidates both readiness and operation evidence together", async () => {
     const actor = user();
     const otherPrincipal = { ...actor, homeAccountId: randomUUID() };
-    const otherTenant = { ...actor, tenantId: randomUUID() };
+    const otherTenant = { ...actor, tenantId: "33333333-3333-3333-3333-333333333333" };
     const { value } = service();
     await denied(value, actor);
     expect(await failure(value, otherPrincipal)).toBeUndefined();

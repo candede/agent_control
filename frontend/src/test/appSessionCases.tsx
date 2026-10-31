@@ -48,6 +48,7 @@ const viewer: SessionUser = {
   tenantId: "tenant-1",
   roles: ["AgentControl.Viewer"],
 };
+const admin: SessionUser = { ...viewer, roles: ["AgentControl.Admin"] };
 
 function activeBulkJobStorageKey(user: SessionUser = viewer) {
   return `agent-control:active-bulk-job:v2:${encodeURIComponent(user.tenantId ?? "")}:${encodeURIComponent(user.homeAccountId)}`;
@@ -409,6 +410,19 @@ export function sessionAndNavigationCases() {
     expect(screen.queryByRole("heading", { name: "Understand adoption. Empower your people." })).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname === "/api/official-usage/history/adoption")).toBe(false);
   });
+
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader"] as const)(
+    "hides Audit and does not read audit logs when %s opens its direct URL", async role => {
+      window.history.replaceState({}, "", "/audit");
+      const transport = appTransport({ initialRoles: [role], revalidatedRoles: [role] });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByRole("button", { name: "Sign out" });
+      expect(screen.queryByRole("button", { name: "Audit" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Audit evidence" })).not.toBeInTheDocument();
+      expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname.startsWith("/api/audit/events"))).toBe(false);
+    },
+  );
 
   it("shows checking then Users sync progress on sign-in and adopts published counts without a manual task", async () => {
     vi.useFakeTimers();
@@ -791,8 +805,9 @@ export function sessionAndNavigationCases() {
     expect(reads()).toBe(1);
   });
 
-  it("checks automatic Users refresh after a CSV import and invalidates saved views once, not again when acknowledging it", async () => {
-    const roles: SessionUser["roles"] = ["AgentControl.Admin"];
+  it.each(["AgentControl.Admin", "AgentControl.UsageReportUploader"] as const)(
+    "checks automatic Users refresh after a CSV import by %s and invalidates saved views once, not again when acknowledging it", async role => {
+    const roles: SessionUser["roles"] = [role];
     const saved = verifiedSavedAgentPage();
     const transport = appTransport({ initialRoles: roles, revalidatedRoles: roles, unifiedResponse: saved });
     const original = transport.fetchMock.getMockImplementation()!;
@@ -1315,12 +1330,15 @@ export function sessionAndNavigationCases() {
   });
 
   it.each([
-    { boundary: "same-account revalidation", user: viewer, roles: viewer.roles },
-    { boundary: "account replacement", user: { ...viewer, tenantId: "tenant-2", homeAccountId: "viewer-2" }, roles: viewer.roles },
+    { boundary: "same-account revalidation", user: admin, roles: admin.roles },
+    { boundary: "account replacement", user: { ...admin, tenantId: "tenant-2", homeAccountId: "viewer-2" }, roles: admin.roles },
+    { boundary: "downgrade to Viewer", user: viewer, roles: viewer.roles },
+    { boundary: "downgrade to Uploader", user: viewer, roles: ["AgentControl.UsageReportUploader"] satisfies SessionUser["roles"] },
     { boundary: "role removal", user: viewer, roles: [] as SessionUser["roles"] },
   ])("retires local audit reads, details and exports on $boundary", async ({ user, roles }) => {
     window.history.replaceState({}, "", "/audit");
-    const transport = appTransport({ revalidatedRoles: roles, revalidatedUser: user });
+    const transport = appTransport({ initialRoles: admin.roles, revalidatedRoles: roles, revalidatedUser: user });
+    const retainsAudit = roles.includes("AgentControl.Admin");
     const base = transport.fetchMock.getMockImplementation()!;
     const pendingExport = deferredResponse(), pendingRead = deferredResponse();
     const previousEvent: AuditEvent = {
@@ -1361,15 +1379,19 @@ export function sessionAndNavigationCases() {
     expect(screen.queryByRole("dialog", { name: "Event details" })).not.toBeInTheDocument();
     expect(screen.queryByText("Previous audit actor")).not.toBeInTheDocument();
     expect(exportSignal?.aborted).toBe(true);
-    if (roles.length) expect(await screen.findByText("Current audit actor")).toBeVisible();
-    else expect(screen.queryByRole("button", { name: "Export current audit page CSV" })).not.toBeInTheDocument();
+    if (retainsAudit) expect(await screen.findByText("Current audit actor")).toBeVisible();
+    else {
+      expect(screen.queryByRole("button", { name: "Export current audit page CSV" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Audit" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Audit evidence" })).not.toBeInTheDocument();
+    }
     const sessionReads = transport.meCalls();
     await act(async () => pendingExport.resolve(new Response("obsolete,audit,csv")));
     expect(download).not.toHaveBeenCalled();
     expect(transport.meCalls()).toBe(sessionReads);
-    expect(auditReads).toBe(roles.length ? 2 : 1);
+    expect(auditReads).toBe(retainsAudit ? 2 : 1);
 
-    if (roles.length) {
+    if (retainsAudit) {
       // Exercise the same boundary with an unfinished saved read, not just an export.
       replaced = false;
       await userEvent.click(screen.getByRole("button", { name: "Refresh audit log" }));
@@ -5338,7 +5360,7 @@ export function savedInventoryCases() {
     let verificationRequested = false;
     transport.fetchMock.mockImplementation(async (input, init) => {
       if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
-        const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
+        const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
         return Response.json({ value: [{ enabled: true, definition, decision: {
           capabilityId: definition.id, status: "available", authorized: true, fresh: true, verification: "provider",
           checkedAt: new Date(Date.now() - 1000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
@@ -5537,7 +5559,8 @@ export function savedInventoryCases() {
     expect(overview.getByText("Understand and manage your organization's AI agents, from adoption to access.")).toBeInTheDocument();
     expect(overview.getByRole("heading", { name: "Know your agent inventory" })).toBeInTheDocument();
     expect(overview.getByRole("heading", { name: "Understand adoption" })).toBeInTheDocument();
-    expect(overview.getByRole("heading", { name: "Manage access and investigate" })).toBeInTheDocument();
+    expect(overview.getByRole("heading", { name: "Manage agent access" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent administration. A single workspace." })).not.toHaveTextContent(/Purview|Defender/);
     expect(screen.queryByText(/outstanding delegated permissions|Consent does not run investigations/)).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/capabilities"))).toBe(false);
   });
@@ -6318,7 +6341,7 @@ export function savedInventoryCases() {
     })).toBe(true);
     expect(screen.queryByText(/Bulk-reference filters require/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Users" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Audit" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Audit" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Security" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Manage access for/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Block Sensitive/ })).not.toBeInTheDocument();
@@ -8359,7 +8382,7 @@ export function savedInventoryCases() {
         const url = new URL(input, "http://localhost");
         if (url.pathname === "/api/capabilities" || url.pathname === "/api/capabilities/check") {
           const definitions = capabilityDefinitions.filter(item =>
-            item.id === "graph.package.read.delegated"
+            item.id === "graph.package.read.application"
             || item.id === "powerPlatform.inventory.read");
           return Response.json({ value: definitions.map(definition => ({
             enabled: true, definition,
@@ -8985,7 +9008,7 @@ export function savedInventoryCases() {
     expect(screen.queryByRole("region", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
     expect(screen.getByRole("list", { name: "First sync sources" }).children).toHaveLength(3);
-    expect(within(notice).queryByRole("button")).not.toBeInTheDocument();
+    expect(within(notice).getByRole("button", { name: "Continue to workspace" })).toBeVisible();
     expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs?"))).toBe(false);
 
@@ -9162,6 +9185,32 @@ export function commandsAndExportsCases() {
     expect(refreshRequests(transport.fetchMock)).toHaveLength(1);
   });
 
+  it.each(["Refresh agents", "Refresh matching details"] as const)(
+    "explains application authorization when %s returns no provider diagnostic",
+    async action => {
+      const transport = initialCatalogTransport();
+      const base = transport.fetchMock.getMockImplementation()!;
+      const job = { ...completedRefreshJob(), status: "waiting_authorization" };
+      const path = action === "Refresh agents" ? "/api/agents/refresh-jobs" : "/api/agents/refresh-selection";
+      transport.fetchMock.mockImplementation((input, init) => input === path && init?.method === "POST"
+        || input === `/api/agents/refresh-jobs/${job.id}/resume`
+        ? Promise.resolve(Response.json(job)) : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` }));
+      await userEvent.click(screen.getByRole("button", { name: /^Sync/ }));
+      await userEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+      const dialog = within(screen.getByRole("dialog", { name: "Inventory diagnostics" }));
+      await waitFor(() => expect(dialog.getByRole("button", { name: action })).toBeEnabled());
+      await userEvent.click(dialog.getByRole("button", { name: action }));
+      const alert = await dialog.findByRole("alert");
+      expect(alert).toHaveTextContent("current Microsoft Graph application authorization");
+      expect(alert).not.toHaveTextContent(/delegated|request consent/i);
+      expect(dialog.getByRole("button", { name: action })).toBeEnabled();
+      expect(transport.fetchMock.mock.calls.filter(([input, init]) => input === path && init?.method === "POST")).toHaveLength(1);
+    },
+  );
+
   it("keeps package refresh explicit and allows an explicit retry after failure", async () => {
     const transport = initialCatalogTransport();
     transport.failRefresh = true;
@@ -9223,6 +9272,27 @@ export function commandsAndExportsCases() {
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/agents/refresh-jobs"))).toBe(false);
     expect(agentListRequests(transport.fetchMock).every(([path]) => !String(path).includes("snapshotId=snapshot-private"))).toBe(true);
   });
+
+  it.each([undefined, "Microsoft Graph rejected the application's credential."])(
+    "keeps exact access preparation diagnostics aligned with application collection (%s)",
+    async message => {
+      const transport = accessEditorTransport();
+      transport.exactStatus = "failed";
+      transport.exactMessage = message;
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await userEvent.click(await screen.findByRole("button", { name: `Manage access for ${agent.displayName}` }));
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(message
+        ?? "Microsoft Graph could not load current package access. Check application permissions and credentials and retry.");
+      expect(alert).not.toHaveTextContent(/delegated/i);
+      expect(screen.queryByRole("dialog", { name: "Manage agent access" })).not.toBeInTheDocument();
+      const requests = transport.fetchMock.mock.calls.filter(([input]) => input === `/api/agents/${agent.id}/refresh-jobs`);
+      expect(requests).toHaveLength(1);
+      expect(JSON.parse(String(requests[0][1]?.body))).toEqual({ mode: "application" });
+      expect(transport.fetchMock.mock.calls.some(([input]) => input.includes("mutation-preview") || input.endsWith("/access"))).toBe(false);
+    },
+  );
 
   it("loads fresh exact access details before opening the table access editor", async () => {
     const transport = accessEditorTransport();
@@ -10715,9 +10785,9 @@ export function commandsAndExportsCases() {
       const pending = deferredResponse();
       const complete = completedRefreshJob();
       const running = { ...complete, status: "running", finishedAt: null };
-      const path = `/api/agents/refresh-jobs/${complete.id}?mode=delegated`;
+      const path = `/api/agents/refresh-jobs/${complete.id}?mode=application`;
       const selectedId = action === "Refresh agents" ? complete.id : "other-history-job";
-      const selectedPath = `/api/agents/refresh-jobs/${selectedId}?mode=delegated`;
+      const selectedPath = `/api/agents/refresh-jobs/${selectedId}?mode=application`;
       const commandPath = action === "Refresh agents" ? "/api/agents/refresh-jobs" : "/api/agents/refresh-selection";
       let started = false;
       let reads = 0;
@@ -10777,7 +10847,6 @@ export function commandsAndExportsCases() {
   );
 
   it.each([
-    ["package-refresh", "delegated"],
     ["package-refresh", "application"],
     ["power-platform", "delegated"],
   ] as const)("opens %s %s history details without reloading Sync or losing table controls", async (source, mode) => {
@@ -11084,12 +11153,12 @@ export function commandsAndExportsCases() {
     const pending = deferredResponse();
     let oldReads = 0;
     transport.fetchMock.mockImplementation((input, init) => {
-      if (input === "/api/agents/refresh-jobs/unavailable-refresh?mode=delegated") {
+      if (input === "/api/agents/refresh-jobs/unavailable-refresh?mode=application") {
         oldReads += 1;
         return oldReads === 1 ? Promise.resolve(Response.json({ code: "unavailable", detail: "Status unavailable." }, { status: 503 }))
           : pending.promise;
       }
-      if (input === "/api/agents/refresh-jobs/current-refresh?mode=delegated") {
+      if (input === "/api/agents/refresh-jobs/current-refresh?mode=application") {
         return Promise.resolve(Response.json({ ...completedRefreshJob(), id: "current-refresh" }));
       }
       return base(input, init);
@@ -11101,7 +11170,7 @@ export function commandsAndExportsCases() {
     await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
     await screen.findByText("Loading package refresh status…");
     expect(oldReads).toBe(2);
-    const request = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/refresh-jobs/unavailable-refresh?mode=delegated").at(-1)!;
+    const request = transport.fetchMock.mock.calls.filter(([input]) => input === "/api/agents/refresh-jobs/unavailable-refresh?mode=application").at(-1)!;
     act(() => {
       window.history.pushState({}, "", "/sync?refreshJob=current-refresh");
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -11124,7 +11193,7 @@ export function commandsAndExportsCases() {
     const pending = deferredResponse();
     let statusReads = 0;
     transport.fetchMock.mockImplementation((input, init) => {
-      if (input === "/api/agents/refresh-jobs/pending-poll?mode=delegated") {
+      if (input === "/api/agents/refresh-jobs/pending-poll?mode=application") {
         statusReads += 1;
         return statusReads === 1 ? Promise.resolve(Response.json({ ...completedRefreshJob(), id: "pending-poll", status: "running" }))
           : pending.promise;
@@ -11152,7 +11221,7 @@ export function commandsAndExportsCases() {
     window.history.replaceState({}, "", "/sync?refreshJob=missing-refresh");
     const transport = appTransport({ revalidatedRoles: viewer.roles });
     const base = transport.fetchMock.getMockImplementation()!;
-    transport.fetchMock.mockImplementation((input, init) => input === "/api/agents/refresh-jobs/missing-refresh?mode=delegated"
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/agents/refresh-jobs/missing-refresh?mode=application"
       ? Promise.resolve(Response.json({ code: "job_not_found", detail: "Previous refresh is unavailable." }, { status: 404 }))
       : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
@@ -11170,7 +11239,7 @@ export function commandsAndExportsCases() {
     const transport = appTransport({ initialRoles: ["AgentControl.Admin"], revalidatedRoles: ["AgentControl.Admin"] });
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation((input, init) => {
-      if (input === "/api/agents/refresh-jobs/missing-refresh?mode=delegated") {
+      if (input === "/api/agents/refresh-jobs/missing-refresh?mode=application") {
         return Promise.resolve(Response.json({ code: "job_not_found", detail: "Refresh bookmark failure." }, { status: 404 }));
       }
       if (input === "/api/agents/bulk-jobs/missing-control") {
@@ -11199,7 +11268,7 @@ export function commandsAndExportsCases() {
     if (initiallyComplete) transport.publish("graph_packages");
     let inventoryReads = 0;
     transport.fetchMock.mockImplementation(async (input, init) => {
-      if (input === "/api/agents/refresh-jobs/linked-publish?mode=delegated") {
+      if (input === "/api/agents/refresh-jobs/linked-publish?mode=application") {
         return Response.json({ ...completedRefreshJob(), id: "linked-publish", status: completed ? "succeeded" : "running" });
       }
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") {
@@ -13212,7 +13281,7 @@ function appTransport({
         ? records.reduce((total, record) => total + (record.packageCount ?? record.packages.length), 0) : unifiedResponse.counts.packageTargets });
     }
     if (input === "/api/agents/refresh-selection" && init?.method === "POST"
-      || input === "/api/agents/refresh-jobs/refresh-first-load?mode=delegated") {
+      || input === "/api/agents/refresh-jobs/refresh-first-load?mode=application") {
       return Response.json({ ...completedRefreshJob(), scopeKind: "exact", targetCount: unifiedResponse.counts.packageTargets });
     }
     if (input.startsWith("/api/agents/refresh-jobs?")) {
@@ -13366,7 +13435,7 @@ function selectedRefreshRequests(fetchMock: ReturnType<typeof vi.fn>) {
 
 function completedRefreshJob(): PackageRefreshJob {
   return {
-    id: "refresh-first-load", authorizationPrincipalId: viewer.homeAccountId, tokenMode: "delegated", scopeKind: "broad", targetCount: 0, resultRevision: "fixture",
+    id: "refresh-first-load", authorizationPrincipalId: viewer.homeAccountId, tokenMode: "application", scopeKind: "broad", targetCount: 0, resultRevision: "fixture",
     status: "succeeded", pageCount: 1, observedCount: 1, totalRecords: 1, snapshotId: "snapshot-private",
     createdAt: new Date().toISOString(), attemptedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), finishedAt: new Date().toISOString(),
   };
@@ -13389,7 +13458,7 @@ function initialCatalogTransport(options: Partial<Parameters<typeof appTransport
       return Response.json(selectedFixtureRead(input));
     }
     if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {
-      const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.delegated")!;
+      const definition = capabilityDefinitions.find(item => item.id === "graph.package.read.application")!;
       return Response.json({ value: [{
         enabled: true, definition,
         decision: { capabilityId: definition.id, status: transport.readAuthorized ? "available" : "missing_permission", authorized: transport.readAuthorized, fresh: true, verification: "provider", checkedAt: new Date(Date.now() - 1_000).toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), previewQualification: "not_required", remediation: [] },

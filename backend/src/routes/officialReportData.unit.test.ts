@@ -207,7 +207,7 @@ describe("retained adoption history HTTP contract", () => {
       page: { limit: options?.limit ?? 50, nextCursor: null, previousCursor: null },
     }));
   });
-  it.each(["AgentControl.Viewer", "AgentControl.Admin"])("serves saved adoption to %s without provider or source reads", async role => {
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"])("serves saved adoption to %s without provider or source reads", async role => {
     roles = [role];
     expect(await request("GET", "/official-usage/history/adoption?limit=100")).toMatchObject({
       status: 200, body: { value: [], counts: { total: 0, filtered: 0 }, page: { limit: 100 } },
@@ -482,6 +482,89 @@ describe("report confirmation HTTP input", () => {
   });
 });
 
+describe("report uploader HTTP role boundaries", () => {
+  const bundle = { bundleId: setId, bundleHash: "a".repeat(64), expectedActiveRevision: "1", stages: [], complete: true };
+  const accepted = { setId, activeRevision: "2", complete: true };
+  const preview = { id: selectionId, revision: 1, kind: "users" as const, bundleId: setId, contentHash: "a".repeat(64),
+    fileHash: "b".repeat(64), rowCount: 0, storedBytes: 2, wireBytes: 100, activeRevision: "1",
+    expiresAt: "2026-10-01T01:00:00Z", reportingPeriod: { startDate: null, endDate: null, provenance: "activity_range", days: null },
+    sourceAsOf: null, sourceAsOfProvenance: "absent", sourceFreshness: "unknown", correctionOfSetId: null,
+    status: "active", examples: [], warnings: [], reconciliation: {} };
+
+  it.each(["AgentControl.UsageReportUploader", "AgentControl.Admin"])("allows new report upload, review, publication and own draft cleanup for %s", async role => {
+    roles = [role];
+    const opened = vi.spyOn(OfficialReportImports.prototype, "open").mockImplementation(async () => ({
+      id: selectionId, signal: new AbortController().signal, cancel: async () => {},
+      receive: async input => {
+        for await (const chunk of input) void chunk;
+        return { kind: "users", rows: 0, wireBytes: 100 };
+      },
+      finish: async () => preview,
+    }));
+    const boundary = "role-upload";
+    const value = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="users.csv"\r\nContent-Type: text/csv\r\n\r\nCSV\r\n--${boundary}--\r\n`;
+    expect(await request("POST", `/official-usage/staging?bundleId=${setId}`, undefined,
+      { value, type: `multipart/form-data; boundary=${boundary}` })).toMatchObject({ status: 201 });
+    expect(opened).toHaveBeenCalledWith(identity, { bundleId: setId, rejectDuplicateKind: false }, expect.any(AbortSignal));
+    vi.spyOn(OfficialReportImports.prototype, "preview").mockResolvedValue(preview);
+    vi.spyOn(OfficialReportImports.prototype, "bundle").mockResolvedValue(bundle);
+    vi.spyOn(OfficialReportImports.prototype, "acceptBundle").mockResolvedValue(accepted);
+    vi.spyOn(OfficialReportImports.prototype, "accept").mockResolvedValue(accepted);
+    vi.spyOn(OfficialReportImports.prototype, "discard").mockResolvedValue(undefined);
+    vi.spyOn(OfficialReportImports.prototype, "diagnostics").mockResolvedValue({
+      value: [], page: { limit: 50, nextCursor: null, previousCursor: null },
+    });
+    for (const [method, path, body] of [
+      ["GET", `/official-usage/staging/${selectionId}`],
+      ["GET", `/official-usage/staging/${selectionId}/diagnostics`],
+      ["POST", `/official-usage/bundles/${setId}/preview`, {}],
+      ["POST", `/official-usage/bundles/${setId}/accept`, bundle],
+      ["POST", `/official-usage/staging/${selectionId}/accept`, {}],
+    ] as const) expect(await request(method, path, body)).toMatchObject({ status: 200 });
+    expect(await request("DELETE", `/official-usage/staging/${selectionId}`)).toMatchObject({ status: 204 });
+  });
+
+  it("denies correction upload intent before starting multipart ingestion", async () => {
+    roles = ["AgentControl.UsageReportUploader"];
+    const opened = vi.spyOn(OfficialReportImports.prototype, "open");
+    expect(await request("POST", `/official-usage/staging?bundleId=${setId}&correctionOfSetId=${selectionId}`))
+      .toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
+    expect(opened).not.toHaveBeenCalled();
+  });
+
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader"])("keeps published report management and associations Admin-only for %s", async role => {
+    roles = [role];
+    for (const [method, path] of [
+      ["POST", `/official-usage/sets/${setId}/preview`],
+      ["POST", `/official-usage/confirmations/${selectionId}`],
+      ["GET", `/agent-inventory/${objectId}/usage-candidates`],
+      ["POST", `/agent-inventory/${objectId}/usage-associations`],
+      ["DELETE", `/agent-inventory/${objectId}/usage-associations`],
+    ]) expect(await request(method, path, {})).toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
+  });
+
+  it("does not grant any import routes to ordinary Viewers", async () => {
+    roles = ["AgentControl.Viewer"];
+    for (const [method, path] of [
+      ["POST", `/official-usage/staging?bundleId=${setId}`],
+      ["GET", `/official-usage/staging/${selectionId}`],
+      ["GET", `/official-usage/staging/${selectionId}/diagnostics`],
+      ["POST", `/official-usage/bundles/${setId}/preview`],
+      ["POST", `/official-usage/bundles/${setId}/accept`],
+      ["POST", `/official-usage/staging/${selectionId}/accept`],
+      ["DELETE", `/official-usage/staging/${selectionId}`],
+    ]) expect(await request(method, path, {})).toMatchObject({ status: 403, body: { code: "missing_internal_role" } });
+  });
+
+  it("keeps upload authentication and CSRF checks authoritative", async () => {
+    signedIn = false;
+    expect(await request("POST", `/official-usage/staging?bundleId=${setId}`)).toMatchObject({ status: 401 });
+    signedIn = true; roles = ["AgentControl.UsageReportUploader"];
+    expect(await request("POST", `/official-usage/bundles/${setId}/accept`, {}, undefined, "wrong-csrf"))
+      .toMatchObject({ status: 403, body: { code: "invalid_csrf" } });
+  });
+});
+
 describe("report multipart metadata validation without persistence", () => {
   function upload(fields: Array<[string, string]>) {
     const cancelled = vi.fn(async () => {});
@@ -555,19 +638,19 @@ describe("report multipart parser error contracts without persistence", () => {
   });
 });
 
-function request(method: string, path: string, body?: unknown, raw?: { value: string; type: string }): Promise<{ status: number; body: Record<string, unknown> }> {
+function request(method: string, path: string, body?: unknown, raw?: { value: string; type: string }, csrf = "fixture-csrf"): Promise<{ status: number; body: Record<string, unknown> }> {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing fixture address");
   const content = raw?.value ?? (body === undefined ? undefined : JSON.stringify(body));
   return new Promise((resolve, reject) => {
     const message = httpRequest({ host: "127.0.0.1", port: address.port, method, path: `/api${path}`,
-      headers: { "x-csrf-token": "fixture-csrf",
+      headers: { "x-csrf-token": csrf,
         ...(content ? { "Content-Type": raw?.type ?? "application/json", "Content-Length": Buffer.byteLength(content) } : {}) },
     }, response => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", chunk => { text += chunk; });
-      response.on("end", () => resolve({ status: response.statusCode!, body: JSON.parse(text) }));
+      response.on("end", () => resolve({ status: response.statusCode!, body: text ? JSON.parse(text) : {} }));
     });
     message.once("error", reject);
     message.end(content);

@@ -52,7 +52,7 @@ export function sdkResponse(options: {
     preferred_username: "alex@example.invalid", name: "Synthetic Alex", iat: now, exp: now + 3600,
     ...options.claims,
   };
-  const scope = options.scope ?? new URLSearchParams(String(request?.body ?? "")).get("scope") ?? "User.ReadBasic.All openid profile";
+  const scope = options.scope ?? new URLSearchParams(String(request?.body ?? "")).get("scope") ?? "openid profile";
   return new Response(JSON.stringify({
     token_type: "Bearer", access_token: options.accessToken ?? "synthetic-opaque-provider-access",
     scope, expires_in: options.expiresIn ?? 3600,

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { acquireAuthorizedToken } from "../auth/msal.js";
+import type { acquireApplicationToken } from "../auth/msal.js";
 import { requireUserPublication } from "../db/dataSync.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { directoryNeedsReportRefresh } from "../db/officialReportStatus.js";
@@ -83,14 +83,14 @@ function fixture(denied: UserSourceKind, status: "waiting_authorization" | "perm
   });
   const assertAuthority = vi.fn(() => undefined);
   const beginOperationValidation = vi.fn<(capability: CapabilityId, user: AuthenticatedUser) => () => void>(() => assertAuthority);
-  const revalidateUser = vi.fn(async () => user), delegatedToken = vi.fn<typeof acquireAuthorizedToken>(async () => "synthetic-token");
+  const revalidateUser = vi.fn(async () => user), applicationToken = vi.fn<typeof acquireApplicationToken>(async () => "synthetic-token");
   const service = new CopilotUsageService(pool, {
     provider, admissions: () => undefined,
-    revalidateUser, delegatedToken, requireAvailable: async () => undefined,
+    revalidateUser, applicationToken, requireAvailable: async () => undefined,
     beginOperationValidation,
     observeOperation: async (_capability, _user, operation) => operation(() => undefined),
   });
-  return { service, refresh, sources, saved, statusRead, assertAuthority, beginOperationValidation, revalidateUser, delegatedToken,
+  return { service, refresh, sources, saved, statusRead, assertAuthority, beginOperationValidation, revalidateUser, applicationToken,
     publication: { runId: randomUUID(), jobId: randomUUID() } };
 }
 
@@ -132,7 +132,7 @@ describe("Users refresh session boundaries", () => {
     });
     await expect(f.service.refreshUsers(user, undefined, { publication: f.publication }))
       .resolves.toMatchObject({ status: "partial" });
-    expect(f.delegatedToken.mock.calls.map(([, , capability]) => capability)).toEqual(["reports.copilotUsage.read"]);
+    expect(f.applicationToken.mock.calls.map(([, capability]) => capability)).toEqual(["reports.copilotUsage.read"]);
   });
 
   it("retains the original session generation while obtaining the report identity", async () => {
@@ -213,7 +213,7 @@ describe("Users refresh session boundaries", () => {
       .toMatchObject({ status: "partial" });
     expect(rejected).toHaveBeenCalledWith(expect.objectContaining({ code: "authorization_expired" }));
     expect(f.revalidateUser).toHaveBeenCalledOnce();
-    expect(f.delegatedToken).toHaveBeenCalledOnce();
+    expect(f.applicationToken).toHaveBeenCalledOnce();
   });
 
   it("rolls back generation publication superseded after source completion but before COMMIT", async () => {

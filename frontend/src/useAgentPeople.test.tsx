@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { capabilityDefinitions } from "../../backend/src/services/capabilityRegistry";
 import * as api from "./api/client";
-import type { CapabilityView, UnifiedAgentRecord } from "./api/client";
+import type { AppRole, CapabilityView, UnifiedAgentRecord } from "./api/client";
 import { CapabilityContext } from "./capabilityContext";
 import { deferred } from "./test/deferred";
 import { useAgentPeople } from "./useAgentPeople";
@@ -28,19 +28,20 @@ const record: UnifiedAgentRecord = {
   observations: { graphPackages: null, powerPlatform: null, packageSnapshots: {} },
 };
 
-function authorized({ children, account = "reader", allowed = true }: { children: ReactNode; account?: string; allowed?: boolean }) {
+function authorized({ children, account = "reader", allowed = true, roles = ["AgentControl.Viewer"], views }: {
+  children: ReactNode; account?: string; allowed?: boolean; roles?: AppRole[]; views?: CapabilityView[];
+}) {
   const now = Date.now();
-  const directory: CapabilityView = {
-    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+  const users: CapabilityView = {
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.users.read")!,
     decision: {
-      capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
-      verification: "provider", previewQualification: "not_required", remediation: [],
-      checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 60_000).toISOString(),
+      capabilityId: "graph.users.read", status: "available", authorized: true, fresh: true,
+      verification: "on_demand", previewQualification: "not_required", remediation: [],
     },
   };
   return <CapabilityContext value={{
-    views: allowed ? [directory] : [], user: { tenantId: "tenant", homeAccountId: account, username: "reader@example.invalid",
-      displayName: "Reader", roles: ["AgentControl.Viewer"] },
+    views: views ?? (allowed ? [users] : []), user: { tenantId: "tenant", homeAccountId: account, username: "reader@example.invalid",
+      displayName: "Reader", roles },
     now, loading: false, pending: false, error: undefined, reload: vi.fn(), openPermissions: vi.fn(),
   }}>{children}</CapabilityContext>;
 }
@@ -51,6 +52,43 @@ afterEach(() => {
 });
 
 describe("authoritative saved agent people responses", () => {
+  it.each<AppRole>(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"])(
+    "uses application-only user readiness for %s without delegated group access", async role => {
+      const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({ people: { owner: savedPerson }, changed: true });
+      const { result } = renderHook(() => useAgentPeople(record, [role]),
+        { wrapper: ({ children }) => authorized({ children, roles: [role] }) });
+      expect(result.current.canRetry).toBe(true);
+      expect(result.current.unavailable).toBeUndefined();
+      expect(lookup).not.toHaveBeenCalled();
+      await act(async () => result.current.retry());
+      expect(lookup).toHaveBeenCalledExactlyOnceWith(record.id, { force: true, signal: expect.any(AbortSignal) });
+      expect(result.current.people.owner?.displayName).toBe("Saved owner");
+    },
+  );
+
+  it("does not substitute delegated group access for denied application user lookup", async () => {
+    const lookup = vi.spyOn(api, "resolveAgentPeople").mockResolvedValue({ people: {}, changed: false });
+    const views: CapabilityView[] = [
+      {
+        enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+        decision: { capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
+          verification: "on_demand", previewQualification: "not_required", remediation: [] },
+      },
+      {
+        enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.users.read")!,
+        decision: { capabilityId: "graph.users.read", status: "missing_permission", authorized: false, fresh: true,
+          previewQualification: "not_required", remediation: [] },
+      },
+    ];
+    const { result } = renderHook(() => useAgentPeople({ ...record, people: { owner: savedPerson } }, ["AgentControl.Viewer"]),
+      { wrapper: ({ children }) => authorized({ children, views }) });
+    expect(result.current.canRetry).toBe(false);
+    expect(result.current.people.owner?.displayName).toBe("Saved owner");
+    expect(result.current.unavailable).toContain("application User.Read.All");
+    await act(async () => result.current.retry());
+    expect(lookup).not.toHaveBeenCalled();
+  });
+
   it.each([` ${ownerId} `, "Opaque_ABC:/?😀", "J\u030c", " "])(
     "preserves a non-GUID source reference %j without lookup or saved-name attribution", async id => {
       const original: UnifiedAgentRecord = { ...record, people: { owner: {

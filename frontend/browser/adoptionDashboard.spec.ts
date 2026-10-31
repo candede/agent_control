@@ -297,3 +297,67 @@ test("Department paging keeps the current page and organization metrics visible 
     expect(unexpected).toEqual([]);
   } finally { release(); }
 });
+
+test("Company changes preserve department height with name and bar skeletons until the new data arrives", async ({ page }, testInfo) => {
+  const unexpected = await mockLayoutApi(page);
+  const summary = adoptionSummaryPage();
+  const data = adoptionDepartmentPage({ value: Array.from({ length: 11 }, (_, index) => ({
+    id: `department-${index}`, company: index < 7 ? "Contoso" : "Fabrikam",
+    department: index % 2 ? `Department ${index}` : `Department ${index} with a particularly long name that wraps over several lines`,
+    people: 40, activePeople: 30,
+  })) });
+  let release: () => void = () => {};
+  let pending = Promise.resolve();
+  await page.route(url => url.pathname === "/api/official-usage/history/adoption", route =>
+    route.fulfill({ json: reportPage([adoptionSnapshot()]) }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/summary", route =>
+    route.fulfill({ json: summary }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/facets", route =>
+    route.fulfill({ json: { value: [{ value: "Contoso", count: 7 }, { value: "Fabrikam", count: 4 }],
+      counts: { total: 2, filtered: 2 }, selection: summary.selection, page: summary.page } }));
+  await page.route(url => url.pathname === "/api/copilot-usage/adoption/departments", async route => {
+    const company = new URL(route.request().url()).searchParams.get("company");
+    const value = company ? data.value.filter(row => `~string:${row.company}` === company) : data.value;
+    await pending;
+    await route.fulfill({ json: { ...data, value: value.slice(0, 10), counts: { total: 11, filtered: value.length },
+      page: { limit: 10, number: 1, offset: 0, nextCursor: value.length > 10 ? "next" : null, previousCursor: null } } });
+  });
+  try {
+    await page.goto("/dashboard");
+    const panel = page.getByRole("region", { name: "Adoption by department" });
+    const results = panel.locator(".dashboard-department-results");
+    const list = panel.getByRole("list", { name: "Department adoption" });
+    await expect(list.getByRole("listitem")).toHaveCount(10);
+    for (const company of ["Fabrikam", "Contoso"]) {
+      if (company === "Contoso") await page.emulateMedia({ reducedMotion: "reduce" });
+      const before = await results.boundingBox();
+      const panelBefore = await panel.boundingBox();
+      const rows = await list.getByRole("listitem").count();
+      pending = new Promise<void>(resolve => { release = resolve; });
+      await panel.getByRole("combobox", { name: "Company", exact: true }).click();
+      await page.getByRole("option", { name: company, exact: true }).click();
+      const skeleton = panel.locator(".dashboard-department-placeholder");
+      await expect(panel.getByText("Loading departments...", { exact: true })).toBeVisible();
+      await expect(skeleton).toHaveAttribute("aria-hidden", "true");
+      await expect(skeleton).toHaveAttribute("inert", "");
+      await expect(skeleton.locator(".dashboard-department")).toHaveCount(rows);
+      await expect(skeleton.locator(".dashboard-department-bar")).toHaveCount(rows);
+      await expect(panel.getByRole("link")).toHaveCount(0);
+      await expect(panel.getByRole("navigation", { name: "departments pages" })).toHaveCount(0);
+      const during = await results.boundingBox();
+      const panelDuring = await panel.boundingBox();
+      expect(during!.height).toBeCloseTo(before!.height, 0);
+      expect(panelDuring!.height).toBeCloseTo(panelBefore!.height, 0);
+      if (company === "Contoso") await expect(skeleton.locator(".dashboard-departments")).toHaveCSS("animation-name", "none");
+      expect((await new AxeBuilder({ page }).include(".dashboard-panel-teal").analyze()).violations).toEqual([]);
+      if (company === "Fabrikam") await panel.screenshot({ path: testInfo.outputPath("department-company-loading.png"), animations: "disabled" });
+      release();
+      await expect(skeleton).toHaveCount(0);
+      await expect(list.getByRole("listitem")).toHaveCount(company === "Fabrikam" ? 4 : 7);
+      await expect(panel.getByRole("link").first()).toHaveAttribute("href", new RegExp(`company=%7Estring%3A${company}`));
+      await expect(panel.getByRole("navigation", { name: "departments pages" })).toHaveAttribute("aria-busy", "false");
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect(unexpected).toEqual([]);
+  } finally { release(); }
+});

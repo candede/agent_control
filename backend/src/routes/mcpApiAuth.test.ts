@@ -73,7 +73,8 @@ beforeEach(async () => {
   replaceMsalClientForTest(tenant.tenantId, {
     getAuthCodeUrl: async () => { throw new Error("No browser login"); },
     acquireTokenByCode: async () => { throw new Error("No browser login"); },
-    acquireTokenByClientCredential: async () => { throw new Error("No application grant"); },
+    acquireTokenByClientCredential: async () => ({ ...browserAuthenticationResult(), account: null,
+      scopes: ["https://graph.microsoft.com/.default"], accessToken: "synthetic-application-user-read" }),
     acquireTokenSilent: async request => ({ ...browserAuthenticationResult(), account: selected,
       uniqueId: selected.localAccountId, scopes: Array.isArray(request.scopes) ? request.scopes : [],
       idTokenClaims: { ...browserAuthenticationResult().idTokenClaims, roles: ["AgentControl.Viewer"] } }),
@@ -283,8 +284,8 @@ describe("registered canonical HTTP authentication", () => {
     vi.spyOn(capabilities, "requireAvailable").mockImplementation(async capabilityId => ({
       capabilityId, status: "available", authorized: true, fresh: true, previewQualification: "not_required", remediation: [],
     }));
-    const search = vi.spyOn(DirectoryPrincipalsClient.prototype, "search").mockImplementation(async (token, _query, _limit, _signal, assertCurrent) => {
-      expect(token).toBe("synthetic-opaque-provider-access");
+    const search = vi.spyOn(DirectoryPrincipalsClient.prototype, "search").mockImplementation(async (tokens, _query, _limit, _signal, assertCurrent) => {
+      expect(tokens).toEqual({ user: "synthetic-application-user-read", group: "synthetic-opaque-provider-access" });
       expect(currentAuthority()?.principal.transport).toBe("bearer");
       assertCurrent?.();
       return [];
@@ -292,6 +293,31 @@ describe("registered canonical HTTP authentication", () => {
     const response = await call("/directory/principals?search=alex&limit=1");
     expect(response.status).toBe(200); expect(await response.json()).toEqual({ value: [] });
     expect(search).toHaveBeenCalledOnce(); expect(exchanges.length).toBeGreaterThan(1);
+    for (const exchange of exchanges) {
+      expect(exchange.split(/\s+/).every(scope => ["openid", "profile", "offline_access", "https://graph.microsoft.com/Group.Read.All"].includes(scope))).toBe(true);
+    }
+  });
+
+  it("validates user recipients with application access without any delegated directory grant", async () => {
+    vi.spyOn(capabilities, "requireAvailable").mockImplementation(async capabilityId => ({
+      capabilityId, status: "available", authorized: true, fresh: true, previewQualification: "not_required", remediation: [],
+    }));
+    const resolve = vi.spyOn(DirectoryPrincipalsClient.prototype, "resolve").mockResolvedValue([{
+      resourceType: "user", resourceId: native, principalKind: "user", displayName: "Synthetic user",
+    }]);
+    const applicationToken = vi.spyOn(getMsalClient(tenant.tenantId), "acquireTokenByClientCredential");
+    const response = await call("/directory/principals/resolve", apiToken(), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ principals: [{ resourceType: "user", resourceId: native }] }),
+    });
+    expect(response.status).toBe(200);
+    expect(resolve).toHaveBeenCalledWith({ user: "synthetic-application-user-read" },
+      [{ resourceType: "user", resourceId: native }], expect.any(AbortSignal), expect.any(Function));
+    expect(applicationToken).toHaveBeenCalledExactlyOnceWith({
+      authority: `https://login.microsoftonline.com/${tenant.tenantId}`, scopes: ["https://graph.microsoft.com/.default"],
+    });
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].split(/\s+/).every(scope => ["openid", "profile", "offline_access"].includes(scope))).toBe(true);
   });
 
   it("fences an in-flight provider result after internal revocation", async () => {

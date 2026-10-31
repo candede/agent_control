@@ -91,9 +91,9 @@ if (mode === "seed") {
     const quarantineUnsent=await submitQuarantine(frozenQuarantineTargets.find(target=>target.resourceNativeId==="restart-quarantine-unsent")!,"unsent");
     const inventoryInterrupted=await inventory.submit(scope,{idempotencyKey:"restart-interrupted",roleScope:"full",requestedTypes:["microsoft.copilotstudio/agents"]});
     assert.equal(await inventory.markRunning(scope,inventoryInterrupted.id),true);
-    const packageInterrupted=await packages.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:"package-restart-interrupted",requestedIds:["package-restart-target"]});
+    const packageInterrupted=await packages.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"application",idempotencyKey:"package-restart-interrupted",requestedIds:["package-restart-target"]});
     assert.equal(await packages.markRunning(scope,packageInterrupted.id),true);
-    const packageCompleted=await packages.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"delegated",idempotencyKey:"package-restart-completed"});
+    const packageCompleted=await packages.submit(scope,{authorizationPrincipalId:scope.principalId,tokenMode:"application",idempotencyKey:"package-restart-completed"});
     assert.equal(await packages.markRunning(scope,packageCompleted.id),true);
     await refreshInventoryFixture(fixture.runtime,scope,packageCompleted.id,"packages",[]);
     const purviewScope:PurviewAuditScope={tenantId:scope.tenantId,authorizationPrincipalId:scope.principalId,resultScope:{kind:"principal",scopeId:scope.principalId,configurationRevision:null},tokenMode:"delegated"};
