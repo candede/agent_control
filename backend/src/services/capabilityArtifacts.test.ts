@@ -25,18 +25,17 @@ describe("capability documentation artifacts", () => {
 
   it("documents every required permission and links the current capability/source registry", () => {
     const inventory = readRepositoryFile("docs/provider-contracts.md");
+    const permissions = readRepositoryFile("docs/user-roles-and-permissions.md");
 
     expect(inventory).toContain("](../backend/src/services/capabilityRegistry.ts)");
     for (const permission of new Set(capabilityDefinitions.flatMap(definition => definition.permissions))) {
-      expect(inventory).toContain(`\`${permission}\``);
+      expect(`${permissions}\n${inventory}`).toContain(`\`${permission}\``);
     }
   });
 
   it.each([
     ["README.md", "## App registration permissions", "## Usage report access"],
     ["docs/user-roles-and-permissions.md", "## App registration permissions", "## CSV downloads and report import"],
-    ["docs/deployment-setup.md", "### 5. Add API permissions", "## Start locally"],
-    ["docs/provider-contracts.md", "## App registration permissions", "## Authorization and saved scope"],
     ["infra/entra-id-api-mcp-app-registrations.md", "## App registration permissions", "## Synchronization and reports"],
   ])("keeps %s aligned with the current Permissions page groups", (path, start, end) => {
     const document = readRepositoryFile(path);
@@ -64,34 +63,55 @@ describe("capability documentation artifacts", () => {
       expect(documented.sort()).toEqual([...new Set(permissions)].sort());
     }
     expect(section).not.toMatch(/AgentControl\.(?:Viewer|UsageReportUploader|Admin)/);
-    const packagePermission = section.split("\n").find(line => line.startsWith("| `CopilotPackages.ReadWrite.All` |"));
-    expect(packagePermission).toContain("Recommended signed-in administrator role: **AI Administrator**");
-    expect(packagePermission).toContain("**Global Administrator** is a broader alternative");
-    expect(packagePermission).toContain("delegated tenant admin consent");
-    expect(packagePermission).toContain("Microsoft Agent 365 license");
-    expect(packagePermission).toContain("delegated work or school accounts only");
-    expect(section).toContain("both application and delegated forms");
-    expect(section).toMatch(/application form does not authorize\s+these writes/);
-    expect(section.replace(/\s+/g, " ")).toContain("not a confirmed exclusive API role requirement");
-    expect(section.replace(/\s+/g, " ")).toContain("Microsoft 365 admin center");
-    expect(section).not.toContain("no additional Entra administrator-role requirement");
-    expect(section).toContain("**AI Reader**");
+  });
+
+  it.each([
+    "docs/deployment-setup.md",
+    "docs/provider-contracts.md",
+    "docs/security-model.md",
+  ])("links %s to the authoritative permission reference", path => {
+    expect(readRepositoryFile(path)).toMatch(
+      /\]\(user-roles-and-permissions\.md(?:#[^)]+)?\)/,
+    );
+  });
+
+  it("explains permission purposes and provider requirements in the authoritative reference", () => {
+    const reference = readRepositoryFile("docs/user-roles-and-permissions.md");
+    const normalized = reference.replace(/\s+/g, " ");
+    const delegated = normalized.split("### Microsoft Graph / Delegated")[1]
+      .split("### Power Platform / Delegated")[0];
+    const reportPermission = reference.split("\n").find(line => line.startsWith("| `Reports.Read.All` |"));
+    const catalogPermission = reference.split("\n").find(line => line.startsWith("| `LicenseAssignment.Read.All` |"));
+
+    expect(reportPermission).toMatch(/per-user.*Copilot.*Office apps/);
+    expect(reportPermission).toContain("28 days");
+    expect(reportPermission).toMatch(/dashboard.*Users/);
+    expect(catalogPermission).toMatch(/catalog.*identify Copilot entitlement/);
+    expect(normalized).toContain("Grant admin consent");
+    expect(normalized).toContain("signed-in user does not need Microsoft directory or reporting roles");
+    expect(delegated).toContain("Microsoft Agent 365 license");
+    expect(delegated).toContain("delegated work or school accounts only");
+    expect(delegated).toContain("both application and delegated forms");
+    expect(delegated).toContain("application form does not authorize these writes");
+    expect(delegated).toMatch(/Recommended.*AI Administrator/);
+    expect(delegated).toContain("Global Administrator is a broader alternative");
+    expect(delegated).toContain("does not publish an explicit minimum user role");
+    expect(reference).toContain("**AI Reader**");
     for (const role of ["AI Administrator", "Power Platform Administrator", "Global Administrator"]) {
-      expect(section).toContain(`**${role}**`);
+      expect(reference).toContain(`**${role}**`);
     }
   });
 
   it("documents the current Copilot report endpoint and activity window", () => {
     const inventory = readRepositoryFile("docs/provider-contracts.md");
     const row = inventory.split("\n").find(line => line.startsWith("| `reports.copilotUsage.read` |"));
-    const activityDescription = readRepositoryFile("docs/copilot-license-usage.md").split("\n")
-      .find(line => line.startsWith("Imported response counts and last activity"));
+    const activityDescription = readRepositoryFile("docs/copilot-license-usage.md").replace(/\s+/g, " ");
 
     expect(row?.match(/`GET ([^`]+)`/)?.[1]).toBe(new URL(buildCopilotReportUrl()).pathname);
     expect(row).toContain(`Required ${copilotAppActivityReportVersion} CSV headers`);
-    expect(activityDescription).toContain(
-      `The current ${copilotAppActivityPeriod}/${copilotAppActivityReportVersion} Microsoft report supplies`,
-    );
+    expect(activityDescription).toMatch(new RegExp(
+      `${copilotAppActivityPeriod}[^\\n]{0,20}${copilotAppActivityReportVersion}`,
+    ));
   });
 
   it("documents the exact prepared-vault contract and excludes the admin password from runtime", () => {
@@ -100,8 +120,7 @@ describe("capability documentation artifacts", () => {
     const { preparedVaultContract } = JSON.parse(readRepositoryFile("infra/production-target.example.json"));
     const runtimeDescription = readRepositoryFile("docs/security-model.md").split("\n")
       .find(line => line.startsWith("- Azure runtime configuration"));
-    const rotationDescription = readRepositoryFile("docs/operations.md").split("\n")
-      .find(line => line.startsWith("Follow the") && line.includes("runtime-consumer contract"));
+    const rotationDescription = readRepositoryFile("docs/operations.md");
 
     expect(documentedNames).toEqual([
       "agent-control-tenants-json",
@@ -109,17 +128,18 @@ describe("capability documentation artifacts", () => {
       "agent-control-postgres-admin-password",
       "agent-control-postgres-app-password",
     ]);
-    expect(setup).toContain("Only the three rows other than `agent-control-postgres-admin-password`");
+    const adminPassword = setup.split("\n").find(line => line.startsWith("| `agent-control-postgres-admin-password` |"));
+    expect(adminPassword).toMatch(/provision|maintenance|operator/i);
     expect(setup).not.toContain("agent-control-evidence-expiry");
     expect(documentedNames).toEqual(preparedVaultContract.secretNames);
     expect(preparedVaultContract.runtimeConsumers).toEqual(
       documentedNames.filter(name => name !== "agent-control-postgres-admin-password"),
     );
-    expect(runtimeDescription).toContain(
-      `uses ${preparedVaultContract.runtimeConsumers.length} native Key Vault references: \`TENANTS_JSON\`, \`SESSION_SECRET\`, and \`PGPASSWORD\``,
+    expect([...(runtimeDescription?.matchAll(/`([A-Z_]+)`/g) ?? [])].map(match => match[1])).toEqual(
+      ["TENANTS_JSON", "SESSION_SECRET", "PGPASSWORD"],
     );
-    expect(rotationDescription).toContain(
-      `${documentedNames.length}-name/${preparedVaultContract.runtimeConsumers.length}-runtime-consumer contract`,
+    expect(rotationDescription).toMatch(
+      /\]\(azure-production-deployment\.md(?:#[^)]+)?\)/,
     );
   });
 });

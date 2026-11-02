@@ -366,11 +366,13 @@ describe("registered canonical HTTP authentication", () => {
 
   it("classifies every current operation from the sole contract, with no bearer aliases", () => {
     const document = readFileSync(new URL("../../../docs/mcp-integration.md", import.meta.url), "utf8");
-    for (const line of document.split("\n").filter(line => /^\| `[A-Z]+ \/api\//.test(line))) {
+    const currentMap = document.split("## Administrative audit origin v1")[0];
+    for (const line of currentMap.split("\n").filter(line => /^\| `[A-Z]+ \/api\//.test(line))) {
       const match = /^\| `([A-Z]+) (\/api\/[^`]+)`/.exec(line)!;
       const key = `${match[1]} ${match[2].slice(4)}`;
       const policy = declaredRoutePolicies.get(key) ?? declaredRoutePolicies.get(`${match[1]} ${match[2]}`);
-      if (!policy) continue; // Future 04/04A contracts are explicitly not registered.
+      expect(policy, key).toBeDefined();
+      if (!policy) throw new Error(`Missing current route policy: ${key}`);
       if (policy.access === "authenticated") expect(Boolean(policy.browserOnly), key).toBe(line.includes("| — |"));
     }
   });

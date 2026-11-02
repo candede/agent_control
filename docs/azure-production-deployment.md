@@ -1,37 +1,52 @@
 # Azure production deployment
 
-Production deployment uses `deploy-azure.ps1` to deploy the Express/React
-application to Linux App Service with PostgreSQL Flexible Server and an
-administrator-prepared Key Vault.
+Deploy Agent Control to Linux App Service with PostgreSQL Flexible Server using
+`deploy-azure.ps1`. The deployment requires a prepared Key Vault and an approved
+target file; these deployment records are not application login or sync gates.
 
 ## Requirements
 
-Install:
-
-- PowerShell 7
-- Docker
-- Azure CLI
+- Git, PowerShell 7, Docker with Buildx, and Azure CLI.
 - Standalone [Bicep CLI](https://learn.microsoft.com/azure/azure-resource-manager/bicep/install#install-manually).
-  The owner compiles locally, without authentication or a container download.
+- An existing resource group, prepared Key Vault and monitoring action group.
+- Deployment and role-assignment permissions for the exact target resources.
+- Permission to read the selected Key Vault secret versions and use Key Vault
+  template deployment.
+- Access to review every configured tenant's Entra registration, assignments
+  and admin consent.
+- Approved exact App Service outbound addresses and temporary runner IPv4
+  firewall access to PostgreSQL.
 
-The deployment operator needs:
-
-- deployment access to the target subscription and resource group;
-- permission to read the selected Key Vault secret versions;
-- permission for Key Vault template deployment;
-- permission to review the Entra app registration and assignments;
-- the approved App Service and PostgreSQL network configuration.
-
-Configure every Entra application by following
-[Deployment setup](deployment-setup.md). Production callback URLs must use HTTPS:
+Complete [Entra setup](deployment-setup.md#configure-the-entra-application).
+Every tenant registration must use the production callback:
 
 ```text
 https://<app-host>/api/auth/callback
 ```
 
+Use the [permissions reference](user-roles-and-permissions.md) for app roles and
+Microsoft permissions; do not add deployment-specific user permissions.
+
+## Supported deployment profile
+
+The scripts and templates enforce this profile:
+
+| Resource | Supported configuration |
+| --- | --- |
+| App Service | One Linux Basic B1 instance; Node 24; remote build disabled |
+| PostgreSQL | Version 17, `Standard_B1ms`, Burstable, 32 GiB |
+| Database availability | Seven-day backup retention; no HA or replicas |
+| Application pool | Maximum four connections |
+| Monitoring | 30-day retention; 0.1 GiB daily ingestion cap; existing action group |
+
+Other tiers and sizes require corresponding template and deployment-tool
+changes, not just a revised approval file. Review
+[PostgreSQL compute limitations](https://learn.microsoft.com/azure/postgresql/flexible-server/concepts-compute)
+against the expected workload and budget before choosing this profile.
+
 ## Prepare Key Vault
 
-The prepared vault must contain these exact versioned secret names:
+The prepared vault must contain these exact secret names with selected versions:
 
 | Secret name | Consumer |
 | --- | --- |
@@ -41,303 +56,229 @@ The prepared vault must contain these exact versioned secret names:
 | `agent-control-postgres-app-password` | Application database role |
 
 Only the three rows other than `agent-control-postgres-admin-password` are
-provided to the application runtime. The operator password must never appear
-in its environment or runtime secret references.
+provided to the application runtime, as `TENANTS_JSON`, `SESSION_SECRET` and
+`PGPASSWORD`. The administrator password must not appear in runtime settings or
+be readable by the application's identity.
 
-The tenant registry contains the tenant ID, client ID, client secret, accepted
-domains, and optional display name for every tenant. Keep secret values out of
-source control, shell arguments, approval files, deployment receipts, and logs.
+The registry contains each tenant's ID, application client ID, client secret,
+accepted domains and optional display name. Keep secret values out of source
+control, command arguments, target files, receipts and logs.
+
+## Build the release ZIP
+
+Run from the repository root. Build the Linux/amd64 export stage; `Plan` and
+`Deploy` inspect an existing archive rather than producing it:
+
+```powershell
+$revision = (git rev-parse --short=12 HEAD).Trim()
+docker buildx build --platform linux/amd64 --target export `
+  --build-arg "RELEASE_REVISION=$revision" `
+  --output type=local,dest=artifacts/release .
+```
+
+The output contains:
+
+- `artifacts/release/agent-control-linux-x64.zip`
+- `artifacts/release/agent-control-linux-x64.zip.sha256`
+
+The ZIP includes compiled backend/frontend assets and production dependencies.
+Keep both files together and do not edit the archive after packaging. Builds
+use the approved npm feed configured in the Dockerfile; no host npm install is
+required.
+
+Record the exact source used. This command packages the current worktree, not
+only the named commit; use a distinct reviewed revision label if the worktree
+differs from that commit.
 
 ## Prepare the approval file
 
-Copy `infra/production-target.example.json` to an access-restricted location
-outside source control and complete it with:
+Copy [`infra/production-target.example.json`](../infra/production-target.example.json)
+to an access-restricted location outside source control. Complete:
 
-- tenant, subscription, resource group, and region;
-- Entra application and callback details;
-- App Service, plan, PostgreSQL, database, and Key Vault resource IDs;
-- exact Key Vault secret versions;
-- tenant-registry approval reference;
-- network addresses and rules;
-- monthly estimate and budget;
-- change approval and maintenance window;
-- installation mode: `fresh` or `existing`.
+- `isApproval=true`, tenant/subscription/resource-group/region identities.
+- Entra application, canonical HTTPS origin, exact callback and tenant-registry
+  registration approval reference.
+- Resource names and matching expected IDs, database name, exact outbound
+  addresses and runner IPv4.
+- All four selected Key Vault versions; for an existing installation, also
+  supply all four currently deployed versions. Selected and deployed versions
+  must match; this owner does not perform credential rotation.
+- Dated, itemized monthly estimate, budget, operator approval and a maintenance
+  window no longer than eight hours.
+- The profile's explicit Burstable risk acceptance and monitoring/action-group
+  details.
 
-Use `fresh` only for an empty application database. Use `existing` only for an
-installation already running the current application schema.
+Choose the installation mode:
 
-Agent Control uses a Burstable PostgreSQL tier for this deployment profile.
-Review Microsoft's
-[PostgreSQL compute guidance](https://learn.microsoft.com/azure/postgresql/flexible-server/concepts-compute),
-record the expected workload and cost, and approve a different tier when the
-workload requires it.
+| Mode | Required target state |
+| --- | --- |
+| `fresh` | App Service, plan and PostgreSQL target resources do not yet exist; set `firstInstallApproved=true`. Initialization requires an empty database. |
+| `existing` | Exact target resources exist and the database already uses the current application schema; set `firstInstallApproved=false`. |
+
+An existing empty server is not a fresh target under this owner. An incompatible
+schema is not upgraded automatically. Do not edit schema markers or use a
+destructive reset as a deployment retry.
 
 ## Preview the deployment
 
-Authenticate Azure CLI to the approved tenant and subscription, then run:
+Authenticate Azure CLI to the target tenant and subscription, then run:
 
 ```powershell
-pwsh ./deploy-azure.ps1 -Action Plan -TargetFile <approved-target.json>
+pwsh ./deploy-azure.ps1 -Action Plan -TargetFile <approved-target.json> `
+  -ReceiptPath artifacts/release/azure-plan.json
 ```
 
-Plan validates the target, secret references, Entra configuration, resource
-identities, artifact checksum, pricing evidence, and Bicep what-if. It does not
-change Entra roles, assignments, permissions, or consent.
+Plan validates identity, the fixed resource profile, pricing, secret references,
+Entra configuration, release checksum/content and Bicep what-if.
+It queries Azure and builds an inspection image locally; it does not provision
+the target or change Entra roles, grants or consent.
 
-Review the redacted output and resolve every failure before deployment.
+Review the redacted output. Resolve failures and rerun Plan whenever source,
+target, network or estimate changes.
 
 ## Deploy
 
-Use the same approved target file:
+Use the same reviewed target and unchanged release ZIP:
 
 ```powershell
-pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <approved-target.json>
+pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <approved-target.json> `
+  -ReceiptPath artifacts/release/azure-deployment.json
 ```
 
-Deployment requires the approved target to match the preview. Keep the generated
-receipt with the release records.
+Deploy repeats preflight and what-if, then performs the authorized changes
+within the maintenance window. For existing installations it drains the app
+and verifies a managed backup before applying changes.
 
-After contained smoke and database integrity checks pass, deployment reopens the
-application automatically; no separate login receipt or application-enable
-approval is required. Deployment checks verify authentication configuration, not
-the interactive sign-in journey, which remains a post-deployment check below.
-The canonical origin may include a final root slash; smoke checks always request
-the exact `/api/...` and application paths, without duplicate slashes.
+The owner verifies current schema/grants, deploys the ZIP, resolves runtime
+secret references and checks monitoring and contained HTTP routes. It reopens
+the app automatically after those checks pass. No login receipt, release
+acceptance or application-enable action is required.
 
-For isolated, in-process deployment regressions without Azure, Docker or HTTP
-requests, run `pwsh -NoProfile -NonInteractive -File scripts/azure-deployment.unit.tests.ps1`.
-It uses synthetic release data and exact command fixtures, not a deployment
-entrypoint or the full CLI-process test suite.
+Retain the redacted receipt and release ZIP/checksum for troubleshooting.
+Deployment checks verify authentication configuration, not interactive login.
 
 ## Verify the release
 
 After deployment:
 
-1. Confirm `/api/health` and `/api/ready` return success.
-2. Verify assigned Viewer, Usage Report Uploader and Admin access using the
-   [current role and permission reference](user-roles-and-permissions.md).
-3. Confirm initial read-only synchronization starts automatically after sign-in.
-4. Review **Sync** source progress; use **Permissions** for actual access failures.
-5. Verify shared saved inventory, users, reports and activity, including when
-   the signed-in user lacks Microsoft source-read access.
-6. Confirm only Admin can see Audit and read/export local administrative logs;
-   Viewer/Uploader must be denied through direct URLs/APIs. Verify Uploader can
-   import new CSV sets but cannot correct/select/delete published reports.
-   Test provider changes only with an exact reviewed target and current Admin
-   plus Microsoft permission/role/license.
-7. Confirm monitoring, backup retention, budget alerts, and network rules.
+1. Check `/api/health` and `/api/ready`.
+2. Sign in and out using assigned test accounts. Verify Viewer, Uploader and
+   Admin behavior against the [permissions reference](user-roles-and-permissions.md).
+3. Confirm automatic read-only synchronization starts while visible and online.
+   Use **Sync** for progress and **Permissions** for actual provider failures.
+4. Verify shared saved inventory, users, reports and activity, including access
+   by a user without Microsoft source-read permissions.
+5. Check Admin-only audit access and Uploader restrictions on published reports
+   through both the UI and direct APIs.
+6. Test provider changes only with an exact reviewed target, current Admin and
+   Microsoft authority, and the normal destructive-action confirmation.
+7. Verify backup retention, effective network rules, alert delivery and budget.
+
+Health and software tests alone do not prove provider access or these journeys.
+
+## Recover a failed deployment
+
+Read the receipt's failed step, completed steps, containment and cleanup outcome.
+If an external write has an unknown outcome, reconcile the exact resource,
+deployment, package or database state before any retry.
+
+For a supported resumable failure, keep the same target, component and release:
+
+```powershell
+pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <approved-target.json> `
+  -ResumeReceiptPath <failed-receipt.json> `
+  -ReceiptPath artifacts/release/azure-resume.json
+```
+
+Resume refuses uncertain external-write phases rather than blindly replaying
+them. Do not alter receipts to bypass that refusal.
+
+If only run-owned cleanup remains, use the same failed receipt:
+
+```powershell
+pwsh ./deploy-azure.ps1 -Action Cleanup -TargetFile <approved-target.json> `
+  -ResumeReceiptPath <failed-receipt.json> `
+  -ReceiptPath artifacts/release/azure-cleanup.json
+```
+
+Cleanup removes only tracked temporary resources. A containment failure requires
+operator incident handling; do not assume the app is safely stopped.
 
 ## Operate the deployment
 
-- Keep Key Vault, App Service, PostgreSQL, and Entra changes under the approved
-  change process.
-- Use versioned Key Vault references and obtain approval before rotating
-  credentials.
-- Review PostgreSQL CPU credits, memory, storage, connections, and query latency.
-- Keep provider permissions and app-role assignments limited to approved users.
-- Use PostgreSQL point-in-time restore for Azure recovery and verify access scope
-  before reopening provider work.
-- Run `Plan` again whenever the target, resource tier, network, secret version, or
-  estimate changes.
+- Keep Key Vault references versioned and the database administrator password
+  operator-only.
+- Coordinate credential rotation separately with the credential owners. The
+  current deployment owner rejects selected/deployed version differences on
+  existing installations; Plan/Deploy is not a rotation procedure. Do not
+  falsify deployed-version metadata to bypass that check.
+- Monitor PostgreSQL CPU credits, memory, storage, connections and query latency.
+- Check application readiness, HTTP failures, restarts and provider failures.
+- Verify alert delivery and budget notifications; configured alerts are not
+  proof that notifications arrived.
+- Keep provider permissions and app-role assignments limited to intended users.
+
+Use [Operations](operations.md) for synchronization and job troubleshooting.
+
+### Point-in-time recovery
+
+Use the [disaster recovery procedure](../infra/disaster-recovery.md) to select
+the exact source, restore point, expected data loss and cleanup owner:
+
+```powershell
+pwsh ./deploy-azure.ps1 -Action PointInTimeRestore `
+  -TargetFile <approved-target.json> -RestorePoint <approved-UTC-timestamp>
+```
+
+This creates an isolated review server without repointing the app.
+`-Action Recover` switches serving to a verified restored server and requires
+separate authorization for that switch and its data loss. Verify scope, revoked
+sessions, report selections and uncertain jobs before returning to use.
 
 ## Optional independent MCP App Service
 
-This is **source deployment support**, not evidence of an Azure deployment.
-The roadmap production target remains local Compose `seha`. Nothing here
-authorizes login, resource/secret reads, image publication, grants, networking
-or provisioning. Obtain exact target/action/content/budget approval first.
-Missing `mcp` in the existing version-2 target provisions no MCP resources.
-Supplied null, empty, partial, unknown or invalid configuration fails; it is
-never silently treated as absent.
+Browser operation does not require MCP. Use
+[MCP integration](mcp-integration.md) for its registration, configuration,
+image, storage, backup and recovery contracts, and
+[MCP client setup](mcp-clients.md) for connections.
 
-Place a completed [MCP object example](../infra/mcp-target.example.json) at the
-target's `mcp` property. This is a **fragment**, not another target format or an
-approval. Keep the ordinary target/tenant-registry, estimate and maintenance
-contracts. Use the production image stage, reviewed source identity and exact
-`<approved ACR>/<repository>@sha256:<digest>`, never a tag. The source image runs
-UID/GID10001 and one Uvicorn process; no provider/SQL/API credentials enter it.
-
-The existing owner supports:
-
-```powershell
-pwsh ./deploy-azure.ps1 -Action Plan -TargetFile <approved-target.json>
-pwsh ./deploy-azure.ps1 -Action Deploy -TargetFile <same-approved-target.json>
-# Independent MCP change: does not build/deploy/stop Node or touch PostgreSQL.
-pwsh ./deploy-azure.ps1 -Action Plan -Component Mcp -TargetFile <approved-target.json>
-pwsh ./deploy-azure.ps1 -Action Deploy -Component Mcp -TargetFile <same-approved-target.json>
-# Exact existing MCP writer stop/drain for an approved backup window:
-pwsh ./deploy-azure.ps1 -Action Stop -Component Mcp -TargetFile <approved-existing-target.json>
-# Retry only after checking the failed receipt's exact outcome:
-pwsh ./deploy-azure.ps1 -Action Deploy -Component Mcp -TargetFile <same-approved-target.json> `
-  -ResumeReceiptPath <failed-receipt.json>
-```
-
-`All` is the default component. `Application` requires a target without `mcp`;
-it cannot ignore supplied MCP configuration. MCP-only needs PowerShell, Azure
-CLI and Bicep, not Docker or an API ZIP. Application deploy still uses its
-existing artifact, current-schema installer, backup, maintenance and recovery
-owner. `infra/main.bicep` remains Node/PostgreSQL-only.
-`infra/mcp.bicep` is applied separately **after** API/web is open. Its failure
-records `deployed_mcp_failed`/`recovered_mcp_failed`, attempts to stop only MCP,
-and leaves API/web online. The CLI exits nonzero for those partial outcomes.
-Resume preserves the exact target/component/digest/version/storage identity;
-completed apply is not repeated, but the stopped MCP service is started again.
-An uncertain ARM apply remains non-replayable until the operator reconciles
-the actual resource/digest/mount/reference outcome. It is not a reset request.
+The target's optional `mcp` object uses
+[`infra/mcp-target.example.json`](../infra/mcp-target.example.json) as a fragment,
+not a separate target file. Omit it for API/web-only deployment.
 
 ### Prepared identities, storage and network
 
-The only provisioned MCP resources are its separate single-worker Linux **S1**
-plan, custom-container site, per-secret runtime Key Vault grants, diagnostics
-and finite metric alerts. ACR, user-assigned identity, premium file account/share,
-private endpoint, VNet/subnets/NSGs/private DNS, existing action group and vault
-must already be separately authorized and prepared. The tool never publishes
-images, creates registry/identity/network/storage, retrieves storage keys,
-passes registry passwords, or changes Entra registrations/consent.
+Before selecting the MCP profile, prepare:
 
-- Bind the same tenant and existing API GUID/origin. The API's protected tenant
-  registry must already contain exactly this MCP integration client, scalar API
-  audience and `AgentControl.Access`. Full Plan checks it in the existing
-  registry owner. MCP-only does not read API secrets: its reviewed registration/
-  network references and the live API remain authoritative. Readiness is **not**
-  proof of authenticated OBO/API connectivity.
-- The initial public resource is exactly
-  `https://<mcp-site>.azurewebsites.net/mcp`, Entra return is origin-root
-  `/auth/callback`, and SDK discovery issuer includes the trailing `/`.
-  Client callbacks are the distinct, exact1–32 HTTPS/HTTP-loopback redirects
-  from [client onboarding](mcp-clients.md), never wildcard callbacks. Custom
-  domains/front doors/extra proxies are not implemented by this profile.
-- Prepare the user-assigned identity in the same tenant/subscription with
-  existing `AcrPull` on the exact registry. Disable ACR admin credentials.
-  Only that exact grant, the object-conditioned Blob grant below and
-  `Key Vault Secrets User` on the three exact MCP secret scopes are supported.
-  The owner rejects broad, inherited or custom
-  grants (including group-derived assignments), including management-plane
-  access that could obtain API secrets. The owner queries both subscription
-  descendants and inherited parent/management-group assignments, with group
-  membership included and principal-name enrichment disabled. The approved
-  operator needs that role metadata visibility; enumeration failure is a
-  failure, not a clean result.
-  The profile uses registry RBAC/AcrPull, not ACR repository-ABAC permissions.
-  The template grants access only to `agent-control-mcp-client`,
-  `agent-control-mcp-signing`, `agent-control-mcp-encryption`; selected versions
-  are immutable. Native Key Vault references use that identity. No secret values
-  enter parameters, command arguments or receipts. The Python Azure source
-  accepts only resolved values in memory, with the same independent-key and
-  format checks; it never falls back to local files or plaintext OAuth state.
-  Inherited access to any API/session/database/tenant-registry secret is refused.
-- Azure uses **one prepared Block Blob**, not a filesystem mount or the
-  application's database. Pin the exact HTTPS account URL, dedicated private
-  container and `oauth-state.v1.fernet` object. `storage.identity` is this exact
-  object URL, not an invented marker file. Prepare a same-region `StorageV2`
-  Standard_LRS/ZRS account with HTTPS-only, TLS1.2, shared-key authorization and
-  public Blob access disabled, and public network access disabled. The container
-  has `publicAccess=None`. The storage owner creates the empty Block Blob once,
-  or supplies the intact same-binding encrypted object on recovery.
-  The runtime never creates containers/objects or falls back to local storage.
-- Prepare `Storage Blob Data Contributor`
-  (`ba92f5b4-2d11-453d-a403-e96b0029c9fe`) on **only** the exact container
-  resource ID, with conditionVersion `2.0` and the exact condition:
+- A reviewed immutable ACR image digest and separate user-assigned identity.
+- The exact registry pull and per-secret Key Vault permissions.
+- One `StorageV2` Standard_LRS/ZRS account, private container and prepared
+  `oauth-state.v1.fernet` Block Blob, with the exact object-conditioned grant.
+- The Blob private endpoint, private DNS and delegated integration subnet.
+- Exact HTTPS resource/callback URLs, ingress rules and outbound reachability
+  to Entra, the API, Key Vault and ACR.
 
-  ```text
-  @Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringEquals 'oauth-state.v1.fernet'
-  ```
+There is no Azure Files or premium file-share prerequisite. The runtime uses
+the leased encrypted Blob, not a filesystem mount or PostgreSQL.
+The deployment owner creates the separate single-worker Linux S1 plan/site;
+it does not prepare registry, identity, network or Blob resources.
+Use the integration guide for exact binding, lease and recovery requirements.
 
-  No unconditioned/other-object/account/subscription Blob grant is accepted.
-  The dedicated container contains no other data. The existing deployment
-  owner verifies already-prepared storage/registry grants; it does not create
-  them. The runtime uses only `ManagedIdentityCredential(client_id=<exact UAMI>)`,
-  never `DefaultAzureCredential`, user/environment credentials, SAS or keys.
-  Native Key Vault secret delivery remains separate from this SDK credential.
-- Prepare the exact approved `blob` private endpoint in the integration VNet,
-  its `default` private DNS zone group for `privatelink.blob.core.windows.net`,
-  and completed non-registering link to that VNet. The Web/serverFarms-delegated
-  integration subnet and `vnetRouteAllEnabled=true` route outbound traffic
-  through the prepared network. Record effective private DNS, HTTPS443 to the
-  endpoint and bounded firewall/NSG/route egress to Entra, the exact API, Key
-  Vault and ACR dependencies in `preparedReference` and the existing network
-  reachability reference. Do not open public storage or weaken TLS to fix DNS.
-  ARM identity checks do not prove effective packets/DNS; the network owner must
-  verify these on the authorized target before claiming cloud qualification.
-- The exact data blob is also the lease object. Startup acquires a finite15s
-  SDK lease once; a competing worker fails startup. Renew every4s only during
-  service lifespan. Every read/authorization boundary verifies ownership;
-  every persisted mutation uses the same blob lease plus ETag condition.
-  No guard-blob/unfenced-key design, stale authorization cache, automatic
-  reacquisition or mutation retry exists. Each SDK I/O is bounded5s with SDK
-  retries disabled; a local10s ownership deadline starts at request dispatch,
-  not response receipt. Expired/unknown ownership or any ambiguous mutation
-  permanently stops this process's issuance and readiness, with safe503 and
-  redacted operator logging. Stop and reconcile; never replay cached success.
-  Shutdown cancels renewal and attempts bounded release; after a crash wait for
-  finite lease expiry, never break an active holder to force replacement.
-- The encrypted map permanently binds tenant/MCP/API/resource and exact storage
-  object, with hashed lookups, maintained Fernet/MultiFernet encryption,4096
-  records,256KiB per record,24h maximum TTL and expiry culling on mutations/
-  readiness. Serialized plaintext is bounded below48MiB so encrypted bytes
-  stay below64MiB; one bounded single-Put-Blob update avoids unfenced block
-  staging. No business, provider or API/OBO credential state moves here.
-  Local protected FileTree/Fernet behavior and ownership/modes are unchanged.
+For an independent MCP change:
 
-See Microsoft's [Blob lease SDK](https://learn.microsoft.com/python/api/azure-storage-blob/azure.storage.blob.aio.blobleaseclient),
-[lease protocol](https://learn.microsoft.com/rest/api/storageservices/lease-blob),
-[ABAC examples](https://learn.microsoft.com/azure/storage/blobs/storage-auth-abac-examples)
-and [private endpoints](https://learn.microsoft.com/azure/storage/common/storage-private-endpoints).
-One site/worker/no-slot/no-autoscale remains capacity policy, not fencing.
-Verified stop plus75s drain remains useful for owner-managed updates, but the
-server-enforced data-blob lease fences platform replacement independently.
-`scripts/azure-oauth-fixture.ps1` proves real SDK/emulator lease semantics on a
-guarded internal Docker network with a loopback-only port and exact cleanup.
-It does not prove Azure managed identity, ABAC, TLS/private DNS or durability.
+```powershell
+pwsh ./deploy-azure.ps1 -Action Plan -Component Mcp -TargetFile <approved-target.json>
+pwsh ./deploy-azure.ps1 -Action Deploy -Component Mcp -TargetFile <approved-target.json>
+```
+
+MCP-only deployment needs Azure CLI and Bicep, not Docker or the API ZIP.
+`All` is the default component and applies MCP after API/web is open.
+`Application` requires a target without `mcp`; it cannot ignore supplied settings.
+MCP failure leaves API/web online and returns a nonzero partial outcome.
 
 ### Transport and proof boundaries
 
-Ingress is HTTPS/TLS1.2, explicit IPv4 CIDR allows with default deny; SCM defaults
-deny. Preserve the public Host through App Service. Uvicorn ignores all forwarded
-headers; neither Node's proxy policy nor browser Origin/CSRF rules are widened.
-The SDK keeps exact Host/Origin/resource/audience/PKCE checks.
-The current Streamable HTTP profile returns bounded JSON responses, not an
-unbounded SSE event broker. Invocation deadline60s, API deadline30s/OBO10s,
-request/output512KiB,32 connections/backlog64, OAuth/body30s, callback16KiB,
-keepalive5s, graceful drain65s and host stop75s remain explicit. Azure's Linux
-approximately230-second front-end idle boundary is not a configurable promise
-of long-lived streaming. No buffering/reverse-proxy setting is invented.
-
-Deployment verifies observed image/Blob binding/egress/ingress/native references,
-runtime binding, redacted diagnostics/alerts, encrypted readiness and public
-OAuth discovery. It explicitly records authenticated API connectivity, actual
-Azure persistence/restart, disconnect/streaming/client compatibility as
-**not proven**. Exact approved accounts/network must test OAuth→OBO→a saved read,
-revocation, restart/lease-expiry/host replacement, key rotations, callback rejection,
-spoofed forwarding, bounded streaming/cancellation and graceful drain. No test
-receipt is a runtime enable flag or substitute for real authorization.
-
-### Signals and owning responses
-
-MCP metric alerts use the existing bounded30-day/0.1GiB-day workspace and action
-group: >=5 HTTP5xx/5min, health<100%/5min, average latency>2s/5min,
-working memory>768MiB/5min. No raw HTTP/query/callback/token logging is enabled.
-These are configured thresholds, not measured capacity or delivered-alert proof.
-The platform health metric is a0–100 average; by default it reflects unhealthy
-status only after ten failed one-minute pings, before the five-minute alert
-window. Readiness503 can appear earlier; do not infer immediate detection.
-See [Health Check behavior](https://learn.microsoft.com/azure/app-service/monitor-instances-health-check)
-and [the metric unit clarification](https://learn.microsoft.com/en-us/answers/questions/1551682/what-is-the-unit-for-health-check-metric).
-
-| Signal/limit | Owner and response |
-| --- | --- |
-| Repeated401/403, rejected callback/resource/PKCE, claims challenge | Identity owner checks exact tenant/client/scope/redirect/grant or same-account reconnect. Do not widen audience/Origin or log codes/tokens. |
-| OBO/API503/504, invocation60s, API30s/OBO10s | MCP/API owner distinguishes token service from authenticated API reachability; inspect sanitized correlation/status, network and current permissions. No app-only fallback or POST retry. |
-| Provider429/503/errors or schema omissions | API/provider owner observes existing provider-failure alerts (>=5/5min), cooldown and saved job state. Saved reads stay provider-free. |
-| Sent-unknown/readback-pending/partial control | Control owner uses saved exact receipt/job and read-only reconciliation; never execute/replay an uncertain write to “test recovery.” One safety incident requires incident handling. |
-| Authorization-wait or queued work beyond its documented API deadline | API/job owner reacquires fresh same-account authority for eligible unsent work; use current saved status. No MCP queue/scheduler or invented approval. |
-| OAuth >=80% of4096 records or64MiB; readiness503 or lost-lease log | MCP storage owner uses authenticated `/diagnostics` record/encrypted-byte usage and expired-state culling. Stop the failed process; reconcile the exact object/ETag and active holder before restart. Never break a live holder, replay an uncertain write or broaden permissions. |
-| Latency/memory/CPU/restarts | MCP owner checks configured metric alerts and S1 plan CPU; investigate sustained CPU>80%/15min or >2 restarts/15min. Stop only MCP for containment; no unapproved scale-out. |
-| Spend actual/forecast80% of approved ceiling or extra shared-resource charge | Budget owner checks the existing budget notices, MCP's separately itemized plan/storage/registry/network/monitoring/restore cost and other-RG prepared-resource costs. Escalate forecast before100%; do not silently provision/upgrade. |
-
-Disk/queue/auth-specific thresholds above are operator runbook responses, not
-fabricated installed Azure log alerts: the current SDK emits normalized safe
-logs, not a new analytics schema. Delivery, effective NSG/DNS, billing outside the
-deployment RG, API-authenticated reachability and restart observations are
-external owner actions. MCP failure must never turn off API/web or request a
-database reset.
+Readiness and discovery do not verify authenticated OAuth/OBO/API access,
+effective private DNS/network rules, client compatibility or restart recovery.
+Validate those journeys with authorized accounts on the intended target.
+Never use an MCP failure as a reason to reset the application database.

@@ -1,22 +1,18 @@
 # Agent Control
 
-Understand Copilot adoption and manage AI agents across Microsoft 365 and Copilot Studio from one workspace.
+Track Microsoft 365 Copilot adoption and manage Microsoft 365 and Copilot Studio agents.
 
-- Browse agents, owners, environments, and access assignments.
-- Explore Copilot licenses, agent activity, and Copilot usage across Office apps.
-- Compare department participation, follow adoption trends, and identify potential champions.
-- Manage package availability and Copilot Studio quarantine.
-- Upload official usage reports with a dedicated non-admin report-uploader role.
+- **Agents:** inventory, owners, environments, access, package availability and Studio quarantine.
+- **Users:** Copilot licenses, agent activity and Copilot usage in Office apps.
+- **Dashboard:** adoption trends, department participation and potential champions.
+- **CSV imports:** upload official agent-usage reports using Admin or report-uploader access.
 
 ## Quick start
 
 ### 1. Install the prerequisites
 
-Install:
-
-- Git
-- PowerShell 7
-- Docker Desktop, or Docker Engine with Compose v2
+Install **Git**, **PowerShell 7**, and **Docker Desktop** or **Docker Engine with
+Compose v2**.
 
 Clone the repository:
 
@@ -25,22 +21,13 @@ git clone https://github.com/candede/agent_control.git
 cd agent_control
 ```
 
-Node.js and PostgreSQL run in containers. You do not need to install them on the
-host.
+Node.js and PostgreSQL run in containers; no host installation is needed.
 
 ### 2. Configure Microsoft Entra ID
 
-Follow the [setup guide](docs/deployment-setup.md) to register Agent Control in
-Microsoft Entra ID. The guide covers:
-
-- creating the app registration;
-- the callback URL;
-- creating a client secret;
-- the Viewer, UsageReportUploader and Admin app roles;
-- user or group assignments;
-- Microsoft API permissions and admin consent.
-
-The normal local setup uses `http://localhost:3001`.
+Use the [setup guide](docs/deployment-setup.md) to create the app registration,
+callback URL, client secret, app roles, user assignments and API permissions.
+Default local URL: `http://localhost:3001`.
 
 ### 3. Start Agent Control
 
@@ -48,156 +35,105 @@ The normal local setup uses `http://localhost:3001`.
 pwsh ./deploy-local.ps1 start
 ```
 
-The first start opens a setup wizard and saves configuration under
-`.local/agent-control/`. It then builds and starts the app with PostgreSQL.
+The first start opens a setup wizard, saves configuration under
+`.local/agent-control/`, and starts the app with PostgreSQL.
 
 Open [http://localhost:3001](http://localhost:3001), or the port selected in the
 wizard, and sign in with an assigned work or school account.
 
 ### 4. Collect data
 
-Initial read-only synchronization starts automatically after any Viewer,
-UsageReportUploader or Admin signs in while the app is visible and online.
-Graph package, people, license and Office app activity collection uses application
-permissions, not the signed-in user's Microsoft reader roles. Power Platform
-collection remains delegated. **Sync** shows source progress and retained history.
-Use **Permissions** to diagnose an actual authorization failure, not as a
-prerequisite to collection.
-You can dismiss first-sync progress and use saved data while collection continues.
-Application-token failures require checking app configuration, not signing in as
-a more privileged user.
-Office observations are prepared automatically from committed directory and app
-activity sources. Local preparation failures do not downgrade saved-source success.
-Background Office recovery is cancelled and joined during application shutdown;
-terminal source-status checkpoints and semantic replay acknowledgments roll back if cancelled
-before commit, without suppressing necessary failure cleanup.
+Read-only sync starts automatically after sign-in while the app is visible and
+online. **Sync** shows progress; **Permissions** diagnoses access failures.
+All app roles share saved tenant data, even without permission to collect it.
 
-To add Microsoft 365 Copilot agent usage, export the **Agents**,
-**Users & agents**, and **Users** CSV reports for the same period and import them
-from **Sync > Add CSV reports**. See the
-[usage import guide](docs/official-usage-import.md).
+| Source | Data collected |
+| --- | --- |
+| Microsoft Graph (application permissions) | Published agents/packages, users, Copilot licenses and Copilot usage in Office apps |
+| Power Platform (signed-in user's delegated access) | Copilot Studio agents and environments |
+| Imported Microsoft 365 CSVs | Copilot agent usage |
 
-Purview and Defender UI entry points and setup guidance are deferred. Their
-backend implementations and saved data are unchanged.
-
-**Dashboard** compares active users and active agents across retained reports,
-with a selectable baseline and recent report-to-report direction. Company-filtered
-department participation, people and engagement, and **Agents and Agent Champs** panels
-show where to focus support. Department percentages use saved directory members,
-not a full workforce census. It does not estimate daily activity or treat import
-dates as usage dates.
-
-Office participation summary cards stack in one column at viewport widths of
-760px or less. Agent insight cards retain their separate 500px breakpoint.
-Office dashboard drill-through links preserve a selected Office observation and
-baseline while saved context loads or a retryable read fails; Latest links pin
-the measured observation once context is available.
-
-In **Users > Adoption > Office apps**, person details show frozen evidence from
-the selected observation; current profiles are separate. Closing details returns
-focus to that person, or to the groups heading if the people page is still loading.
+For agent usage, export **Agents**, **Users & agents** and **Users** for the same
+period, then import them through **Sync > Add CSV reports**.
+[Export and import instructions](docs/official-usage-import.md).
 
 ## Permissions
 
-Application permissions authorize the app. **App roles** authorize users in
-Agent Control. **Delegated permissions** use the logged-in user's Microsoft access.
-
-The **Permissions** page has three always-visible sections: **Issues**,
-**App-defined roles**, and **App registration permissions**, without a shortcut
-bar. Issues show current diagnostics; the permission reference describes required
-configuration, not proof of consent or successful provider access.
+- **App roles:** what a user can do in Agent Control.
+- **Application permissions:** what Agent Control can read using its own identity.
+- **Delegated permissions:** what Agent Control can do using the signed-in user's Microsoft access.
 
 ### App-defined roles
 
 | App role | Allowed tasks |
 | --- | --- |
-| `AgentControl.Viewer` | Read shared tenant data and run read-only sync |
-| `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish new CSV sets; discard own unaccepted drafts |
-| `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/deletion, configuration and local Audit read/export |
+| `AgentControl.Viewer` | Read shared tenant data; run read-only sync |
+| `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish CSV reports; discard own drafts |
+| `AgentControl.Admin` | Viewer/Uploader access; manage agents and settings; correct/delete published reports; read/export audit logs |
 
-Assign roles through **Enterprise applications > Agent Control > Users and
-groups**. Uploader includes Viewer; Admin includes both. Directly assigned cards
-are purple and marked **Assigned to you**; inherited cards remain neutral and
-marked **Included**. These roles never grant Microsoft provider access.
-
-Only Admin can see the **Audit** tab/page or read/export local administrative
-audit logs, including through direct URLs and APIs. Audit recording is unchanged.
+Assign one role per user or group through **Enterprise applications > Agent
+Control > Users and groups**. Uploader includes Viewer; Admin includes both.
+App roles do not grant Microsoft API access.
 
 ## App registration permissions
 
-These are the same **11 entries in four groups** shown on Permissions. Configure
-the app registration and grant tenant admin consent; sign-in does not request
-additional API consent. Microsoft roles and licensing are separate requirements.
+Configure these permissions in the app registration and grant tenant admin
+consent. Sign-in does not request these grants. Microsoft roles and licenses are
+separate requirements.
 
 ### Microsoft Graph / Application
 
-Application identity supports automatic Graph reads. No signed-in Microsoft
-directory or reporting role is required.
+Used for automatic Graph sync. The signed-in user needs no Microsoft directory
+or reporting role.
 
-| Permission | Feature and required Microsoft access |
+| Permission | Used by Agent Control to |
 | --- | --- |
-| `CopilotPackages.Read.All` | Published agent/package inventory, metadata and sharing details. Requires applicable Microsoft Agent 365 licensing, application credentials and tenant admin consent. |
-| `User.Read.All` | Directory users and Copilot license assignments; exact creator/owner resolution; management user search and user-ID validation. |
-| `LicenseAssignment.Read.All` | Product and service-plan catalog |
-| `Reports.Read.All` | 28-day per-user Copilot Office-app activity; does not replace the three imported agent-usage CSV reports. |
+| `CopilotPackages.Read.All` | Retrieve published agents, package metadata and sharing details. Requires applicable Microsoft Agent 365 licensing. |
+| `User.Read.All` | Retrieve users and Copilot license assignments; identify agent owners; find and validate users for access changes. |
+| `LicenseAssignment.Read.All` | Retrieve product and service-plan catalog entries to identify Copilot licenses. |
+| `Reports.Read.All` | Retrieve each user's Copilot usage in Office apps (last 28 days) for the Office adoption dashboard and **Users > Adoption > Office apps**. |
 
 ### Microsoft Graph / Delegated
 
-Signed-in user identity supports management group lookups and package changes.
-User lookups use application access.
-
-| Permission | Feature and required Microsoft access |
+| Permission | Used by Agent Control to |
 | --- | --- |
-| `CopilotPackages.ReadWrite.All` | Package blocking/unblocking, availability/installation assignments and control readback. Requires delegated tenant admin consent and a Microsoft Agent 365 license. Recommended signed-in administrator role: **AI Administrator**; **Global Administrator** is a broader alternative. Package writes support delegated work or school accounts only. |
-| `Group.Read.All` | Management group search/resolution using the signed-in user's delegated directory visibility. |
+| `CopilotPackages.ReadWrite.All` | Block/unblock packages, change availability and installation assignments, and verify changes in **Agents > Manage**. |
+| `Group.Read.All` | Find groups for package availability and installation assignments. |
 
-Microsoft defines both application and delegated forms of the package permission,
-but the application form does not authorize these writes. Configure
-**Microsoft Graph > Delegated permissions**, not Application, for package
-controls. The role recommendation follows Microsoft's agent-management guidance
-for the Microsoft 365 admin center. The package API does not publish an explicit
-role minimum; this is not a confirmed exclusive API role requirement. See the
-[recommended administrator role and API support](docs/user-roles-and-permissions.md#package-management-administrator-roles).
+Package changes require a **Microsoft Agent 365 license** and a **delegated work
+or school account**. Application permissions cannot authorize these writes.
+**Recommended role:** **AI Administrator**; **Global Administrator** is broader.
+The package API does not specify a minimum role.
+[Role and API requirements](docs/user-roles-and-permissions.md#package-management-administrator-roles).
 
 ### Power Platform / Delegated
 
-Power Platform is separate from Graph. Inventory and administrative actions use
-the signed-in user's Microsoft privileges.
+| Permission | Used by Agent Control to | Microsoft role |
+| --- | --- | --- |
+| `ResourceQuery.Resources.Read` | Retrieve Copilot Studio agents and environments. | Recommend **AI Reader** for read-only sync. |
+| `CopilotStudio.AdminActions.Invoke` | Read quarantine status; quarantine or restore Studio agents. | **AI Administrator**, **Power Platform Administrator** or **Global Administrator**, including for status reads. |
 
-| Permission | Feature and required Microsoft access |
-| --- | --- |
-| `ResourceQuery.Resources.Read` | Copilot Studio agents and environment inventory. Recommend **AI Reader**, the least-privileged supported Entra inventory role for this sync. There is **no application permission equivalent**. Saved tenant data remains readable without sync access. |
-| `CopilotStudio.AdminActions.Invoke` | Studio quarantine status and quarantine/restore. Both status and changes require **AI Administrator**, **Power Platform Administrator** or **Global Administrator**. |
-
-**Assign AI Reader:** a **Privileged Role Administrator** opens **Microsoft Entra
-admin center > Identity > Roles & admins > AI Reader > Add assignments**, selects
-the viewer and selects **Add**. The viewer signs out/in, activating the role first
-if PIM-eligible. Delegated API consent is still required; an API permission is not
-a user role, and inventory access does not grant quarantine status or changes.
-
-**Other roles, if already assigned:** Global Reader, AI Administrator, Power
-Platform Administrator, Dynamics 365 Administrator and Global Administrator also
-work. AI roles cover AI-scoped resources; do not assign broader roles solely for
-this sync. These are inventory-feature roles; the REST API publishes no separate
-role minimum. See the [assignment instructions and Microsoft references](docs/user-roles-and-permissions.md#power-platform-sync-roles).
+Inventory sync has no application-permission equivalent. For role assignments
+and other supported roles, see [Power Platform access](docs/user-roles-and-permissions.md#power-platform-sync-roles).
 
 ### Sign-in / OpenID Connect
 
-These sign-in scopes do not authorize inventory reads or administrative changes.
+Sign-in and token renewal only; these scopes do not authorize inventory reads or
+management changes.
 `User.Read` is not used.
 
 | Scope | Purpose |
 | --- | --- |
-| `openid` | Authenticate the account using an ID token; no provider-data access. |
+| `openid` | Sign in using an ID token. |
 | `profile` | Display the signed-in account's name and username. |
-| `offline_access` | Renew delegated tokens when Microsoft policy allows; no additional API permissions. |
+| `offline_access` | Renew delegated tokens when Microsoft policy allows. |
 
 ## Usage report access
 
-Local CSV import needs no Microsoft token. Downloading the original user-level
-reports from Microsoft 365 requires **Reports Reader** or **AI Administrator**;
-**Usage Summary Reports Reader** does not include user details. Import
-authorization is covered by the app-defined roles above, not a Microsoft grant.
+- **Export from Microsoft 365:** **Reports Reader** or **AI Administrator**.
+  **Usage Summary Reports Reader** does not include user details.
+- **Import into Agent Control:** `AgentControl.UsageReportUploader` or
+  `AgentControl.Admin`; no Microsoft token needed.
 
 See the [permissions reference](docs/user-roles-and-permissions.md) and
 [registration setup](docs/deployment-setup.md#5-add-api-permissions).
@@ -215,27 +151,18 @@ Add `-Project <name>` to keep separate installations.
 
 ## Documentation
 
-The optional [MCP service](docs/deployment-setup.md#optional-mcp-service)
-is implemented as a separately runnable Python package with OAuth, encrypted
-connection state and a canonical API adapter. Its [typed tools](docs/mcp-integration.md#implemented-typed-business-catalog-phase-06)
-cover saved inventory/people/reports/investigations plus explicit application Graph
-and delegated Power Platform collection, exact shared/package/Studio controls and
-bounded job recovery.
-Controls retain current API authority/receipts and client confirmation; uncertain
-writes are never replayed automatically. Optional local container/lifecycle
-support and [optional Azure source deployment tooling](docs/azure-production-deployment.md#optional-independent-mcp-app-service)
-are implemented. Local software checks do not prove live Entra consent, provider
-access, vendor-client compatibility or a working Azure deployment.
-The web app needs none of it.
+Optional: run the [MCP service](docs/deployment-setup.md#optional-mcp-service) to
+connect AI clients to Agent Control. The web app does not require it.
 
 | Guide | Covers |
 | --- | --- |
 | [Setup](docs/deployment-setup.md) | Entra ID, permissions, local setup, and multiple tenants |
 | [Microsoft roles](docs/user-roles-and-permissions.md) | Roles required for each feature |
 | [Usage reports](docs/official-usage-import.md) | Exporting and importing Microsoft 365 reports |
+| [Office adoption](docs/copilot-license-usage.md) | Copilot licenses, Office app activity and adoption metrics |
 | [Operations](docs/operations.md) | Updates, troubleshooting, backups, and recovery |
-| [Saved data](docs/data-architecture.md) | Current schema, source publication, selections, and lifecycle |
-| [Provider contracts](docs/provider-contracts.md) | Supported Microsoft contracts, permissions, limits, and evidence |
+| [Saved data](docs/data-architecture.md) | Database schema, storage and retention |
+| [Provider contracts](docs/provider-contracts.md) | Supported Microsoft APIs, permissions and limits |
 | [Security](docs/security-model.md) | Authentication, authorization, and data isolation |
-| [MCP clients](docs/mcp-clients.md) | Versioned client onboarding, ordinary workflows, exact callbacks and synthetic proof limits |
+| [MCP clients](docs/mcp-clients.md) | Client setup, authentication and tools |
 | [Azure deployment](docs/azure-production-deployment.md) | Production requirements and deployment |

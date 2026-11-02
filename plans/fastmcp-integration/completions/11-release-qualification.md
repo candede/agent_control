@@ -458,7 +458,7 @@ cleanup receipts are in the identified release directory.
 
 ## Reproduction and phase12 handoff
 
-Use the current [operations commands](../../../docs/operations.md#current-release-qualification-for-deployment-testing).
+Use the current [operations commands](../../../docs/operations.md#validation).
 Build a unique owned current operator with approved feeds, capture its immutable
 ID, and pass both explicitly; never use the obsolete default5096 image or weaken
 manifest/image/socket/mount/ownership guards. Exact executed selectors include

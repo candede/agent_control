@@ -241,6 +241,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         else if (policy?.roles?.includes("AgentControl.Admin")) expect(policyText).toMatch(/^A(?:;|$)/);
         else expect(policyText).toBe("S");
         if (policy?.access === "authenticated" && policy.capabilityId) expect(row[3]).toContain(policy.capabilityId);
+        if (policy?.access === "authenticated") expect(Boolean(policy.browserOnly), raw).toBe(row[3].includes("| — |"));
       }
     } finally { await store.close(); }
   });
@@ -270,8 +271,8 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     ]));
   });
 
-  it("keeps every current workbench page in the sole regression/manual map with no MCP transport", () => {
-    const featureMap = document.split("## Web regression and manual handoff")[1]?.split("## Synthetic workflow corpus and test isolation")[0];
+  it("keeps every current workbench page in the browser contract checklist with no MCP transport", () => {
+    const featureMap = document.split("## Browser contract checks")[1]?.split("## Verification")[0];
     expect(featureMap).toBeDefined();
     for (const page of ["agents", "users", "sync", "audit", "permissions"]) expect(featureMap).toContain(`\`${page}\``);
     for (const file of sourceFiles(resolve(root, "frontend/src"))) {
@@ -367,9 +368,11 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(dataset.relations).toContain("WHERE r.kind='userAgents' AND r.responses>0");
     expect(dataset.relations).toContain('responses DESC NULLS LAST,agents DESC,lower(name) COLLATE "C",identity');
     expect(dataset.relations).toContain("rank<=3 AND (coalesce(responses,0)>0 OR agents>0)");
-    expect(document).toContain("p1=(3,10,2),p2=(2,50,2),p3=(2,20,7)");
-    expect(document).toContain("Jan->Mar comparable50%");
-    expect(document).toContain("Jan->overlap/Jan->Apr/undated not growth");
+    const contract = document.replace(/\s+/g, " ");
+    expect(contract).toContain("Champions rank by responses descending, then positively used agent count, name and identity");
+    expect(contract).toContain("creation counts do not influence rank");
+    expect(contract).toContain("equal-length non-overlapping windows");
+    expect(contract).toContain("Overlapping, unequal or undated windows do not prove growth");
   });
 
   it("keeps report defaults, exact identities and meaningful-filter rejection in the current API parser", () => {
@@ -450,7 +453,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document).toContain("POST/PATCH/DELETE submissions are never automatically replayed");
     expect(document).toContain("Do not retain protocol session IDs");
     expect(document).toContain("first **accepted execution submission**");
-    expect(document).toContain("Same idempotency key returns original origin");
+    expect(document.replace(/\s+/g, " ")).toContain("Same idempotency key returns original origin");
     expect(document).toContain("no automatic double dispatch");
     const tools = routeRows.map(row => row[3].split("|").at(-3)?.trim()).filter(tool => tool !== "—" && tool !== "HTTP only");
     expect(new Set(tools).size).toBe(tools.length);
