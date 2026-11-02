@@ -176,6 +176,12 @@ test("the login layout is accessible, keyboard operable, and fits its viewport",
   const remember = page.getByRole("checkbox", { name: "Remember my email on this browser" });
   const button = page.getByRole("button", { name: "Sign in with Entra ID" });
   await expect(input).toBeVisible();
+  const overview = page.getByRole("region", { name: "Copilot adoption. Agent control." });
+  await expect(overview.getByText("Your Copilot and agent workspace")).toBeVisible();
+  await expect(overview.getByRole("listitem")).toHaveCount(4);
+  for (const name of ["Understand Copilot adoption", "Find where to focus", "Know your agent landscape", "Manage agent access"]) {
+    await expect(overview.getByRole("heading", { name, level: 3 })).toBeVisible();
+  }
   await page.keyboard.press("Tab");
   await expect(input).toBeFocused();
   await page.keyboard.press("Tab");

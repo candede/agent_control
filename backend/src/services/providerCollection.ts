@@ -39,7 +39,8 @@ export async function* streamProviderCollection(response: Response, options: {
     fence();
     const tokens: AsyncIterable<Token> = tokenizer;
     for await (const token of tokens) {
-      fence();
+      // External admission checks belong at input-chunk and record boundaries.
+      options.signal.throwIfAborted();
       const parent = frames.at(-1);
       if (token.name === "startKey" || token.name === "startString" || token.name === "startNumber") scalarBytes = 0;
       if (token.name === "stringChunk" || token.name === "numberChunk") {
@@ -98,6 +99,7 @@ export async function* streamProviderCollection(response: Response, options: {
         if (!parent) throw schema();
         frames.pop();
         if (assembler?.done) {
+          fence();
           const value = assembler.current;
           assembler = undefined;
           metadata.rows += 1;

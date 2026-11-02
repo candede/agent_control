@@ -1,9 +1,10 @@
 # Agent Control
 
-Discover and manage Microsoft 365 and Copilot Studio agents from one dashboard.
+Understand Copilot adoption and manage AI agents across Microsoft 365 and Copilot Studio from one workspace.
 
 - Browse agents, owners, environments, and access assignments.
-- Track Copilot licenses, adoption, and agent usage.
+- Explore Copilot licenses, agent activity, and Copilot usage across Office apps.
+- Compare department participation, follow adoption trends, and identify potential champions.
 - Manage package availability and Copilot Studio quarantine.
 - Upload official usage reports with a dedicated non-admin report-uploader role.
 

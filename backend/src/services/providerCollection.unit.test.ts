@@ -37,6 +37,58 @@ describe("streamed provider collections", () => {
     ]);
   });
 
+  it("bounds admission checks by records and input chunks, not nested JSON tokens", async () => {
+    const count = 100;
+    const body = JSON.stringify({ value: Array.from({ length: count }, (_, index) => ({
+      id: String(index),
+      assignedPlans: Array.from({ length: 120 }, (_, plan) => ({
+        servicePlanId: String(plan), service: "MicrosoftOffice", capabilityStatus: "Enabled",
+        assignedDateTime: "2026-10-01T00:00:00Z",
+      })),
+    })) });
+    const assertCurrent = vi.fn();
+    let records = 0, completed = false;
+    for await (const event of streamProviderCollection(new Response(body), { ...options, assertCurrent })) {
+      if (event.kind === "record") records++;
+      else completed = true;
+    }
+    expect(records).toBe(count);
+    expect(completed).toBe(true);
+    expect(assertCurrent.mock.calls.length).toBeGreaterThanOrEqual(count);
+    expect(assertCurrent.mock.calls.length).toBeLessThanOrEqual(count + 4 * Math.ceil(Buffer.byteLength(body) / 16384) + 16);
+  });
+
+  it("rejects buffered records when authority changes while the consumer is paused", async () => {
+    const reason = new Error("Source authority changed.");
+    let revoked = false;
+    const cancel = vi.fn();
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(Buffer.from('{"value":[{"id":"one"},{"id":"two"}]}')); }, cancel,
+    });
+    const iterator = streamProviderCollection(new Response(source), {
+      ...options, assertCurrent: () => { if (revoked) throw reason; },
+    });
+    expect((await iterator.next()).value).toEqual({ kind: "record", value: { id: "one" } });
+    revoked = true;
+    await expect(iterator.next()).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("preserves cancellation before yielding another buffered record", async () => {
+    const controller = new AbortController(), cancel = vi.fn();
+    const reason = new Error("Collection cancelled.");
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(Buffer.from('{"value":[{"id":"one"},{"id":"two"}]}')); }, cancel,
+    });
+    const iterator = streamProviderCollection(new Response(source), {
+      ...options, signal: controller.signal,
+    });
+    expect((await iterator.next()).value).toEqual({ kind: "record", value: { id: "one" } });
+    controller.abort(reason);
+    await expect(iterator.next()).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("streams over 100000 records and 16 MB without holding the collection", async () => {
     const count = 100001, encoder = new TextEncoder();
     let wireBytes = 0;

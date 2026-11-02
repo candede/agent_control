@@ -20,6 +20,7 @@ import {
   LogOut,
   RefreshCw,
   ShieldCheck,
+  Users,
 } from "lucide-react";
 import {
   ApiError,
@@ -3356,24 +3357,28 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         </header>
         <div className="signin-content">
           <section className="signin-overview" aria-labelledby="signin-overview-title">
-            <p className="eyebrow">Your agent administration workspace</p>
-            <h2 id="signin-overview-title">Agent administration.<br /> A single workspace.</h2>
+            <p className="eyebrow">Your Copilot and agent workspace</p>
+            <h2 id="signin-overview-title">Copilot adoption.<br /> Agent control.</h2>
             <p className="signin-lede">
-              Understand and manage your organization&apos;s AI agents,
-              from adoption to access.
+              One workspace to understand Copilot usage, support your people,
+              and manage AI agents across Microsoft 365 and Copilot Studio.
             </p>
             <ul className="signin-capabilities">
               <li>
-                <span className="signin-capability-icon"><Bot size={20} aria-hidden="true" /></span>
-                <div><h3>Know your agent inventory</h3><p>Discover agents, owners, and environments across Microsoft 365 and Copilot Studio.</p></div>
+                <span className="signin-capability-icon"><BarChart3 size={20} aria-hidden="true" /></span>
+                <div><h3>Understand Copilot adoption</h3><p>Explore licenses, agent activity, and Copilot usage across Office apps.</p></div>
               </li>
               <li>
-                <span className="signin-capability-icon"><BarChart3 size={20} aria-hidden="true" /></span>
-                <div><h3>Understand adoption</h3><p>Review Copilot licenses, usage, and agent activity.</p></div>
+                <span className="signin-capability-icon"><Users size={20} aria-hidden="true" /></span>
+                <div><h3>Find where to focus</h3><p>Compare department participation, follow adoption trends, and identify potential champions.</p></div>
+              </li>
+              <li>
+                <span className="signin-capability-icon"><Bot size={20} aria-hidden="true" /></span>
+                <div><h3>Know your agent landscape</h3><p>Discover agents, owners, and environments across Microsoft 365 and Copilot Studio.</p></div>
               </li>
               <li>
                 <span className="signin-capability-icon"><ShieldCheck size={20} aria-hidden="true" /></span>
-                <div><h3>Manage agent access</h3><p>Control agent availability, installation assignments, and quarantine.</p></div>
+                <div><h3>Manage agent access</h3><p>Control agent availability, installation assignments, and Copilot Studio quarantine.</p></div>
               </li>
             </ul>
           </section>

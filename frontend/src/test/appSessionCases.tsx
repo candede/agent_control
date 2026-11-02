@@ -5770,19 +5770,28 @@ export function savedInventoryCases() {
     expect(screen.queryByRole("dialog", { name: "Data sync" })).not.toBeInTheDocument();
   });
 
-  it("introduces agent management benefits and offers one Entra sign-in", async () => {
+  it("introduces Copilot adoption and agent management benefits and offers one Entra sign-in", async () => {
     const transport = appTransport({ revalidatedRoles: [], authenticated: false });
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByRole("button", { name: "Sign in with Entra ID" })).toBeEnabled();
     expect(within(screen.getByRole("region", { name: "Sign in" })).getAllByRole("button")).toHaveLength(1);
     expect(screen.getByRole("textbox", { name: "Work or school username" })).toBeVisible();
-    const overview = within(screen.getByRole("region", { name: "Agent administration. A single workspace." }));
-    expect(overview.getByText("Understand and manage your organization's AI agents, from adoption to access.")).toBeInTheDocument();
-    expect(overview.getByRole("heading", { name: "Know your agent inventory" })).toBeInTheDocument();
-    expect(overview.getByRole("heading", { name: "Understand adoption" })).toBeInTheDocument();
-    expect(overview.getByRole("heading", { name: "Manage agent access" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Agent administration. A single workspace." })).not.toHaveTextContent(/Purview|Defender/);
+    const region = screen.getByRole("region", { name: "Copilot adoption. Agent control." });
+    const overview = within(region);
+    expect(overview.getByText("Your Copilot and agent workspace")).toBeInTheDocument();
+    expect(overview.getByText("One workspace to understand Copilot usage, support your people, and manage AI agents across Microsoft 365 and Copilot Studio.")).toBeInTheDocument();
+    expect(overview.getAllByRole("listitem")).toHaveLength(4);
+    for (const [heading, description] of [
+      ["Understand Copilot adoption", "Explore licenses, agent activity, and Copilot usage across Office apps."],
+      ["Find where to focus", "Compare department participation, follow adoption trends, and identify potential champions."],
+      ["Know your agent landscape", "Discover agents, owners, and environments across Microsoft 365 and Copilot Studio."],
+      ["Manage agent access", "Control agent availability, installation assignments, and Copilot Studio quarantine."],
+    ]) {
+      expect(overview.getByRole("heading", { name: heading, level: 3 })).toBeInTheDocument();
+      expect(overview.getByText(description)).toBeInTheDocument();
+    }
+    expect(region).not.toHaveTextContent(/Purview|Defender/);
     expect(screen.queryByText(/outstanding delegated permissions|Consent does not run investigations/)).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/capabilities"))).toBe(false);
   });
