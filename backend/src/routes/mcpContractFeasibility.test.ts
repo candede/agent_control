@@ -19,7 +19,7 @@ import { unifiedAgentRecordId, parseUnifiedAgentRecordId, type UnifiedAgentRecor
 import type { PowerPlatformResource } from "../types/powerPlatformInventory.js";
 
 const root = fileURLToPath(new URL("../../../", import.meta.url));
-const document = readFileSync(resolve(root, "docs/mcp-integration.md"), "utf8");
+const document = readFileSync(resolve(root, "docs/mcp-reference.md"), "utf8");
 const currentMap = document.split("## Administrative audit origin v1")[0];
 const routeRows = [...currentMap.matchAll(/^\| `(GET|POST|PUT|PATCH|DELETE) ([^`]+)` \|(.+)$/gm)];
 const currentRoutes = routeRows.map(match => `${match[1]} ${match[2]}`);

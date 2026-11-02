@@ -114,6 +114,28 @@ describe("capability documentation artifacts", () => {
     ));
   });
 
+  it("keeps MCP setup actionable and separates the developer contract", () => {
+    const setup = readRepositoryFile("docs/mcp-integration.md");
+    const headings = [...setup.matchAll(/^## (\d)\. /gm)].map(match => Number(match[1]));
+    const normalized = setup.replace(/\s+/g, " ");
+
+    expect(headings).toEqual([1, 2, 3, 4, 5]);
+    expect(setup).toContain("App registrations > New registration");
+    expect(setup).toContain("AgentControl.Access");
+    expect(setup).toContain("Mcp.Access");
+    expect(setup).toContain("api.requestedAccessTokenVersion");
+    expect(setup).toContain("Grant admin consent");
+    expect(normalized).toContain("save its **Value** securely");
+    expect(setup).toContain("https://mcp.example.com/auth/callback");
+    expect(setup).toContain("pwsh ./deploy-local.ps1 start -ConfigureMcp");
+    expect(setup).toContain("list_capabilities");
+    expect(setup).toContain("](mcp-reference.md)");
+    expect(setup).not.toMatch(/^\| `(GET|POST|PUT|PATCH|DELETE) \/api\//m);
+    for (const match of setup.matchAll(/```json\n([\s\S]*?)\n```/g)) {
+      expect(() => JSON.parse(match[1])).not.toThrow();
+    }
+  });
+
   it("documents the exact prepared-vault contract and excludes the admin password from runtime", () => {
     const setup = readRepositoryFile("docs/azure-production-deployment.md");
     const documentedNames = [...setup.matchAll(/^\| `((?:agent-control-)[^`]+)` \|/gm)].map(match => match[1]);

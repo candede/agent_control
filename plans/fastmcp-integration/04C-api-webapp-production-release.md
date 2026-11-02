@@ -10,7 +10,7 @@ This plan does not claim that deployment or live verification has happened.
 
 ## Current inputs
 
-- [Roadmap](README.md), [canonical API contract](../../docs/mcp-integration.md),
+- [Roadmap](README.md), [canonical API contract](../../docs/mcp-reference.md),
   [data architecture](../../docs/data-architecture.md),
   [security](../../docs/security-model.md) and
   [operations](../../docs/operations.md#existing-installation-maintenance).

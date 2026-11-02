@@ -164,73 +164,11 @@ documented separately in [provider contracts](../docs/provider-contracts.md#reta
 
 ## Optional MCP registration and consent
 
-### Expose the canonical API scope
-
-On the existing Agent Control registration:
-
-1. Under **Expose an API**, set the Application ID URI to `api://<API_CLIENT_ID>`.
-2. Add the enabled, admin-consented delegated scope **AgentControl.Access**.
-3. Set **Manifest > api.requestedAccessTokenVersion** to **2**.
-4. Preserve the existing app-role definitions, assignments and provider grants.
-
-The API validates an access token's audience as the **API client GUID**, not the
-scope URI or MCP audience. It also checks tenant, issuer, signature, expiry,
-delegated scope, current user roles and the configured MCP calling-client `azp`.
-Preauthorization is consent configuration, not a replacement for caller checks.
-
-### Create the separate MCP registration
-
-Create **Agent Control MCP** in the same tenant, with single-tenant account type
-and a **Web** callback of `https://<mcp-origin>/auth/callback`.
-Do not append `/mcp` to that callback. Keep implicit grants and public-client
-flows disabled.
-
-1. Under **Expose an API**, set `api://<MCP_CLIENT_ID>` and add the enabled,
-   admin-consented delegated scope **Mcp.Access**.
-2. Set **api.requestedAccessTokenVersion** to **2**.
-3. Under **API permissions > My APIs**, add Agent Control's delegated
-   **AgentControl.Access**.
-4. Include the MCP registration's own delegated **Mcp.Access** in its consent
-   set. If the self-resource is absent from the portal picker, declare it using
-   the manifest/Graph with the actual resource client ID and scope-definition
-   GUID. Declaring a permission does not grant consent.
-5. Grant administrator consent for both custom-resource permissions and required
-   sign-in scopes. Consent to API access does not consent to MCP sign-in.
-6. Create a **separate** MCP client secret. Never copy the API secret or provider
-   credentials into MCP.
-
-If assignment is required on the MCP enterprise application, also assign its
-approved users/groups (Default Access if it defines no roles). That assignment
-does not replace the three Agent Control roles on the API enterprise application.
-
-The upstream MCP request uses `api://<MCP_CLIENT_ID>/Mcp.Access` plus
-`openid profile offline_access`, not Graph scopes. MCP exchanges the resulting
-MCP-audience Entra assertion for `api://<API_CLIENT_ID>/AgentControl.Access`.
-The consumer receives MCP-issued credentials, not either server's confidential
-credential or a Graph token.
-
-### Bind deployment configuration
-
-Inside the existing tenant profile, configure:
-
-```json
-{
-  "integration": {
-    "clientId": "33333333-3333-3333-3333-333333333333",
-    "audience": "22222222-2222-2222-2222-222222222222",
-    "scope": "AgentControl.Access"
-  }
-}
-```
-
-Replace these synthetic IDs with the actual MCP and API client IDs. Missing
-integration configuration disables bearer admission without changing browser
-operation. MCP signing/encryption keys are independent of Entra client secrets
-and must persist across restarts. Use the
-[MCP service/container setup](../docs/deployment-setup.md#optional-mcp-service)
-for exact protected-file/environment settings and
-[client recipes](../docs/mcp-clients.md) for discovery, PKCE, resource indicators,
-refresh and exact allowed consumer callbacks.
+Follow [Enable the MCP server](../docs/mcp-integration.md) for the complete Entra
+portal steps, both custom scopes, administrator consent and server startup.
+The wizard saves the API integration binding and creates protected MCP keys.
+For manual configuration and token-validation rules, use the
+[technical reference](../docs/mcp-reference.md).
 
 | Callback | Configure in |
 | --- | --- |
@@ -238,11 +176,8 @@ refresh and exact allowed consumer callbacks.
 | `https://<mcp-origin>/auth/callback` | MCP registration, Web redirect. |
 | Actual consumer OAuth callback | MCP downstream redirect allowlist, not the Entra registration. |
 
-The API uses its own credential for provider token acquisition. Graph collection
-uses the application grants above; delegated group lookups, Power Platform and
-provider changes retain signed-in user authority. Graph and Power Platform
-tokens are different resources. Never mix browser cookies with API bearer
-credentials or treat a gateway-issued token as an Entra OBO assertion.
+Provider permissions remain on the API registration. MCP users still need their
+Agent Control role; an MCP registration or consent grant does not assign that role.
 
 ## Verify the affected journeys
 

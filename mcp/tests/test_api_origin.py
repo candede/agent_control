@@ -693,7 +693,7 @@ def test_allowlist_is_a_subset_of_the_canonical_operation_table():
 
     from agent_control_mcp.tools import OPERATIONS
 
-    document = Path("../docs/mcp-integration.md").read_text()
+    document = Path("../docs/mcp-reference.md").read_text()
     for operation in OPERATIONS:
         path = re.sub(r"\{(\w+)\}", r":\1", operation.path)
         assert f"| `{operation.method} {path}` |" in document

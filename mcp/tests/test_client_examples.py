@@ -67,8 +67,43 @@ def test_every_template_is_a_native_document_and_linked_from_the_guide():
     for path in FILES.values():
         assert f"../mcp/examples/clients/{path}" in guide
     assert "no documented remote-connector JSON import" in guide
-    assert "not full delegated OAuth support" in guide
-    assert "2025-10-25" in guide
+    assert "not full delegated OAuth support" in " ".join(guide.split())
+    assert "standalone `copilot` executable" in guide
+    assert "`gh copilot` extension is not an MCP host" in guide
+
+
+@pytest.mark.parametrize(
+    "heading",
+    [
+        "VS Code / GitHub Copilot",
+        "Standalone GitHub Copilot CLI, not `gh copilot`",
+        "OpenCode",
+        "Claude web, Desktop and Cowork",
+        "Claude Code",
+        "Claude Messages API",
+        "Copilot Studio and Microsoft 365 publication",
+        "GitHub cloud coding agent and code review",
+    ],
+)
+def test_each_client_has_an_explicit_first_read(heading):
+    section = DOC.read_text().split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0]
+    assert "list_capabilities" in section
+
+
+def test_messages_api_recipe_has_the_documented_transport_toolset_and_token_boundary():
+    section = DOC.read_text().split("\n## Claude Messages API\n", 1)[1].split("\n## ", 1)[0]
+    document = json.loads(section.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert document["mcp_servers"] == [
+        {
+            "type": "url",
+            "url": "https://mcp.example.test/mcp",
+            "name": "agentControl",
+            "authorization_token": "<current MCP-resource access token>",
+        }
+    ]
+    assert document["tools"] == [{"type": "mcp_toolset", "mcp_server_name": "agentControl"}]
+    assert "anthropic-beta: mcp-client-2025-11-20" in section
+    assert "own exact allowlisted callback" in section
 
 
 @pytest.mark.parametrize("product", ["vscode", "claude-code", "copilot-cli", "github-cloud"])
@@ -169,9 +204,12 @@ def test_documented_callback_shapes_match_templates_and_existing_wire_profiles(
     for redirects in modeled_callback_shapes.values():
         for redirect in redirects:
             assert redirect in guide
-    for _, redirects, _ in PROFILES:
+    for profile, redirects, _ in PROFILES:
         for redirect in redirects:
-            assert redirect in guide
+            if profile == "Copilot Studio synthetic callback":
+                assert redirect not in guide
+            else:
+                assert redirect in guide
     assert "MCP_ALLOWED_CLIENT_REDIRECT_URIS" in guide
     assert "environment-specific callback" in guide
 

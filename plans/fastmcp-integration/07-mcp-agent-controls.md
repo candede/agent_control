@@ -4,7 +4,7 @@
 
 Wrap current shared control APIs using [05](05-fastmcp-service-and-auth.md)
 and [06](06-mcp-read-tools.md). Read the
-[canonical control contract](../../docs/mcp-integration.md),
+[canonical control contract](../../docs/mcp-reference.md),
 [security](../../docs/security-model.md),
 [mutation diagnostics](../../docs/mutation-canaries.md) and current package/
 quarantine routes, services and jobs. No historical acceptance artifact is needed.

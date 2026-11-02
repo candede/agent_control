@@ -2,7 +2,7 @@
 
 ## Mission and inputs
 
-Implement typed tools over the [current API map](../../docs/mcp-integration.md)
+Implement typed tools over the [current API map](../../docs/mcp-reference.md)
 and [05's adapter](05-fastmcp-service-and-auth.md).
 Read [data semantics](../../docs/data-architecture.md),
 [usage](../../docs/official-usage-import.md),

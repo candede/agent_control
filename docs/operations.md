@@ -1,198 +1,160 @@
 # Operations runbook
 
-Use this guide for local maintenance, synchronization recovery, backups and
-data resets. For initial configuration, see [Deployment setup](deployment-setup.md).
-For Azure lifecycle and recovery commands, see
-[Azure production deployment](azure-production-deployment.md).
+For initial setup, use [Deployment setup](deployment-setup.md); for hosted
+updates, monitoring and recovery, use [Azure deployment](azure-production-deployment.md).
+Identity and data-scope rules are in the [security model](security-model.md).
 
 ## Start, stop, update, and check
 
-Run from the repository root with the exact installation's project name:
+Run from the repository root with the installation's exact project name:
 
 ```powershell
 pwsh ./deploy-local.ps1 start -Project agent-control
 pwsh ./deploy-local.ps1 stop -Project agent-control
-pwsh ./deploy-local.ps1 check -Project agent-control
 ```
 
-- `start` builds and applies the current source, verifies the database and starts
-  the application.
-- `stop` stops the project while retaining configuration and data.
-- `check` builds and runs isolated regression fixtures without deploying.
-- `start -ForceChecks` runs checks before applying the same source snapshot.
+`start` applies current source and verifies the database, reusing configuration
+and data; an unchanged healthy app needs no restart. `stop` retains state.
+Never add `-DbReset` to a restart. Optional [checks](#validation) do not gate use.
 
 ## Change configuration
 
-```powershell
-pwsh ./deploy-local.ps1 edit-config -Project agent-control
-pwsh ./deploy-local.ps1 start -Project agent-control
-```
-
-Use the [setup instructions](deployment-setup.md#change-local-settings) for
-tenant profiles, credentials and callback changes. Keep independent installations
-in separate projects.
+Run `pwsh ./deploy-local.ps1 edit-config -Project agent-control`, then ordinary
+`start`; follow [Change local settings](deployment-setup.md#change-local-settings).
+Edits may stop the app; identity/domain changes require sign-in again.
 
 ## Check health
 
-Use the configured port; these examples use the default:
+Use the configured origin/port; the local default is:
 
 ```powershell
 Invoke-RestMethod http://localhost:3001/api/health
 Invoke-RestMethod http://localhost:3001/api/ready
+Invoke-RestMethod http://localhost:3001/api/auth/status
 ```
 
-| Endpoint | Meaning |
-| --- | --- |
-| `/api/health` | The HTTP process is responding. |
-| `/api/ready` | The current schema, runtime grants and operational state permit serving. Maintenance returns HTTP 503. |
+| Check | Expected result | If it fails |
+| --- | --- | --- |
+| `/api/health` | HTTP 200, `ok: true`: process responds. | Check origin/port and [service logs](#review-logs). |
+| `/api/ready` | HTTP 200, `ok: true`: schema/grants valid, normal operation. | 503: database/schema failure or maintenance. Follow [installation recovery](#existing-installation-maintenance). |
+| `/api/auth/status` | `authConfigured: true`, correct callback. | Repair configuration with `edit-config`, then `start`. |
 
-Neither endpoint verifies provider access, saved-data correctness or interactive
-sign-in. Readiness requests share only an in-flight schema check; completed
-results are not cached.
+Health does not prove sign-in, provider access or saved-data correctness.
+Never clear maintenance markers or alter operational state to force readiness.
 
 ## First sign-in and synchronization
 
-Read-only collection starts automatically for eligible signed-in users while the
-browser is visible and online. It needs no administrator session, Permissions
-visit or additional application approval.
+1. Sign in; keep the browser visible and online. Read-only sync starts automatically,
+   including after reset: no Admin session, Permissions visit or enable step.
+2. Open **Sync**: expect **Users**, **Graph packages** and **Power Platform** complete
+   with saved counts. The modal closes when all three are saved;
+   **Continue to workspace** dismisses it without cancelling sync.
+3. Check saved **Agents** and **Users**. Complete sources are tenant-shared;
+   another account needs no personal first sync.
 
-- **Sync** shows Users, Graph packages and Power Platform collection progress.
-- The first-sync modal closes after all three sources are saved.
-  **Continue to workspace** dismisses it without cancelling synchronization.
-- Complete saved sources are shared within the tenant. Another account does not
-  need a personal first synchronization.
-- Failed or partial attempts do not replace the previous complete publication.
-- CSV imports and package-detail enrichment do not block workspace access.
-- Routine source collection is due every six hours. Ordinary failed attempts
-  wait one hour before automatic retry; real provider backoff and renewed
-  authorization can change admission.
-
-Use the [permissions reference](user-roles-and-permissions.md) for collection
-access. App roles and Microsoft provider permissions are separate.
+Collection is browser-driven, not unattended: normally due every six hours,
+with a one-hour retry after ordinary failures. Provider backoff/renewed authority
+can change eligibility. Failed/partial attempts retain the last complete data.
+CSV imports and package enrichment do not block workspace access.
 
 ## Resolve sign-in and permission problems
 
-1. Confirm the configured tenant, accepted domain, callback and app-role assignment.
-2. Open **Permissions > Check status** and inspect the failing provider.
-3. Correct the reported consent, role, licensing, sharing or network limitation
-   using the [permissions reference](user-roles-and-permissions.md).
-4. Sign in again when Microsoft requires MFA, renewed authorization or role
-   activation. A provider challenge does not invalidate an otherwise valid
-   browser session or prevent other providers from working.
-5. For a saved job waiting for authorization, obtain fresh same-account authority
-   and explicitly resume eligible unsent work.
-
-Token acquisition alone does not establish provider data access. Do not replay
-an uncertain provider mutation. Purview, Defender and investigation-only identity
-setup are not ordinary synchronization prerequisites.
-
-## Reload saved agent inventory
-
-Reloading saved views reads PostgreSQL, not Microsoft. Rows remain available
-while a successor publication is preparing; errors remain visible.
-
-- Compare source scope and collection time when checking Microsoft portal counts.
-  Logical agents and package versions are different counts.
-- **Updating** means publication or reconciliation is in progress.
-- **Details pending** means package enrichment is incomplete, not that agents
-  are absent.
-- **Needs attention** identifies a source, authorization or integrity problem.
-- A running observation count is not a provider total or an ETA.
-
-Use **Sync** for explicit collection. Changing filters, opening history or
-following `/sync?syncRun=<id>` does not resubmit provider work.
-
-### Package and Studio job recovery
-
-Open the saved job under **Access and availability**, or follow
-`/agents?controlJob=<id>`.
-
-- **Cancel** stops unstarted work; it does not undo completed effects.
-- **Resume** requires current authorization.
-- **Check uncertain results** reconciles read-only. A later mutation retry
-  requires a fresh preview and confirmation.
-- After `selection_invalidated`, refresh status and restart result paging.
-  Do not combine pages from different result revisions.
-
-Package controls and Studio quarantine are separate effects. Use the
-[permissions reference](user-roles-and-permissions.md) for their requirements.
-
-## Office adoption automatic recovery
-
-Office adoption uses saved directory/license and Office app report sources.
-It does not require agent CSVs or a manual synchronization.
-
-If source collection succeeds but Office preparation fails:
-
-1. Keep the successful source data.
-2. Allow the next automatic local recovery pass, which runs every 30 seconds.
-3. If the failure persists, correlate `office_derivation_failed` or
-   `office_publication_cleanup_failed` with source diagnostics and the failing read.
-4. Repair the reported derivation, storage or integrity failure; do not clear
-   healthy sources or recollect Microsoft data merely to retry local preparation.
-
-Unknown, stale, denied or malformed evidence is not zero adoption. See
-[Office adoption](copilot-license-usage.md) for report coverage and history meaning.
+Check tenant, accepted domain, callback and app-role assignment. Use
+**Permissions > Check status** and the [permissions reference](user-roles-and-permissions.md)
+for source failures: app roles/token acquisition do not prove provider access.
+Complete requested MFA, renewed authorization or role activation; provider challenges
+do not invalidate a valid browser session or block other providers.
+Purview, Defender and investigation setup are not ordinary sync prerequisites.
 
 ## Diagnose synchronization problems
 
-Correlate request, run, source and job IDs. Distinguish:
+Open **Sync**; correlate request/run/source/job IDs with [logs](#review-logs).
+Saved reloads read PostgreSQL, not Microsoft; complete data stays readable during refresh.
 
-| Symptom | Check |
-| --- | --- |
-| Sign-in or permission required | Current account, consent and provider diagnostics |
-| Throttled or unavailable provider | Reported backoff and source error; retain the last complete publication |
-| Checked targets but stale saved data | Publication outcome; `package_refresh_succeeded` confirms package publication |
-| Detail not found | Exact target result, including a confirmed 404; not catalog-wide absence |
-| Storage or record limit | Reported bound and accounting failure; do not raise limits to hide the failure |
-| Cancelled job | Saved run/job state before starting another operation |
+| Symptom | Check and action | Safe recovery / expected result |
+| --- | --- | --- |
+| Sync not starting / authorization required | Check visibility/connection, source status and [permissions](#resolve-sign-in-and-permission-problems). | Reconnect or renew authority as reported; **Retry sync** if explicitly paused. |
+| Provider throttled/unavailable | Read source error and actual retry delay. | Respect backoff; keep last complete data. |
+| **Updating** / **Details pending** | Check publication/reconciliation or enrichment progress. | Wait; pending detail does not mean absent agents. |
+| **Needs attention** / stale or different portal counts | Compare scope/time and integrity diagnostics; logical agents differ from package versions. | Repair the cause, then collect the affected source in **Sync**. `package_refresh_succeeded` confirms package publication. |
+| Detail not found | Check exact target result, including confirmed 404. | One missing target is not catalog-wide absence. |
+| Storage/record limit | Check reported bound and accounting failure. | Repair the cause; do not hide it by raising limits or clearing healthy data. |
 
-Concurrent request durations overlap; do not add them to derive wall time.
-Keep partial observations distinct from completed publications.
+Running counts are not totals/ETAs; concurrent durations overlap.
+Filters, history and `/sync?syncRun=<id>` never submit new work.
 
-## Review logs
+### Package and Studio job recovery
 
-Use service logs and request/job correlation IDs. API failures return
-`application/problem+json` with a request ID.
+Inspect the saved job before starting another:
 
-Never print environment variables, tenant registries, credentials, tokens,
-continuation URLs, report contents or raw provider bodies. Preserve sanitized
-diagnostic categories and actual provider retry delays.
+| Job | Open | Read-only reconciliation |
+| --- | --- | --- |
+| Package control | **Access and availability** or `/agents?controlJob=<id>` | **Check uncertain results** |
+| Studio quarantine | **Copilot Studio quarantine** or `/agents?quarantineJob=<id>` | **Reconcile by status read** |
 
-Only Admin can read or export local administrative audit logs. This history
-is separate from Microsoft Purview Audit Search.
+- **Cancel** stops unstarted work, not in-flight/completed effects.
+- **Resume** eligible unsent work explicitly with fresh same-account authority.
+- Never replay uncertain writes; later mutation retries need fresh preview and confirmation.
+- After `selection_invalidated`, refresh status and restart paging; never mix revisions.
+
+Package controls and Studio quarantine have separate [requirements](user-roles-and-permissions.md).
+
+## Office adoption automatic recovery
+
+Office uses saved directory/license and Office app reports, not agent CSVs/manual sync.
+If preparation fails after collection succeeds, keep the sources: local recovery
+runs every 30 seconds during normal operation. For persistent failure, correlate
+`office_derivation_failed` / `office_publication_cleanup_failed` with source/read
+diagnostics and repair derivation, storage or integrity; do not recollect healthy
+sources. Unknown/stale/denied/malformed is not zero adoption.
+See [Office adoption](copilot-license-usage.md).
 
 ## Operator-only local helpers
 
-Load the existing deployment owner:
+For status/logs, backup, restore and retention below, load the existing owner:
 
 ```powershell
 . ./scripts/local-deployment.ps1
 $context = New-LocalContext -Root $PWD.Path -Project agent-control
 ```
 
-Use only the exact owned project, database and volume. Do not substitute ambient
-database credentials or ad hoc SQL.
+Verify Docker context, project labels, container identities, volume, database and
+origin. Use only this project's secrets and `agentcontrol`, never ambient credentials
+or ad hoc SQL.
+
+## Review logs
+
+```powershell
+docker context show
+Get-OwnedLocalContainers $context | Select-Object Service, Id, Image
+Invoke-DockerCommand ($context.Compose + @('ps'))
+Invoke-DockerCommand ($context.Compose + @('logs','--tail','200','app','postgres'))
+```
+
+Stop if context/identities are unexpected; the owner rejects mismatched labels.
+Expect `app` and `postgres` running and healthy after start. Correlate API
+`application/problem+json` errors with `X-Request-ID` and job/run IDs.
+Only Admin can read/export local administrative audit; it is not Purview Audit Search.
+
+Restrict log access. Never print environment/tenant registries, credentials, tokens,
+continuation URLs, report contents or raw provider bodies. Share sanitized categories,
+IDs and actual retry delays only.
 
 ## Backup and isolated restore
 
-Create a protected current-schema logical backup:
-
-```powershell
-Invoke-LocalDeployment $context 'Backup'
-```
-
-To select a filename, use a new file in an existing access-restricted directory:
+Choose a new filename in an existing access-restricted directory:
 
 ```powershell
 Invoke-LocalDeployment $context 'Backup' `
   -BackupFile "$PWD/.local/agent-control/backups/operator-verified.dump"
 ```
 
-Retain the dump and its adjacent `.dump.json` receipt together. The receipt binds
-checksum, schema, table contents and snapshot time. An existing target is never
-overwritten. Backups contain sensitive data; protect them outside source control.
-Only current-schema backups are supported.
+Expect `Backup verified: <path>`. Keep the dump and adjacent `.dump.json` receipt
+together, access-restricted and outside source control. The receipt binds checksum,
+schema, contents and snapshot time. Only current-schema backups work.
+Incomplete pairs are not verified; repair failures and use a new filename.
+Existing targets are never overwritten.
+Omitting `-BackupFile` chooses a timestamped file in `.local/<project>/backups/`.
 
 ### Restore for review
 
@@ -202,24 +164,28 @@ Invoke-LocalDeployment $context 'Restore' `
   -RestoreDatabase agentcontrol_restore_review
 ```
 
-The restore uses a new isolated `agentcontrol_restore_*` database. It revokes
-restored authority and reconciles current ownership, deletions and configuration.
-Review tenant/private scope, report selection, Office facts, audit and job
-integrity before reopening:
+Expect `Restore verified: <path>` and a new isolated `agentcontrol_restore_*`
+database in maintenance. Sessions/provider execution authority are revoked;
+ownership, deletions and configuration reconcile against the current database,
+which must remain available. Review tenant/private scope, report selection,
+Office facts, audit and jobs before reopening:
 
 ```powershell
 Invoke-LocalDeployment $context 'Reopen' `
   -RestoreDatabase agentcontrol_restore_review
 ```
 
-Reopen repeats current-state checks and retention, returning that database to
-normal operation. It does **not** switch the running application's database.
-Previously issued sessions remain revoked; uncertain provider writes must not
-be replayed. See [Disaster recovery](../infra/disaster-recovery.md).
+Reopen repeats reconciliation/retention and returns the review database to normal.
+Neither command switches the app's database. Sessions stay revoked; never replay
+uncertain writes. After failure, keep any created target isolated, repair and use
+a new name. Follow [Disaster recovery](../infra/disaster-recovery.md) for serving
+recovery; successful restore alone is not a database switch.
 
 ## Run retention
 
-Preview first, then apply bounded slices:
+**Backup deletion:** apply removes dump/receipt pairs in `.local/<project>/backups/`
+older than seven days by receipt creation time. Preserve longer-lived pairs
+elsewhere securely first. Preview, then apply bounded slices:
 
 ```powershell
 Invoke-LocalDeployment $context 'Retain' `
@@ -228,96 +194,76 @@ Invoke-LocalDeployment $context 'Retain' `
   -ConfirmCleanup 'agent-control/agentcontrol' -CleanupBatchSize 1000
 ```
 
-Use the exact lowercase `<project>/agentcontrol` confirmation. Repeat applied
-slices until `pending=false` and no changes remain.
-
-Retention makes no provider calls. It expires sessions, transient evidence, jobs,
-audit, staging and exports under their defined policies. It does not delete
-accepted live CSV reports merely for age; published-report deletion requires
-explicit Admin action. Office observations retain twelve UTC calendar months
-from provider refresh date, including the cutoff date.
+Use exact lowercase `<project>/agentcontrol`. Check `affected`/`pending`; repeat
+until `pending=false` and no changes remain. Retention makes no provider calls.
+It expires sessions, evidence, jobs, audit, staging and exports, not live accepted
+CSVs merely for age; report deletion requires explicit Admin action. Office
+observations retain twelve UTC calendar months from provider refresh date, including cutoff.
+Dry-run rolls back database changes and deletes no backup files.
 
 ## Existing installation maintenance
 
-Before changing an installation, verify its Docker context, project labels,
-container identities, data volume, database, origin and intended source.
-Preserve settings, secrets, backups and unrelated projects.
+Preserve settings/secrets/backups and unrelated projects. `start` checks schema/grants
+before draining; incompatible schemas need explicit reset/current-schema recovery.
 
-Normal start checks the current schema/grants before draining the app.
-An incompatible schema requires an explicit reset, not an automatic migration.
-Maintenance protects interrupted database work; successful installation or
-recovery returns to normal operation without a second enable step.
+| Failure | Safe action |
+| --- | --- |
+| Initialization failed, reset not uncertain | Repair and retry ordinary `start`; a completed reset is not repeated. |
+| Reset outcome unknown | Keep maintenance; inspect the exact target before destructive retry. |
+| Ownership, credential or schema mismatch | Recover exact project state/secrets or use current-schema recovery. Never bypass checks, edit receipts or delete volumes. |
 
-If initialization fails, fix the reported cause and retry ordinary `start`.
-If an explicit reset completed, resume the unfinished initialization without
-requesting another reset. If its outcome is unknown, retain maintenance and
-inspect the exact target before any destructive retry.
-
-After an update, verify the served revision, health/readiness, sign-in/out,
-authorized saved views, automatic synchronization and affected controls.
-Software tests or health alone do not prove these journeys.
+Success returns to normal operation without another enable step. Verify served
+revision, health/readiness, sign-in/out, authorized saved views, automatic sync
+and affected controls; tests/health alone do not prove these journeys.
 
 ## Reset application data
 
-**Destructive:** confirm the exact project/database and intentional data loss
-before running:
+**Destructive:** authorize exact project/database `agentcontrol` and data loss.
+The switch confirms it; no second prompt. Keep a verified backup first if schema permits.
 
 ```powershell
 pwsh ./deploy-local.ps1 start -Project agent-control -DbReset
 ```
 
-The switch authorizes deletion and does not prompt again.
-
 - Deletes inventory, CSV reports/history, Office observations, sessions, audit,
   jobs and database-stored configuration.
 - Retains project settings, secret files, PostgreSQL roles, the volume and
   existing backups. Do not delete the volume to reset application data.
-- Each new invocation after a completed deployment requests a new reset.
-  Use ordinary `start` for a non-destructive restart.
+- Each invocation after completed deployment requests a new reset.
 - If reset succeeded but initialization failed, correct the failure and retry
-  **without** `-DbReset`. Do not repeat an unknown destructive outcome blindly.
+  **without** `-DbReset`. For an unknown outcome, retain maintenance.
 
-After success, sign in again. Authorized read-only synchronization starts
-automatically. Re-enter required database-stored sharing settings and reimport
-official CSVs. Provider synchronization cannot reconstruct deleted report,
-Office, audit or job history.
+After success, sign in: read-only sync starts automatically. Re-enter stored sharing
+settings and [reimport CSVs](official-usage-import.md). Provider sync cannot rebuild
+deleted report, Office, audit or job history.
 
 ## Credential recovery
 
-- Replace an Entra credential through `edit-config`, then `start`.
-- Restore missing/corrupt session or database secrets from the same project's
-  protected storage. Do not generate replacement database passwords for an
-  existing PostgreSQL volume.
-- Protect `.local/<project>/settings.json`, its `secrets/` directory and the
-  PostgreSQL volume together.
+Replace Entra credentials with `edit-config`, then `start`. Restore missing/corrupt
+session/database secrets from the same project's protected storage; never generate
+replacement database passwords for an existing volume.
 
-For Azure runtime secret references, use the
-[Key Vault contract](azure-production-deployment.md#prepare-key-vault).
-Azure Plan/Deploy does not rotate existing credentials; see its
-[operating limitations](azure-production-deployment.md#operate-the-deployment).
+| State owner | Preserve / recover |
+| --- | --- |
+| `.local/<project>/` | `settings.json`, `secrets/`, control/deployment state. `compose.env` is generated; do not edit it. |
+| Docker `<project>_data` volume | PostgreSQL data and roles, not project settings/secrets. |
+| Protected backups | Dump and receipt together; never commit backups/secrets. |
+
+For Azure, use the [Key Vault contract](azure-production-deployment.md#2-prepare-key-vault).
+Plan/Deploy does not rotate existing credentials; see [limitations](azure-production-deployment.md#operate-the-deployment).
 
 ### Optional MCP recovery and backup
 
-MCP OAuth state and keys have a separate backup/recovery lifecycle from
-PostgreSQL. Use [MCP integration](mcp-integration.md) for exact local-volume and
-Azure Blob procedures, and [MCP client setup](mcp-clients.md) for reconnecting.
-An MCP failure is not an API/database reset request.
+MCP OAuth state/keys are separate from PostgreSQL; MCP failure is not an API/database
+reset request. Follow [MCP storage recovery](mcp-reference.md#storage-rotation-and-recovery)
+and [client reconnection](mcp-clients.md).
 
 ## Validation
 
-For documentation-only changes, check local links, heading anchors and
-`git diff --check`; do not start infrastructure.
-
-For code changes, use the repository's focused unit, type and lint checks.
-`npm run check:unused` runs the configured Knip check. Run infrastructure-backed
-fixtures only in an explicitly disposable non-production environment.
-
-Record source/mock checks, browser evidence and real provider/deployment
-verification separately. Do not report unrun journeys as passed or turn test
-receipts into runtime authorization.
-
-## Production operations
-
-Use the [Azure guide](azure-production-deployment.md) for updates, credential
-rotation, monitoring and point-in-time recovery. Keep the exact resource,
-network and Key Vault target under the organization's change process.
+Docs: check links/anchors and `git diff --check`, without infrastructure.
+Code: focused unit/type/lint checks; `npm run check:unused` runs Knip.
+`pwsh ./deploy-local.ps1 check -Project agent-control` builds/runs isolated fixtures
+without deploying; `start -ForceChecks` checks before applying the same source.
+Use a disposable non-production environment for infrastructure-backed checks.
+Record local/mock, browser and provider/deployment evidence separately.
+Unrun journeys are not passed; test receipts never authorize application use.

@@ -1,282 +1,205 @@
 # Microsoft 365 Copilot licenses and usage
 
-Use **Users** to review paid Copilot entitlement and reported agent activity.
-Use **Dashboard > Copilot in Office apps** or **Users > Adoption > Office apps**
-for Word, Excel, PowerPoint, Outlook, OneNote, Loop and Teams adoption.
+Use **Users** to check paid Copilot access and reported agent use. Use
+**Dashboard > Copilot in Office apps** or **Users > Adoption > Office apps**
+to review Copilot adoption in Word, Excel, PowerPoint, Outlook, OneNote, Loop
+and Teams.
 
-These views read saved tenant data. Opening a page, changing filters or exporting
-results does not call Microsoft Graph.
+Agent usage and Office activity are separate:
 
-## Required access
-
-Every Viewer-capable app role can read shared saved data and initiate read-only
-sync. Graph collection uses the application's credentials and application
-permissions with administrator consent, not a Microsoft directory or report-reader
-role on the signed-in person. No administrator needs to remain signed in.
-
-For grants and role assignments, use the canonical
-[roles and permissions reference](user-roles-and-permissions.md).
-The exporting account's Microsoft role for manual agent CSV downloads is
-[a separate requirement](user-roles-and-permissions.md#csv-downloads-and-report-import).
-
-## Refresh user data
-
-Read-only sync starts automatically after sign-in while the browser is visible
-and online. **Sync** shows progress and supports explicit refreshes.
-
-Directory/license evidence and Office-app activity collect independently.
-Routine collection is due every six hours; failed automatic attempts normally
-wait an hour, subject to provider backoff. A failed refresh preserves the last
-successful source and exposes its age/error rather than publishing a partial
-result. Explicit incomplete-source retries retain sources that already succeeded.
-
-Agent activity requires the separate **Agents**, **Users & agents**, and **Users**
-CSV imports. A changed usable default report makes directory verification due
-automatically; newly reported identities remain license-unknown until that
-verification succeeds. Personal report viewing does not alter this sync state.
-See [export and import instructions](official-usage-import.md).
-
-## Users: paid users and active users without paid Copilot
-
-Open **Users** and choose a cohort:
-
-| View | People included |
+| Data | Source |
 | --- | --- |
-| **Paid M365 Copilot users** | Users with at least one verified usable paid feature, including grace-period and partially active users; zero or unavailable usage does not exclude them |
+| Paid Copilot access, company and department | Automatically collected Microsoft Graph directory/license data |
+| Office-app activity | Automatically collected per-user **D28/v2** Microsoft report |
+| Agent responses, agents used and agent last activity | Imported **Agents**, **Users & agents** and **Users** CSVs |
+
+## Before you start
+
+- Have `AgentControl.Viewer`, `AgentControl.UsageReportUploader` or
+  `AgentControl.Admin` access. All three can read shared saved data and run
+  read-only sync.
+- For automatic collection, configure the Agent Control application's credentials
+  and these Microsoft Graph **Application** permissions with **Grant admin consent**:
+
+  | Data | Permissions |
+  | --- | --- |
+  | Directory and licenses | `User.Read.All`, `LicenseAssignment.Read.All` |
+  | Office activity | `Reports.Read.All` |
+
+  The signed-in reader needs no Microsoft directory or reporting role; an
+  administrator does not need to remain signed in.
+- For agent activity, have an Uploader or Admin
+  [import the three CSVs for the same reporting period](official-usage-import.md).
+  Downloading them from Microsoft 365 separately requires **Reports Reader** or
+  **AI Administrator** on the exporting account.
+
+See [roles and permissions](user-roles-and-permissions.md) for assignments.
+Concealed, unmatched or ambiguous report identities cannot establish a person's
+license or activity match; they remain unknown.
+
+## How data refreshes
+
+Read-only collection starts automatically after sign-in while the app is visible
+and online, including after installation or a database reset. No manual start or
+Permissions check is required. Collection is due every six hours; failed automatic
+attempts normally wait an hour, subject to provider backoff.
+
+Open **Sync** for progress, errors or an explicit refresh. Directory/license and
+Office sources collect independently; failures preserve the last successful data.
+Office collection does not require agent CSVs or inventory.
+
+Saved data is tenant-shared. Viewing, filtering and exporting do not call Microsoft
+Graph. A changed usable default agent report automatically makes directory
+verification due; newly reported identities remain license-unknown until it succeeds.
+
+## 1. Review users
+
+Open **Users**, keep the **Users** view selected and choose **User cohort**:
+
+| Cohort | Included people |
+| --- | --- |
+| **Paid M365 Copilot users** | Saved users with at least one verified usable paid feature, including grace-period and partially active users, even without reported usage |
 | **Active users without paid Copilot** | Uniquely matched, currently verified non-paid users with positive reported agent responses |
 
-Unknown licensing is not unpaid licensing. Concealed, unmatched or ambiguous
-identities are excluded from the non-paid cohort with a coverage notice.
-Wholly unverified paid-feature evidence does not establish either cohort.
-Neither view measures basic/free Copilot Chat use.
+Unknown licensing is not unpaid licensing. Coverage notices explain excluded
+identities. Neither cohort measures basic/free Copilot Chat use.
 
-1. Use search and **Filters** to narrow company, department, activity, low-response
-   threshold and sort order.
-2. Select a summary card to filter the paid-user table.
-3. Select a person for **Overview**, **Usage & agents**, **Licenses** and
-   **Responsibility** details.
-4. Export the verified matching results when needed.
+1. Choose a **Report set** for agent activity.
+2. Search or use **Filters** for company, department, activity, low-response
+   threshold and sort order. Select a summary card to filter the paid-user table.
+3. Select a person for **Overview**, **Usage & agents**, **Licenses** or
+   **Responsibility**.
+4. Select **Export users CSV** to download all matching people, not just the page.
 
-Filtering, sorting, counts and pagination run **server-side against saved data**,
-not against only the browser's visible page. Company and department options come
-from the eligible saved cohort. Missing organization fields appear as
-**Not set**, not an inferred department.
+Filters and exports cover the complete saved cohort. Missing company/department
+values appear as **Not set**. Paid-user summary cards stay organization-wide within
+the selected report/source context; table filters do not change them. The
+low-response threshold affects **Needs attention**.
 
-The four paid-user summary cards remain organization-wide within the selected
-report/source context. Search, organization filters, selected cards and paging
-change the table and export, not those totals. The low-response threshold affects
-the corresponding attention calculation.
-
-| Paid-user measure | Meaning |
+| Summary card | Meaning |
 | --- | --- |
-| **Active M365 Copilot licensed users** | Verified usable paid-feature availability, not recent use or account sign-in activity |
+| **Active M365 Copilot licensed users** | Usable paid access, not recent use or account sign-in activity |
 | **Using agents** | Positive response evidence in the selected agent reports |
-| **Needs attention** | Licensed users with no/low reported usage or qualifying inactive-app evidence; a review cohort, not a license-removal instruction |
-| **No reported agent activity** | Matched licensed users for whom available reports support absence of reported activity |
+| **Needs attention** | No/low reported agent usage, qualifying inactive-app evidence, or grace-period/partially active paid features; a review list, not a license-removal instruction |
+| **No reported agent activity** | Available reports support absence of reported agent activity |
 
-Missing reports, uncertain identity matches or missing metrics remain unknown.
-They are not converted into measured inactivity.
+Missing reports, uncertain matches and missing metrics mean unknown, not zero.
+Response totals, agents used and user last activity come from **Users**.
+**Users & agents** relationship totals stay separate: positive relationships can
+establish activity but cannot fill missing user totals. Zero-response relationships
+remain visible without counting as positively used agents.
 
-### User details and exports
+**Usage & agents** also shows Office-app dates. **Responsibility** shows saved
+Owner, Created by and Last modified by relationships, even without license/usage
+details. Modification does not prove ownership; relationships grant no permissions.
 
-**Overview** shows paid-feature classification, organization and Users-report
-metrics. **Usage & agents** keeps the searchable, paginated agent breakdown and
-separate Office-app dates. **Licenses** shows the individual paid features and
-their states. **Responsibility** shows saved owner/creator/modifier relationships.
+Export is unavailable with unresolved filters/reads or unavailable non-paid
+verification. Report-user exports include all relationships of matching people,
+even outside the selecting filter. Repeated user totals must not be added.
 
-User responses, agents used and user last activity come from the **Users** CSV.
-Relationship totals from **Users & agents** stay separate. Bridge-only positive
-responses can establish activity, but do not replace missing Users-report totals.
-Zero-response relationships remain visible without counting as positively used
-agents.
+### License status
 
-Downloads cover all matching people, not just the page, under the displayed
-saved selection. Official report-user downloads include every relationship of
-matching people, even outside the relationship filter that selected them.
-Repeated user totals are not additive. Pending filters, failed reads or
-unavailable non-paid license verification disable export.
+A product assignment alone does not prove paid access. Classification checks
+current assignments, disabled plans and effective paid-feature evidence.
 
-## How users are classified
-
-A product assignment is not proof of effective paid Copilot access. The app
-discovers products containing recognized paid Copilot service plans, then checks
-the user's current assignments, disabled plans and capability evidence.
-Product names, catalog provisioning status, activity and historical assignments
-do not substitute for that evidence.
-
-| Paid-feature evidence | Display / cohort effect |
+| Evidence | Meaning |
 | --- | --- |
-| Enabled | **Active**; qualifies as paid |
-| Warning | **Active (grace period)**; qualifies as paid |
-| Usable and inactive/unverified features mixed | **Partially active**; qualifies once because at least one feature is usable |
-| Disabled in every current assignment | **Paid features: Not enabled**; not active paid access |
-| Suspended, locked out or deleted | Not active paid access unless another paid feature is usable |
-| Missing or conflicting effective evidence | **License not verified**, not proof of being unlicensed |
+| **Active** | Enabled paid feature |
+| **Active (grace period)** | Usable paid feature in warning state |
+| **Partially active** | At least one usable paid feature mixed with inactive or unverified features; counts once as paid |
+| Disabled, suspended, locked out or deleted features | Not active paid access unless another paid feature is usable |
+| **License not verified** | Missing or conflicting evidence; not proof of being unlicensed |
 | Verified identity with no assigned paid service | No active M365 Copilot license |
 
-Disabling a feature in one product does not override another current assignment
-that enables it. Account sign-in status is displayed separately. The saved
-directory includes discovery candidates and exactly verified active report
-identities, not tenant headcount or an already-filtered list of licensed users.
-The [technical entitlement contract](data-architecture.md#official-reports-and-user-evidence)
-identifies the recognized plans.
+A feature disabled in one product can be enabled by another. Account sign-in
+status is separate. Checked directory candidates are not headcount or paid-user totals.
 
-## Personal report context
+### Agent adoption by group
 
-The **Report set** dropdown on Users and Agents is reader-personal.
-**Latest report** follows the newest available content period, not the latest
-upload. A selected report carries through navigation and bookmarks using
-`snapshot`; returning to Latest removes the pin.
+Open **Users > Adoption > Agents** for company/department groups. Report-only
+agents need no inventory link; shared agents count once overall. Up to three
+**Agent Champs** per group are suggested by responses and positively used agents,
+not by creating an unused agent.
 
-The same retained report can be interpreted with **current saved license
-evidence**. Historical licensing is not reconstructed. After verification of a
-paid feature, a person leaves the non-paid cohort regardless of when the selected
-activity occurred.
+## 2. Review Office adoption
 
-Deleted or expired report choices recover to Latest with a notice. A permission
-or service error does not silently select a different report.
-See [report selection](official-usage-import.md#choose-the-report-set-shown-in-agents-and-users)
-for the agent dialog's separate local period controls.
+1. Open **Dashboard > Copilot in Office apps**. Review participation, app adoption
+   and department gaps. Company selection narrows the department panel, not the
+   organization cards or trends.
+2. Select **Explore Office groups**, or open **Users > Adoption > Office apps**.
+   Search company/department groups, apply filters and page through groups or
+   people. Select a person for the captured Office details.
+3. Use **Office observation** for Latest details or a weekly summary, and
+   **Office baseline** for an earlier comparison. Weekly summaries have no
+   person records; use **Explore current people** for current saved details.
 
-## Office adoption saved-read contract
+App filters narrow recent people and **Office Champs**, not the group's paid
+denominator or seven app totals. Up to three Champs per group are suggested by
+app breadth and recency, not volume or an assigned role.
 
-Office adoption is prepared automatically from saved directory/license data and
-the **D28/v2** per-user Microsoft report. It does not depend on agent CSV imports,
-inventory or an administrator's session.
+### What Office metrics mean
 
 | Measure | Meaning |
 | --- | --- |
-| Saved licensed people | Exact directory identities with usable paid features when captured; not tenant headcount |
-| Reported active Office users | Distinct saved licensed people with recent qualifying evidence in at least one of the seven apps |
-| Participation | Reported active Office users / saved licensed people |
-| Per-app active users | People with qualifying evidence in that app; app populations overlap |
-| User-app pairs | One pair per person/app, so one person using three apps contributes three pairs but one active person |
-| No recent reported Office evidence | No qualifying app date in the observation's window; not proof of inactivity or license waste |
-| Unknown Office evidence | A subset of no recent evidence, with explicit missing/ambiguous/invalid/retained-evidence reasons—not a separate disjoint population |
+| **Enabled paid Copilot users** | Exact saved identities with usable paid features at capture; not tenant headcount |
+| **Active Office users** | Distinct saved licensed people with qualifying recent activity in at least one of the seven apps |
+| Participation | Active Office users divided by enabled paid Copilot users |
+| **No recent Office activity reported** | No qualifying app date in the window; not proof of inactivity or unused licenses |
+| Unknown evidence | A subset of people without recent evidence, not an additional inactive population |
 
-Recent means the provider refresh date minus 27 days through that refresh date,
-inclusive in UTC. Older dates remain visible but are not recent. Copilot Chat,
-Edge, overall last activity and agent activity do not contribute to these seven
-app metrics. There are no prompt-volume, ROI or productivity measures.
+Recent means the provider refresh date minus 27 days through that date, inclusive
+in UTC—not the upload date or today. Older app dates remain visible. Missing or
+invalid source inputs mean unavailable, not zero.
 
-Imported response counts and last activity describe **Copilot Agents** only.
-The current D28/v2 Microsoft report supplies separate per-app last-activity
-dates; these latest dates can fall outside the selected period. Compare them
-with the report's refresh window, not the CSV upload date or today's date.
-Missing or invalid source inputs make metrics unavailable, not a dated zero.
+App counts overlap: one person using three apps contributes three user-app pairs
+but one active person. Copilot Chat, Edge, overall last activity and imported
+agent activity do not count. These views measure no prompts, productivity or ROI.
 
-Partial coverage makes participation a **confirmed-participation lower bound**.
-Blank dates can reflect delayed telemetry or a new license; they are not proof
-of never-used. Retained unseen rows keep their original dates and unknown
-classification rather than becoming current participation.
+Check **Activity report coverage**: incomplete coverage makes participation a
+confirmed lower bound. Blank dates can reflect reporting delay or a new license.
+Retained unseen rows keep original dates and remain unknown, not never-used.
 
-### Retained history
+### History and comparisons
 
-Office history keeps one aggregate point per UTC Monday-start week for twelve
-calendar months, using the provider refresh date. Each point represents the
-latest real D28/v2 report refreshed that week—not activity occurring only during
-that week.
+History keeps one aggregate point per UTC Monday-start week for twelve calendar
+months, using the latest D28/v2 report refreshed that week—not activity only
+during that week. New reports/corrections replace that week's point.
 
-| Dataset | Available detail |
+Only the latest current observation has person-level details; weekly history
+contains organization and group totals. Licenses and organization are frozen
+at capture. Later changes or source aging do not rewrite measurements; current
+freshness is shown separately. Stale app evidence does not establish current use
+or an inactivity recommendation.
+
+Graphs show weekly points in the last 30 calendar days through the selected
+report and need two points. Switch between counts and share of enabled users.
+The default baseline is about four weeks earlier when available; check its actual
+date. Shorter history and denominator changes are disclosed. Rate changes are
+percentage points.
+
+## Report choices and bookmarks
+
+The **Report set** choice on Users and Agents is personal. **Latest report** uses
+the newest complete available reporting period, not upload date. Bookmarks preserve
+a selection; Latest removes the pin. Older agent activity uses current saved
+license evidence, not reconstructed historical licensing.
+
+Office observations/baselines are independent of agent reports. Bookmarks and
+Back/Forward preserve Office context. Removed/replaced choices recover with a
+notice; permission or service failures do not silently select different data.
+
+## Troubleshooting
+
+| Problem | Check |
 | --- | --- |
-| Latest current observation | Captured people, paid-feature context, organization, seven app dates and evidence gaps |
-| Weekly history | Organization and company/department aggregates; no archived person records |
+| No license data, or collection fails | Check the directory outcome in **Sync**, then application credentials/grants/consent in **Permissions**. Assigning the reader a Microsoft report role does not fix application collection. |
+| Checked directory users exceed paid users | Compare effective paid features, not product assignments or tenant headcount. Disabled and unverified candidates can be included in the directory count. |
+| Licenses appear but Office activity is unavailable | Check the Office source in **Sync**, `Reports.Read.All` consent and **Activity report coverage**, not license assignments. |
+| People are missing from the non-paid cohort | Check directory verification, exact identity matching and report privacy settings. Concealed/ambiguous identities remain unknown. |
+| Company or department is missing | Check the user's saved directory fields; display names and agent owners do not supply organization membership. |
+| Report download fails | Retry collection for a fresh download. Check outbound HTTPS to Graph and supported report-download hosts. |
+| HTTP 400 during directory collection | Review the query/schema diagnostic, not extra consent. See [sync diagnostics](operations.md#diagnose-synchronization-problems). |
+| Microsoft sign-in is blocked | Ask the tenant administrator to review Conditional Access for the account/device/network; this is not a license-count issue. |
 
-Licensing and company/department are captured context, not daily workforce
-history. Later license or department changes do not recompute older totals.
-Repeated identical evidence preserves a capture; a newer report or correction
-within a week replaces that week's aggregate point.
-
-Frozen observations retain their measured metrics as source data ages.
-Current source freshness is disclosed separately. For current saved-user
-attention signals, stale app evidence does not qualify as recent measured use
-or an inactivity recommendation; last-known dates remain visible.
-
-## Dashboard and Office Users navigation
-
-Dashboard defaults to **Agent adoption**. Choose **Copilot in Office apps** for
-paid-user participation, app adoption, department gaps and seven app history
-graphs.
-
-- Organization cards and trends stay organization-wide; company selection narrows
-  the department panel.
-- A shared measure control switches all app graphs between active users and share
-  of enabled users. App counts overlap and must not be added as distinct people.
-- Graphs use available weekly observations in the last 30 calendar days up to the
-  selected report. Fewer than two points show a history-building notice.
-- The default comparison uses a measured point about four weeks earlier when
-  available, showing its actual date. Shorter history is identified; missing
-  daily activity is not interpolated.
-- Rate changes are percentage points, rounded to the nearest tenth. Smaller
-  nonzero changes retain their direction and show `<0.1`; denominator changes
-  are disclosed.
-
-In **Users > Adoption**, choose **Office apps**. Search and company/department
-filters select groups; five-group pages and separate people pages keep large
-organizations browsable. An app filter narrows recent people and suggested
-**Office Champs**, while each group's full paid denominator and all seven app
-totals stay intact.
-
-Office Champs are suggestions, not assigned roles or volume rankings. Up to
-three per group rank by positive app breadth, qualifying recency, normalized
-display label and exact identity, over the complete matching population.
-
-Use **Office observation** for Latest current details or a weekly summary, and
-**Office baseline** for an earlier capture. Weekly summaries offer
-**Explore current people**, because historical person records are not archived.
-Current person details show frozen facts for that observation; opening a separate
-current profile cannot replace them.
-
-Office navigation uses `adoption=office`, `officeSnapshot` and `officeBaseline`.
-Agent report `snapshot`/`baseline` choices remain independent. Bookmarks,
-Back/Forward and links from Dashboard preserve the selected Office context.
-Removed or replaced observations recover explicitly; failures do not silently
-combine panels from different observations.
-
-### Agent adoption
-
-**Users > Adoption > Agents** groups saved paid users and positively used report
-agents by company/department, five groups per page. Report-only agents remain
-visible without an inventory link. A shared agent can appear in several groups
-but counts once in the overall **Agents used** measure.
-
-Up to three **Agent Champs** per group rank by reported responses, distinct
-positively used agents, lowercase name and exact identity. Positive responses
-or positively used agents qualify; creating an unused agent does not.
-
-## Agent responsibility in user details
-
-The **Responsibility** tab shows saved **Owner**, **Created by** and
-**Last modified by** relationships with observation dates and paged agent rows.
-Modification is not proof of ownership or ongoing responsibility. None of these
-relationships grants access or management permission.
-
-Responsibility can be available for people outside both user cohorts. Missing
-profile, license or usage evidence does not hide an exact saved relationship.
-Browsing makes no provider call and never guesses a person from a display name.
-
-## Troubleshooting small or unexpected counts
-
-| Symptom | Check |
-| --- | --- |
-| Checked directory candidates exceed licensed users | Expected when discovered products include disabled, inactive or unverified paid features. Compare effective entitlement, not assignment/headcount. |
-| License count is unknown | Check the directory source outcome in Sync and configured application credentials/consent in Permissions. Do not assign the signed-in person a Microsoft reader role to fix application collection. |
-| HTTP 400 from directory collection | Investigate the Graph query/schema diagnostic, not extra consent. Incomplete evidence must not become zero. |
-| Licensed users appear but Office activity is unavailable | The sources are independent. Resolve report collection separately; do not reassign licenses to repair access. |
-| Active report users are missing from the non-paid view | Check completed identity verification, privacy settings and unique exact identity matching. Unknown is not unpaid. |
-| Department/company is missing | Check the directory fields. Display names or inventory owners do not supply organization membership. |
-| A report download fails | Retry collection to obtain a fresh signed download; check outbound HTTPS to Graph and the supported report-download hosts. |
-| Microsoft sign-in says access is unavailable | Review Conditional Access with the tenant administrator and an approved account/device/network; it is not a license-count problem. |
-
-Collection streams records, follows validated continuation links and checks
-provider counts, duplicate identities, schema, deadlines and storage bounds.
-Oversized individual records or unavailable source evidence fail explicitly
-without replacing the last complete source. See the
-[current resource boundaries](data-architecture.md#collection-and-publication).
-
-Use normalized source diagnostics such as `provider_count_mismatch`,
-`provider_schema`, `provider_result_limit` or `data_generation_bytes` in authorized
-operational logs. Never extract session tokens or signed download URLs for
-troubleshooting. For API/storage details, see
-[saved-data architecture](data-architecture.md#official-reports-and-user-evidence);
-for operational recovery, see [sync diagnostics](operations.md#diagnose-synchronization-problems).
+For source definitions and recognized paid features, see
+[saved-data architecture](data-architecture.md#official-reports-and-user-evidence).

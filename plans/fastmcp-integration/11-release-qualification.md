@@ -3,7 +3,7 @@
 ## Mission and inputs
 
 Verify implemented MCP/API/web behavior before the authorized release.
-Read [current API map](../../docs/mcp-integration.md),
+Read [current API map](../../docs/mcp-reference.md),
 [data architecture](../../docs/data-architecture.md),
 [operations](../../docs/operations.md), the actual implementation from
 [05](05-fastmcp-service-and-auth.md)–[10](10-azure-deployment-integration.md),

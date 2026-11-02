@@ -1,125 +1,106 @@
 # Provider contracts
 
-Developer reference for supported Microsoft requests, data meaning and failure
-handling. The [capability registry](../backend/src/services/capabilityRegistry.ts)
-defines current capability IDs, modes, requirements and Microsoft source links.
+Supported Microsoft endpoints, token modes, evidence and limits.
+See the [capability registry](../backend/src/services/capabilityRegistry.ts) for IDs
+and Microsoft sources; [permissions](user-roles-and-permissions.md#app-registration-permissions)
+for grants and roles.
 
-## App registration permissions
-
-Use the [permission and role reference](user-roles-and-permissions.md#app-registration-permissions)
-for the grant matrix, consent and role assignments.
+## Identity and saved scope
 
 | Operation | Provider identity |
 | --- | --- |
 | Graph package inventory, users, licenses, Office-app activity and user lookup | Application |
-| Management group lookup and package changes/readback | Signed-in user's delegated identity |
-| Power Platform inventory and quarantine | Signed-in user's delegated identity |
-| Retained Purview/Defender investigations | Delegated, or explicitly configured application/shared scope |
+| Management group lookup; package changes and control readback | Delegated |
+| Power Platform inventory and quarantine | Delegated |
+| Purview/Defender investigations | Delegated, or explicitly configured application/shared scope |
 
-MCP/API caller authentication is separate from provider-token mode. A delegated
-API caller can request authorized application Graph collection; this is not a
-fallback from failed delegated access.
+- Initial read-only sync starts automatically after sign-in while visible and
+  online; no diagnostic approval or mutation canary is required.
+- Saved inventory, directory/license/activity data and imports are tenant-shared.
+  Viewer-capable roles need no provider permission to read them.
+  Investigation results and job/control receipts retain their own scopes.
+- Provider changes need Admin, delegated provider authorization, exact confirmed targets,
+  current source authority, prestate and readback—not old observations or diagnostics.
+- Failed/limited-visibility refreshes preserve saved data. Catalog absence is not
+  deletion; verified exact absence may remove a supported target.
 
-## Authorization and saved scope
-
-- Inventory, directory/license/activity sources and imported reports are
-  tenant-owned. Viewer-capable roles can read saved tenant data without provider
-  source-read permission.
-- Collection starts automatically after sign-in while the app is visible and
-  online. Permission checks are diagnostics, not an enablement step.
-- Provider changes require current Admin access, delegated provider authorization,
-  an exact target, confirmation, prestate and readback.
-- Private investigation results and job/control receipts retain their owner and
-  configuration scope. App roles do not grant Microsoft access.
-- Failed or limited-visibility refreshes preserve saved data. Catalog absence is
-  not deletion evidence; verified exact absence may remove a supported target.
-- Saved observation age does not grant live identity authority. Writes require
-  current, unexpired source authority.
-- Tenant, session, capability and configuration changes fence in-flight work.
-  Stale diagnostics or a replacement sign-in cannot authorize older operations.
+API/MCP caller authentication is independent of provider mode. Delegated callers
+can request authorized application Graph collection; failed delegated access never
+triggers application fallback. App roles do not grant Microsoft permissions.
 
 ## Graph package reads and controls
+
+Origin: `https://graph.microsoft.com`.
 
 | Request | Contract |
 | --- | --- |
 | `GET /v1.0/copilot/admin/catalog/packages` | Exactly `$filter=supportedHosts/any(h:h eq 'Copilot')` |
-| `GET /v1.0/copilot/admin/catalog/packages/{id}` | One encoded exact opaque package ID |
-| Beta package block/unblock and access update | Exact delegated operation, current prestate, one-shot dispatch and semantic readback |
+| `GET /v1.0/copilot/admin/catalog/packages/{id}` | Inventory/detail or control readback, using the modes above |
+| `POST /beta/copilot/admin/catalog/packages/{id}/block` or `/unblock` | Block/unblock |
+| `PATCH /beta/copilot/admin/catalog/packages/{id}` | Availability/installation assignments |
 
-Read continuation may add one nonempty `$skiptoken`, preserving the endpoint and
-filter. No `$top`, arbitrary query, caller origin or redirected request is accepted.
-Package IDs retain case and whitespace significance; directory GUID rules do not
-apply to them. Duplicate exact identities, continuation loops and malformed
-security fields reject the scan.
+- Opaque package IDs preserve case/whitespace; encode one exact path segment.
+- Continuation keeps the endpoint/filter and adds one nonempty `$skiptoken`;
+  no `$top`, arbitrary query, foreign origin or redirect. Duplicate identities,
+  continuation loops and malformed security fields fail collection.
+- `sharedWithUsersAndGroups` is read-only sharing, not availability/installation.
+  Missing is not empty; exact IDs, types and order are retained, up to 5,000
+  principals. Neither it nor `availableTo` proves maker-controlled whole-tenant sharing.
+- Access writes support specific users/groups or none; “All users” has no documented
+  supported payload. Untouched access must be preservable. Reassignment is not
+  implemented: package detail has no owner readback.
+- Writes are not provider-atomic. External changes can race prestate/readback;
+  never replay an uncertain sent write. Reconciliation reads only.
 
-Catalog collection streams into durable staging without detail-request fan-out.
-Record parsing, batches, storage and execution time are bounded; total tenant
-record/page counts are not capped. Exact details use their own response limits.
-See [the client](../backend/src/services/graphPackages.ts) and
-[collection bounds](../backend/src/db/dataBounds.ts).
-
-`sharedWithUsersAndGroups` is read-only sharing evidence, separate from
-availability and installation assignments. Missing does not mean an empty list.
-The collection has a 5,000-principal bound; exact IDs, types and order are retained.
-Neither it nor `availableTo` proves maker-controlled organization-wide chat sharing.
-
-Mutations are not provider-atomic. The app serializes its own exact-target work
-and rechecks provider prestate, but cannot exclude concurrent external changes.
-An uncertain sent write is not replayed; explicit reconciliation performs reads
-only. Optional mutation diagnostics do not gate ordinary controls.
+[Client limits](../backend/src/services/graphPackages.ts) bound records, requests
+and execution, not total tenant records/pages.
 
 ## Power Platform fields and identity
 
-Inventory uses the delegated Resource Query API and collects supported agents
-and supporting environments, not broad flow/connector catalogs. Application and
-managed-identity authentication are unsupported by this provider.
+Origin: `https://api.powerplatform.com`. Inventory is delegated-only; no
+application/service-principal or managed-identity flow.
+
+| Request | Purpose |
+| --- | --- |
+| `POST /resourcequery/resources/query?api-version=2024-10-01` | Supported agents and supporting environments, not broad flow/connector catalogs |
+| `GET /copilotstudio/environments/{environmentId}/bots/{botId}/api/botQuarantine?api-version=1` | Exact quarantine status |
+| `POST /copilotstudio/environments/{environmentId}/bots/{botId}/api/botQuarantine/{action}?api-version=1` | `SetAsQuarantined` or `SetAsUnquarantined` |
 
 | Evidence | Meaning |
 | --- | --- |
-| `properties.sharedWithViewers` / `properties.sharedWithEditors` | Preview maker-sharing fields, saved separately as `details.makerSharing.viewers/editors` |
+| `properties.sharedWithViewers` / `properties.sharedWithEditors` | Preview maker sharing, saved as `details.makerSharing.viewers/editors` |
 | `viewers.entireTenant` | Maker-controlled whole-tenant sharing, not administrative approval |
-| Harness/title/instruction-length metadata and component/knowledge/flow counts | Observed provider metadata, not imported usage metrics |
-| `properties.entraAgentId` | Identity candidate until explicitly verified against the directory |
+| Harness/title/instruction-length metadata; component/knowledge/flow counts | Observed metadata, not reported usage |
+| `properties.entraAgentId` | Candidate until verified by the typed Graph `agentIdentity` lookup |
 
-No instruction text, generic raw-resource archive or unverified flow/trigger
-schema is stored. Malformed typed values and duplicate members reject collection.
-See [field mappings](data-architecture.md#maker-controlled-sharing-and-captured-agent-configuration).
+No instruction text, raw-resource archive or unverified flow/trigger schema is
+stored. Invalid typed observations or duplicate contract members fail collection.
+[Field mappings](data-architecture.md#maker-sharing-and-configuration).
 
-A verified Microsoft `agentIdentity` has equal object/app IDs under that specific
-contract. Do not generalize this to ordinary service principals, blueprints,
-packages or native resource IDs. Names and prefixed IDs are not identity proof.
-
-Quarantine requires the exact environment and Bot ID and uses the current
-`copilotstudio` namespace. Role hints are diagnostic, not authorization. Status
-and changes have the same provider administrator-role requirement; classic bot
-write restrictions remain explicit. See [quarantine requirements](user-roles-and-permissions.md#power-platform--delegated).
-
-Power Platform access checks have a ten-second logical deadline; exact agent
-diagnostics have sixty seconds, shortened by an earlier caller deadline.
-Cancellation, token renewal, retry waits and final projection stay inside those
-budgets.
+Verified `agentIdentity` object/app IDs are equal; do not infer equality for other
+identities or match by names/prefixes. Quarantine requires exact environment/Bot
+IDs; classic bots are unsupported. Status and writes require the same
+[provider administrator role](user-roles-and-permissions.md#power-platform--delegated);
+role hints are not authorization.
 
 ## Retained backend investigations
 
-These capabilities are hidden from the current UI and are not additions to
-ordinary registration/setup. They are separate from local Admin-only Audit logs.
+Hidden from the UI; separate from local Admin-only Audit logs and ordinary setup.
 
-| Capability | Microsoft permission | Provider requirement |
+| Source | Microsoft permission | Request / provider requirement |
 | --- | --- | --- |
-| Agent log identity resolution | Delegated `AgentIdentity.Read.All` | Agent ID Administrator for identities the user does not own |
-| Purview Audit Search | Delegated/application `AuditLogsQuery.Read.All` | Purview Audit enabled and applicable role/entitlement |
-| Defender hunting | Delegated/application `ThreatHunting.Read.All` | Defender RBAC, source visibility, connectivity and applicable licensing |
+| Agent identity | Delegated `AgentIdentity.Read.All` | `GET /v1.0/servicePrincipals/{id}/microsoft.graph.agentIdentity?$select=id,servicePrincipalType`; Agent ID Administrator for nonowned identities |
+| Purview Audit Search | Delegated/application `AuditLogsQuery.Read.All` | `/v1.0/security/auditLog/queries`: create, poll and records; Audit enabled and applicable role/entitlement |
+| Defender hunting | Delegated/application `ThreatHunting.Read.All` | `POST /v1.0/security/runHuntingQuery`; Defender RBAC, source visibility, connectivity and licensing |
 
-- **Purview:** selected Graph v1.0 query lifecycle and singular `serviceFilter`;
-  ordinary searches are bounded to 168 hours, 20 pages and 5,000 stored records.
-  Use the [selected contract](purview-audit-search.md), not an invented request
-  dialect when Microsoft examples disagree.
-- **Defender:** `POST /v1.0/security/runHuntingQuery` with code-owned KQL and matching
-  explicit `Timespan`. Ordinary hunts cover at most seven days, 200 rows and 2 MB.
-  No arbitrary KQL or workspace override. See [Defender contracts](defender-agent365-hunting.md).
-- **Saved evidence:** provider-free reads still enforce current local ownership,
-  sharing, configuration and expiry. Empty results do not prove complete ingestion
-  or safety. External RBAC revocation cannot be learned while offline.
+- **Purview app limits:** 168 hours, 20 record pages, 5,000 stored records.
+  Singular `serviceFilter`; see [Purview contract](purview-audit-search.md).
+- **Defender app limits:** seven days, 200 stored rows, 2 MB responses.
+  Fixed KQL and matching `Timespan`; no arbitrary KQL/workspace override.
+  See [Defender contracts](defender-agent365-hunting.md).
+- Delegated results are principal-private; application results need the current
+  configured shared scope. Saved reads enforce ownership, configuration and expiry,
+  not offline detection of external RBAC revocation. Empty is not complete coverage.
 
 ## Reports and source authority
 
@@ -127,32 +108,23 @@ ordinary registration/setup. They are separate from local Admin-only Audit logs.
 | --- | --- | --- |
 | `reports.copilotUsage.read` | `GET /v1.0/copilot/reports/getMicrosoft365CopilotUsageUserDetail(period='D28',version='v2')` | Required v2 CSV headers are exact; additive columns are ignored |
 
-The Office activity source accepts one signed-download redirect to the allowed
-HTTPS report origins without forwarding the Graph token. Hidden, unmatched or
-duplicate user identities are not guessed. Period/version metadata is preserved;
-older or different windows are not relabeled.
+One signed-download redirect to `https://reports.office.com` or
+`https://reportsweu.office.com` is allowed, without the Graph token.
+Hidden/unmatched/duplicate identities are not guessed; period/version is preserved.
 
 Only the manually exported **Agents**, **Users & agents** and **Users** CSVs
-establish reported agent usage. Graph app activity, observed inventory counters,
-Purview and Defender do not replace them. Import requires no provider probe.
+establish reported agent usage—not Graph app activity, inventory counters, Purview
+or Defender. Import requires no provider probe.
 See [CSV import](official-usage-import.md) and [Office adoption](copilot-license-usage.md).
 
 ## Transport and privacy
 
-- Retry only safe reads within request/deadline limits. Never replay an uncertain
-  provider mutation.
-- Validate fixed HTTPS origins, route families and continuation structure before
-  attaching credentials. The Office download redirect is an explicit exception.
-- Graph throttling establishes shared cooldown; token-service throttling does
-  not change Graph-wide pacing.
-- Streamed package headers have a thirty-second deadline, separate from body
-  idle waits and the overall execution budget. Late responses are disposed.
-- Validate UTF-8 and reject duplicate JSON contract members. Bound individual
-  records, parsing work, exact-detail bodies and retained storage.
-- Preserve safe HTTP/correlation/Retry-After diagnostics. Do not log tokens,
-  raw provider bodies or private record contents.
-- Recheck captured authorization and source fences at dispatch and publication.
-  Cancellation cannot become a successful late result.
+- Validate fixed HTTPS origins/routes/continuation before attaching credentials;
+  only Office downloads allow a token-free redirect. Retry safe reads within deadlines.
+- Reject invalid UTF-8 and duplicate JSON contract members. Recheck authorization
+  at dispatch/publication; cancelled or superseded work cannot publish.
+- Diagnostics may retain safe HTTP/correlation/Retry-After data, never tokens,
+  raw bodies or private records.
 
-Local fixtures verify implementation behavior, not live tenant consent,
-licensing, provider rollout, coverage or response compatibility.
+Local fixtures do not establish live consent, licensing, provider rollout,
+coverage or response compatibility.

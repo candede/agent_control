@@ -2,7 +2,7 @@
 
 The current product is the Express API and React web app. API authentication,
 saved-read contracts, generic controls and audit origin are described by the
-[current API contract](../../docs/mcp-integration.md),
+[current API contract](../../docs/mcp-reference.md),
 [data architecture](../../docs/data-architecture.md) and
 [security model](../../docs/security-model.md), not old implementation records.
 This roadmap describes remaining work; it is not deployment or live-test evidence.

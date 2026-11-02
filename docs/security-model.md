@@ -1,261 +1,167 @@
 # Security model
 
-Agent Control uses Entra ID for authentication, app roles for application access,
-and Microsoft permissions for provider operations. This is the current security
-reference; configuration steps are in [setup](deployment-setup.md) and the
-[role and permission guide](user-roles-and-permissions.md).
+Agent Control protects tenant data and authorizes agent changes. **Entra ID
+proves identity; app roles govern application access; Microsoft authorizes
+provider operations.** None substitutes for another.
 
-## Identity and tenant routing
+Use [setup](deployment-setup.md) for configuration and the
+[role and permission guide](user-roles-and-permissions.md) for grants and licensing.
 
-- The entered work/school username selects an exact configured tenant domain.
-  Unknown or overlapping domains are rejected.
-- Verified Entra tenant/account claims establish identity; client-supplied
-  identity headers and reported client names do not.
-- Each tenant has separate registration credentials and accepted domains.
-- Sign-in return targets must normalize to local application paths; network-path
-  redirects are rejected.
-- Protected operations require a recognized current Agent Control role.
-
-## App roles
-
-The [role matrix](user-roles-and-permissions.md#app-defined-roles) defines Viewer,
-Usage Report Uploader and Admin access. Uploader includes Viewer; Admin includes
-both. Set **Assignment required?** to **Yes** on the Enterprise application.
-
-Only Admin can access agent management, configuration and local Audit
-reads/exports, including through direct URLs/APIs. Provider changes also require
-Microsoft authorization. A role assignment never grants provider access.
-
-## Tenant and account isolation
+## Access boundaries
 
 | Data | Access boundary |
 | --- | --- |
 | Saved inventory, people, directory/license/activity sources and imported reports | Shared within the tenant among Viewer-capable roles |
-| Delegated private investigation evidence | Collecting/authorizing account and current sharing rules |
-| Configured application investigation evidence | Exact tenant, configuration revision and shared scope |
-| Job lifecycle, control receipts, credentials and capability evidence | Initiating principal and current authorization |
-| Local administrative Audit | Admin-only |
+| Delegated investigation evidence | Authorizing account and current sharing rules |
+| Configured application investigation evidence | Exact tenant, configuration revision and shared application scope |
+| Jobs, control receipts and capability evidence | Initiating account and current authorization |
+| Local administrative Audit | Admin-only, scoped to the current tenant and account |
 
-Saved tenant data remains readable without Microsoft source-read permission.
-Failed or limited-visibility collection preserves existing publications and
-observation dates; absence is not automatically deletion.
+The [role matrix](user-roles-and-permissions.md#app-defined-roles) defines tasks
+and inheritance. Management, configuration and local Audit require Admin, including
+direct URLs/APIs. An app role never grants Microsoft permissions.
 
-Revoking one account fences its unfinished work, selections and private receipts,
-not other accounts or completed tenant publications. Saved historical identity
-evidence never substitutes for current, unexpired authority to change a provider.
+Saved tenant data is readable without the reader's Microsoft source-read
+permission. Failed or limited-visibility collection preserves saved data and dates;
+absence alone is not deletion. Account revocation fences that account's unfinished work
+and private selections, not other accounts or completed tenant publications.
 
-## Sessions and role freshness
+## Authentication and sessions
 
-- Browser sessions are opaque server-side PostgreSQL records with an eight-hour
-  lifetime. Production cookies are `HttpOnly`, `Secure` and `SameSite=Lax`.
-- Stored session data contains sanitized identity/roles, expiry/freshness, CSRF
-  state and a random authentication-transaction handle.
-- Provider tokens, refresh/ID tokens, OAuth codes/state/nonces, PKCE verifiers and
-  MSAL cache contents are not stored in PostgreSQL or sent to the browser.
-- MSAL token caches are process-local. Restart loses those caches, not saved
-  tenant data.
-- Browser app roles are revalidated with Entra every five minutes. External role
-  revocation may take that interval to affect an active session.
-- Long-running browser reads revalidate before role evidence expires. An expired
-  bearer assertion is never extended by that browser mechanism.
-- Logout removes account credentials and server sessions, advances authorization
-  epochs, and cancels that actor's unfinished work. A replacement sign-in cannot
-  lend authority to an earlier request.
-- Changed tenant/application bindings invalidate sessions. Publication rechecks
-  the initiating identity after asynchronous work and before releasing data.
+- Initial username domains select an exact configured tenant, not identity;
+  unknown/overlapping domains are rejected. Each tenant has separate credentials.
+  Verified Entra tenant/account claims—not identity headers or client labels—are authoritative.
+- Sign-in uses session-bound, single-use state, nonce and PKCE. Return URLs must
+  be local application paths, never network-path redirects.
+- Browser sessions are opaque PostgreSQL records with an eight-hour maximum.
+  Cookies are `HttpOnly`, `SameSite=Lax` and `Secure` on HTTPS. Stored data is
+  allowlisted identity/roles, expiry/freshness, CSRF state and a random transaction
+  handle—not tokens, OAuth codes/state/nonces, PKCE verifiers or MSAL caches.
+  OAuth parameters pass through browser redirects; access/refresh/ID tokens are
+  not returned as browser app data.
+- MSAL caches and pending sign-ins are process-local. Restart loses them, not
+  saved tenant data; reauthenticate when needed.
+- Protected browser requests revalidate roles with Entra after five minutes;
+  long-running reads refresh before evidence expires. Revocation is not instant.
+  Removed tenants or changed application bindings invalidate sessions.
+- Logout removes account credentials/sessions and advances authorization epochs.
+  Earlier requests remain fenced after replacement sign-in; asynchronous results
+  recheck authority before release.
 
 ## Browser request protection
 
-State-changing browser requests require an authenticated session, the operation's
-app role, an exact configured `Origin`, a session-bound `X-CSRF-Token` and validated
-input. Missing Origin is rejected; there is no Referer fallback.
+Authenticated browser writes require a current session, applicable app role,
+validated input, exact configured `Origin` and session-bound `X-CSRF-Token`.
+Missing Origin is rejected without Referer fallback. Public `POST` sign-in also
+requires exact Origin, but not an authenticated session or CSRF token.
 
-Verified API bearer requests use their own authentication boundary, not cookie
-CSRF. Mixed bearer/cookie credentials are rejected without fallback. Browser-only
-and public authentication endpoints reject bearer credentials.
+API bearer requests use verified token authority, not cookie CSRF. Mixed bearer/
+session-cookie credentials are rejected without fallback; browser-only and public
+auth endpoints reject bearers. API tokens bind tenant, audience, client and scope.
+App roles come from that assertion, not Graph roles. Assertions five minutes old
+require newly issued authorization; browser role refresh cannot extend them.
 
-The API serves one canonical origin. Azure trusts one reverse-proxy hop; local
-deployments trust no forwarding headers unless an operator explicitly configures
-a controlled proxy. MCP has its own Host/Origin/resource binding and does not
-inherit the Node proxy policy.
+API identity proof and restart-safe revocation checks are defined in the
+[MCP/API contract](mcp-reference.md). Reported client metadata is attribution, not authority.
 
-## Delegated API foundation and canonical integration
-
-The [MCP/API contract](mcp-integration.md) defines the same registered handlers
-used by browser and delegated API callers:
-
-- Exact tenant, API audience, client and scope binding with RS256 verification
-  and bounded JWKS refresh.
-- SDK OBO proof of the existing private home-account identity. Guest resource
-  object IDs and `sub` alone are not home-account keys.
-- API app roles from the verified API assertion, never Graph roles or client
-  labels. Assertions older than five minutes cannot refresh their own role evidence.
-- Process-local credential sources and non-secret job references. Assertions and
-  provider tokens are not serialized into sessions, jobs, audit or principal DTOs.
-- Durable epoch and issuance-cutoff checks prevent revoked assertions from
-  regaining authority after restart. Recovery requires fresh same-principal
-  authorization, not automatic replay.
-- Separate immutable execution initiator and current lifecycle attribution.
-  Client metadata is reported attribution, not proof of identity or intent.
-
-Delegated MCP/API caller authentication does **not** make every provider request
-delegated. Provider-token mode is defined by the requested capability below.
-
-## Provider credentials and permissions
+## Provider authority
 
 | Operation | Provider credentials |
 | --- | --- |
-| Graph package collection, directory/users, licenses, Office activity and user resolution | Configured tenant application credentials |
+| Graph package collection, users, licenses, Office activity and user resolution | Configured tenant application credentials |
 | Power Platform inventory/quarantine, management group lookup and package controls/readback | Initiating user's delegated credentials |
-| Retained investigations | Delegated credentials, or separately configured application/shared scope where supported |
+| Agent identity resolution and MCP/API investigations | Initiating user's delegated credentials |
+| Browser investigations | Delegated credentials, or separately configured application/shared scope where supported |
 
-Standard Graph collection has fixed tenant scope and starts automatically after
-eligible sign-in while visible and online. It needs no administrator session,
-manual enablement, prior permission check or release acceptance.
+**Read-only Graph sync starts automatically** after eligible sign-in while visible
+and online, in fixed tenant scope. It needs no Microsoft directory/reporting role
+for the user, Admin session, manual enablement, prior status check or acceptance.
+Delegated MCP/API authentication does not change application collection to delegated.
 
-**Application authorization failures:** administrator verifies application
-credentials and consented grants; user sign-in does not repair them.
-**Delegated interaction/expiry:** sign in again for MFA or Conditional Access;
-missing API grants still require external administrator setup.
+Microsoft enforces grants, roles, licensing and resource/cloud support. Login,
+token or readiness success proves neither full visibility nor later write access.
+There is no credential-mode fallback. **Permissions > Check status** diagnoses
+access; it does not grant consent, approve operations or enable workflows.
 
-Provider permissions, roles, licensing, cloud availability and resource support
-are enforced by Microsoft. Readiness/token success is not proof of full provider
-visibility or permission for a later write. No automatic credential-mode fallback
-is used.
+## Agent changes and durable work
 
-## Shared exact agent controls
-
-Preview, execute and receipt reads use the same current Admin handlers for
-browser and configured API callers. A control binds the exact provider target,
-source revisions, actor/session, requested effect, prestate and expiry.
-
-- Interactive clients show the exact preview and request confirmation.
-- Scheduled clients submit the same current server receipt; there is no
-  application approval/bypass flag or new scheduler.
-- Generic Studio effects are quarantine/unquarantine. Package block/access
-  controls remain distinct from Studio controls.
-- Names, origin labels and report-only matches do not establish provider identity.
-- The app checks live prestate immediately before one-shot dispatch and verifies
-  semantic provider state afterward.
-- Local locks serialize this app's operations, not external administrators.
-  Package APIs without ETag/If-Match cannot promise provider atomicity.
-- A timeout or unknown result after dispatch is inconclusive, not success.
-  Explicit GET-only reconciliation never resends the write.
-- Stable idempotency keys recover the original receipt; they do not authorize
-  automatic mutation retries.
+- Browser/API controls share Admin handlers. Previews bind exact targets, source
+  revisions, actor/session, effect, prestate and expiry. Interactive clients show
+  the preview and request confirmation; scheduled clients submit the same current
+  receipt, not an approval/bypass flag. The app supplies no scheduler.
+- Names, origin labels, historical identity evidence and report-only matches
+  cannot authorize writes. Studio quarantine/unquarantine and package block/access
+  are distinct controls.
+- Live prestate is checked before one-shot dispatch; provider state is verified
+  afterward. Local locks do not serialize external administrators. Package APIs
+  without ETag/If-Match cannot promise provider atomicity.
+- Unknown post-dispatch outcomes are inconclusive. Explicit GET-only
+  reconciliation never resends writes; idempotency keys recover original receipts,
+  not authority for automatic write retries.
+- Jobs retain intent/progress/ownership, not tokens or assertions. Admission and
+  publication recheck initiating identity, session, capability and source/configuration.
+  Cancellation/lost authority fences late results. Restart recovers status, not
+  credentials: new provider work needs current same-principal authority. Safe
+  unsent work may resume; uncertain writes are never replayed automatically.
+  Partial exports are not completed results.
 
 Optional [mutation diagnostics](mutation-canaries.md) retain their own approval
 and restoration rules but never gate ordinary supported controls.
 
-## Durable jobs
+## Data handling and audit
 
-Jobs retain immutable intent, bounded progress, owner and execution fences.
-Admission and publication recheck the initiating principal, session, capability,
-source and configuration revision.
+- Saved reads use saved data; provider lookups/collection require separate
+  authorization. Catalog and detail freshness are independent.
+- Provider fields are allowlisted/minimized. Verified IDs establish associations;
+  source text is untrusted data, not instructions.
+- Concealment, missing evidence and partial coverage stay explicit; unknown is not
+  zero or inactivity. CSVs escape spreadsheet-sensitive cells without losing
+  whitespace, newlines or Unicode.
+- Saved pages, details and export chunks recheck owner/configuration/source and
+  session authority before release.
 
-| Situation | Required behavior |
-| --- | --- |
-| Cancellation, sign-out or lost authority | Stop further admission; reject late publication |
-| Restart or expired credentials | Recover durable status; require current authorization before new provider work |
-| Unsent work with safe recovery | Resume through its existing lifecycle |
-| Write sent with unknown outcome | Preserve inconclusive status; reconcile with provider reads only |
-| Partial export or failed publication | Do not publish a completed file/result |
-| Shutdown | Close admission, cancel and join active work; report drain/persistence failures |
+Local Audit retains actor, operation/job/correlation IDs, minimal change evidence
+and outcomes—not tokens, raw provider errors, prompts, transcripts or exported rows.
+Metadata is allowlisted on write/read; reads/exports exclude records older than
+ninety days. It is append-only application history, not a hash chain or Purview history.
 
-Power Platform collection remains delegated; package and user-source collection
-use application credentials while retaining the initiating user's authorization.
-Catalog and detail freshness are independent. Refresh failure preserves the last
-successful tenant data.
+## Transport and secrets
 
-## Data handling
+The web app/API share one canonical origin; local HTTP is supported. Responses
+use CSP, frame denial, `nosniff`, no-referrer and browser-feature restrictions;
+HTTPS adds HSTS. API/HTML are `no-store`; hashed assets are immutable.
+Azure trusts one reverse-proxy hop; local deployment trusts none unless a
+controlled proxy is explicitly configured.
 
-- Saved reads use saved data; they do not initiate hidden provider collection.
-  Explicit lookups/collection are separately authorized.
-- Provider fields are allowlisted and minimized. Raw provider bodies, prompts,
-  transcripts, tokens and unnecessary principal data are not audit evidence.
-- Exact verified IDs establish associations; names or guessed cross-provider
-  equivalence do not.
-- Report privacy concealment, missing evidence and partial coverage remain
-  explicit; unknown data does not become zero or proof of inactivity.
-- CSV exports escape spreadsheet-sensitive cells without discarding source
-  whitespace, embedded newlines or Unicode.
-- Current owner/configuration/source and session authority are checked before
-  saved pages, details and export chunks are released.
-- Returned source text is inert untrusted data, not executable instructions.
+Provider credentials go only to validated HTTPS origins/route families. Redirects
+are rejected except allowlisted Office downloads, which receive no Graph token.
+Requests enforce response/record limits, deadlines and retry budgets; streaming
+collection has no total tenant row/page ceiling. Request limits are per-process,
+not distributed quotas.
 
-## FastMCP OAuth state and recovery
-
-The optional service has an independent OAuth boundary. Full configuration,
-storage limits, key rotation and reconnection procedures are in
-[MCP integration](mcp-integration.md) and [client setup](mcp-clients.md).
-
-- Validate tenant, resource/audience, scope, client and upstream user identity.
-  Reference credentials are not upstream/API/ID tokens.
-- Encrypt persistent OAuth connection state. Keep signing/encryption keys separate
-  from the confidential client credential.
-- Local storage requires protected ownership/modes and one service worker;
-  capacity or corrupt-state failures are explicit, not plaintext/ephemeral fallback.
-- Azure uses the exact managed identity and leased/ETag-fenced encrypted Blob
-  object described in [Azure deployment](azure-production-deployment.md).
-- Refresh/restart must preserve the bound upstream identity. Changed identity
-  requires reconnect; API assertions are reacquired per invocation.
-- Disconnect revokes both access and refresh credentials. It does not fabricate
-  account-wide API logout, Entra consent revocation or cancellation of accepted work.
-- Redact OAuth diagnostics and callback data before logging. MCP does not store
-  application records, SQL access, a provider-token warehouse or a scheduler.
-
-## Permission Center
-
-The UI renders code-owned capabilities and actual current failures. **Check
-status** is diagnostic, not runtime approval. It does not infer a grant, role,
-license or mutation authority from successful login/read/token acquisition.
-
-Saved-data role visibility is separate from source-read permission. A Viewer's
-lack of Admin actions is not a permission failure. Local test/qualification
-artifacts do not enable or authorize application workflows.
-
-## Transport, admission and recovery
-
-Production uses one HTTPS origin with HSTS, CSP, frame denial, `nosniff`,
-no-referrer and disabled sensitive browser features. API/HTML responses are
-`no-store`; content-hashed assets are immutable. Local HTTP omits HSTS.
-
-Provider clients validate fixed HTTPS origins and route families before attaching
-credentials. Redirects are rejected except the explicit allowlisted Office
-report download, which does not receive the Graph token. UTF-8, JSON contract
-fields, record/body sizes, idle waits, execution deadlines and retry budgets are
-validated. Streaming collection does not impose a total tenant row/page ceiling.
-
-API JSON is limited to 512 KiB. Uploads allow two concurrent 8 MiB/50,000-row
-operations. Per-process request limits are 1,200 reads/300 writes per minute per
-trusted IP and 600 reads/200 writes per authenticated principal; they are not a
-distributed quota. Exports retain source-specific limits and a fifteen-second
-publication deadline.
-
-Liveness is separate from provider access. Readiness fails for actual schema,
-database/file maintenance or admission problems. Current-schema restore verifies
-fingerprints, revokes sessions/execution authority, clears transient staging and
-reconciles current ownership before reopening. Uncertain writes are not replayed.
-Successful reopening requires no additional provider-enable or review step.
-
-## Deployment
-
-- Local deployment serves the web app and API from one origin.
 - Azure runtime configuration uses 3 native Key Vault references: `TENANTS_JSON`, `SESSION_SECRET`, and `PGPASSWORD`. The PostgreSQL administrator password is provisioning/maintenance-only.
 - Protect configuration, backups, tenant credentials and OAuth keys separately.
-  Follow [operations](operations.md) for rotation, retention and restore.
-- Run software checks, but verify actual first-run/sign-in/provider journeys in
-  an authorized deployment before claiming they work.
+  Follow [operations](operations.md) for rotation, retention, shutdown and restore.
 
-## Audit and residual risk
+FastMCP has independent Host/Origin/resource and OAuth checks. Protect encrypted
+OAuth state and signing/encryption keys separately from client secrets and
+PostgreSQL backups. Changed identity requires reconnect; storage failures have
+no plaintext/ephemeral fallback. Disconnect revokes MCP access/refresh credentials,
+not API sessions, Entra consent or accepted work. Storage/worker limits and
+recovery: [technical reference](mcp-reference.md),
+[client setup](mcp-clients.md), [Azure deployment](azure-production-deployment.md).
 
-Local Audit records actor, operation/job/correlation identifiers, minimal
-before/after evidence and outcomes. Metadata is allowlisted on write and read;
-tokens, raw provider errors and exported rows are excluded. Audit reads/exports
-exclude records older than ninety days. This is append-only application audit,
-not a hash chain or Microsoft Purview history.
+## Administrator actions and limitations
 
-Remaining limits include external revocation timing, process-local credential
-loss, provider/API changes, Preview fields, licensing and cloud/data-source
-availability. Local fixtures do not establish live consent, production coverage,
-vendor-client compatibility or provider success.
+| Need | Action |
+| --- | --- |
+| App access | Assign app roles; set Enterprise application **Assignment required?** to **Yes**. Missing Admin actions for a Viewer are intentional. |
+| Application collection failure | Verify application credentials and consented grants; user reauthentication cannot repair them. |
+| Delegated access failure | Complete requested sign-in/MFA/Conditional Access. Administrators must supply missing grants, Microsoft roles or licenses externally. |
+| Origin failure | Use the canonical URL; ensure the controlled proxy preserves Origin. Do not bypass Origin/CSRF checks. |
+| Restore | Follow current-schema recovery: verify schema, revoke sessions/execution authority, clear transient staging and reconcile ownership. Reopening needs no additional provider-enable/review step. |
+
+External revocation timing, credential-cache loss, API/Preview changes, licensing
+and cloud/source availability remain limits. Health and local fixtures cannot prove
+live consent, full visibility, client compatibility or provider success. Verify
+first-run, sign-in and affected journeys in an authorized deployment.

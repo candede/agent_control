@@ -4,7 +4,7 @@
 
 Verify client workflows over [06](06-mcp-read-tools.md)/
 [07](07-mcp-agent-controls.md) using [08](08-local-container-integration.md).
-Read [current API semantics](../../docs/mcp-integration.md),
+Read [current API semantics](../../docs/mcp-reference.md),
 [usage](../../docs/official-usage-import.md) and
 [security](../../docs/security-model.md). Inspect actual catalog/configuration;
 no obsolete phase snapshots or acceptance file are prerequisites.

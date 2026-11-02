@@ -151,7 +151,7 @@ Add `-Project <name>` to keep separate installations.
 
 ## Documentation
 
-Optional: run the [MCP service](docs/deployment-setup.md#optional-mcp-service) to
+Optional: [set up the MCP server](docs/mcp-integration.md) to
 connect AI clients to Agent Control. The web app does not require it.
 
 | Guide | Covers |

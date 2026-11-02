@@ -5,7 +5,7 @@
 Deploy MCP beside the independent API/web app in current-host Compose project
 `seha`, verify actual user journeys and repair defects forward. Read
 [08](08-local-container-integration.md), [09](09-client-workflows-and-evaluation.md),
-[11](11-release-qualification.md), [current contracts](../../docs/mcp-integration.md),
+[11](11-release-qualification.md), [current contracts](../../docs/mcp-reference.md),
 [operations](../../docs/operations.md) and
 [security](../../docs/security-model.md).
 Planning/source tests are not authority for live resource, ingress, tenant-grant

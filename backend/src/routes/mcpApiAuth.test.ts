@@ -365,7 +365,7 @@ describe("registered canonical HTTP authentication", () => {
   });
 
   it("classifies every current operation from the sole contract, with no bearer aliases", () => {
-    const document = readFileSync(new URL("../../../docs/mcp-integration.md", import.meta.url), "utf8");
+    const document = readFileSync(new URL("../../../docs/mcp-reference.md", import.meta.url), "utf8");
     const currentMap = document.split("## Administrative audit origin v1")[0];
     for (const line of currentMap.split("\n").filter(line => /^\| `[A-Z]+ \/api\//.test(line))) {
       const match = /^\| `([A-Z]+) (\/api\/[^`]+)`/.exec(line)!;

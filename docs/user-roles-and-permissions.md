@@ -1,92 +1,103 @@
 # User roles and Microsoft permissions
 
-Use this guide to assign Agent Control access and configure Microsoft permissions.
-For registration steps, see [deployment setup](deployment-setup.md).
+Administrator: assign an app role, grant the API permissions, and assign
+Microsoft roles where required below. Registration and credentials:
+[deployment setup](deployment-setup.md).
 
 ## App-defined roles
 
 | App role | Allowed tasks |
 | --- | --- |
-| `AgentControl.Viewer` | Read shared tenant data; run read-only sync; select reports |
-| `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish CSV reports; discard own drafts |
+| `AgentControl.Viewer` | Read shared tenant data; run read-only sync; choose reports for their own view |
+| `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish new CSV report sets; discard own drafts |
 | `AgentControl.Admin` | Viewer/Uploader access; manage agents and settings; correct/delete published reports; read/export local Audit logs |
 
 Assign access:
 
-1. Open **Enterprise applications > Agent Control > Users and groups**.
-2. Set **Assignment required?** to **Yes**.
-3. Assign one role to each user or group. Uploader includes Viewer; Admin includes both.
+1. Create the roles from the [manifest](../infra/entra-app-manifest.json) under
+   **App registrations > Agent Control > App roles**, enabled for **Users/Groups**.
+2. Open **Enterprise applications > Agent Control > Properties** and set
+   **Assignment required?** to **Yes**.
+3. Under **Users and groups > Add user/group**, select the user/group, select
+   one role, then **Assign**. Uploader includes Viewer; Admin includes both.
 4. Sign out and sign in after assignment changes.
 
-App roles do not grant Microsoft API access. All three roles share saved tenant
-data, even without permission to collect it. Only Admin can access **Manage**,
-settings and local **Audit** reads/exports.
+App roles do not grant Microsoft API access. All three roles can read
+tenant-shared saved data without permission to collect it.
+Group assignment requires applicable Entra licensing; nested groups do not inherit assignments.
+
+Read-only sync starts automatically after sign-in while the app is visible and
+online, including on first use. No **Permissions** visit or **Check status** is required.
 
 ## App registration permissions
 
-Add these permissions under **App registrations > Agent Control > API
-permissions**, then **Grant admin consent**. Configure application credentials
-as described in [setup](deployment-setup.md).
+Open **App registrations > Agent Control > API permissions > Add a permission**:
 
-The Permissions page lists the following 11 entries in four groups. Sign-in does
-not request these grants.
+1. Select **Microsoft Graph**, then **Application permissions** or **Delegated
+   permissions** as listed below.
+2. For **Power Platform**, select **APIs my organization uses**, search for
+   application ID `8578e004-a5c6-46e7-913e-12f58912df43`, then **Delegated permissions**.
+3. Select **Grant admin consent** for the tenant; confirm **Granted for \<tenant\>**.
+
+The Permissions page's 11 entries in four groups follow the
+[capability registry](../backend/src/services/capabilityRegistry.ts).
+Sign-in does not request these grants. Application tokens use the app identity;
+delegated tokens use the signed-in user's Microsoft authority.
 
 ### Microsoft Graph / Application
 
-These grants support automatic Graph collection. The signed-in user does not
-need Microsoft directory or reporting roles.
+These grants and application credentials support automatic Graph collection.
+The signed-in user does not need Microsoft directory or reporting roles.
 
 | Permission | Application use |
 | --- | --- |
-| `CopilotPackages.Read.All` | Retrieve published agents, package metadata and sharing details. Requires applicable Microsoft Agent 365 licensing. |
-| `User.Read.All` | Retrieve users and Copilot license assignments; resolve agent creators/owners; find and validate users for access changes. |
+| `CopilotPackages.Read.All` | Read published agents, package metadata and sharing details. Requires applicable Microsoft Agent 365 licensing. |
+| `User.Read.All` | Read users and Copilot license assignments; resolve creators/owners; find and validate access-change recipients. |
 | `LicenseAssignment.Read.All` | Retrieve product and service-plan catalog entries to identify Copilot entitlement. |
-| `Reports.Read.All` | Retrieve per-user Copilot usage in Office apps for the Office adoption dashboard and Users view, using the last 28 days. |
+| `Reports.Read.All` | Fetch per-user Copilot activity in Office apps for the Office adoption dashboard and Users view (last 28 days); not the imported agent-usage CSVs. |
 
 ### Microsoft Graph / Delegated
 
 | Permission | Application use |
 | --- | --- |
 | `CopilotPackages.ReadWrite.All` | Block/unblock packages, change availability and installation assignments, and verify changes in **Agents > Manage**. |
-| `Group.Read.All` | Find and validate groups for package availability and installation assignments. |
+| `Group.Read.All` | Find and validate access-assignment groups using the signed-in user's delegated directory access. |
 
-Package changes require a **Microsoft Agent 365 license** and **delegated work
-or school accounts only**. Configure the write permission under **Delegated
-permissions**, not Application.
-
-Microsoft defines both application and delegated forms of the permission, but
-the application form does not authorize these writes.
+Package changes require a **Microsoft Agent 365 license** and support
+**delegated work or school accounts only**. Microsoft defines both application
+and delegated forms of the permission, but the application form does not authorize
+these writes.
 
 #### Package-management administrator roles
 
-**Recommended signed-in administrator role: AI Administrator.** Global
-Administrator is a broader alternative; do not assign it solely for this task.
-This follows Microsoft's Microsoft 365 admin center
-[agent-management guidance](https://learn.microsoft.com/en-us/microsoft-agent-365/admin/agent-roles-perms).
+**Recommended signed-in administrator role: AI Administrator.**
+Global Administrator is a broader alternative. This follows Microsoft's
+[agent-management guidance](https://learn.microsoft.com/en-us/microsoft-agent-365/admin/agent-roles-perms)
+for the Microsoft 365 admin center.
 The package API does not publish an explicit minimum user role.
 
-To assign the recommended role, a **Privileged Role Administrator** opens
-**Identity > Roles & admins > AI Administrator > Add assignments** in the Entra
-admin center. If PIM-eligible, activate the role before signing in again.
+In the Entra admin center, a **Privileged Role Administrator** opens
+**Identity > Roles & admins > AI Administrator > Add assignments**,
+selects the account, then **Add**. Activate a PIM-eligible role
+before signing in again.
 
 ### Power Platform / Delegated
 
 | Permission | Application use | Signed-in user's Microsoft role |
 | --- | --- | --- |
 | `ResourceQuery.Resources.Read` | Retrieve Copilot Studio agents and environments. | Recommend **AI Reader** for read-only sync. |
-| `CopilotStudio.AdminActions.Invoke` | Read quarantine status; quarantine or restore supported Studio agents. | **AI Administrator**, **Power Platform Administrator** or **Global Administrator**, including for status reads. |
+| `CopilotStudio.AdminActions.Invoke` | Quarantine status, quarantine/restore for supported Studio agents. | Both reads and changes: **AI Administrator**, **Power Platform Administrator** or **Global Administrator**. |
 
 #### Power Platform sync roles
 
-**AI Reader** is the least-privileged supported inventory role for this app's
-agents and environments. Inventory authentication is delegated-only: there is
-no application-permission equivalent, service-principal or managed-identity flow.
+**AI Reader** is the least-privileged supported inventory-feature role for this
+app's AI-scoped agents and environments, not a separately published REST API minimum.
+Inventory is delegated-only: no application-permission equivalent,
+service-principal or managed-identity flow.
 
 Already-assigned **Global Reader**, **AI Administrator**, **Power Platform
 Administrator**, **Dynamics 365 Administrator** and **Global Administrator**
-also work. AI roles cover AI-scoped resources; broader roles are unnecessary
-for this sync. These are Microsoft's inventory-feature roles, not a separately
-published REST API minimum.
+also work.
 
 ##### Assign AI Reader to a viewer
 
@@ -96,13 +107,13 @@ published REST API minimum.
 3. Select the viewer, then **Add**.
 4. If PIM-eligible, activate the role; then sign out and sign in again.
 
-Role assignment does not replace delegated API consent. Inventory access does
-not grant quarantine status or changes.
+For quarantine, use **Roles & admins > \<role\> > Add assignments** for one of
+the table's administrator roles. Inventory access alone does not grant quarantine
+status or changes; role assignment does not replace API consent.
 
 ### Sign-in / OpenID Connect
 
-These scopes support sign-in and token renewal, not inventory or management
-access. `User.Read` is not used.
+Sign-in and renewal only, not provider-data access. `User.Read` is not used.
 
 | Scope | Purpose |
 | --- | --- |
@@ -115,39 +126,33 @@ access. `User.Read` is not used.
 | Task | Required access |
 | --- | --- |
 | Export user-level reports from Microsoft 365 | **Reports Reader** or **AI Administrator**; **Usage Summary Reports Reader** does not include user details |
-| Import new report sets | `AgentControl.UsageReportUploader` or `AgentControl.Admin`; no Microsoft token |
+| Import new report sets | `AgentControl.UsageReportUploader` or `AgentControl.Admin`; local, no Microsoft token |
 | Correct or delete published reports | `AgentControl.Admin` |
 | Select and read saved reports | Any Viewer-capable role |
 
-The imported **Agents**, **Users & agents** and **Users** CSVs measure agent
-usage. They are separate from Graph's Office-app activity report.
-See [report import](official-usage-import.md) and [Office adoption](copilot-license-usage.md).
+The imported **Agents**, **Users & agents** and **Users** CSVs measure agent usage,
+not Graph's Office-app activity. See [report import](official-usage-import.md)
+and [Office adoption](copilot-license-usage.md).
 
 ## Issues
 
-Read-only sync starts automatically after sign-in while the app is visible and
-online. Visiting **Permissions** or running **Check status** is not required.
-
 | Problem | Action |
 | --- | --- |
-| Application Graph authorization fails | Administrator checks application credentials, API grants and admin consent; user sign-in does not repair app-only authorization |
-| Delegated authorization expires or requires interaction | Sign in again for MFA or Conditional Access; administrator configures any missing grants separately |
-| Power Platform inventory is denied | Check delegated inventory consent and the signed-in user's supported Entra role |
-| Provider returns a licensing, cloud or resource restriction | Check that specific provider requirement; a successful login is not proof of API access |
-| Saved data is visible but sync fails | Saved reads and provider collection have different permissions; existing data remains readable |
+| Application Graph authorization fails | Administrator checks credentials, grants and admin consent; user sign-in cannot repair app-only access |
+| Delegated access fails | Check consent and Microsoft role; sign in again for MFA or Conditional Access when required |
+| Provider returns a license, RBAC, cloud or resource restriction | Resolve that specific requirement; saved tenant data remains readable |
 
-**Check status** reports bounded diagnostics, not proof of complete provider
-visibility or approval for later changes.
+**Check status** is diagnostic; it neither grants access nor proves complete visibility.
 
 ## Backend-only investigation reference
 
-Purview, Defender and investigation-only identity setup are hidden from the
-current UI and are not ordinary deployment prerequisites. Their permissions and
-scope rules are listed in [provider contracts](provider-contracts.md#retained-backend-investigations).
-They are separate from Agent Control's Admin-only local Audit logs.
+Purview, Defender and investigation-only identity features have
+[backend-only requirements](provider-contracts.md#retained-backend-investigations),
+not UI paths or ordinary setup prerequisites. They are separate from Admin-only
+local Audit logs.
 
 ## Microsoft references
 
-- Package API: [list](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackages-list), [details](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackagedetail-get), [block](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-block), [unblock](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackage-unblock), [update access](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackagedetail-update).
-- Power Platform: [inventory roles](https://learn.microsoft.com/en-us/power-platform/admin/power-platform-inventory#access-requirements), [inventory API](https://learn.microsoft.com/en-us/power-platform/admin/inventory-api), [quarantine API](https://learn.microsoft.com/en-us/microsoft-copilot-studio/admin-api-quarantine).
-- Entra: [role assignment](https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/manage-roles-portal#assign-roles-with-tenant-scope), [Reports Reader](https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/permissions-reference#reports-reader).
+- [Power Platform inventory roles](https://learn.microsoft.com/en-us/power-platform/admin/power-platform-inventory#access-requirements)
+- [Entra role assignment](https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/manage-roles-portal#assign-roles-with-tenant-scope)
+- [Reports Reader](https://learn.microsoft.com/en-us/entra/identity/role-based-access-control/permissions-reference#reports-reader)

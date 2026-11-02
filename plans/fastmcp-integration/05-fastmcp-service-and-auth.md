@@ -4,7 +4,7 @@
 
 Implement the future Python FastMCP service, authenticated Streamable HTTP,
 encrypted connection storage and typed API client. Read the [roadmap](README.md),
-[current API/authentication contract](../../docs/mcp-integration.md),
+[current API/authentication contract](../../docs/mcp-reference.md),
 [security](../../docs/security-model.md) and
 [configuration](../../docs/deployment-setup.md). Inspect current API source and
 supported pinned SDK contracts; historical completion/acceptance records are
