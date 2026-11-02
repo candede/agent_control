@@ -36,16 +36,19 @@ export async function measureGraphDetails(client: GraphPackagesClient, count: nu
 
 export async function tinyGraphCatalog(client: GraphPackagesClient, token: string, options: PackageReadOptions = {}) {
   const rows: CopilotPackageDetail[] = [], visited = new Set<string>();
-  for await (const page of client.catalogPages(token, { ...options, visit: async token => {
+  await client.collectCatalog(token, { ...options, visit: async token => {
     if (visited.has(token)) throw new AppError(502, "provider_continuation", "Repeated synthetic page.");
     if (visited.size >= 8) throw new Error("tiny_graph_fixture_page_limit");
     visited.add(token);
-  } })) {
-    if (rows.length + page.records.length > 100 || Buffer.byteLength(JSON.stringify(page.records)) > 1_048_576) {
+  }, onPage: async () => {}, onRecords: async records => {
+    if (rows.length + records.length > 100 || Buffer.byteLength(JSON.stringify(records)) > 1_048_576) {
       throw new Error("tiny_graph_fixture_limit");
     }
-    rows.push(...page.records);
-  }
+    for (const record of records) {
+      if (rows.some(row => row.id === record.id)) throw new AppError(502, "provider_schema", "Repeated synthetic identity.");
+      rows.push(record);
+    }
+  } });
   return rows;
 }
 

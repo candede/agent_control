@@ -38,6 +38,7 @@ import { responsibilityFixture, responsibilityOwnerId } from "./agentResponsibil
 import { unifiedAgentInventoryScopes } from "../../../backend/src/types/unifiedAgents";
 import { decodeInventoryFacet, encodeInventoryFacet } from "../../../backend/src/types/inventoryFacets";
 import { adoptionDepartmentPage, adoptionSnapshot, adoptionSummaryPage, reportPage } from "./reportDataFixture";
+import { officeContext, officeFixtureContext, officeGroup, officeHistory, officePage, officePerson, officeSummary } from "./officeAdoptionFixture";
 
 mockNativeDialogs();
 
@@ -354,6 +355,121 @@ export function registerAppSessionTests(register: () => void) {
 }
 
 export function sessionAndNavigationCases() {
+  it("keeps ordinary agent Dashboard baseline navigation out of the Users URL", async () => {
+    window.history.replaceState(null, "", "/dashboard?baseline=10000000-0000-4000-8000-000000000001");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Agent adoption" });
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    expect(window.location.pathname + window.location.search).toBe("/users");
+  });
+
+  it("shares Office context across Dashboard and Users while retaining the independent agent pin and clearing account-private pins", async () => {
+    const officeSnapshot = officeContext().observation!.id, officeBaseline = officeContext({}, 1).observation!.id;
+    const agentPin = "10000000-0000-4000-8000-000000000001";
+    window.history.replaceState({}, "", `/users?section=adoption&adoption=office&officeSnapshot=${officeSnapshot}&officeBaseline=${officeBaseline}&snapshot=${agentPin}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (url.pathname === "/api/auth/logout") return Promise.resolve(new Response(null, { status: 204 }));
+      if (!url.pathname.startsWith("/api/office-app-adoption/")) return base(input, init);
+      const context = officeFixtureContext(Object.fromEntries(url.searchParams));
+      if (url.pathname.endsWith("/context")) return Promise.resolve(Response.json(context));
+      if (url.pathname.endsWith("/summary")) return Promise.resolve(Response.json(officeSummary(context)));
+      if (url.pathname.endsWith("/history")) return Promise.resolve(Response.json(officePage(officeHistory(context), context)));
+      if (url.pathname.endsWith("/departments") || url.pathname.endsWith("/groups")) return Promise.resolve(Response.json(officePage([officeGroup()], context)));
+      if (url.pathname.endsWith("/people")) return Promise.resolve(Response.json(officePage([officePerson()], context)));
+      return Promise.resolve(Response.json(officePage([{ value: "Contoso", groups: 1, people: 54 }], context)));
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Office Person 1" });
+    expect(within(screen.getByRole("group", { name: "Adoption domain" })).getByRole("button", { name: "Office apps" }))
+      .toHaveAttribute("aria-pressed", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    const officeTrends = within(await screen.findByRole("region", { name: "App adoption over time" }));
+    await waitFor(() => expect(officeTrends.getAllByRole("img", { name: /participation over weekly snapshots/ })).toHaveLength(7));
+    expect(new URLSearchParams(window.location.search).get("officeSnapshot")).toBe(officeSnapshot);
+    expect(new URLSearchParams(window.location.search).get("officeBaseline")).toBe(officeBaseline);
+    await userEvent.click(screen.getByRole("button", { name: "Users" }));
+    await screen.findByRole("button", { name: "Office Person 1" });
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin);
+    await userEvent.click(within(screen.getByRole("group", { name: "Adoption domain" })).getByRole("button", { name: "Agents" }));
+    expect(within(screen.getByRole("group", { name: "Adoption domain" })).getByRole("button", { name: "Agents" }))
+      .toHaveAttribute("aria-pressed", "true");
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin);
+    expect(new URLSearchParams(window.location.search).get("officeSnapshot")).toBe(officeSnapshot);
+    await userEvent.click(within(screen.getByRole("group", { name: "Adoption domain" })).getByRole("button", { name: "Office apps" }));
+    await screen.findByRole("button", { name: "Office Person 1" });
+    await userEvent.click(screen.getByRole("button", { name: "Sign out" }));
+    await screen.findByRole("button", { name: "Sign in with Entra ID" });
+    expect(new URLSearchParams(window.location.search).has("officeSnapshot")).toBe(false);
+    expect(new URLSearchParams(window.location.search).has("officeBaseline")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Office Person 1" })).not.toBeInTheDocument();
+  });
+  it.each([
+    ["users", "10000000-0000-4000-8000-000000000002"],
+    ["users", undefined],
+    ["dashboard", "10000000-0000-4000-8000-000000000002"],
+    ["dashboard", undefined],
+  ] as const)("restores the independent agent snapshot from %s Office history (%s)", async (view, agentPin) => {
+    const initialPin = "10000000-0000-4000-8000-000000000001";
+    const officeSnapshot = officeContext({}, 2).observation!.id;
+    window.history.replaceState({}, "", `/users?section=adoption&adoption=office&snapshot=${initialPin}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => {
+      const url = new URL(input, "http://localhost");
+      if (!url.pathname.startsWith("/api/office-app-adoption/")) return base(input, init);
+      const context = officeFixtureContext(Object.fromEntries(url.searchParams));
+      if (url.pathname.endsWith("/context")) return Promise.resolve(Response.json(context));
+      if (url.pathname.endsWith("/summary")) return Promise.resolve(Response.json(officeSummary(context)));
+      if (url.pathname.endsWith("/history")) return Promise.resolve(Response.json(officePage(officeHistory(context), context)));
+      if (url.pathname.endsWith("/departments") || url.pathname.endsWith("/groups")) return Promise.resolve(Response.json(officePage([officeGroup()], context)));
+      if (url.pathname.endsWith("/people")) return Promise.resolve(Response.json(officePage([officePerson()], context)));
+      return Promise.resolve(Response.json(officePage([{ value: "Contoso", groups: 1, people: 54 }], context)));
+    });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Office Person 1" });
+    act(() => {
+      window.history.pushState(window.history.state, "",
+        `/${view}?adoption=office&officeSnapshot=${officeSnapshot}${view === "users" ? "&section=adoption" : ""}${agentPin ? `&snapshot=${agentPin}` : ""}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(screen.getByRole("button", { name: view === "users" ? "Users" : "Dashboard" })).toHaveAttribute("aria-current", "page");
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin ?? null);
+    await userEvent.click(within(screen.getByRole("navigation", { name: "Primary views" })).getByRole("button", { name: "Agents" }));
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin ?? null);
+    expect(inventorySelections.get(currentInventorySelection(transport.fetchMock))?.query.setId).toBe(agentPin);
+    await userEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    expect(new URLSearchParams(window.location.search).get("officeSnapshot")).toBe(officeSnapshot);
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin ?? null);
+    expect(transport.meCalls()).toBe(1);
+    expect(refreshRequests(transport.fetchMock)).toHaveLength(0);
+  });
+
+  it("preserves the independent agent snapshot across ordinary Dashboard history", async () => {
+    const agentPin = "10000000-0000-4000-8000-000000000001";
+    window.history.replaceState({}, "", `/agents?snapshot=${agentPin}`);
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    await userEvent.click(screen.getByRole("button", { name: "Dashboard" }));
+    act(() => {
+      window.history.pushState(window.history.state, "", `/dashboard?baseline=${agentPin}`);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+    expect(new URLSearchParams(window.location.search).get("snapshot")).toBe(agentPin);
+    expect(inventorySelections.get(currentInventorySelection(transport.fetchMock))?.query.setId).toBe(agentPin);
+  });
+
   it("opens Dashboard directly before inventory setup settles and preserves its baseline across navigation", async () => {
     const first = adoptionSnapshot(1, { reportingStart: "2026-08-14", reportingEnd: "2026-09-12" });
     const second = adoptionSnapshot(2, { reportingStart: "2026-09-09", reportingEnd: "2026-10-08", activeUsers: 344 });
@@ -6030,7 +6146,7 @@ export function savedInventoryCases() {
 
   it.each(["pending", "settled"] as const)("preserves the same %s exact detail through tab-only browser history", async phase => {
     const current = { ...unifiedPage.value[0], id: "agent:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
-    const transport = appTransport({ revalidatedRoles: viewer.roles, unifiedResponse: unifiedRecordsPage([current]) });
+    const transport = appTransport({ initialRoles:admin.roles,revalidatedRoles:admin.roles,unifiedResponse:unifiedRecordsPage([current]) });
     const base = transport.fetchMock.getMockImplementation()!;
     const pending = deferredResponse();
     transport.fetchMock.mockImplementation((input, init) => isPackageDetailRequest(input, agent.id)

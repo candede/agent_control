@@ -22,12 +22,9 @@ test("background Users refresh keeps the page stable and interactive with a subt
   updated.selection = { ...updated.selection, id: "70000000-0000-4000-8000-000000000001",
     publicationRevisions: automaticRefreshFixture({ ...original.selection.publicationRevisions, users: "users-2" }).revisions };
   updated.sources.directory = { ...updated.sources.directory, generationId: "90000000-0000-4000-8000-000000000001", revision: "3" };
-  updated.reports = { ...updated.reports, setId: "80000000-0000-4000-8000-000000000001", activeSetId: "80000000-0000-4000-8000-000000000001",
-    activeRevision: "5", historyRevision: "36", lineages: updated.reports.lineages.map((lineage, index) => ({
-      ...lineage, versionId: `80000000-0000-4000-8000-00000000001${index}`, contentHash: "f".repeat(64),
-    })) };
   let refreshing = false;
   let reads = 0;
+  const userReads: URLSearchParams[] = [];
   let checks = 0;
   let finish!: () => void;
   const pending = new Promise<void>(resolve => { finish = resolve; });
@@ -38,9 +35,13 @@ test("background Users refresh keeps the page stable and interactive with a subt
       nextCheckAt: layoutTime,
     } });
   });
-  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users"), async route => {
+  await page.route(url => url.pathname.startsWith("/api/copilot-usage/users")
+    || url.pathname === "/api/official-usage/history/options", async route => {
     const url = new URL(route.request().url());
-    if (url.pathname === "/api/copilot-usage/users") reads += 1;
+    if (url.pathname === "/api/copilot-usage/users") {
+      reads += 1;
+      userReads.push(url.searchParams);
+    }
     if (refreshing) await pending;
     const data = refreshing ? updated : original;
     if (url.searchParams.has("selectionId") && url.searchParams.get("selectionId") !== data.selection.id) {
@@ -65,7 +66,10 @@ test("background Users refresh keeps the page stable and interactive with a subt
 
     refreshing = true;
     await page.clock.fastForward(60_000);
-    await expect.poll(() => reads).toBe(readsBefore + 1);
+    await expect.poll(() => reads).toBe(readsBefore + 2);
+    const renewed = userReads.slice(readsBefore);
+    expect(renewed.map(query => query.get("search")).sort()).toEqual(["ben", null].sort());
+    expect(renewed.every(query => !query.has("selectionId") && !query.has("cursor"))).toBe(true);
     await page.clock.runFor(501);
     const indicator = page.getByRole("status", { name: "Background refresh" });
     await expect(indicator).toBeVisible();

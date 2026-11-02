@@ -128,9 +128,9 @@ test("missing creator lookup is bounded, shows errors, and retries without hidin
   const unexpected = await mockPeopleInventory(page, record);
   await page.clock.setFixedTime(new Date(layoutTime));
   const capability: CapabilityView = {
-    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.users.read")!,
     decision: {
-      capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
+      capabilityId: "graph.users.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],
       checkedAt: "2026-09-12T09:59:00Z", expiresAt: "2026-10-12T10:00:00Z",
     },
@@ -196,9 +196,9 @@ test("fresh negative and failure evidence is not automatically retried and prese
   const unexpected = await mockPeopleInventory(page, record);
   await page.clock.setFixedTime(new Date(layoutTime));
   const capability: CapabilityView = {
-    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.directory.read")!,
+    enabled: true, definition: capabilityDefinitions.find(value => value.id === "graph.users.read")!,
     decision: {
-      capabilityId: "graph.directory.read", status: "available", authorized: true, fresh: true,
+      capabilityId: "graph.users.read", status: "available", authorized: true, fresh: true,
       verification: "provider", previewQualification: "not_required", remediation: [],
       checkedAt: "2026-09-12T09:59:00Z", expiresAt: "2026-10-12T10:00:00Z",
     },

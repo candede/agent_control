@@ -16,6 +16,8 @@ export type DependencyRoot =
   | { kind: "generation"; scopeId: string; generationId: string; revision: string; expiresAt: Date }
   | { kind: "tenant_history"; scopeId: string; revision: string; expiresAt: Date }
   | { kind: "user_sources"; scopeId: string; revision: string; expiresAt: Date }
+  | { kind: "office_history"; scopeId: string; revision: string; expiresAt: Date }
+  | { kind: "office_observation"; scopeId: string; generationId: string; revision: string; expiresAt: Date }
   | { kind: "inventory_delta"; scopeId: string; generationId: string; revision: string; expiresAt: Date };
 export type DomainRootValidator = (client: pg.PoolClient, root: DependencyRoot, identity: SelectionIdentity, exportSelectionId?: string) => Promise<void>;
 export type Selection = {
@@ -39,17 +41,37 @@ export class SelectionError extends AppError {
   }
 }
 
+function validFilterText(value: unknown): value is string {
+  return typeof value === "string" && !/[\0\p{Cs}]/u.test(value);
+}
+
 function canonicalFilters(input: Record<string, unknown>, allowed: readonly string[]) {
-  if (Object.keys(input).some(key => !allowed.includes(key))) throw new SelectionError("invalid_cursor");
+  if (Object.keys(input).some(key => !allowed.includes(key) || !validFilterText(key))) throw new SelectionError("invalid_cursor");
   const entries = Object.keys(input).sort().map(key => {
     const value = input[key];
     if (typeof value === "number" && !Number.isFinite(value)) throw new SelectionError("invalid_cursor");
-    if (value !== null && typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean"
-      && !(Array.isArray(value) && value.every(item => typeof item === "string"))) throw new SelectionError("invalid_cursor");
+    if (value !== null && !validFilterText(value) && typeof value !== "number" && typeof value !== "boolean"
+      && !(Array.isArray(value) && Array.from(value).every(validFilterText))) throw new SelectionError("invalid_cursor");
     return [key, Array.isArray(value) ? [...new Set(value)].sort() : value];
   });
   const json = JSON.stringify(Object.fromEntries(entries));
-  if (Buffer.byteLength(json) > 2048) throw new SelectionError("invalid_cursor");
+  // Match the persisted JSONB bound, including separator spaces and expanded exponents.
+  const stored = `{${entries.map(([key, value]) => `${JSON.stringify(key)}: ${
+    Array.isArray(value) ? `[${value.map(item => JSON.stringify(item)).join(", ")}]` : JSON.stringify(value)
+  }`).join(", ")}}`;
+  let bytes = Buffer.byteLength(stored);
+  for (const [, value] of entries) {
+    if (typeof value !== "number") continue;
+    const encoded = JSON.stringify(value);
+    const [coefficient, exponent] = encoded.split("e");
+    if (exponent === undefined) continue;
+    const unsigned = coefficient.replace("-", "");
+    const digits = unsigned.replace(".", "").length;
+    const position = (unsigned.includes(".") ? unsigned.indexOf(".") : digits) + Number(exponent);
+    const expanded = position <= 0 ? 2 - position + digits : position >= digits ? position : digits + 1;
+    bytes += expanded + (value < 0 ? 1 : 0) - encoded.length;
+  }
+  if (bytes > 4096) throw new SelectionError("invalid_cursor");
   return JSON.parse(json) as Record<string, unknown>;
 }
 
@@ -223,7 +245,7 @@ export class DataSelections {
     if (scopeChanged) throw new SelectionError("selection_invalidated", "changed");
     if (pins.some(pin => pin.expired)) throw new SelectionError("selection_invalidated", "expired");
     for (const pin of pins) {
-      const root: DependencyRoot = pin.root_kind === "tenant_history" || pin.root_kind === "user_sources"
+      const root: DependencyRoot = pin.root_kind === "tenant_history" || pin.root_kind === "user_sources" || pin.root_kind === "office_history"
         ? { kind: pin.root_kind, scopeId: pin.scope_id, revision: pin.revision, expiresAt: pin.expires_at }
         : { kind: pin.root_kind, scopeId: pin.scope_id, generationId: pin.generation_id, revision: pin.revision, expiresAt: pin.expires_at };
       await this.validateRoot(client, root, identity, exportId === undefined ? undefined : id);

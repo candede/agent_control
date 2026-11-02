@@ -61,7 +61,7 @@ export function directoryPlanRecord(userId: string, input: unknown): PlanRecord 
 }
 
 export function activitySourceRecord(row: CopilotReportUser, ordinal: number): ActivityRecord {
-  if (!Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal > dataLimits.sourceRows) throw invalidEvidence();
+  if (!Number.isSafeInteger(ordinal) || ordinal < 0) throw invalidEvidence();
   const source = ownRecord(row, ["normalizedUserPrincipalName", "activity"]);
   const a = ownRecord(source.activity, ["reportRefreshDate", "lastActivityDate", "copilotChatLastActivityDate",
     "microsoftTeamsCopilotLastActivityDate", "wordCopilotLastActivityDate", "excelCopilotLastActivityDate",

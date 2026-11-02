@@ -9,13 +9,18 @@ import { auditDefaultPageSize, auditMaximumOffset, auditMaximumSearchLength } fr
 import { decodeInventoryFacet, encodeInventoryFacet, type InventoryFacetValue } from "../../backend/src/types/inventoryFacets";
 import { normalizeEnvironmentIdentity } from "../../backend/src/services/inventoryIdentity";
 import { quarantineTargetKey } from "./quarantineTarget";
+import { officeApps, type OfficeApp } from "../../backend/src/types/officeAppAdoption";
 
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 export const maximumAuditOriginCharacters = 256;
 
 export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions";
 
-export type DashboardRouteState = { baselineId?: string; company?: string | null };
+export type OfficeRouteState = {
+  adoption?: "office"; officeSnapshot?: string; officeBaseline?: string; app?: OfficeApp;
+  officeNotice?: string;
+};
+export type DashboardRouteState = OfficeRouteState & { baselineId?: string; reportSetId?: string; company?: string | null };
 
 export type AgentRouteState = {
   inventoryScope: UnifiedAgentInventoryScope;
@@ -70,7 +75,7 @@ export type SyncReportRouteState = {
 const userDetailTabs = ["overview", "usage", "licenses", "responsibility", "purview"] as const;
 export type UserDetailTab = typeof userDetailTabs[number];
 
-export type UsersRouteState = {
+export type UsersRouteState = OfficeRouteState & {
   view: "licenses" | "activity";
   section?: "adoption";
   company?: string | null;
@@ -83,6 +88,8 @@ export type UsersRouteState = {
   agentId?: string;
   reportSetId?: string;
   page: number;
+  officeGroup?: string;
+  baselineId?: string;
 };
 
 type DataSyncRouteState = {
@@ -128,14 +135,17 @@ export function workbenchUrl(
 
 export function parseDashboardRoute(search: string): DashboardRouteState {
   const params = routeParams(search), baseline = params.get("baseline");
-  const company = routeFacet(params, "company", 256);
-  return { baselineId: isGraphGuid(baseline) ? baseline!.toLowerCase() : undefined,
+  const company = routeFacet(params, "company", 256), reportSetId = params.get("snapshot");
+  return { ...parseOfficeRoute(params), baselineId: isGraphGuid(baseline) ? baseline!.toLowerCase() : undefined,
+    ...(isGraphGuid(reportSetId) ? { reportSetId: reportSetId!.toLowerCase() } : {}),
     ...(company !== undefined ? { company } : {}) };
 }
 
 export function dashboardRouteSearch(state: DashboardRouteState): URLSearchParams {
   const params = new URLSearchParams();
+  serializeOfficeRoute(params, state);
   if (isGraphGuid(state.baselineId)) params.set("baseline", state.baselineId!.toLowerCase());
+  if (isGraphGuid(state.reportSetId)) params.set("snapshot", state.reportSetId!.toLowerCase());
   if (state.company !== undefined) params.set("company", encodeInventoryFacet(state.company));
   return params;
 }
@@ -350,6 +360,7 @@ export function parseUsersRoute(search: string): UsersRouteState {
   const params = routeParams(search);
   const detailId = params.get("detail");
   return {
+    ...parseOfficeRoute(params),
     ...(params.get("section") === "adoption" ? { section: "adoption" as const } : {}),
     ...(params.get("section") === "adoption" ? {
       company: routeFacet(params, "company", 256), department: routeFacet(params, "department", 256),
@@ -364,19 +375,26 @@ export function parseUsersRoute(search: string): UsersRouteState {
     search: bounded(params.get("q"), 256) ?? "",
     agentId: bounded(params.get("agent"), 512),
     reportSetId: durableRouteId(params.get("snapshot")),
-    // Users pages require an owned selection cursor, not an offset.
-    page: 0,
+    ...(isGraphGuid(params.get("baseline")) ? { baselineId: params.get("baseline")!.toLowerCase() } : {}),
+    // Office groups support numbered bookmarks; other Users pages require an owned cursor.
+    page: params.get("section") === "adoption" && params.get("adoption") === "office"
+      ? boundedPage(params.get("page"), Number.MAX_SAFE_INTEGER) : 0,
+    officeGroup: /^[a-f0-9]{64}$/.test(params.get("officeGroup") ?? "") ? params.get("officeGroup")! : undefined,
   };
 }
 
 export function usersRouteSearch(state: UsersRouteState) {
   const params = new URLSearchParams();
+  serializeOfficeRoute(params, state);
   if (state.section === "adoption") {
     params.set("section", "adoption");
     if (state.company !== undefined) params.set("company", encodeInventoryFacet(state.company));
     if (state.department !== undefined) params.set("department", encodeInventoryFacet(state.department));
-    if (state.adoptionChamps) params.set("champs", state.adoptionChamps);
-    if (state.adoptionAgents) params.set("groupAgents", state.adoptionAgents);
+    if (state.adoption !== "office" && state.adoptionChamps) params.set("champs", state.adoptionChamps);
+    if (state.adoption !== "office" && state.adoptionAgents) params.set("groupAgents", state.adoptionAgents);
+    if (state.adoption === "office" && Number.isSafeInteger(state.page) && state.page > 0 && state.page < Number.MAX_SAFE_INTEGER) {
+      params.set("page", String(state.page + 1));
+    }
   }
   if (state.view === "activity") params.set("view", state.view);
   if (state.detailId) {
@@ -387,7 +405,28 @@ export function usersRouteSearch(state: UsersRouteState) {
   if (search) params.set("q", search);
   if (state.view === "activity" && state.agentId && validSelectedId(state.agentId)) params.set("agent", state.agentId);
   setDurableRouteId(params, "snapshot", state.reportSetId);
+  if (isGraphGuid(state.baselineId)) params.set("baseline", state.baselineId!.toLowerCase());
+  if (state.adoption === "office" && state.detailId && /^[a-f0-9]{64}$/.test(state.officeGroup ?? "")) params.set("officeGroup", state.officeGroup!);
   return params;
+}
+
+function parseOfficeRoute(params: URLSearchParams): OfficeRouteState {
+  const snapshot = params.get("officeSnapshot"), baseline = params.get("officeBaseline");
+  const invalid = snapshot !== null && !isGraphGuid(snapshot) || baseline !== null && !isGraphGuid(baseline);
+  return {
+    ...(params.get("adoption") === "office" ? { adoption: "office" as const } : {}),
+    ...(!invalid && isGraphGuid(snapshot) ? { officeSnapshot: snapshot!.toLowerCase() } : {}),
+    ...(!invalid && isGraphGuid(baseline) ? { officeBaseline: baseline!.toLowerCase() } : {}),
+    ...(officeApps.some(app => app.id === params.get("app")) ? { app: params.get("app") as OfficeApp } : {}),
+    ...(invalid ? { officeNotice: "The Office bookmark contains an invalid observation or baseline. Showing Latest instead." } : {}),
+  };
+}
+
+function serializeOfficeRoute(params: URLSearchParams, state: OfficeRouteState) {
+  if (state.adoption === "office") params.set("adoption", "office");
+  if (isGraphGuid(state.officeSnapshot)) params.set("officeSnapshot", state.officeSnapshot!.toLowerCase());
+  if (isGraphGuid(state.officeBaseline)) params.set("officeBaseline", state.officeBaseline!.toLowerCase());
+  if (state.adoption === "office" && officeApps.some(app => app.id === state.app)) params.set("app", state.app!);
 }
 
 function normalizePath(pathname: string) {
@@ -450,10 +489,10 @@ function setDurableRouteId(params: URLSearchParams, key: string, value: string |
   return id;
 }
 
-function boundedPage(value: string | null) {
+function boundedPage(value: string | null, maximum = 2_001) {
   if (!value || !/^\d+$/.test(value)) return 0;
   const oneBased = Number(value);
-  return Number.isSafeInteger(oneBased) && oneBased >= 1 && oneBased <= 2_001 ? oneBased - 1 : 0;
+  return Number.isSafeInteger(oneBased) && oneBased >= 1 && oneBased <= maximum ? oneBased - 1 : 0;
 }
 
 function boundedIntegerText(value: string | null, maximum: number) {

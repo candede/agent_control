@@ -5,7 +5,6 @@ import * as schema from "./schema.js";
 import { schemaSql, schemaFingerprint, verifySchema } from "./schema.js";
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
-import { inventoryLimits } from "../types/inventoryRecords.js";
 import { currentSchemaSql } from "./currentSchema.js";
 import { backupTableKeys } from "../../scripts/backupInventory.js";
 
@@ -101,6 +100,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
       }],
     })),
     { name: "agent control receipts", rows: [{ valid: true }] },
+    { name: "Office evidence", rows: [{ valid: true }] },
   ];
 }
 
@@ -156,14 +156,14 @@ describe("current schema source contracts", () => {
   });
 
   it("constructs the exact current objects once", () => {
-    for (const [kind, count] of [["TABLE", 104], ["VIEW", 3], ["FUNCTION", 78], ["TRIGGER", 105], ["COLLATION", 2]] as const) {
+    for (const [kind, count] of [["TABLE", 107], ["VIEW", 3], ["FUNCTION", 80], ["TRIGGER", 111], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
     }
     const tables = [...topLevel.matchAll(/^CREATE TABLE ([a-z_]+)/gm)].map(match => match[1]).sort();
     expect(tables).toEqual(Object.keys(backupTableKeys).sort());
-    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(166);
+    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(169);
     const alterations = topLevel.split(";").map(statement => statement.trim()).filter(statement => /^ALTER /i.test(statement));
     expect(alterations).toHaveLength(90);
     for (const statement of alterations) {
@@ -185,6 +185,15 @@ describe("current schema source contracts", () => {
         expect(topLevel).toMatch(new RegExp(`^CREATE INDEX ${table}_${column}\\s+ON ${table} \\(${column}\\);`, "m"));
       }
     }
+  });
+
+  it("cannot release a generation charge while any Office evidence remains", () => {
+    const guard = schemaSql.match(/CREATE FUNCTION data_protect_generation\(\)[\s\S]*?END\$\$;/)![0];
+    const collection = guard.slice(guard.indexOf("IF NEW.collected_at IS NOT NULL AND OLD.collected_at IS NULL"));
+    for (const table of ["office_observations", "office_person_facts", "office_group_facts"]) {
+      expect(collection).toContain(`EXISTS(SELECT 1 FROM ${table} WHERE generation_id=NEW.id)`);
+    }
+    expect(collection).toContain("RAISE EXCEPTION 'data_generation_not_collected'");
   });
 
   it("creates but does not populate the fingerprint marker and retains required fresh seed rows", () => {
@@ -215,23 +224,12 @@ describe("current schema source contracts", () => {
   });
 
   it.each(["power_platform_refresh_jobs", "package_refresh_jobs"])(
-    "persists provider progress within the configured bounds in %s", table => {
+    "persists nonnegative provider progress without tenant-size ceilings in %s", table => {
       const definition = schemaSql.match(new RegExp(`CREATE TABLE ${table} \\([\\s\\S]*?\\n\\);`))?.[0];
       expect(definition).toBeDefined();
-      for (const [column, admitted, ceiling] of [
-        ["observed_count", 5_001, inventoryLimits.sourceRows],
-        ["total_records", 5_001, inventoryLimits.sourceRows],
-        ["page_count", 101, inventoryLimits.pages],
-      ] as const) {
-        const predicate = definition!.match(new RegExp(
-          `CONSTRAINT ${table}_${column}_check CHECK \\(${column} >= (\\d+)\\s+AND ${column} <= (\\d+)\\)`,
-        ));
-        expect(predicate).not.toBeNull();
-        const permits = (value: number) => value >= Number(predicate![1]) && value <= Number(predicate![2]);
-        expect(permits(admitted)).toBe(true);
-        expect(permits(ceiling)).toBe(true);
-        expect(permits(ceiling + 1)).toBe(false);
-        expect(permits(-1)).toBe(false);
+      for (const column of ["observed_count", "total_records", "page_count"]) {
+        expect(definition).toContain(`CONSTRAINT ${table}_${column}_check CHECK (${column} >= 0)`);
+        expect(definition).not.toContain(`${column} <=`);
       }
     },
   );
@@ -317,6 +315,40 @@ describe("current schema source contracts", () => {
 });
 
 describe("schema verification without a database", () => {
+  it.each([
+    ["user sources", "'user_source_attempts'", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["user sources", "'user_source_skus'", ["SELECT", "INSERT", "DELETE"]],
+    ["user sources", "name", ["SELECT", "INSERT", "DELETE"]],
+    ["official reports", "'official_usage_history_memberships'", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["official reports", "'official_usage_ingestion_rows'", ["SELECT", "INSERT", "DELETE"]],
+    ["refresh targets", "'inventory_refresh_targets'", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+    ["data generations", "'directory_user_rows'", ["SELECT", "INSERT", "DELETE"]],
+    ["agent control receipts", "'agent_control_receipts'", ["SELECT", "INSERT", "UPDATE", "DELETE"]],
+  ] as const)("requires every runtime grant at %s for %s", async (stage, relation, privileges) => {
+    const results = schemaResults();
+    const database = databaseWithResults(...results.map(result => result.rows));
+    await verifySchema(database);
+    const statement = database.query.mock.calls[results.findIndex(result => result.name === stage)][0];
+    for (const privilege of privileges) {
+      expect(statement).toContain(`has_table_privilege(current_user,${relation},'${privilege}')`);
+    }
+    expect(statement).not.toContain(`has_table_privilege(current_user,${relation},'${privileges.join(",")}')`);
+  });
+
+  it("requires the Office-owned rows in the collection guard", async () => {
+    const database = databaseWithResults(...schemaResults().map(result => result.rows));
+    await expect(verifySchema(database)).resolves.toBeUndefined();
+    const statement = database.query.mock.calls.at(-1)?.[0];
+    for (const table of ["office_observations", "office_person_facts", "office_group_facts"]) {
+      expect(statement).toContain(`EXISTS(SELECT 1 FROM ${table} WHERE generation_id=NEW.id)`);
+    }
+  });
+
+  it.each([[], [{ valid: false }]])("rejects missing Office collection evidence: %j", async (...rows) => {
+    const database = databaseWithResults(...resultsBefore("Office evidence"), rows);
+    await expect(verifySchema(database)).rejects.toThrow("office_app_adoption_schema");
+  });
+
   it("verifies that association writes use current live sources and effective authority expiry", async () => {
     const database = databaseWithResults(...schemaResults().map(result => result.rows));
     await expect(verifySchema(database)).resolves.toBeUndefined();
@@ -325,16 +357,17 @@ describe("schema verification without a database", () => {
     expect(statement).toContain("source.authority_expires_at>clock_timestamp()");
   });
 
-  it("checks validated progress constraints for both streamed refresh sources against the provider bounds", async () => {
+  it("checks nonnegative progress constraints for both streamed refresh sources", async () => {
     const database = databaseWithResults(...schemaResults().map(result => result.rows));
     await expect(verifySchema(database)).resolves.toBeUndefined();
     const progressQuery = database.query.mock.calls.find(([sql]) => sql.includes("AS progress_bounds"));
-    expect(progressQuery?.[1]).toEqual([inventoryLimits.sourceRows, inventoryLimits.pages]);
+    expect(progressQuery?.[1]).toBeUndefined();
+    expect(progressQuery?.[0]).toContain("format('(%s >= 0)',bounds.column_name)");
     for (const table of ["power_platform_refresh_jobs", "package_refresh_jobs"]) {
       expect(progressQuery?.[0]).toContain(`('${table}')`);
     }
     for (const column of ["observed_count", "total_records", "page_count"]) {
-      expect(progressQuery?.[0]).toContain(`('${column}',`);
+      expect(progressQuery?.[0]).toContain(`('${column}')`);
     }
     expect(progressQuery?.[0]).toContain("c.contype='c' AND c.convalidated");
     expect(progressQuery?.[0]).toContain("pg_get_expr(c.conbin,c.conrelid)=format(");

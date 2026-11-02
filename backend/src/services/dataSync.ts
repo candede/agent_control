@@ -19,6 +19,7 @@ import { AgentPeopleService } from "./agentPeople.js";
 import { config } from "../config.js";
 import { temporaryAgentSharingDiagnostic, type AgentSharingDiagnosticContext } from "./temporaryAgentSharingDiagnostic.js";
 import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
+import { OfficeAppAdoptionRepository } from "../db/officeAppAdoption.js";
 
 type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
 type PowerPlatformJob = Awaited<ReturnType<PowerPlatformInventoryService["get"]>>;
@@ -34,6 +35,7 @@ type DataSyncDependencies = {
   agentPeople: Pick<AgentPeopleService, "refreshReferences">;
   wait: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>;
+  officeRecovery?: (signal: AbortSignal) => Promise<void>;
 };
 
 type SyncAuthorization = {
@@ -72,6 +74,7 @@ export class DataSyncService {
   private readonly cleanupPending = new Map<string, ActiveRun>();
   private readonly admissions = new Set<RunAdmission>();
   private readonly cancelling = new Set<string>();
+  private readonly officeRecoveries = new Set<{ controller: AbortController; operation: Promise<void> }>();
   private draining = false;
 
   constructor(
@@ -256,7 +259,25 @@ export class DataSyncService {
       await new Promise<void>(resolve => setImmediate(resolve));
     }
     if (count) operationalLog("warn", "data_sync_recovered", { count });
+    await this.recoverOffice(admissionsOpen);
     return count;
+  }
+  recoverOffice(admissionsOpen?: () => Promise<boolean>) {
+    const officeRecovery = this.dependencies.officeRecovery;
+    if (this.draining || !officeRecovery) return Promise.resolve();
+    const controller = new AbortController();
+    const recovery = {
+      controller,
+      operation: Promise.resolve().then(async () => {
+        if (admissionsOpen && !await admissionsOpen()) return;
+        controller.signal.throwIfAborted();
+        await officeRecovery(controller.signal);
+      }).catch(error => {
+        if (!controller.signal.aborted || error !== controller.signal.reason) throw error;
+      }).finally(() => this.officeRecoveries.delete(recovery)),
+    };
+    this.officeRecoveries.add(recovery);
+    return recovery.operation;
   }
 
   async drain() {
@@ -264,6 +285,10 @@ export class DataSyncService {
     const admissions = this.stopAdmissions(new AppError(401, "interaction_required", "Application shutdown requires explicit data sync authorization."));
     const active = [...this.active.values()];
     const pending = [...this.cleanupPending.values()];
+    const recoveries = [...this.officeRecoveries];
+    for (const recovery of recoveries) {
+      recovery.controller.abort(new AppError(503, "data_sync_shutdown", "Office recovery is stopping for application shutdown."));
+    }
     for (const run of active) {
       run.controller.abort(new AppError(401, "interaction_required", "Application shutdown requires explicit data sync authorization."));
     }
@@ -271,6 +296,7 @@ export class DataSyncService {
       admissions,
       ...active.map(run => this.dependencies.repository.pausePrincipal(run.scope, "Application shutdown requires explicit resume with current authorization.")),
       ...active.map(run => run.operation),
+      ...recoveries.map(recovery => recovery.operation),
     ]);
     const cleanup = await this.cleanupRuns([...active, ...pending]);
     const failure = [...results, ...cleanup].find(result => result.status === "rejected");
@@ -840,6 +866,7 @@ function defaultDependencies(database: pg.Pool): DataSyncDependencies {
     copilotUsage: new CopilotUsageService(database),
     agentPeople: new AgentPeopleService(database),
     wait: waitFor,
+    officeRecovery: signal => new OfficeAppAdoptionRepository(database).recover(undefined, signal),
     ...(config.agentSharingDiagnostics
       ? { sharingDiagnostic: temporaryAgentSharingDiagnostic.run.bind(temporaryAgentSharingDiagnostic) } : {}),
   };

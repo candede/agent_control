@@ -46,6 +46,11 @@ const definitions = {
 } as const;
 const managedHeartbeats = new Map<string, { heartbeat: ReturnType<typeof generationHeartbeat>; published: boolean }>();
 
+export const activeGenerationWritersSql = `SELECT g.*,CASE WHEN g.job_kind='derived' AND scope.source IN ('office_app_adoption','office_history')
+  THEN g.tenant_id||':office:'||g.job_id::text ELSE g.id::text END AS writer
+  FROM data_generations g JOIN data_scope_epochs scope ON scope.id=g.scope_id
+  WHERE g.state IN ('staging','validating') AND g.lease_until>clock_timestamp()`;
+
 export function prepareGenerationBatch(lease: GenerationLease, rows: readonly RecordBase[], residency = new BatchResidency()) {
   if (rows.length > 250) throw dataLimitError("data_batch_rows", 250, rows.length);
   const releaseInput = residency.track(rows);
@@ -77,7 +82,7 @@ export class DataGenerations {
     if (input.jobKind === "data_sync" && !input.runId) throw new Error("data_source_run_required");
     return this.connections.run(async client => {
       await client.query("SET LOCAL enable_seqscan=off; SET LOCAL jit=off");
-      if (input.runId || ["inventory_packages", "inventory_power_platform", "inventory_canonical"].includes(input.scope.source)) {
+      if (input.runId || ["inventory_packages", "inventory_power_platform", "inventory_canonical", "office_app_adoption", "office_history"].includes(input.scope.source)) {
         await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
           [`data-sync:${input.scope.tenantId}`]);
       }
@@ -103,19 +108,21 @@ export class DataGenerations {
       const head = (await client.query("SELECT revision FROM data_generation_heads WHERE scope_id=$1 FOR UPDATE", [scope.id])).rows[0];
       await client.query(`UPDATE data_generations SET state='failed',cancellation=cancellation+1,reserved_bytes=byte_count
         WHERE scope_id=$1 AND state IN ('staging','validating') AND (lease_until<=clock_timestamp() OR deadline_at<=clock_timestamp())`, [scope.id]);
-      const counts = (await client.query(`SELECT count(*)::int AS active,
-        count(*) FILTER(WHERE tenant_id=$1)::int AS tenant_active,
+      const counts = (await client.query(`WITH writers AS (${activeGenerationWritersSql})
+        SELECT count(DISTINCT writer)::int AS active,
+        count(DISTINCT writer) FILTER(WHERE tenant_id=$1)::int AS tenant_active,
+        count(*) FILTER(WHERE tenant_id=$1 AND writer=$1||':office:'||$4::text)::int AS related_active,
         count(*) FILTER(WHERE scope_id=$2 OR tenant_id=$1 AND scope_id IN (
-          SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND source=$3))::int AS scope_active FROM data_generations
-        WHERE state IN ('staging','validating') AND lease_until>(SELECT clock_timestamp())
-          AND lease_until>clock_timestamp()`,[s.tenantId,scope.id,s.source])).rows[0];
+          SELECT id FROM data_scope_epochs WHERE tenant_id=$1 AND source=$3))::int AS scope_active FROM writers`,
+        [s.tenantId,scope.id,s.source,input.jobId])).rows[0];
       const bytes = (await client.query(`SELECT coalesce(sum(generation_bytes),0)::text AS bytes
         FROM data_generation_charges WHERE tenant_id=$1 AND generation_bytes>0`,[s.tenantId])).rows[0].bytes;
       const uploads = (await client.query(`SELECT count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END)::int AS active,
         count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END) FILTER(WHERE tenant_id=$1)::int AS tenant_active
         FROM official_usage_ingestions WHERE state IN ('streaming','validating','accepting') AND lease_until>clock_timestamp()`, [s.tenantId])).rows[0];
       if (counts.scope_active) throw new AppError(409, "data_source_active", "This tenant source is already being collected.");
-      if (counts.active + uploads.active >= 4 || counts.tenant_active + uploads.tenant_active >= 2) {
+      const paired = input.jobKind==="derived" && ["office_app_adoption","office_history"].includes(s.source) && counts.related_active===1;
+      if (!paired && (counts.active + uploads.active >= 4 || counts.tenant_active + uploads.tenant_active >= 2)) {
         throw dataAdmissionError("data_ingestion_admission");
       }
       if (exactCount(bytes) + input.reserveBytes > dataLimits.tenantBytes) throw dataLimitError("data_tenant_bytes", dataLimits.tenantBytes, exactCount(bytes) + input.reserveBytes);
@@ -192,7 +199,7 @@ export class DataGenerations {
       ) SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||s.tenant_id,0))
       FROM selected_generation g JOIN data_scope_epochs s ON s.id=g.scope_id
       WHERE g.scope_id=$2 AND g.tenant_id=$3 AND (g.run_id IS NOT NULL
-        OR s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical'))`,
+        OR s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical','office_app_adoption','office_history'))`,
     [lease.id, lease.scopeId, lease.tenantId]);
   }
 
@@ -261,10 +268,6 @@ export class DataGenerations {
       if (ordinal !== generation.batch_count) throw new Error("data_batch_order");
       const bytes = exactCount(generation.byte_count) + batch.bytes;
       if (bytes > exactCount(generation.reserved_bytes)) throw dataLimitError("data_generation_bytes", exactCount(generation.reserved_bytes), bytes);
-      const maximumRows = generation.job_kind === "derived" ? dataLimits.derivedRows : dataLimits.sourceRows;
-      if (kind !== "plans" && generation.row_count + rows.length > maximumRows) {
-        throw dataLimitError("data_generation_rows", maximumRows, generation.row_count + rows.length);
-      }
       if (kind==="directory") for (const row of rows as readonly DirectoryRecord[]) {
         if (row.plan_count>dataLimits.plansPerUser) throw dataLimitError("data_directory_plan_count",dataLimits.plansPerUser,row.plan_count);
       }
@@ -293,7 +296,7 @@ export class DataGenerations {
   }
 
   observePage(lease: GenerationLease, token: string, wireRows: number) {
-    if (!Number.isSafeInteger(wireRows) || wireRows < 0 || wireRows > dataLimits.wireRows) throw new Error("data_wire_rows");
+    if (!Number.isSafeInteger(wireRows) || wireRows < 0) throw new Error("data_wire_rows");
     return this.connections.run(async client => {
       const generation = await this.fence(client, lease);
       if (generation.state !== "staging") throw new Error("data_not_staging");
@@ -353,46 +356,67 @@ export class DataGenerations {
   }
 
   async publish(lease: GenerationLease, options: {
+    relatedLeases?: readonly GenerationLease[];
     validateInputs?: (client: pg.PoolClient) => Promise<void>;
     completeJob?: (client: pg.PoolClient, result: { jobId: string; runId: string | null; rows: number; bytes: number }) => Promise<void>;
     beforeCommit?: () => void;
     onCommitted?: (revision: string) => void;
   } = {}) {
-    const managed = managedHeartbeats.get(lease.id);
-    const heartbeat = managed?.heartbeat;
+    const leases = [lease, ...(options.relatedLeases ?? [])].sort((a, b) => a.scopeId.localeCompare(b.scopeId));
+    if (new Set(leases.map(item => item.scopeId)).size !== leases.length) throw new Error("data_duplicate_publication_scope");
+    const managed = leases.flatMap(item => {
+      const entry = managedHeartbeats.get(item.id);
+      return entry ? [entry] : [];
+    });
+    const signal = managed.length ? AbortSignal.any(managed.map(item => item.heartbeat.signal)) : undefined;
     // A terminal commit must not race a timer interpreting its published state
     // as a lost lease. Keep cancellation armed until COMMIT nevertheless.
-    await heartbeat?.pause();
-    heartbeat?.signal.throwIfAborted();
+    await Promise.all(managed.map(item => item.heartbeat.pause()));
+    signal?.throwIfAborted();
     let publishedRows = 0;
     let publishedRevision = "";
     const revision = await measurePublication(() => publishedRows>=1000 ? "generation-large" : "generation-bounded",() => this.connections.run(async client => {
-      await this.lockSyncRun(client, lease);
+      for (const item of leases) await this.lockSyncRun(client, item);
       // Domain-owned input reachability is checked in this same transaction.
       // It must lock captured roots in scope order; newer safe heads are not a
       // reason to reject a still-readable captured vector.
       await options.validateInputs?.(client);
-      const row = await this.fence(client, lease);
-      publishedRows = row.row_count;
-      if (row.job_kind === "derived" && !options.validateInputs) throw new Error("data_input_fence_required");
-      if (row.job_kind !== "fixture" && !options.completeJob) throw new Error("data_job_completion_required");
-      if (row.state !== "validating" || !row.validated) throw new Error("data_not_validated");
-      const previous = (await client.query("SELECT generation_id FROM data_generation_heads WHERE scope_id=$1", [lease.scopeId])).rows[0];
-      const result = await client.query(`UPDATE data_generation_heads SET generation_id=$1,revision=revision+1
-        WHERE scope_id=$2 AND tenant_id=$3 AND revision=$4 RETURNING revision::text`,
-      [lease.id, lease.scopeId, lease.tenantId, lease.expectedRevision]);
-      if (result.rowCount !== 1) throw new Error("data_head_conflict");
-      if (previous.generation_id) await client.query("UPDATE data_generations SET state='retired' WHERE id=$1 AND state='published'", [previous.generation_id]);
-      await client.query("UPDATE data_generations SET state='published',reserved_bytes=byte_count WHERE id=$1", [lease.id]);
-      await options.completeJob?.(client, { jobId: row.job_id, runId: row.run_id, rows: row.row_count, bytes: exactCount(row.byte_count) });
-      observeDataWork("generation", { rows: row.row_count, bytes: exactCount(row.byte_count) });
-      publishedRevision = result.rows[0].revision as string;
+      let relatedJobId: string | undefined;
+      if (leases.length > 1) {
+        const primary = (await client.query<{ job_id: string }>(
+          "SELECT job_id FROM data_generations WHERE id=$1 AND job_kind='derived'", [lease.id])).rows[0];
+        if (!primary) throw new Error("data_related_publication_job");
+        relatedJobId = primary.job_id;
+      }
+      let primaryResult: { jobId: string; runId: string | null; rows: number; bytes: number } | undefined;
+      for (const item of leases) {
+        const row = await this.fence(client, item);
+        if (relatedJobId !== undefined && (item.tenantId !== lease.tenantId
+          || row.job_kind !== "derived" || row.job_id !== relatedJobId)) throw new Error("data_related_publication_job");
+        publishedRows += row.row_count;
+        if (row.job_kind === "derived" && !options.validateInputs) throw new Error("data_input_fence_required");
+        if (row.job_kind !== "fixture" && !options.completeJob) throw new Error("data_job_completion_required");
+        if (row.state !== "validating" || !row.validated) throw new Error("data_not_validated");
+        const previous = (await client.query("SELECT generation_id FROM data_generation_heads WHERE scope_id=$1", [item.scopeId])).rows[0];
+        const result = await client.query(`UPDATE data_generation_heads SET generation_id=$1,revision=revision+1
+          WHERE scope_id=$2 AND tenant_id=$3 AND revision=$4 RETURNING revision::text`,
+        [item.id, item.scopeId, item.tenantId, item.expectedRevision]);
+        if (result.rowCount !== 1) throw new Error("data_head_conflict");
+        if (previous.generation_id) await client.query("UPDATE data_generations SET state='retired' WHERE id=$1 AND state='published'", [previous.generation_id]);
+        await client.query("UPDATE data_generations SET state='published',reserved_bytes=byte_count WHERE id=$1", [item.id]);
+        observeDataWork("generation", { rows: row.row_count, bytes: exactCount(row.byte_count) });
+        if (item.id === lease.id) {
+          publishedRevision = result.rows[0].revision as string;
+          primaryResult = { jobId: row.job_id, runId: row.run_id, rows: row.row_count, bytes: exactCount(row.byte_count) };
+        }
+      }
+      if (primaryResult) await options.completeJob?.(client, primaryResult);
       return publishedRevision;
-    }, false, heartbeat?.signal, undefined, options.beforeCommit, () => {
-      if (managed) managed.published = true;
+    }, false, signal, undefined, options.beforeCommit, () => {
+      for (const item of managed) item.published = true;
       options.onCommitted?.(publishedRevision);
     }));
-    await heartbeat?.stop();
+    await Promise.all(managed.map(item => item.heartbeat.stop()));
     return revision;
   }
 
@@ -409,7 +433,7 @@ export class DataGenerations {
   invalidate(scopeId: string, tenantId: string, invalidateDomain?: (client: pg.PoolClient) => Promise<void>) {
     return this.connections.run(async client => {
       await client.query(`SELECT pg_advisory_xact_lock(hashtextextended('data-sync:'||tenant_id,0))
-        FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND source IN ('inventory_packages','inventory_power_platform','inventory_canonical')`, [scopeId, tenantId]);
+        FROM data_scope_epochs WHERE id=$1 AND tenant_id=$2 AND source IN ('directory','app_activity','office_app_adoption','office_history','inventory_packages','inventory_power_platform','inventory_canonical')`, [scopeId, tenantId]);
       await lockDataScope(client, scopeId, tenantId);
       await client.query("SELECT scope_id FROM data_generation_heads WHERE scope_id=$1 FOR UPDATE", [scopeId]);
       await client.query(`UPDATE data_scope_epochs SET epoch=epoch+1 WHERE id=$1`, [scopeId]);

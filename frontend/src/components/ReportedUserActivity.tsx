@@ -107,11 +107,12 @@ function ReportedUsers({ route, onRouteChange, dataRevision = 0, agentInventoryR
     </div>
     {data ? <details className="copilot-users-provenance"><summary>Report sources</summary><UsageReportContext reports={data.reports} inlineSources /></details> : null}
     {selected ? <UserDetailModal key={selected.username} identity={selected.username} kind="report" selectionId={selected.selectionId}
+      reportSetId={route.reportSetId}
       filters={route.agentId ? { agentId: route.agentId } : undefined}
       returnFocusTo={trigger} closeLabel="Close reported user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent} onOpenAdoption={onRouteChange}
-      onFocusAgent={(agentId, reportSetId) => {
+      onFocusAgent={agentId => {
         if (!read.isCurrentData(true)) return;
-        setSelected(undefined); read.restart(); resetFilters(); onRouteChange({ ...route, search: "", agentId, reportSetId, page: 0 });
+        setSelected(undefined); read.restart(); resetFilters(); onRouteChange({ ...route, search: "", agentId, page: 0 });
       }}
       dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
       onSelectionInvalidated={() => { if (selected.selectionId === read.selectedData?.selection.id) read.invalidateSelection(); }} /> : null}

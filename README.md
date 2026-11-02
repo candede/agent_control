@@ -65,6 +65,11 @@ prerequisite to collection.
 You can dismiss first-sync progress and use saved data while collection continues.
 Application-token failures require checking app configuration, not signing in as
 a more privileged user.
+Office observations are prepared automatically from committed directory and app
+activity sources. Local preparation failures do not downgrade saved-source success.
+Background Office recovery is cancelled and joined during application shutdown;
+terminal source-status checkpoints and semantic replay acknowledgments roll back if cancelled
+before commit, without suppressing necessary failure cleanup.
 
 To add Microsoft 365 Copilot agent usage, export the **Agents**,
 **Users & agents**, and **Users** CSV reports for the same period and import them
@@ -76,10 +81,20 @@ backend implementations and saved data are unchanged.
 
 **Dashboard** compares active users and active agents across retained reports,
 with a selectable baseline and recent report-to-report direction. Company-filtered
-department participation, people and engagement, and agents and champions panels
+department participation, people and engagement, and **Agents and Agent Champs** panels
 show where to focus support. Department percentages use saved directory members,
 not a full workforce census. It does not estimate daily activity or treat import
 dates as usage dates.
+
+Office participation summary cards stack in one column at viewport widths of
+760px or less. Agent insight cards retain their separate 500px breakpoint.
+Office dashboard drill-through links preserve a selected Office observation and
+baseline while saved context loads or a retryable read fails; Latest links pin
+the measured observation once context is available.
+
+In **Users > Adoption > Office apps**, person details show frozen evidence from
+the selected observation; current profiles are separate. Closing details returns
+focus to that person, or to the groups heading if the people page is still loading.
 
 ## Permissions
 
@@ -97,7 +112,7 @@ configuration, not proof of consent or successful provider access.
 | --- | --- |
 | `AgentControl.Viewer` | Read shared tenant data and run read-only sync |
 | `AgentControl.UsageReportUploader` | Viewer access; upload, validate and publish new CSV sets; discard own unaccepted drafts |
-| `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/selection/deletion, configuration and local Audit read/export |
+| `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/deletion, configuration and local Audit read/export |
 
 Assign roles through **Enterprise applications > Agent Control > Users and
 groups**. Uploader includes Viewer; Admin includes both. Directly assigned cards

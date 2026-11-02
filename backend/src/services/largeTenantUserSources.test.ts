@@ -473,7 +473,7 @@ describe("dormant user-source foundation", () => {
     { kind: "catalog", limit: 200, preceding: 0 },
     { kind: "discovery", limit: 1000, preceding: 1 },
     { kind: "identity", limit: 6000, preceding: 2 },
-  ] as const)("checks the $kind page budget before another provider request", async ({ kind, limit, preceding }) => {
+  ] as const)("continues beyond the former $kind page budget", async ({ kind, limit }) => {
     const stages = new UserSourceStages(fixture.runtime), original = stages.query.bind(stages);
     const input = generationInput({ actorPrincipalId: randomUUID() });
     let generationId = "", targetRequests = 0;
@@ -494,15 +494,17 @@ describe("dormant user-source foundation", () => {
       if (current !== kind) return Response.json(body);
       targetRequests++;
       url.searchParams.set("$skiptoken", String(targetRequests));
-      return Response.json({ ...body, "@odata.nextLink": url.toString() });
+      return Response.json({ ...body, ...targetRequests < 2 ? { "@odata.nextLink": url.toString() } : {} });
     });
     try {
-      await expect(new UserSourceProvider(fetcher).refresh(stages, input, {
+      await new UserSourceProvider(fetcher).refresh(stages, input, {
         authorize: async () => "synthetic-token", identities: lease => stages.identities(lease, ["missing@example.invalid"]),
-      })).rejects.toMatchObject({ code: "provider_page_limit", details: { limit, observed: limit + 1 } });
-      expect(targetRequests).toBe(1);
-      expect((await fixture.runtime.query("SELECT page_count,state FROM data_generations WHERE id=$1", [generationId])).rows)
-        .toEqual([{ page_count: limit + preceding, state: "failed" }]);
+      });
+      expect(targetRequests).toBe(2);
+      expect((await fixture.runtime.query("SELECT page_count FROM user_source_queries WHERE generation_id=$1 AND kind=$2", [generationId, kind])).rows)
+        .toEqual([{ page_count: limit + 1 }]);
+      expect((await fixture.runtime.query("SELECT state FROM data_generations WHERE id=$1", [generationId])).rows)
+        .toEqual([{ state: "published" }]);
     } finally { query.mockRestore(); }
   });
 
@@ -823,20 +825,20 @@ describe("dormant user-source foundation", () => {
       .rejects.toMatchObject({ code: "provider_schema" });
   });
 
-  it("accepts exactly 100000 quoted multiline records and rejects the next before malformed trailing input", async () => {
-    for (const size of [100000, 100001]) {
+  it("accepts more than 100000 quoted multiline records but still rejects malformed trailing input", async () => {
+    for (const { size, malformed } of [{ size: 100000, malformed: false }, { size: 100001, malformed: false }, { size: 100001, malformed: true }]) {
       const line = csv().split("\n")[1].replace("Émployee", '"Émployee\ncontinued"') + "\n";
       let emitted = -1;
       const response = new Response(new ReadableStream({ pull(controller) {
         emitted++;
         if (emitted === 0) controller.enqueue(Buffer.from(reportHeaders.join(",") + "\n"));
         else if (emitted <= size) controller.enqueue(Buffer.from(line));
-        else if (size > 100000 && emitted === size + 1) controller.enqueue(Buffer.from('"unterminated'));
+        else if (malformed && emitted === size + 1) controller.enqueue(Buffer.from('"unterminated'));
         else controller.close();
       } }));
       const consume = async () => { let count = 0; for await (const row of streamAppActivity(response, new AbortController().signal)) { void row; count++; } return count; };
-      if (size === 100000) expect(await consume()).toBe(size);
-      else await expect(consume()).rejects.toMatchObject({ code: "provider_report_rows", details: { limit: 100000, observed: 100001 } });
+      if (!malformed) expect(await consume()).toBe(size);
+      else await expect(consume()).rejects.toMatchObject({ code: "provider_schema" });
     }
   }, 30_000);
 
@@ -929,7 +931,7 @@ describe("dormant user-source foundation", () => {
     } finally { await generations.abort(lease); }
   });
 
-  it("enforces exact 64-MiB streamed wire bytes plus one without holding a report array", async () => {
+  it("streams reports beyond 64 MiB without holding a report array", async () => {
     const limit = 64 * 1024 ** 2;
     for (const total of [limit, limit + 1]) {
       const header = Buffer.from(reportHeaders.join(",") + ",Extra\n");
@@ -946,8 +948,7 @@ describe("dormant user-source foundation", () => {
         remaining = 0;
       } }));
       const consume = async () => { let count = 0; for await (const row of streamAppActivity(response, new AbortController().signal)) { void row; count++; } return count; };
-      if (total === limit) expect(await consume()).toBeGreaterThan(50_000);
-      else await expect(consume()).rejects.toMatchObject({ code: "provider_report_bytes", details: { limit, observed: limit + 1 } });
+      expect(await consume()).toBeGreaterThan(50_000);
     }
   }, 60_000);
 

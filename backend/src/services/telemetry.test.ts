@@ -59,7 +59,7 @@ describe("operational telemetry", () => {
         expect(safeTelemetry({ [field]: value })).toEqual({});
       }
     }
-    for (const field of ["hasContinuation", "resultTruncated", "environmentScoped"]) {
+    for (const field of ["hasContinuation", "resultTruncated", "environmentScoped", "complete"]) {
       for (const value of ["private-value", 0, 1]) expect(safeTelemetry({ [field]: value })).toEqual({});
     }
     for (const field of ["provider", "source", "stage", "mode", "outcome", "status", "reason", "field", "actualType", "resourceType", "capabilityId", "errorKind"]) {
@@ -73,6 +73,14 @@ describe("operational telemetry", () => {
       status: "waiting_authorization", mode: "POST", source: "directory", actualType: "undefined",
       reason: "identity_too_long", durationMs: 0.5, count: Number.MAX_SAFE_INTEGER,
     });
+  });
+
+  it("retains boolean page-completion evidence without accepting provider values", () => {
+    expect(safeTelemetry({ complete: true, providerBody: "private-provider-body" })).toEqual({ complete: true });
+    expect(safeTelemetry({ complete: false })).toEqual({ complete: false });
+    for (const complete of ["private-provider-value", 0, 1, null, {}, []]) {
+      expect(safeTelemetry({ complete })).toEqual({});
+    }
   });
 
   it("reads only bounded own data fields without evaluating getters or enumerating provider keys", () => {

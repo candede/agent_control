@@ -36,6 +36,10 @@ import { savedReadBrowserFixture } from "./savedReadBrowserFixture.js";
 import { DataSyncRepository } from "../src/db/dataSync.js";
 import { UserSourceProvider } from "../src/services/userSourceProvider.js";
 import { buildCopilotReportUrl, reportHeaders } from "../src/services/userSourceGraphFields.js";
+import { officeFixtureActivity, officeFixturePerson, publishOfficeSource } from "./officeAppAdoptionFixtures.js";
+import { OfficeAppAdoptionRepository } from "../src/db/officeAppAdoption.js";
+import { officeApps } from "../src/types/officeAppAdoption.js";
+import * as copilotSemantics from "../src/types/copilotUsage.js";
 
 await vi.hoisted(async () => {
   const { configureBrowserFixtureEnvironment, createBrowserFixtureFetch } = await import("./fixtureSupport.js");
@@ -48,6 +52,10 @@ await vi.hoisted(async () => {
     { tenantId: "66666666-6666-4666-8666-666666666666", domains: ["desktop-failed.lifecycle.example.invalid"] },
     { tenantId: "77777777-7777-4777-8777-777777777777", domains: ["mobile-running.lifecycle.example.invalid"] },
     { tenantId: "88888888-8888-4888-8888-888888888888", domains: ["mobile-failed.lifecycle.example.invalid"] },
+    { tenantId: "99999999-9999-4999-8999-999999999999", domains: ["office-desktop.example.invalid"] },
+    { tenantId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", domains: ["office-mobile.example.invalid"] },
+    { tenantId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", domains: ["first-sync-desktop.example.invalid"] },
+    { tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", domains: ["first-sync-mobile.example.invalid"] },
   ].map(profile => ({ ...tenant, ...profile })));
   // Provider clients capture fetch during module initialization.
   vi.stubGlobal("fetch", createBrowserFixtureFetch(globalThis.fetch));
@@ -98,6 +106,46 @@ const selectedBrowserFiles = browserFixtureTestFiles();
 let application: ReturnType<typeof createApp>;
 let server: Server;
 let savedLifecycle: Awaited<ReturnType<typeof savedReadBrowserFixture>> | undefined;
+async function seedOfficeBrowserEvidence() {
+  if (selectedBrowserFiles.length && !selectedBrowserFiles.some(file => ["adoptionDashboard.spec.ts", "adoption.spec.ts"].includes(file))) return;
+  const repository = new OfficeAppAdoptionRepository(fixture.runtime);
+  const freshness = vi.spyOn(copilotSemantics, "isCopilotAppActivityFresh").mockReturnValue(true);
+  try {
+    for (const tenant of config.tenants.filter(tenant => tenant.domains.some(domain => /^office-(desktop|mobile)\.example\.invalid$/.test(domain)))) {
+      for (const [point, days] of [14, 7, 0].entries()) {
+        const date = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+        const people = Array.from({ length: 60 }, (_, offset) => {
+          const person = officeFixturePerson(offset + 1);
+          return { ...person, identity: { ...person.identity, companyName: "Office Fixture",
+            department: offset < 54 ? point === 2 ? "Engineering" : "Historical Engineering" : `Department ${offset - 52}`,
+            displayName: `${point === 2 ? "Current" : "Historical"} Office Person ${offset + 1}` } };
+        });
+        await publishOfficeSource(fixture.runtime, "directory", people, tenant.tenantId!);
+        const activity = Array.from({ length: 58 }, (_, offset) => {
+          const active = offset < 20 + point * 10;
+          const recent = new Date(Date.parse(date) - 86_400_000).toISOString().slice(0, 10);
+          const older = new Date(Date.parse(date) - 60 * 86_400_000).toISOString().slice(0, 10);
+          const future = new Date(Date.parse(date) + 86_400_000).toISOString().slice(0, 10);
+          const fields = Object.fromEntries(officeApps.map((app, appIndex) => [app.column,
+            active && (appIndex < 2 || app.id === "outlook" || offset < 3 && appIndex < 7 - offset) ? recent : appIndex === 0 ? offset === 57 ? future : older : null]));
+          return officeFixtureActivity(offset + 1, fields, date);
+        });
+        await publishOfficeSource(fixture.runtime, "app_activity", activity, tenant.tenantId!);
+        const outcome = await repository.reconcile(tenant.tenantId!);
+        expect(["published", "idle"]).toContain(outcome.state);
+        expect((await fixture.operator.query(`SELECT count(*)::int AS count FROM office_observations o
+          JOIN data_generation_heads h ON h.generation_id=o.generation_id WHERE o.tenant_id=$1`, [tenant.tenantId])).rows[0].count).toBe(point + 2);
+      }
+      expect((await fixture.operator.query(`SELECT count(*)::int AS count FROM office_observations o
+        JOIN data_generation_heads h ON h.generation_id=o.generation_id WHERE o.tenant_id=$1`, [tenant.tenantId])).rows[0].count).toBe(4);
+      expect((await fixture.operator.query(`SELECT count(*)::int AS count FROM office_person_facts p
+        JOIN office_observations o ON o.generation_id=p.generation_id WHERE o.tenant_id=$1 AND o.kind='weekly'`, [tenant.tenantId])).rows[0].count).toBe(0);
+      expect((await fixture.operator.query(`SELECT count(*)::int AS count FROM official_usage_sets WHERE tenant_id=$1`, [tenant.tenantId])).rows[0].count).toBe(0);
+    }
+  } finally {
+    freshness.mockRestore();
+  }
+}
 const quarantineEnvironmentId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const qualifiedQuarantineBotId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const unqualifiedQuarantineBotId = "cccccccc-cccc-cccc-cccc-cccccccccccc";
@@ -129,7 +177,7 @@ beforeAll(async () => {
   vi.spyOn(GraphPackagesClient.prototype, "checkCatalogAccess").mockImplementation(async token => {
     if (token === "fixture-provider_error") throw new AppError(502, "provider_error", "Synthetic provider outage");
   });
-  vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (token, options) {
+  vi.spyOn(GraphPackagesClient.prototype, "collectCatalog").mockImplementation(async (token, options) => {
     if (token === "fixture-provider_error") throw new AppError(502, "provider_error", "Synthetic provider outage");
     options.signal?.throwIfAborted();
     const tokenValue = "synthetic-browser-catalog";
@@ -137,8 +185,9 @@ beforeAll(async () => {
     const records = [{ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false,
       sourceSystem: "graph_packages" as const, authoringTool: null, creatorType: "unknown" as const,
       agentKind: "copilot_package" as const, lifecycle: "unknown" as const, identityConfidence: "exact_native" as const, provenance: {} }];
+    await options.onRecords(records);
+    await options.onPage({ token: tokenValue, nextToken: null, rawCount: 1, expectedCount: 1, page: 1 });
     await options.onProgress?.({ pages: 1, observedCount: 1, totalRecords: 1 });
-    yield { token: tokenValue, nextToken: null, records, rawCount: 1, expectedCount: 1, page: 1 };
   });
   vi.spyOn(GraphPackagesClient.prototype, "getPackageDetails").mockResolvedValue({ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false, availableTo: "none", deployedTo: "none", allowedUsersAndGroups: [], acquireUsersAndGroups: [], sourceSystem: "graph_packages", authoringTool: null, creatorType: "unknown", agentKind: "copilot_package", lifecycle: "unknown", identityConfidence: "exact_native", provenance: {} });
   vi.spyOn(DirectoryPrincipalsClient.prototype, "search").mockResolvedValue([]);
@@ -177,20 +226,13 @@ beforeAll(async () => {
     quarantineProviderFixture.updatedAt.set(target.botId, "2026-09-10T10:00:00.456Z");
     return { ...target, isBotQuarantined: requestedState, lastUpdateTimeUtc: "2026-09-10T10:00:00.456Z", observedAt: new Date().toISOString(), correlationId: options.correlationId };
   });
+  await seedOfficeBrowserEvidence();
   application = createApp(fixture.runtime, resolve("../frontend/dist"));
   reportRuntime(fixture.runtime).start();
   if (!selectedBrowserFiles.length || selectedBrowserFiles.includes("savedBackendLifecycle.spec.ts")) {
     savedLifecycle = await savedReadBrowserFixture(fixture.runtime, fixture.operator,
       config.tenants.map(tenant => ({ tenantId: tenant.tenantId!, domains: tenant.domains })));
     process.env.AGENT_CONTROL_LIFECYCLE_CONTROL = savedLifecycle.origin;
-    const automaticRefresh = dataSync.automaticRefresh.bind(dataSync);
-    vi.spyOn(dataSync, "automaticRefresh").mockImplementation(async (user, signedInAt) => {
-      if (!user.homeAccountId.startsWith("fixture-lifecycle-")) return automaticRefresh(user, signedInAt);
-      return { run: null, detailJob: null, nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
-        revisions: await new DataSyncRepository(fixture.runtime).automaticRevisions({
-          tenantId: user.tenantId!, principalId: user.homeAccountId,
-        }) };
-    });
     const runtime = inventoryRuntime();
     const enqueue = runtime.enqueue.bind(runtime);
     vi.spyOn(runtime, "enqueue").mockImplementation((scope, schedule, signal) => {
@@ -198,6 +240,16 @@ beforeAll(async () => {
       return scope.principalId.startsWith("fixture-lifecycle-") ? Promise.resolve(false) : enqueue(scope, schedule, signal);
     });
   }
+  const automaticRefresh = dataSync.automaticRefresh.bind(dataSync);
+  vi.spyOn(dataSync, "automaticRefresh").mockImplementation(async (user, signedInAt) => {
+    const officeFixture = config.tenants.some(tenant => tenant.tenantId === user.tenantId
+      && tenant.domains.some(domain => /^office-(desktop|mobile)\.example\.invalid$/.test(domain)));
+    if (!officeFixture && !user.homeAccountId.startsWith("fixture-lifecycle-")) return automaticRefresh(user, signedInAt);
+    return { run: null, detailJob: null, nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+      revisions: await new DataSyncRepository(fixture.runtime).automaticRevisions({
+        tenantId: user.tenantId!, principalId: user.homeAccountId,
+      }) };
+  });
   inventoryRuntime().start();
   const origin = new URL(process.env.FRONTEND_ORIGIN!);
   await new Promise<void>((done, reject) => {

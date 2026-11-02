@@ -6,10 +6,10 @@ import { verifyInventoryCollectionRewindSchema } from "./inventoryCollectionRewi
 import { verifyInventoryReconciliationAdmissionSchema } from "./inventoryReconciliationAdmissionSchema.js";
 import { verifyReportCapacitySchema } from "./reportCapacitySchema.js";
 import { verifyReportMembershipCountsSchema } from "./reportMembershipCountsSchema.js";
-import { inventoryLimits } from "../types/inventoryRecords.js";
 import { verifyPrincipalBearerFenceSchema } from "./principalBearerFenceSchema.js";
 import { verifyAuditOriginSchema } from "./auditOriginSchema.js";
 import { verifyAgentControlReceiptsSchema } from "./agentControlReceiptsSchema.js";
+import { verifyOfficeAppAdoptionSchema } from "./officeAppAdoptionSchema.js";
 
 export const schemaSql: string = currentSchemaSql;
 export const schemaFingerprint: string = createHash("sha256").update(schemaSql).digest("hex");
@@ -111,6 +111,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyPrincipalBearerFenceSchema(database);
   await verifyAuditOriginSchema(database);
   await verifyAgentControlReceiptsSchema(database);
+  await verifyOfficeAppAdoptionSchema(database);
 }
 
 async function verifyDataSyncCleanupSchema(database: Pick<pg.Pool, "query">) {
@@ -399,7 +400,7 @@ const userSourceTables = [
 
 async function verifyUserSourceSchema(database: Pick<pg.Pool, "query">) {
   const definitions: Record<string, string> = {
-    user_source_attempts: "generation_id:uuid scope_id:uuid tenant_id:text source:text status:text error_code:text? message:text? observed_count:int4? retained_count:int4 report_refresh_date:date? report_period:text",
+    user_source_attempts: "generation_id:uuid scope_id:uuid tenant_id:text source:text status:text error_code:text? message:text? observed_count:int4? retained_count:int4 report_refresh_date:date? report_period:text office_vector:text? office_status:text? office_error_code:text? office_updated_at:timestamptz? office_revision:int8",
     user_source_queries: "generation_id:uuid scope_id:uuid tenant_id:text query_key:text kind:text expected_count:int4? wire_count:int4 page_count:int4 complete:bool",
     user_source_query_members: "generation_id:uuid query_key:text identity:text",
     user_source_skus: "generation_id:uuid scope_id:uuid tenant_id:text sku_id:uuid plan_ids:_text",
@@ -431,11 +432,18 @@ async function verifyUserSourceSchema(database: Pick<pg.Pool, "query">) {
     AND EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='data_generation_pins'::regclass
       AND conname='data_generation_pins_root_kind_check' AND pg_get_constraintdef(oid) LIKE '%user_sources%')
     AND (current_user<>'agentcontrol_app' OR (
-      has_table_privilege(current_user,'user_source_attempts','SELECT,INSERT,UPDATE,DELETE')
-      AND has_table_privilege(current_user,'user_source_skus','SELECT,INSERT,DELETE')
+      has_table_privilege(current_user,'user_source_attempts','SELECT')
+      AND has_table_privilege(current_user,'user_source_attempts','INSERT')
+      AND has_table_privilege(current_user,'user_source_attempts','UPDATE')
+      AND has_table_privilege(current_user,'user_source_attempts','DELETE')
+      AND has_table_privilege(current_user,'user_source_skus','SELECT')
+      AND has_table_privilege(current_user,'user_source_skus','INSERT')
+      AND has_table_privilege(current_user,'user_source_skus','DELETE')
       AND NOT has_table_privilege(current_user,'user_source_skus','UPDATE,TRUNCATE')
       AND NOT has_any_column_privilege(current_user,'user_source_read_contexts','UPDATE')
-      AND (SELECT bool_and(has_table_privilege(current_user,name,'SELECT,INSERT,DELETE')
+      AND (SELECT bool_and(has_table_privilege(current_user,name,'SELECT')
+        AND has_table_privilege(current_user,name,'INSERT')
+        AND has_table_privilege(current_user,name,'DELETE')
         AND NOT has_table_privilege(current_user,name,'TRUNCATE')) FROM unnest($1::text[]) tables(name))
     )) AS valid`, [userSourceTables, JSON.stringify(columns)]);
   if (!result.rows[0]?.valid) throw new Error("User source schema or runtime grants are invalid.");
@@ -515,13 +523,13 @@ async function verifyInventoryRefreshContractSchema(database: Pick<pg.Pool, "que
       AND conname='inventory_refresh_job_mode' AND convalidated) AS bounded_detail_mode,
     NOT EXISTS (
       SELECT 1 FROM (VALUES ('power_platform_refresh_jobs'),('package_refresh_jobs')) jobs(table_name)
-      CROSS JOIN (VALUES ('observed_count',$1::int),('total_records',$1::int),('page_count',$2::int)) bounds(column_name,maximum)
+      CROSS JOIN (VALUES ('observed_count'),('total_records'),('page_count')) bounds(column_name)
       WHERE NOT EXISTS (
         SELECT 1 FROM pg_constraint c WHERE c.conrelid=to_regclass('public.'||jobs.table_name)
           AND c.conname=jobs.table_name||'_'||bounds.column_name||'_check' AND c.contype='c' AND c.convalidated
-          AND pg_get_expr(c.conbin,c.conrelid)=format('((%s >= 0) AND (%s <= %s))',bounds.column_name,bounds.column_name,bounds.maximum)
+          AND pg_get_expr(c.conbin,c.conrelid)=format('(%s >= 0)',bounds.column_name)
       )
-    ) AS progress_bounds`, [inventoryLimits.sourceRows, inventoryLimits.pages])).rows[0];
+    ) AS progress_bounds`)).rows[0];
   if (!["bounded_detail_mode", "progress_bounds"].every(key => result?.[key] === true)) {
     throw new Error("inventory_refresh_contract_schema");
   }
@@ -546,8 +554,13 @@ async function verifyOfficialReportSchema(database: Pick<pg.Pool, "query">) {
       AND pg_get_expr(conbin,conrelid)='(operation = ''delete''::text)')
     AND EXISTS(SELECT 1 FROM pg_proc WHERE oid='protect_agent_usage_association()'::regprocedure
       AND prosrc=$1 AND NOT prosecdef AND proconfig=ARRAY['search_path=pg_catalog, public, pg_temp'])
-    AND has_table_privilege(current_user,'official_usage_history_memberships','SELECT,INSERT,UPDATE,DELETE')
-    AND has_table_privilege(current_user,'official_usage_ingestion_rows','SELECT,INSERT,DELETE')
+    AND has_table_privilege(current_user,'official_usage_history_memberships','SELECT')
+    AND has_table_privilege(current_user,'official_usage_history_memberships','INSERT')
+    AND has_table_privilege(current_user,'official_usage_history_memberships','UPDATE')
+    AND has_table_privilege(current_user,'official_usage_history_memberships','DELETE')
+    AND has_table_privilege(current_user,'official_usage_ingestion_rows','SELECT')
+    AND has_table_privilege(current_user,'official_usage_ingestion_rows','INSERT')
+    AND has_table_privilege(current_user,'official_usage_ingestion_rows','DELETE')
     AND (current_user<>'agentcontrol_app' OR NOT has_any_column_privilege(current_user,'official_usage_read_contexts','UPDATE'))
     AS valid`, [associationGuard]);
   if (!result.rows[0]?.valid) throw new Error("Official report schema is invalid.");
@@ -595,7 +608,10 @@ async function verifyInventoryRefreshTargetsSchema(database: Pick<pg.Pool, "quer
       AND attname='target_job_id' AND NOT attisdropped) AS target_job,
     EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='package_refresh_jobs'::regclass
       AND attname='auto_details' AND NOT attisdropped) AS detail_metadata,
-    current_user<>'agentcontrol_app' OR (has_table_privilege(current_user,'inventory_refresh_targets','SELECT,INSERT,UPDATE,DELETE')
+    current_user<>'agentcontrol_app' OR (has_table_privilege(current_user,'inventory_refresh_targets','SELECT')
+      AND has_table_privilege(current_user,'inventory_refresh_targets','INSERT')
+      AND has_table_privilege(current_user,'inventory_refresh_targets','UPDATE')
+      AND has_table_privilege(current_user,'inventory_refresh_targets','DELETE')
       AND NOT has_table_privilege(current_user,'inventory_refresh_targets','TRUNCATE')) AS permissions`);
   if (!["targets", "target_job", "detail_metadata", "permissions"]
     .every(key => result.rows[0]?.[key] === true)) throw new Error("inventory_refresh_targets_schema");
@@ -681,7 +697,9 @@ async function verifyDataGenerationSchema(database: Pick<pg.Pool, "query">) {
        'data_selection_admission','data_pin_reachability','data_export_admission'))
     AND (current_user<>'agentcontrol_app' OR (
       NOT has_table_privilege(current_user,'directory_user_rows','UPDATE,TRUNCATE')
-      AND has_table_privilege(current_user,'directory_user_rows','SELECT,INSERT,DELETE')
+      AND has_table_privilege(current_user,'directory_user_rows','SELECT')
+      AND has_table_privilege(current_user,'directory_user_rows','INSERT')
+      AND has_table_privilege(current_user,'directory_user_rows','DELETE')
       AND NOT has_table_privilege(current_user,'data_export_chunks','UPDATE,TRUNCATE')
       AND NOT has_any_column_privilege(current_user,'directory_user_rows','UPDATE')
       AND NOT has_table_privilege(current_user,'data_export_items','UPDATE,TRUNCATE')

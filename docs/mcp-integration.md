@@ -885,6 +885,14 @@ it does not make the endpoint browser-only (`—`).
 | `GET /api/official-usage/history/adoption` | R(adoption_history), unfiltered retained history,limit,cursor? ->selected adoption history | AdoptionView retained report history | HTTP only | V |
 | `GET /api/copilot-usage/adoption/facets` | R(adoption),field,search? ->facets | AdoptionView company/department | list_adoption_facets | V |
 | `GET /api/copilot-usage/adoption/champions` | required exact-group adoption selectionId/full inventorySelectionId,limit50<=100,cursor? ->ChampionAgentPage;top3 portal rank,only their complete used/created edges | readChampionAgents/shared Adoption adapter; department array unchanged | list_champion_agents | V |
+| `GET /api/office-app-adoption/context` | OfficeQuery,selectionId? ->immutable selected Office context | Office dashboard and Users shared read owner | HTTP only | V |
+| `GET /api/office-app-adoption/summary` | same OfficeQuery/selectionId ->unfiltered organization totals and selected comparison | Office organization cards | HTTP only | V |
+| `GET /api/office-app-adoption/comparison` | same OfficeQuery/selectionId and baseline ->OfficeSummary | Office baseline comparison | HTTP only | V |
+| `GET /api/office-app-adoption/history` | same OfficeQuery/selectionId,limit,cursor? ->OfficePage of provider-date observations | Office retained twelve-month trend/history | HTTP only | V |
+| `GET /api/office-app-adoption/groups` | same OfficeQuery/selectionId,limit5,cursor?/pageNumber?/anchor? ->OfficePage of full-denominator groups | Office group anchors and drilldown | HTTP only | V |
+| `GET /api/office-app-adoption/departments` | same OfficeQuery/selectionId,limit,cursor? ->OfficePage of departments | Office department groups | HTTP only | V |
+| `GET /api/office-app-adoption/facets` | same OfficeQuery/selectionId,kind,search?,limit,cursor? ->OfficePage of facets | Office company/department filters | HTTP only | V |
+| `GET /api/office-app-adoption/groups/:groupId/people` | same OfficeQuery/selectionId,limit100,cursor? ->OfficePage of frozen paid people | Office app suggestions and person detail; full group/seven-app denominators retained | HTTP only | V |
 | `GET /api/official-usage/aggregate` | R(official_agents) ->ReportPage<ReportAgent> | reportPages.agents/snapshot inspector | list_report_agents | V |
 | `GET /api/official-usage/aggregate/facets` | R(official_agents),field,search? ->facets | inspector creator filter | list_report_agent_facets | V |
 | `GET /api/official-usage/users` | R(official_users) ->ReportPage<ReportUser> | reportPages.reportedUsers/unpaid active cohort | list_report_users | V |

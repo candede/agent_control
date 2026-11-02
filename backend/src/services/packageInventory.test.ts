@@ -481,7 +481,7 @@ describe("streamed package refresh service", () => {
     f.collection.mockImplementation(async (_token, options) => {
       elapsed = 25;
       if (exact) options.diagnostics!.completeDetail(true);
-      else options.diagnostics!.catalogPage([{}], 1, false, 25, 999);
+      else options.diagnostics!.catalogPage(1, 1, false, 25, 999);
       await options.onProgress!({ pages: exact ? 0 : 1, observedCount: 1, totalRecords: exact ? 20 : 1 });
     });
     f.dependencies.requireAvailable.mockResolvedValueOnce(undefined).mockResolvedValueOnce(undefined)
@@ -513,7 +513,7 @@ describe("streamed package refresh service", () => {
       .mockResolvedValueOnce(undefined).mockRejectedValueOnce(retry);
     f.collection.mockImplementation(async (_token, options) => {
       if (exact) options.diagnostics!.completeDetail(true);
-      else options.diagnostics!.catalogPage([{}], 1, false, 0);
+      else options.diagnostics!.catalogPage(1, 1, false, 0);
       await options.onProgress!({ pages: exact ? 0 : 1, observedCount: 1, totalRecords: exact ? 20 : 1 });
     });
     await f.start();

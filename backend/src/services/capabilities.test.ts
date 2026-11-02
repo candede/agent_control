@@ -8,6 +8,8 @@ import { GraphPackagesClient } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import { capabilityDefinitions } from "./capabilityRegistry.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
+import { withAuthority } from "../auth/authorityContext.js";
+import type { DelegatedCredentialSource, RequestPrincipal } from "../types/requestPrincipal.js";
 
 vi.hoisted(() => {
   process.env.TENANTS_JSON = JSON.stringify([
@@ -63,6 +65,27 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(done => { resolve = done; });
   return { promise, resolve };
+}
+
+function requestAuthority(user: AuthenticatedUser & { tenantId: string }): DelegatedCredentialSource {
+  let revoked = false;
+  const principal: RequestPrincipal = {
+    tenantId: user.tenantId, principalId: user.homeAccountId, apiClientId: "synthetic-api",
+    localAccountId: "synthetic-local", username: user.username, displayName: user.displayName,
+    roles: user.roles, providerRoleIds: [], transport: "browser", integrationClientId: "synthetic-api",
+    rolesValidatedAt: Date.now(), authenticatedAt: Date.now(), expiresAt: Date.now() + 300_000,
+    sessionEpoch: "0", authorizationHash: "synthetic-authorization",
+  };
+  return {
+    principal, expiresAt: principal.expiresAt,
+    reference: { id: "synthetic-source", tenantId: principal.tenantId, principalId: principal.principalId,
+      apiClientId: principal.apiClientId, transport: principal.transport, integrationClientId: principal.integrationClientId,
+      sessionEpoch: principal.sessionEpoch, authorizationHash: principal.authorizationHash, expiresAt: principal.expiresAt },
+    assertCurrent: () => { if (revoked) throw AppError.unauthorized("The initiating request authority ended."); },
+    revalidate: async () => principal,
+    acquire: async () => { throw new Error("Capability tests use injected token acquisition."); },
+    revoke: () => { revoked = true; },
+  };
 }
 
 describe("capability list database admission", () => {
@@ -206,6 +229,37 @@ describe("application configuration session ownership", () => {
 });
 
 describe("capability request session ownership", () => {
+  it.each([
+    ["targeted", "graph.package.read.application"],
+    ["read-through", "graph.package.read.application"],
+    ["targeted", "powerPlatform.inventory.read"],
+    ["read-through", "powerPlatform.inventory.read"],
+  ] as const)("rejects a revoked %s caller after it joins a still-authorized probe for %s", async (mode, capabilityId) => {
+    const held = deferred<unknown>();
+    const probe = vi.fn(() => held.promise);
+    const { value, repository, probes } = service(new MemoryRepository(),
+      capabilityId === "graph.package.read.application" ? { packageProbe: probe } : { inventoryProbe: probe });
+    const initiatingAuthority = requestAuthority(reader);
+    const joiningAuthority = requestAuthority(reader);
+    const first = withAuthority(initiatingAuthority, () => value.refresh(capabilityId, reader));
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce());
+    repository.evidence.mockClear();
+    const second = withAuthority(joiningAuthority, () => mode === "targeted"
+      ? value.refresh(capabilityId, reader)
+      : value.requireAvailable(capabilityId, reader));
+    const rejected = expect(second).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+    try {
+      await vi.waitFor(() => expect(repository.evidence).toHaveBeenCalledTimes(2));
+      joiningAuthority.revoke();
+    } finally {
+      held.resolve([]);
+      await Promise.all([expect(first).resolves.toMatchObject({ authorized: true }), rejected]);
+    }
+    expect(probe).toHaveBeenCalledOnce();
+    expect(capabilityId === "graph.package.read.application" ? probes.applicationToken : probes.delegatedToken).toHaveBeenCalledOnce();
+    expect(repository.recordEvidence).toHaveBeenCalledOnce();
+  });
+
   it("pins a provider operation to its principal authority while other principals remain independent", async () => {
     const { value } = service();
     const assertCurrent = value.beginOperationValidation("powerPlatform.quarantine.read", reader);
@@ -1136,6 +1190,18 @@ describe("capability decisions", () => {
     expect((await value.recordHuntingProviderEvidence("defender.hunting.delegated", reader, "provider_error", {})).verification).toBeUndefined();
   });
 
+  it("automatically authorizes a valid catalog just above the general response limit without a manual probe", async () => {
+    const body = JSON.stringify({ value: [{ id: "P_1", displayName: "Package", isBlocked: false }] }).padEnd(2_001_750, " ");
+    const fetcher = vi.fn(async () => new Response(body));
+    const client = new GraphPackagesClient(fetcher);
+    const { value } = service(new MemoryRepository(), { packageProbe: token => client.checkCatalogAccess(token) });
+    const views = await value.check(reader);
+    expect(views.find(view => view.definition.id === "graph.package.read.application")?.decision)
+      .toMatchObject({ status: "available", authorized: true, verification: "provider" });
+    await expect(value.requireAvailable("graph.package.read.application", reader)).resolves.toMatchObject({ authorized: true });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("publishes bounded Graph diagnostics without copying provider messages, bodies, or tokens", async () => {
     const client = new GraphPackagesClient(async () => Response.json({
       error: { code: "Authorization_RequestDenied", message: "person@example.invalid private-token", innerError: { private: "private-body" } },
@@ -1324,6 +1390,7 @@ describe("capability decisions", () => {
     [new DOMException("private timeout", "TimeoutError"), 504, "provider_timeout"],
     [new TypeError("private transport error"), 503, "provider_error"],
     [new AppError(403, "graph_error", "private denial"), 503, "provider_error"],
+    [new AppError(502, "provider_result_limit", "private response"), 502, "provider_result_limit"],
     [new AppError(429, "TooManyRequests", "private throttle"), 429, "provider_throttled"],
     [new AppError(403, "missing_permission", "private consent"), 403, "capability_unavailable"],
     [new AppError(401, "interaction_required", "private authentication"), 401, "interaction_required"],

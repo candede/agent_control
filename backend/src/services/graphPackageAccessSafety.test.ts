@@ -11,6 +11,7 @@ import {
 } from "./graphPackages.js";
 import { allowlistedPackage } from "./packageObservation.js";
 import { capturePackageMutationState, expectedPackageMutationState } from "./packageMutationState.js";
+import { tinyGraphCatalog } from "./inventoryProviderTestSupport.js";
 
 const principal = { resourceType: "group", resourceId: "group-1" };
 const otherPrincipal = { resourceType: "user", resourceId: "user-1" };
@@ -25,9 +26,7 @@ const replacement: PackageAccessUpdate = {
 class ProviderPromise<T> extends Promise<T> {}
 
 async function catalog(client: GraphPackagesClient) {
-  const rows: CopilotPackageDetail[] = [];
-  for await (const page of client.catalogPages("token", { visit: async () => undefined })) rows.push(...page.records);
-  return rows;
+  return tinyGraphCatalog(client, "token");
 }
 
 function verifyAccessReadback(details: CopilotPackageDetail, update = replacement, before = allowlistedPackage(base)) {

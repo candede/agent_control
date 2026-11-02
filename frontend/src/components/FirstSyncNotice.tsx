@@ -25,8 +25,8 @@ export function FirstSyncNotice({
   const sources = automaticSyncSources.map(id => {
     const saved = state.sources.find(source => source.source === id);
     const attempt = attempts.find(source => source.source === id);
-    return { id, saved: saved?.status === "succeeded",
-      observation: saved?.status === "succeeded" ? saved : attempt && attempt.status !== "succeeded" ? attempt : saved };
+    return { id, saved: saved?.status === "succeeded" ? saved : undefined,
+      observation: attempt && attempt.status !== "succeeded" ? attempt : saved };
   });
   const savedCount = sources.filter(source => source.saved).length;
   const progressing = state.run?.status === "running" || state.run?.status === "waiting";
@@ -55,8 +55,7 @@ export function FirstSyncNotice({
       : automaticRefresh?.message
         ?? (!state.run ? "Your first sync starts automatically." : undefined);
 
-  return <WorkbenchDialog open title={title} className="first-sync-dialog" onClose={onDismiss}
-    description="Read-only collection runs automatically. You can use saved tenant data while sources sync or need attention.">
+  return <WorkbenchDialog open title={title} className="first-sync-dialog" onClose={onDismiss}>
     <div className="first-sync-notice">
     {syncError ? <div className="error-banner" role="alert">{syncError}{stale ? " Progress below is the last reported status." : null}</div> : null}
       <div className="first-sync-completion">
@@ -69,11 +68,13 @@ export function FirstSyncNotice({
       <ul className="first-sync-sources" aria-label="First sync sources">
         {sources.map(({ id, saved, observation }) => <li key={id}>
           <div><strong>{syncSourceDetails[id].label}</strong><span>{syncStatusLabel(observation?.status ?? "not_started")}</span></div>
-          {saved ? <p>{observation?.count === null || observation?.count === undefined ? "Saved successfully."
-            : `${observation.count.toLocaleString()} ${syncSourceDetails[id].unit} saved`}</p>
-            : <p>{!observation || observation.status === "not_started" || observation.status === "queued" ? "Waiting to start."
-              : observation.message || (observation.status === "running" ? "Waiting for the provider's next update." : "No successful collection yet.")}</p>}
-          {!saved && observation?.count !== null && observation?.count !== undefined && observation.status === "running"
+          {saved ? <p>{saved.count === null ? "Saved successfully."
+            : `${saved.count.toLocaleString()} ${syncSourceDetails[id].unit} saved`}</p> : null}
+          {!saved || observation && observation.status !== "succeeded"
+            ? <p>{!observation || observation.status === "not_started" || observation.status === "queued" ? "Waiting to start."
+              : observation.message || (observation.status === "running" ? "Waiting for the provider's next update."
+                : saved ? "No new collection has completed." : "No successful collection yet.")}</p> : null}
+          {observation?.count !== null && observation?.count !== undefined && observation.status === "running"
             ? <p>{observation.count.toLocaleString()} processed in this stage</p> : null}
           {observation?.status === "waiting_authorization" ? <a href="/api/auth/login">Sign in again</a> : null}
           {observation?.status === "permission_required" ? <button type="button" className="secondary" onClick={onOpenPermissions}>Review permissions</button> : null}

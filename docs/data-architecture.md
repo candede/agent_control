@@ -11,7 +11,10 @@ remains the business authority for both transports.
 [Current DDL](../backend/src/db/currentSchema.ts) and the
 [schema verifier](../backend/src/db/schema.ts) define one supported schema.
 Initialization accepts an empty database or verifies that exact current schema
-and runtime grants. An incompatible database is not converted during startup.
+and runtime grants. Checked runtime privilege sets require each privilege
+individually; a read grant alone cannot satisfy a required write grant. This
+applies to startup, readiness and operator preflight without introducing an
+application-owned approval step. An incompatible database is not converted during startup.
 The [database operator](../backend/scripts/database.ts) and
 [explicit reset guard](../backend/scripts/databaseReset.ts) own installation
 and reset; see the [reset procedure](operations.md#reset-application-data).
@@ -22,6 +25,138 @@ is not a supported installation input. Backup and isolated restore also require
 the current schema.
 
 ## Scope, publication and selection
+
+Provider collection is incremental: JSON collection records and activity CSV rows
+flow into awaited, bounded staging writes rather than tenant-sized arrays.
+Physical provider page receipts are recorded separately from database batches,
+after complete syntax/metadata validation. Persisted token hashes and exact
+inventory keys reject continuation replay and duplicate identities. A partial or
+failed stream never publishes over the last complete source. Collection has no
+fixed tenant record, page, or total-response byte ceiling; individual-record work,
+batch bytes/rows, storage reservations, representable counts, and job deadlines
+remain enforced.
+
+### Retained Office observations
+
+Normal directory/license and `D28`/`v2` app-report publication automatically
+reconciles Office evidence, without agent CSV imports, inventory, an administrator
+session, another Graph call or a page visit. The existing sync startup and
+30-second recovery pass retries interrupted local preparation. Source-attempt
+bookkeeping acknowledges processed source vectors; two idle passes do not copy
+people again. Derived failure is separately visible and does not fail a healthy
+source publication. Office publication/status uses the existing `users` revision;
+the three revision keys and provider-source IDs are unchanged.
+Persisted Office head lifecycle transitions also change that revision, so
+retention withdrawals are observed without hashing wall-clock time.
+Acknowledged captures do not age into zeroes: current source freshness is
+disclosed separately, while their frozen historical metrics remain unchanged.
+
+`office_observations`, `office_group_facts` and `office_person_facts` form the Office evidence owner,
+using existing generation admission, leases, byte accounting and lifecycle
+slices. The header identifies provider refresh date, period/version and original
+source provenance; facts freeze exact identity, entitlement, company/department,
+seven app dates, original evidence times and classification reasons for the
+current dataset only. Organization/group metrics are computed once from the
+fenced current facts and saved with both the current observation and its weekly
+aggregate. Weekly generations contain no individual-person records.
+Supported large person/group pages split into inserts bounded by 250 rows and
+1 MiB of actual PostgreSQL Bind parameters, including generation/scope/tenant
+parameters. Each inserted slice contributes its full byte charge and retains
+the original fact order, semantic hash and lease/source fences.
+The 32 KiB per-person JSON bound accommodates the saved directory's bounded
+multibyte identity and labels; batch and generation byte limits remain unchanged.
+The existing header's source/coverage metadata is finalized exactly once while
+its source epochs and staging lease are fenced, then frozen at publication.
+Published reads do not rescan all person facts merely to reconstruct coverage.
+Only header coverage and metrics have staging UPDATE authority; window, identity,
+provenance and all published evidence remain immutable. Generation accounting
+includes the 64-byte generated group identity per frozen person.
+Only current, fresh, validated saved source heads can seed a capture. Active
+staging leases protect source reachability during bounded copies and recheck the
+heads/epochs at atomic publication. Published history has no source-generation
+read dependency.
+The bounded Office copy uses the existing exact indexed identity/alias lookup
+for each 250-person slice, rather than rebuilding whole-source alias counts for
+every slice. The existing evidence guard validates all inserted generations
+once per bounded statement through its transition rows and locks each lease;
+one published, expired or wrong-epoch generation rejects the entire insert.
+Composite foreign keys still enforce every row's generation/scope/tenant, and
+updates/deletes retain their immutable/lifecycle guards. Person pages use the existing paid group index extended with the
+canonical NFKC/C display ordering, without materializing every group payload; full
+group metrics/rankings retain their separate complete-population semantics.
+Group metrics and facets read the compact aggregate rows. Ordinary five-group
+windows are selected before current top-three suggestion reads; department
+windows rank the largest absolute numbers without recent reported activity,
+with enabled-cohort size and deterministic group ordering as ties. The existing authenticated people
+cursor carries counts measured on its first page and the canonical label/exact
+identity boundary. Forward/backward pages seek that boundary through the same
+index, rather than scanning all preceding people. Every later cursor page
+validates the same identity/query/group/selection revision and frozen roots
+before reusing those counts; numbered pages still measure their own counts.
+Missing display names use the nonempty UPN required by the current directory
+admission contract; no unsupported null-UPN or compatibility path is introduced.
+One current generation (`office_app_adoption`, selector `current`) retains person
+details. One aggregate generation per UTC Monday-start week (`office_history`)
+retains organization and company/department totals. Both heads publish in one
+transaction under the same source fences and derived job; admission counts that
+pair as one writer while charging both bounded storage reservations.
+Generation, report-upload and report-acceptance admission use the same writer
+identity. Job completion and dependent-selection invalidation run only after
+every related head and retirement state has advanced in that transaction.
+Both Office scopes take the tenant sync mutex before global admission and
+scope/head locks, matching source publication and clear ordering.
+Collection cannot release either generation's byte charge until its Office
+header, person facts and group facts have all been removed.
+Neither head advances if validation or publication fails. Superseded current
+person rows and within-week aggregate replacements use normal bounded lifecycle
+cleanup, not an ever-growing daily archive.
+Cancellation fences semantic replay acknowledgments as well as new publication.
+Failed preparation attempts clean up both leases independently and retain any
+cleanup errors; failure status updates share the tenant sync mutex and cannot
+downgrade a source vector already acknowledged by another successful attempt.
+
+One historical point exists per tenant/UTC week/`D28`/`v2`.
+Deterministically ordered semantic facts and coverage exclude generation IDs and
+collection/evaluation times. Identical repeated collection preserves the original
+capture/provenance; changed current evidence or a newer report within a week
+replaces the corresponding heads and invalidates actual
+dependent selections, without aliases. Later observations do not change historical
+paid/group facts or include later comparison points. Retained unseen directory or
+app rows remain dated unknown evidence, never current participation.
+
+`/api/office-app-adoption/{context,history,summary,comparison,departments,groups,facets}`
+and `/groups/:groupId/people` are Viewer-capable selected saved reads, independent
+of provider permissions and agent/report/inventory context. Actor-bound selections,
+signed cursors, finite 1..100 row pages and 1 MiB responses apply. Groups use exactly
+five per numbered page with renewal anchors; large groups use separate person
+pages. Aggregation/champion ranking precedes paging. App filters narrow matching
+groups, people and suggestions, while preserving full-group paid denominators and
+all seven app totals. Organization summary cards ignore company filters.
+Current summaries supply complete `suggestedChampions` and
+`filteredSuggestedChampions` counts; neither is a sum of one group page.
+Weekly summaries have no individual suggestions. Historical person reads fail
+explicitly; the UI offers current details instead of querying nonexistent archives.
+
+Office data uses twelve UTC calendar months based on the provider refresh date,
+retaining cutoff equality through its whole UTC day. Lifecycle invalidates child
+reads before bounded fact/header deletion and releases generation charges.
+Timeline expiry invalidates only ranges containing a retained published head;
+expired superseded weekly replacements do not invalidate newer selections.
+The selected history fence expires at the earliest weekly-head expiry within
+its chosen report-date range and evaluated-at snapshot, so expiry during a read
+also rejects its result at the selection completion check.
+Expired context responses automatically renew when the browser is visible and
+online, retaining any still-valid chosen observation rather than requiring a
+manual retry.
+Directory/app clear epochs fence Office staging/history; source GC alone does not
+erase history. Backup keys/grants/current-schema verification include all three tables.
+Verification requires each runtime read/insert/delete grant, only the two permitted
+header update columns, the exact tenant-owned composite foreign keys and enabled
+evidence/source-clear trigger bindings with unchanged fenced function bodies.
+Restore review honors current source clears and superseded canonical captures;
+restored older source vectors cannot resurrect removed captures. Existing MCP
+adoption operations keep their agent-specific contracts; no Office MCP feature
+is added.
 
 - Delegated data uses the verified `(tenantId, MSAL homeAccountId)` principal.
   Report usernames, guest resource object IDs and display names do not establish
@@ -98,6 +233,16 @@ the current schema.
   retry backoff or another request's SQL admission. An in-flight admission stays
   owned until it settles; any late lease is released before cancellation or
   deadline rejection, and release failures retain both causes.
+  Lifecycle measurements retain bounded numeric maxima and observation counts,
+  without request or job identity. SQL observations, including Office person
+  batches, become visible only after their owning transaction confirms COMMIT;
+  rollback discards them, while later acknowledgment or cleanup failures do not.
+  In-memory admission queue measurements are independent of SQL rollback.
+- Data-pool transactions recheck cancellation after connection acquisition,
+  transaction start and start-checkpoint work, before invoking their callback,
+  and after the final authority callback immediately before COMMIT. Cancellation
+  before COMMIT rolls back pending work; cancellation after a confirmed COMMIT
+  does not undo publication or discard its durable lifecycle observations.
 - Agent-person cache writes check cancellation before connection acquisition
   and recheck cancellation and current caller authority immediately before commit,
   after their database publication fences and transaction bookkeeping finish.
@@ -153,6 +298,9 @@ must remain distinguishable.
 Verification checks every visible member's selected source scope, not only the
 preferred Graph and Power Platform observations. Missing, incomplete, invalidated
 or future source evidence requires attention even while reconciliation is running.
+Native target accounting compares canonical memberships with the deduplicated
+native/environment identity union from all captured agent-capable scopes, not the
+preferred observation's count. These full-source checks also cover empty filtered pages.
 Complete older saved observations remain readable, including their successfully
 collected identity links; elapsed observation dates cannot create duplicate agents
 or convert a completed identity check back into missing data.
@@ -233,9 +381,12 @@ evidence sources and cannot replace those reports.
 
 Imports validate and stage content before atomic publication. Exact duplicates
 reuse retained content; failed imports do not replace accepted reports.
-The first complete accepted set is selected automatically. Later imports keep
-the existing shared choice, including an intentionally empty choice. Selecting
-or deleting a report requires the existing Admin preview/confirmation flow.
+The tenant default automatically follows the newest complete, available report
+by reporting end, then reporting start, with acceptance time breaking ties.
+Historical backfills do not replace newer periods, and superseded corrections
+never revive as the default. Publication, deletion, expiry and report/inventory
+reads reconcile this choice. Viewer-capable roles can select a report personally
+without changing the tenant default; corrections and confirmed deletion require Admin.
 
 Directory identity, paid-license state, report association and responsibility
 are independent facts. Unknown licenses are not unpaid licenses; report-only
@@ -296,6 +447,8 @@ Explicit hunts/searches run under current permissions and configured sharing,
 without an earlier qualification query.
 
 Retention invalidates affected references before bounded physical cleanup.
+Export expiration and its audit writes share the lifecycle row/byte budget and
+resume cursor with physical cleanup; a full slice defers them to a later pass.
 Inventory catalog, detail and control generation metadata remains retained while
 stored records reference it, even after the original content is collected.
 Indexed provenance checks preserve freshness and identity evidence until those

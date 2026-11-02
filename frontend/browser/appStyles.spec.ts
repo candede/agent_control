@@ -13,12 +13,54 @@ const styles = [
   "../src/components/workbenchDialog.css", "../src/components/dataSync.css",
   "../src/components/savedInventoryVerification.css",
   "../src/components/workspaceSkeleton.css",
+  "../src/components/adoptionDashboard.css",
 ].map(path => readFileSync(new URL(path, import.meta.url), "utf8")).join("\n");
 
 async function renderStyles(page: Page, content: string) {
   await page.route("**/*", route => route.abort());
   await page.setContent(`<style>${styles}</style>${content}`);
 }
+
+test("weekly Office history action stays readable, spaced and keyboard accessible", async ({ page }) => {
+  await renderStyles(page, `<main class="app-shell"><p class="dashboard-panel-note office-history-note">
+    <span>Weekly history contains app and group totals, not individual-person records.</span>
+    <button type="button" class="secondary">Explore current people</button>
+  </p></main>`);
+  const notice = page.locator(".office-history-note");
+  const button = notice.getByRole("button", { name: "Explore current people" });
+  for (const width of [360, 760, 1440]) {
+    await page.setViewportSize({ width, height: 780 });
+    await page.mouse.move(0, 0);
+    await expect(button).toHaveCSS("font-size", "13px");
+    expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(40);
+    const textBox = (await notice.locator("span").boundingBox())!;
+    const buttonBox = (await button.boundingBox())!;
+    expect(buttonBox.x >= textBox.x + textBox.width + 11
+      || buttonBox.y >= textBox.y + textBox.height + 11).toBe(true);
+    expect(await notice.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    for (const hover of [false, true]) {
+      if (hover) await button.hover();
+      expect(await button.evaluate(element => {
+        const luminance = (color: string) => {
+          const channels = color.match(/[\d.]+/g);
+          if (!channels || channels.length !== 3) throw new Error(`Expected an opaque RGB color, received ${color}`);
+          return channels.map(channel => Number(channel) / 255)
+            .map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2)
+            .reduce((total, channel, index) => total + channel * [0.2126, 0.7152, 0.0722][index], 0);
+        };
+        const style = getComputedStyle(element);
+        const foreground = luminance(style.color), background = luminance(style.backgroundColor);
+        return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+      })).toBeGreaterThanOrEqual(4.5);
+    }
+  }
+  await page.keyboard.press("Tab");
+  await button.focus();
+  await expect(button).toBeFocused();
+  expect(await button.evaluate(element => element.matches(":focus-visible")
+    && getComputedStyle(element).outlineStyle !== "none")).toBe(true);
+});
 
 test("app footer shares theme tokens and keeps attribution and creator links readable at narrow widths", async ({ page }, info) => {
   for (const shell of ["app-shell", "signed-out"]) {
@@ -493,7 +535,6 @@ test("permission setup and recovery fit long evidence, narrow screens and enlarg
       <div class="permission-heading-copy"><h2 id="permissions-title" tabindex="-1">Permissions</h2><p>Setup and troubleshooting for ${reference}.</p></div>
       <div class="permission-actions"><button class="secondary" disabled><svg class="permission-spinner" width="16" height="16"></svg>Checking...</button></div></header>
     <div class="permission-body">
-      <nav class="permission-role-topics" aria-label="Permissions sections"><a href="#roles">Signed-in user roles</a><a href="#prerequisites">App API permissions</a><a href="#logs">Log setup</a></nav>
       <div class="permission-notice" role="status">Sign-in failed. ${reference}</div>
       <section class="permission-progress" aria-label="Permission check progress">
         <div class="permission-progress-heading"><svg class="permission-spinner" width="22" height="22"></svg>
@@ -501,19 +542,28 @@ test("permission setup and recovery fit long evidence, narrow screens and enlarg
         <progress aria-label="Permission checks reviewed"></progress>
         <ul class="permission-progress-checks"><li><span class="permission-progress-dot"></span><span><strong>Power Platform inventory</strong><span>Checking Microsoft access</span></span></li></ul>
       </section>
-      <section class="permission-issues" aria-labelledby="issues-title"><h3 id="issues-title">Issues</h3>
+      <section class="permission-section permission-issues" aria-labelledby="issues-title"><h3 id="issues-title">Issues</h3>
         <div class="error-banner" role="alert">Permission checks could not be loaded. ${reference}</div>
-        <ul class="permission-issue-list"><li><div><strong>Agent inventory</strong><p>Microsoft is limiting requests. Try again after the cooldown.</p></div>
-          <div class="permission-actions"><a href="#setup">Admin setup</a><button class="permission-text-button" aria-label="Details: Agent inventory">Details</button></div></li></ul></section>
-      <section id="prerequisites" class="permission-log-setup permission-prerequisites"><header><h3>App prerequisites</h3><a href="#admin">Open Entra admin center</a></header>
-        <details open><summary>Required API permissions</summary><p class="permission-setup-note">The feature permission list is unavailable. Consult the deployment setup guide; this is not an empty requirements list.</p>
-          <div class="permission-requirements"><section><h4>Microsoft Graph / Delegated</h4><dl class="permission-feature-list"><div><dt><code>${reference}</code></dt><dd><ul><li>${reference}</li></ul></dd></div></dl></section></div></details></section>
-      <section id="logs" class="permission-log-setup permission-collection-setup"><details open><summary>Log collection setup</summary>
-        <ul class="permission-setup-list"><li><div class="permission-setup-heading"><strong>Purview auditing</strong><span class="permission-setup-tag">For audit records</span><a href="#audit">Open Audit Search</a></div>
-          <p>Check the recording banner, or verify status with Exchange Online PowerShell below.</p><details open><summary>Steps &amp; permissions</summary>
-            <pre><code>Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled</code></pre><dl><div><dt>Read access</dt><dd>${reference}</dd></div></dl></details></li></ul></details></section>
-      <section id="roles" class="permission-user-roles"><h3>Signed-in user roles</h3><article class="permission-role-row"><div><h4>Run Defender and Agent 365 hunts</h4><p>Agents &gt; Activity</p></div>
-        <div class="permission-role-requirement"><p>Security Reader</p><p>${reference}</p><ul class="permission-role-sources"><li><a href="#documentation">Microsoft references</a></li></ul></div></article></section>
+        <ul class="permission-issue-list"><li><article class="permission-issue">
+          <header class="permission-issue-heading"><h4>Agent inventory</h4></header>
+          <p class="permission-detail-explanation">Microsoft is limiting requests. Try again after the cooldown.</p>
+          <section class="permission-detail-section" aria-label="Required setup"><h5>Required setup</h5>
+            <dl class="permission-metadata"><div><dt>API permissions</dt><dd><code>${reference}</code></dd></div></dl></section>
+          <section class="permission-technical" aria-label="Technical details"><h5>Check details</h5>
+            <dl class="permission-metadata"><div><dt>Request reference</dt><dd>${reference}</dd></div></dl></section>
+        </article></li></ul></section>
+      <section id="prerequisites" class="permission-section permission-prerequisites"><header class="permission-section-heading">
+        <h3>App registration permissions</h3><a href="#admin">Open Entra admin center</a></header>
+        <p class="permission-section-note">The feature permission list is unavailable. Consult the deployment setup guide; this is not an empty requirements list.</p>
+        <dl class="permission-metadata"><div><dt>API permissions</dt><dd><code>${reference}</code></dd></div></dl></section>
+      <section id="logs" class="permission-section permission-collection-setup"><header class="permission-section-heading">
+        <h3>Log collection setup</h3><a href="#audit">Open Audit Search</a></header>
+        <p>Check the recording banner, or verify status with Exchange Online PowerShell below.</p>
+        <dl class="permission-metadata"><div><dt>Read access</dt><dd>${reference}</dd></div>
+          <div><dt>Command</dt><dd><code>Get-AdminAuditLogConfig | Format-List UnifiedAuditLogIngestionEnabled</code></dd></div></dl></section>
+      <section id="roles" class="permission-section permission-user-roles"><h3>Signed-in user roles</h3>
+        <dl class="permission-metadata"><div><dt>Security Reader</dt><dd>${reference}</dd></div></dl>
+        <a href="#documentation">Microsoft references</a></section>
     </div></section></main>`);
   for (const fontSize of [16, 32]) {
     await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, fontSize);
@@ -523,8 +573,8 @@ test("permission setup and recovery fit long evidence, narrow screens and enlarg
         expect(await page.locator(selector).evaluate(element => element.scrollWidth <= element.clientWidth + 1),
           `${selector} must fit at ${width}px with ${fontSize}px text`).toBe(true);
       }
-      for (const control of [page.getByRole("button", { name: "Details: Agent inventory" }),
-        page.getByRole("link", { name: "Open Entra admin center" }), page.getByText("Steps & permissions", { exact: true })]) {
+      for (const control of [page.getByRole("link", { name: "Open Audit Search" }),
+        page.getByRole("link", { name: "Open Entra admin center" }), page.getByRole("link",{name:"Microsoft references"})]) {
         await control.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
         await expect(control).toBeInViewport({ ratio: 1 });
         await control.click({ trial: true });
@@ -535,37 +585,34 @@ test("permission setup and recovery fit long evidence, narrow screens and enlarg
   }
   await expect(page.getByRole("button", { name: "Checking..." })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Checking..." })).toHaveCSS("opacity", "0.58");
-  await expect(page.getByRole("button", { name: "Details: Agent inventory" })).toHaveCSS("opacity", "1");
+  await expect(page.getByRole("link", { name: "Open Audit Search" })).toHaveCSS("opacity", "1");
   await page.emulateMedia({ reducedMotion: "reduce" });
   for (const element of await page.locator(".permission-spinner, .permission-progress-dot, .permission-progress progress").all()) {
     await expect(element).toHaveCSS("animation-name", "none");
   }
 });
 
-test("permission details retain readable diagnostics and reachable recovery in short viewports", async ({ page }) => {
+test("inline permission evidence retains readable diagnostics and reachable recovery in short viewports", async ({ page }) => {
   const reference = "provider_error_correlation_".repeat(12);
-  await renderStyles(page, `<dialog class="workbench-dialog permission-details">
-    <header class="workbench-dialog-header"><div><h2 tabindex="-1">Agent inventory</h2></div><button class="secondary workbench-dialog-close" aria-label="Close agent inventory">X</button></header>
-    <div class="workbench-dialog-body"><div class="error-banner" role="alert">${reference}</div><p class="permission-detail-explanation">Microsoft did not respond after retrying.</p>
-      <section class="permission-detail-section"><h3>Required setup</h3><dl class="permission-metadata"><div><dt>API permissions</dt><dd>${reference}</dd></div><div><dt>Microsoft roles</dt><dd>${reference}</dd></div></dl></section>
-      <details class="permission-technical" open><summary>Technical details</summary><dl class="permission-metadata"><div><dt>Provider request / correlation ID</dt><dd>${reference}</dd></div></dl><ul><li>${reference}</li></ul></details>
-      <section class="permission-detail-section"><h3>Setup links</h3><p>${reference}</p><div class="permission-actions"><a href="#admin">Entra admin center</a><a href="#documentation">Microsoft documentation</a></div></section>
-      <div class="permission-actions"><a href="#signin">Sign in again</a></div></div></dialog>`);
-  const dialog = page.getByRole("dialog", { includeHidden: true });
-  await expect(dialog).toBeHidden();
-  await dialog.evaluate((element: HTMLDialogElement) => element.showModal());
+  await renderStyles(page, `<main class="app-shell"><section class="permission-center"><article class="permission-issue" aria-label="Agent inventory">
+    <header class="permission-issue-heading"><h4>Agent inventory</h4></header>
+    <div class="error-banner" role="alert">${reference}</div><p class="permission-detail-explanation">Microsoft did not respond after retrying.</p>
+      <section class="permission-detail-section"><h5>Required setup</h5><dl class="permission-metadata"><div><dt>API permissions</dt><dd>${reference}</dd></div><div><dt>Microsoft roles</dt><dd>${reference}</dd></div></dl></section>
+      <section class="permission-technical" aria-label="Technical details"><h5>Check details</h5><dl class="permission-metadata"><div><dt>Provider request / correlation ID</dt><dd>${reference}</dd></div></dl><ul><li>${reference}</li></ul></section>
+      <section class="permission-detail-section"><h5>Setup links</h5><p>${reference}</p><div class="permission-actions"><a href="#admin">Entra admin center</a><a href="#documentation">Microsoft documentation</a></div></section>
+      <div class="permission-actions"><a href="#signin">Sign in again</a></div></article></section></main>`);
   for (const fontSize of [16, 32]) {
     await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, fontSize);
     for (const [width, height] of [[320, 640], [600, 320], [760, 360], [1024, 640]]) {
       await page.setViewportSize({ width, height });
-      for (const selector of [".permission-details", ".workbench-dialog-body", ".permission-metadata"]) {
+      for (const selector of [".permission-center", ".permission-issue", ".permission-metadata", ".permission-technical"]) {
         for (const element of await page.locator(selector).all()) {
           expect(await element.evaluate(element => element.scrollWidth <= element.clientWidth + 1),
             `${selector} must fit at ${width}x${height} with ${fontSize}px text`).toBe(true);
         }
       }
-      for (const control of [page.getByRole("button", { name: "Close agent inventory" }),
-        page.getByText("Technical details", { exact: true }), page.getByRole("link", { name: "Sign in again" })]) {
+      for (const control of [page.getByRole("link", { name: "Entra admin center" }),
+        page.getByRole("link", { name: "Microsoft documentation" }), page.getByRole("link", { name: "Sign in again" })]) {
         await control.evaluate(element => element.scrollIntoView({ block: "center", inline: "nearest" }));
         await expect(control).toBeInViewport({ ratio: 1 });
         await control.click({ trial: true });
@@ -574,8 +621,7 @@ test("permission details retain readable diagnostics and reachable recovery in s
       }
     }
   }
-  await dialog.evaluate((element: HTMLDialogElement) => element.close());
-  await expect(dialog).toBeHidden();
+  await expect(page.locator(".permission-center").locator("dialog,details,summary")).toHaveCount(0);
 });
 
 test("permission gate recovery and the package Preview warning remain visible with keyboard focus", async ({ page }) => {

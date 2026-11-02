@@ -144,6 +144,38 @@ describe("temporary two-agent sharing diagnostic", () => {
     expect(JSON.stringify(body)).not.toContain("synthetic embedded credential");
   });
 
+  it.each([
+    { name: "values", definition: String.raw`{"sharing":{"orgWide":false},"note":"synthetic-trans\u0070ort-secret"}`,
+      expected: { sharing: { orgWide: false }, note: "[REDACTED]" } },
+    { name: "keys", definition: String.raw`{"synthetic-trans\u0070ort-secret":{"orgWide":false}}`,
+      expected: { "[REDACTED]": { orgWide: false } } },
+    { name: "nested definitions", definition: JSON.stringify({
+      sharing: { orgWide: false }, nested: String.raw`{"note":"synthetic-trans\u0070ort-secret"}`,
+    }), expected: { sharing: { orgWide: false }, nested: '{"note":"[REDACTED]"}' } },
+  ])("redacts active tokens escaped in embedded JSON $name", async ({ definition, expected }) => {
+    const f = await fixture();
+    f.graph.getDiagnosticPackageDetails.mockResolvedValueOnce({ id: "target", futureChatSetting: false, recipients: [],
+      optional: null, instructions: definition, access_token: "secret" });
+    await expect(f.service.run(f.user, f.context)).resolves.toBe("succeeded");
+    const capture = await f.capture();
+    const body = JSON.parse(await fs.readFile(join(capture.path, "brd.graph-v1.0.json"), "utf8"));
+    expect(JSON.parse(body.instructions)).toEqual(expected);
+    expect(JSON.stringify(f.log.mock.calls)).not.toContain("synthetic-transport-secret");
+  });
+
+  it("redacts active tokens in raw property names without dropping their sharing evidence", async () => {
+    const f = await fixture();
+    f.graph.getDiagnosticPackageDetails.mockResolvedValueOnce({
+      id: "target", futureChatSetting: false, recipients: [], optional: null, instructions: "private", access_token: "secret",
+      ...{ "synthetic-transport-secret": { orgWide: false } },
+    });
+    await expect(f.service.run(f.user, f.context)).resolves.toBe("succeeded");
+    const capture = await f.capture();
+    const text = await fs.readFile(join(capture.path, "brd.graph-v1.0.json"), "utf8");
+    expect(text).not.toContain("synthetic-transport-secret");
+    expect(JSON.parse(text)["[REDACTED]"]).toEqual({ orgWide: false });
+  });
+
   it("stops when fresh authorization no longer grants administrator scope", async () => {
     const f = await fixture();
     vi.mocked(revalidateAuthorizedUser).mockResolvedValue({ ...f.user, roles: ["AgentControl.Viewer"] });

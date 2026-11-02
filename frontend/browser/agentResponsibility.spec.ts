@@ -222,7 +222,7 @@ test("unresolved people retain negative evidence, invalid deep links do not requ
   await page.getByRole("button", { name: "View details for Responsibility review agent", exact: true }).click();
   await expect(page.getByRole("dialog").getByRole("button", { name: /View responsibility/ })).toHaveCount(0);
   await expect(page.getByText("User not found at the last directory lookup.")).toBeVisible();
-  await page.goto("/users?view=responsibility&person=Alice");
+  await page.goto("/users?detail=Alice&tab=responsibility");
   await expect(page.getByRole("alert")).toContainText("an exact directory object ID is required");
   expect(evidence.requests).not.toContain("/api/agent-responsibility");
   await page.goto(`/users?detail=${owner}&tab=responsibility`);

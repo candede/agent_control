@@ -12,7 +12,7 @@ import type { ReportAgent, ReportMetadata, ReportPage, ReportRelationship, Repor
 import type { PackageDetailSyncState } from "../../backend/src/types/dataSync";
 import { createUnifiedVerification, inventoryPageMetadata } from "../src/test/inventoryVerification";
 import { projectAgentResponsibility } from "../../backend/scripts/agentResponsibilityOracle";
-import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery, inventoryFixtureSelection } from "./selectedInventoryFixture";
+import { captureInventorySelection, fulfillInventoryDetail, fulfillInventoryMembers, fulfillInventoryPage, inventoryFixtureQuery, inventoryFixtureSelection, inventoryFixtureRecord } from "./selectedInventoryFixture";
 import { encodeInventoryFacet } from "../../backend/src/types/inventoryFacets";
 import type {
   AuditEvent, CapabilityView, DefenderHuntingCatalog, DefenderHuntingJob, DefenderHuntingRowPage,
@@ -128,10 +128,10 @@ export async function mockInventoryFacets(page: Page, values: InventoryFacetOpti
   });
 }
 
-const activeSet = historySet(1, { id: "55555555-5555-4555-8555-555555555555",
+const activeSet = historySet(1, { id: selectedFixtureReports.setId!,
   bundleId: "66666666-6666-4666-8666-666666666666", reportingStart: "2026-08-01", reportingEnd: "2026-08-30", acceptedAt: observedAt });
 const layoutReports: ReportMetadata = { ...selectedFixtureReports, setId: activeSet.id, activeSetId: activeSet.id,
-  activeRevision: "1", historyRevision: "1", historyEpoch: "1", periodAgeDays: 13, acceptedAgeDays: 0, acceptedAt: observedAt,
+  periodAgeDays: 13, acceptedAgeDays: 0, acceptedAt: observedAt,
   reportingPeriod: { startDate: "2026-08-01", endDate: "2026-08-30", days: 30, provenance: "operator_asserted" },
   lineages: selectedFixtureReports.lineages.map(row => ({ ...row, rowCount: row.kind === "userAgents" ? 4 : 2 })),
 };
@@ -189,7 +189,7 @@ const auditEvents: AuditEvent[] = packageNames.slice(0, 2).map((agentDisplayName
   message: index ? "Provider temporarily unavailable; saved evidence remains readable." : "Package block state verified.",
 }));
 
-export const purviewJob: PurviewAuditJob = {
+const purviewJob: PurviewAuditJob = {
   id: "77777777-7777-4777-8777-777777777777", authorizationPrincipalId: actor.homeAccountId,
   resultScope: { kind: "principal", scopeId: actor.homeAccountId, configurationRevision: null },
   tokenMode: "delegated", status: "succeeded",
@@ -380,6 +380,19 @@ export async function mockLayoutApi(page: Page, options: { metadataAfterPermissi
         text, totalBytes: text === null ? 0 : Buffer.byteLength(text), returnedBytes: text === null ? 0 : Buffer.byteLength(text),
         nextCursor: null, selection: inventoryFixtureSelection(route) } });
     }
+    const usage = /^\/api\/agent-inventory\/([^/]+)\/usage$/.exec(path);
+    if (usage) {
+      const recordId = decodeURIComponent(usage[1]);
+      const record = inventoryFixtureRecord(route, recordId);
+      if (!record) return unexpectedRequest(route);
+      const selection = inventoryFixtureSelection(route);
+      return route.fulfill({ json: {
+        recordId, status: record.usage?.status ?? "unlinked", responses: record.usage?.responses ?? null,
+        activeUsers: record.usage?.activeUsers ?? null, lastActivityDateUtc: record.usage?.lastActivityDateUtc ?? null,
+        associationCount: record.usage?.associationCount ?? 0, context: { selectionId: selection.id, reportSetId: layoutReports.setId,
+          reports: layoutReports, inventoryRevision: selection.revision, usageRevision: selection.id },
+      } });
+    }
     const history = /^\/api\/agent-inventory\/([^/]+)\/usage-history$/.exec(path);
     if (history) {
       const recordId = decodeURIComponent(history[1]);
@@ -387,7 +400,7 @@ export async function mockLayoutApi(page: Page, options: { metadataAfterPermissi
       const selection = inventoryFixtureSelection(route);
       return route.fulfill({ json: agentUsageHistoryFixture({
         selectionId: selection.id, reportSetId: layoutReports.setId, reports: layoutReports,
-        inventoryRevision: unifiedAgents.selection.revision, usageRevision: unifiedAgents.usageContext.revision,
+        inventoryRevision: selection.revision, usageRevision: selection.id,
       }, recordId, undefined, {
         limit: Number(url.searchParams.get("limit") ?? 50), cursor: url.searchParams.get("cursor") ?? undefined,
       }) });

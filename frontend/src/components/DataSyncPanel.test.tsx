@@ -512,7 +512,8 @@ describe("DataSyncPanel", () => {
     expect(api.getState).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(api.start).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
-    expect(dialog).toHaveTextContent("You can use saved tenant data while sources sync or need attention");
+    expect(dialog).not.toHaveTextContent("Read-only collection runs automatically. You can use saved tenant data while sources sync or need attention.");
+    expect(dialog).not.toHaveAttribute("aria-describedby");
     expect(screen.getByText("Your first sync starts automatically.")).toBeVisible();
     expect(onOpenSync).not.toHaveBeenCalled();
     expect(api.openPermissions).not.toHaveBeenCalled();
@@ -565,6 +566,9 @@ describe("DataSyncPanel", () => {
     const onSourcesChanged = vi.fn();
     const view = renderPanel({ ref, active: false, onOpenSync: vi.fn(), onSourcesChanged });
     expect(await screen.findByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "Your first sync is in progress" })).not.toHaveTextContent(
+      "Read-only collection runs automatically. You can use saved tenant data while sources sync or need attention.",
+    );
     expect(screen.getByText("650 processed in this stage")).toBeVisible();
     expect(screen.getByRole("progressbar")).toHaveAttribute("value", "1");
     expect(within(screen.getByRole("dialog", { name: "Your first sync is in progress" })).getByRole("button", { name: "Continue to workspace" })).toBeVisible();

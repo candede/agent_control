@@ -4,6 +4,7 @@ import { DataConnections } from "../db/dataConnections.js";
 import { DataGenerations, type GenerationLease } from "../db/dataGenerations.js";
 import { DataSelections } from "./dataSelections.js";
 import { dataWorkMetricScope, flushDataWorkMetrics, observeDataWork } from "./dataMetrics.js";
+import * as dataMetrics from "./dataMetrics.js";
 import { admitGeneration } from "../db/generationAdmission.js";
 import { observeTransactionResult } from "./peakMemory.js";
 import { withTelemetryContext } from "./telemetry.js";
@@ -24,6 +25,18 @@ it("aggregates bounded numeric observations without inherited identity or arbitr
   expect(JSON.parse(payload)).toMatchObject({ event: "data_lifecycle_metrics", stage: "record_gc", rows: 250, bytes: 1_048_000,
     backlogRoots: 17, oldestAgeMs: 60_000 });
   expect(flushDataWorkMetrics()).toEqual([]);
+});
+
+it("emits every supported lifecycle stage without inheriting request or job identity", () => {
+  const log = vi.spyOn(console, "log").mockImplementation(() => {});
+  const stages = ["record_gc", "inventory_gc", "generation", "selection", "export", "admission", "office_capture"] as const;
+  withTelemetryContext({ jobId: "private-job", requestId: "private-request", route: "/private" }, () => {
+    for (const stage of stages) observeDataWork(stage, { rows: 0, bytes: 0, durationMs: 0 });
+    expect(flushDataWorkMetrics()).toEqual(stages.map(stage => ({ stage, count: 1, rows: 0, bytes: 0, durationMs: 0 })));
+  });
+  expect(log).toHaveBeenCalledTimes(stages.length);
+  expect(log.mock.calls.map(([value]) => JSON.parse(String(value)).stage)).toEqual(stages);
+  for (const [value] of log.mock.calls) expect(String(value)).not.toMatch(/private|jobId|requestId|route/);
 });
 
 it("keeps sequential scope phases private and rejects an unfinished or closed scope commit/reuse", async () => {
@@ -239,6 +252,32 @@ it("retains confirmed committed observations when later connection cleanup fails
   expect(query).toHaveBeenCalledWith("COMMIT");
   expect(flushDataWorkMetrics()).toEqual([{ stage: "export", count: 1, rows: 1, bytes: 10 }]);
 });
+
+it.each(["callback", "metrics", "both"] as const)(
+  "preserves durable metrics and commit acknowledgment after a post-commit %s failure", async boundary => {
+    const { connections, query } = databaseFixture();
+    const callbackFailure = new Error("Synthetic commit acknowledgment failure.");
+    const metricFailure = new Error("Synthetic metric commit failure.");
+    const scope = dataWorkMetricScope();
+    vi.spyOn(dataMetrics, "dataWorkMetricScope").mockReturnValue({
+      ...scope, commit: () => {
+        scope.commit();
+        if (boundary !== "callback") throw metricFailure;
+      },
+    });
+    const onCommitted = vi.fn(() => { if (boundary !== "metrics") throw callbackFailure; });
+    const pending = connections.run(async () => { observeDataWork("export", { bytes: 10 }); },
+      false, undefined, undefined, undefined, onCommitted);
+    if (boundary === "both") await expect(pending).rejects.toMatchObject({
+      message: "data_transaction_post_commit_failed", errors: [callbackFailure, metricFailure],
+    });
+    else await expect(pending).rejects.toBe(boundary === "callback" ? callbackFailure : metricFailure);
+    expect(onCommitted).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledWith("COMMIT");
+    expect(query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(flushDataWorkMetrics()).toEqual([{ stage: "export", count: 1, bytes: 10 }]);
+  },
+);
 
 it("does not roll back a confirmed COMMIT when its post-commit diagnostic callback throws", async () => {
   const { connections, query, result } = databaseFixture();

@@ -21,6 +21,8 @@ import { createDataSyncRouter } from "./routes/dataSync.js";
 import { defenderHuntingRouter } from "./routes/defenderHunting.js";
 import { inventoryRouter, createInventoryReadRouter } from "./routes/inventory.js";
 import { createOfficialReportDataRouter } from "./routes/officialReportData.js";
+import { createOfficeAppAdoptionRouter } from "./routes/officeAppAdoption.js";
+import { OfficeAppAdoptionReads } from "./services/officeAppAdoptionReads.js";
 import { reportRuntime } from "./services/reportExportDispatcher.js";
 import { reportIdentity } from "./services/reportIdentity.js";
 import { purviewAuditRouter } from "./routes/purviewAudit.js";
@@ -71,9 +73,11 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
     } catch { next(new AppError(400,"invalid_path","Invalid request path.")); }
   });
   policyRoute(app, "get", "/api/health", { access: "public", dataClass: "public" }, (_request, response) => response.json({ ok: true }));
+  let schemaVerification: Promise<void> | undefined;
   policyRoute(app, "get", "/api/ready", { access: "public", dataClass: "public" }, async (_request, response) => {
     try {
-      await verifySchema(database);
+      schemaVerification ??= verifySchema(database).finally(() => { schemaVerification = undefined; });
+      await schemaVerification;
       const state = await readOperationalState(database);
       if (maintenanceActive() || state.mode !== "normal") throw new Error("Maintenance is active.");
       response.json({ ok: true });
@@ -108,6 +112,7 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
   });
   const reports = reportRuntime(database);
   app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(),
+    createOfficeAppAdoptionRouter(new OfficeAppAdoptionReads(database, config.sessionSecret)),
     createOfficialReportDataRouter({ reports: reports.reports,
       identity: async request => ({ identity: await reportIdentity(database, requestUser(request)) }),
       enqueueExport: async job => { reports.enqueue(job.id, job.identity); } }),

@@ -5,6 +5,17 @@ import { browserFixtureTestFiles } from "./fixtureSupport.js";
 const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
 
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "office-app-adoption") return [
+    ["run", "test", "--workspace", "backend", "--", "src/db/officeAppAdoption.test.ts", "src/routes/officeAppAdoption.test.ts",
+      "src/db/officeAppAdoption.unit.test.ts", "src/services/officeAppAdoption.unit.test.ts", "src/routes/officeAppAdoption.unit.test.ts",
+      "src/db/schema.test.ts", "scripts/backup.test.ts", "scripts/largeTenantFixture.test.ts", "src/db/automaticRevisions.unit.test.ts",
+      "src/services/dataSync.test.ts", "src/server.test.ts", "src/routes/policy.test.ts",
+      "src/app.test.ts", "scripts/dataSyncPersistence.test.ts", "src/routes/dataPages.test.ts",
+      "src/routes/mcpContractFeasibility.test.ts", "src/db/copilotStudioQuarantine.test.ts",
+      "src/services/automaticRefreshIntegration.test.ts", "src/services/copilotUsage.unit.test.ts",
+      "src/services/dataSelections.unit.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
   if (suite === "mcp-end-to-end") return [
     ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/sharedAgentControls.test.ts", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
@@ -223,7 +234,8 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "report-source-scale") return [
-    ["run", "test", "--workspace", "backend", "--", "src/services/largeTenantUsersReports.test.ts"],
+    ["run", "test", "--workspace", "backend", "--", "src/services/largeTenantUsersReports.test.ts",
+      "src/db/officeAppAdoption.test.ts", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "backend-shard-1" || suite === "backend-shard-2") return [

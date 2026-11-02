@@ -8,12 +8,12 @@ import { directoryPlanRecord, directorySourceRecord, snapshotUserSourceBatch } f
 import { civilDate, parseReportedIdentity } from "../services/userSourceGraphFields.js";
 import type { UserSourceKind } from "../types/userSources.js";
 import { operationalLog } from "../services/telemetry.js";
+import { OfficeAppAdoptionRepository } from "./officeAppAdoption.js";
 
 type GenerationCompletion = NonNullable<NonNullable<Parameters<DataGenerations["publish"]>[1]>["completeJob"]>;
 export type UserSourceCompletion = (client: pg.PoolClient,
   result: Parameters<GenerationCompletion>[1] & { source: UserSourceKind; generationId: string }) => Promise<void>;
 export type UserSourceQueryKind = "catalog" | "discovery" | "identity" | "activity";
-const queryPageLimits: Record<UserSourceQueryKind, number> = { catalog: 200, discovery: 1000, identity: 6000, activity: 10000 };
 
 export class UserSourceStages {
   readonly generations: DataGenerations;
@@ -113,7 +113,14 @@ export class UserSourceStages {
         }).catch(failure => { throw new AggregateError([error, failure], "user_source_failure_record"); });
       }
       throw error;
-    } finally { clearTimeout(timer); }
+    } finally {
+      clearTimeout(timer);
+      // Every confirmed commit starts recoverable derived work, even if source cleanup fails.
+      if (publishedResult) {
+        try { await new OfficeAppAdoptionRepository(this.generations.database).recover(input.scope.tenantId, options.signal); }
+        catch (error) { operationalLog("error", "office_derivation_failed", errorTelemetry(error)); }
+      }
+    }
   }
 
   async preserveUnseen(lease: GenerationLease, source: UserSourceKind, fence: () => void): Promise<number> {
@@ -202,13 +209,10 @@ export class UserSourceStages {
   }
 
   async page(lease: GenerationLease, key: string, url: string, wireRows: number, reportedCount?: number) {
-    if (reportedCount !== undefined && (!Number.isSafeInteger(reportedCount) || reportedCount < 0 || reportedCount > 100_000)) {
+    if (reportedCount !== undefined && (!Number.isSafeInteger(reportedCount) || reportedCount < 0)) {
       await this.generations.abort(lease);
       throw new AppError(502, "provider_count_mismatch", "Invalid provider count.");
     }
-    const counts = await this.counts(lease);
-    if (counts.pages >= 10000) throw dataLimitError("provider_page_limit", 10000, counts.pages + 1);
-    if (counts.wireRows + wireRows > 5_000_000) throw dataLimitError("provider_wire_rows", 5_000_000, counts.wireRows + wireRows);
     await this.generations.observePage(lease, url, wireRows);
     await this.guarded(lease, async client => {
       const query = (await client.query<{ kind: UserSourceQueryKind; complete: boolean; expected_count: number | null; page_count: number }>(
@@ -217,10 +221,6 @@ export class UserSourceStages {
         || query.page_count === 0 && ["discovery", "identity"].includes(query.kind) && reportedCount === undefined) {
         throw new AppError(502, "provider_count_mismatch", "Inconsistent or missing provider count.");
       }
-      const total = (await client.query(`SELECT coalesce(sum(page_count),0)::int AS count
-        FROM user_source_queries WHERE generation_id=$1 AND kind=$2`, [lease.id, query.kind])).rows[0].count;
-      const limit = queryPageLimits[query.kind];
-      if (total >= limit) throw dataLimitError("provider_page_limit", limit, total + 1);
       await client.query(`UPDATE user_source_queries SET page_count=page_count+1,wire_count=wire_count+$3,
         expected_count=coalesce(expected_count,$4) WHERE generation_id=$1 AND query_key=$2`,
       [lease.id, key, wireRows, reportedCount ?? null]);
@@ -264,8 +264,6 @@ export class UserSourceStages {
         ON CONFLICT DO NOTHING`, [lease.id, lease.scopeId, lease.tenantId, batch.json]);
       await this.charge(client, lease, batch.bytes);
       await this.members(client, lease, key, rows.map(row => row.skuId));
-      const count = (await client.query("SELECT count(*)::int AS n FROM user_source_skus WHERE generation_id=$1", [lease.id])).rows[0].n;
-      if (count > 1000) throw dataLimitError("provider_sku_limit", 1000, count);
     });
   }
 
@@ -290,8 +288,6 @@ export class UserSourceStages {
         SELECT $1,$2,$3,value FROM jsonb_array_elements_text($4::jsonb) ON CONFLICT DO NOTHING`,
       [lease.id, lease.scopeId, lease.tenantId, batch.json]);
       await this.charge(client, lease, batch.bytes);
-      const n = (await client.query("SELECT count(*)::int AS n FROM user_source_identity_inputs WHERE generation_id=$1", [lease.id])).rows[0].n;
-      if (n > 100_000) throw dataLimitError("provider_identity_limit", 100_000, n);
     });
   }
 
@@ -399,16 +395,12 @@ export class UserSourceStages {
 
   assertNewPage(lease: GenerationLease, key: string, url: string) {
     return this.guarded(lease, async client => {
-      const row = (await client.query<{ pages: number; kind: UserSourceQueryKind; complete: boolean; kind_pages: number; repeated: boolean }>(`
-        SELECT g.page_count AS pages,q.kind,q.complete,
-          (SELECT coalesce(sum(page_count),0)::int FROM user_source_queries WHERE generation_id=g.id AND kind=q.kind) AS kind_pages,
+      const row = (await client.query<{ complete: boolean; repeated: boolean }>(`
+        SELECT q.complete,
           EXISTS(SELECT 1 FROM data_generation_pages WHERE generation_id=g.id AND token_hash=$3) AS repeated
         FROM data_generations g JOIN user_source_queries q ON q.generation_id=g.id
         WHERE g.id=$1 AND q.query_key=$2`, [lease.id, key, digest(url)])).rows[0];
       if (!row || row.complete || row.repeated) throw new AppError(502, "provider_schema", "Invalid or repeated provider continuation.");
-      if (row.pages >= 10000) throw dataLimitError("provider_page_limit", 10000, row.pages + 1);
-      const limit = queryPageLimits[row.kind];
-      if (row.kind_pages >= limit) throw dataLimitError("provider_page_limit", limit, row.kind_pages + 1);
     });
   }
 

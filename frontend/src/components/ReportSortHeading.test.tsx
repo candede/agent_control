@@ -1,6 +1,7 @@
 import { act, render, renderHook, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { StrictMode, useState, type ComponentProps, type ReactElement } from "react";
+import { StrictMode, useEffect, useState, type ComponentProps, type ReactElement } from "react";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReportPage, ReportQuery, ReportRelationship } from "../../../backend/src/types/officialReportData";
 import { ApiError } from "../api/client";
@@ -11,6 +12,7 @@ import { CopilotUsersView } from "./CopilotUsersView";
 import { ReportedUserActivity } from "./ReportedUserActivity";
 import { ReportedUserAgents, type UserRelationshipQuery } from "./ReportedUserAgents";
 import { ReportSortHeading } from "./ReportSortHeading";
+import { createSavedQueryClient } from "../savedQueries";
 
 vi.mock("../api/reportData", async original => ({
   ...await original<typeof import("../api/reportData")>(), readReportPage: vi.fn(), readReportFacet: vi.fn(),
@@ -94,9 +96,11 @@ function savedPage(kind: Kind, index: number): ReportPage<unknown> {
 }
 function Consumer({ kind, revision = 0 }: { kind: Kind; revision?: number }) {
   const [query, setQuery] = useState<UserRelationshipQuery>({ search: "", showAll: false, sort: "responses", order: "desc" });
-  return kind === "licensed" ? <CopilotUsersView dataRevision={revision} />
+  const [client] = useState(createSavedQueryClient);
+  useEffect(() => () => client.clear(), [client]);
+  return <QueryClientProvider client={client}>{kind === "licensed" ? <CopilotUsersView dataRevision={revision} />
     : kind === "reported" ? <ReportedUserActivity route={{ view: "activity", search: "", page: 0 }} onRouteChange={vi.fn()} dataRevision={revision} />
-      : <ReportedUserAgents path={relationshipPath} selectionId={selectionId} query={query} onQueryChange={setQuery} />;
+      : <ReportedUserAgents path={relationshipPath} selectionId={selectionId} query={query} onQueryChange={setQuery} />}</QueryClientProvider>;
 }
 function rowLabel(kind: Kind, index: number) { return `${kind === "relationships" ? "Agent" : "User"} ${index}`; }
 

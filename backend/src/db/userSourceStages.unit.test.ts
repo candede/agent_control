@@ -2,6 +2,7 @@ import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActivityRecord, GenerationLease } from "./dataGenerations.js";
 import { UserSourceStages } from "./userSourceStages.js";
+import { OfficeAppAdoptionRepository } from "./officeAppAdoption.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -58,6 +59,89 @@ function fixture(previous: ActivityRecord[], incoming: ActivityRecord[] = []) {
 function result(rows: pg.QueryResultRow[]): pg.QueryResult {
   return { rows, rowCount: rows.length, command: "SELECT", oid: 0, fields: [] };
 }
+
+describe("automatic Office preparation after source publication", () => {
+  it.each((["directory", "app_activity"] as const).flatMap(source =>
+    (["none", "publish", "execute"] as const).flatMap(cleanupAt =>
+      [false, true].map(derivationFails => ({ source, cleanupAt, derivationFails }))),
+  ))("recovers Office after $source commits, cleanupAt=$cleanupAt, derivationFails=$derivationFails",
+    async ({ source, cleanupAt, derivationFails }) => {
+      const database = new pg.Pool({ max: 4 });
+      vi.spyOn(database, "connect").mockRejectedValue(new Error("Unit tests must not connect to a database."));
+      vi.spyOn(database, "query").mockRejectedValue(new Error("Unit tests must not query a database."));
+      const client = Object.assign(new pg.Client(), { release: vi.fn() });
+      const query = vi.spyOn(client, "query").mockResolvedValue(result([]));
+      const stages = new UserSourceStages(database);
+      const counts = { rows: 0, children: 0, batches: 0, pages: 0, wireRows: 0, bytes: 0 };
+      vi.spyOn(stages.generations.connections, "run").mockImplementation(async work => work(client));
+      vi.spyOn(stages.generations, "fence").mockResolvedValue({ state: "staging" });
+      vi.spyOn(stages.generations, "execute").mockImplementation(async (_input, work) => {
+        const published = await work(lease, new AbortController().signal);
+        if (cleanupAt === "execute") throw new Error("Synthetic execution cleanup failure.");
+        return published;
+      });
+      vi.spyOn(stages, "preserveUnseen").mockResolvedValue(0);
+      vi.spyOn(stages, "validate").mockResolvedValue(undefined);
+      vi.spyOn(stages, "counts").mockResolvedValue(counts);
+      const publish = vi.spyOn(stages.generations, "publish").mockImplementation(async (_lease, options) => {
+        await options?.completeJob?.(client, { jobId: "source-job", runId: "source-run", rows: 0, bytes: 0 });
+        options?.onCommitted?.("2");
+        if (cleanupAt === "publish") throw new Error("Synthetic publication cleanup failure.");
+        return "2";
+      });
+      const recover = vi.spyOn(OfficeAppAdoptionRepository.prototype, "recover").mockResolvedValue(undefined);
+      if (derivationFails) recover.mockRejectedValue(new Error("Synthetic Office derivation failure."));
+      const completeJob = vi.fn();
+      const now = new Date();
+      const published = await stages.execute({
+        scope: { tenantId: lease.tenantId, kind: "tenant", principalId: null, tokenMode: "tenant", source, selector: "complete" },
+        actorPrincipalId: "signed-in-viewer", schemaVersion: 1, jobKind: "data_sync", jobId: "source-job", runId: "source-run",
+        sessionEpoch: "0", observedAt: now, expiresAt: new Date(now.getTime() + 60_000),
+        deadlineAt: new Date(now.getTime() + 30_000), reserveBytes: 1024,
+      }, vi.fn(async () => {}), { completeJob, beforePublish: vi.fn(async () => {}) });
+
+      expect(published).toEqual({ generationId: lease.id, scopeId: lease.scopeId, revision: "2", ...counts });
+      expect(completeJob).toHaveBeenCalledExactlyOnceWith(client,
+        { jobId: "source-job", runId: "source-run", rows: 0, bytes: 0, source, generationId: lease.id });
+      expect(recover).toHaveBeenCalledExactlyOnceWith(lease.tenantId, undefined);
+      expect(recover.mock.invocationCallOrder[0]).toBeGreaterThan(publish.mock.invocationCallOrder[0]);
+      expect(query.mock.calls.some(([statement]) => typeof statement === "string"
+        && statement.includes("SET status=$2,error_code=$3"))).toBe(false);
+    },
+  );
+
+  it.each(["work", "publish"] as const)("does not recover Office after a pre-commit %s failure", async boundary => {
+    const database = new pg.Pool({ max: 4 });
+    vi.spyOn(database, "connect").mockRejectedValue(new Error("Unit tests must not connect to a database."));
+    vi.spyOn(database, "query").mockRejectedValue(new Error("Unit tests must not query a database."));
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(client, "query").mockResolvedValue(result([]));
+    const stages = new UserSourceStages(database);
+    vi.spyOn(stages.generations.connections, "run").mockImplementation(async work => work(client));
+    vi.spyOn(stages.generations, "fence").mockResolvedValue({ state: "staging" });
+    vi.spyOn(stages.generations, "execute").mockImplementation(async (_input, work) =>
+      work(lease, new AbortController().signal));
+    vi.spyOn(stages, "preserveUnseen").mockResolvedValue(0);
+    vi.spyOn(stages, "validate").mockResolvedValue(undefined);
+    vi.spyOn(stages, "counts").mockResolvedValue({ rows: 0, children: 0, batches: 0, pages: 0, wireRows: 0, bytes: 0 });
+    const failure = new Error("Synthetic pre-commit failure.");
+    vi.spyOn(stages.generations, "publish").mockRejectedValue(failure);
+    const recover = vi.spyOn(OfficeAppAdoptionRepository.prototype, "recover").mockResolvedValue(undefined);
+    const now = new Date();
+
+    await expect(stages.execute({
+      scope: { tenantId: lease.tenantId, kind: "tenant", principalId: null, tokenMode: "tenant", source: "directory", selector: "complete" },
+      actorPrincipalId: "signed-in-viewer", schemaVersion: 1, jobKind: "data_sync", jobId: "source-job", runId: "source-run",
+      sessionEpoch: "0", observedAt: now, expiresAt: new Date(now.getTime() + 60_000),
+      deadlineAt: new Date(now.getTime() + 30_000), reserveBytes: 1024,
+    }, async () => { if (boundary === "work") throw failure; },
+    { completeJob: vi.fn(), beforePublish: vi.fn(async () => {}) })).rejects.toBe(failure);
+
+    expect(recover).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenCalledWith(expect.stringContaining("SET status=$2,error_code=$3"),
+      [lease.id, "failed", "user_source_failed", expect.any(String)]);
+  });
+});
 
 describe("unseen app activity retention", () => {
   it.each([

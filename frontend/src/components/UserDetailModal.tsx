@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { X } from "lucide-react";
 import type { CombinedUser, ReportUser } from "../../../backend/src/types/officialReportData";
 import type { OfficialReportDetail } from "../../../backend/src/types/officialReportApi";
+import { officeApps } from "../../../backend/src/types/officeAppAdoption";
 import type { ResponsibilityPerson } from "../../../backend/src/types/agentResponsibility";
 import { isGraphGuid } from "../../../backend/src/types/copilotUsage";
 import { readReportDetail } from "../api/reportData";
@@ -24,11 +25,7 @@ import { UserAgentResponsibility } from "./UserAgentResponsibility";
 
 const tabs = [["overview", "Overview"], ["usage", "Usage & agents"], ["licenses", "Licenses"], ["responsibility", "Responsibility"]] as const;
 const defaultRelationshipQuery: UserRelationshipQuery = { search: "", showAll: false, sort: "responses", order: "desc" };
-const appLabels = {
-  copilotChatLastActivityDate: "Copilot Chat", microsoftTeamsCopilotLastActivityDate: "Teams",
-  wordCopilotLastActivityDate: "Word", excelCopilotLastActivityDate: "Excel", powerpointCopilotLastActivityDate: "PowerPoint",
-  outlookCopilotLastActivityDate: "Outlook", onenoteCopilotLastActivityDate: "OneNote", loopCopilotLastActivityDate: "Loop",
-} as const;
+const appLabels = [{ activityField: "copilotChatLastActivityDate", label: "Copilot Chat" }, ...officeApps] as const;
 type Props = { identity: string; selectionId?: string; reportSetId?: string; kind: "directory" | "report"; filters?: UserRelationshipFilters;
   investigationAgent?: { recordId: string; name: string };
   initialTab?: UserDetailTab;
@@ -228,7 +225,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
     const route: UsersRouteState = { view: "licenses", section: "adoption",
       company: directory?.directory.companyName?.trim() || null,
       ...(field === "Department" ? { department: value } : {}),
-      reportSetId: detail?.reports.setId ?? undefined, search: "", page: 0 };
+      reportSetId, search: "", page: 0 };
     return <a href={workbenchUrl("users", usersRouteSearch(route))} aria-label={`View adoption for ${field.toLowerCase()} ${value}`}
       onClick={event => {
         if (!onOpenAdoption || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -305,7 +302,7 @@ export function UserDetailModal({ identity: requestedIdentity, selectionId: requ
           <section className="user-detail-card" aria-label="User Office app activity"><h3>Copilot in Office apps</h3>{directory?.appActivity ? <>
             <p>Last reported activity by app. {detail.sources.app_activity.period ? `${detail.sources.app_activity.period} report` : "Report"} refreshed {usageDate(directory.appActivity.reportRefreshDate)}.</p>
             {detail.sources.app_activity.state === "stale" ? <p className="copilot-users-notice">This Office app report is out of date.</p> : null}
-            <ul className="copilot-app-activity">{(Object.keys(appLabels) as Array<keyof typeof appLabels>).map(key => <li key={key}><strong>{appLabels[key]}</strong>
+            <ul className="copilot-app-activity">{appLabels.map(({ activityField: key, label }) => <li key={key}><strong>{label}</strong>
               <small>{directory.appActivity?.[key] ? usageDate(directory.appActivity[key]) : "No date reported"}</small></li>)}</ul>
           </> : directoryLoading ? null : <p>Office app activity is unavailable for this user. Check Users sync and reporting permissions.</p>}</section></> : null}
         {panel === "licenses" ? directory ? <CopilotServiceDetails path={`${path}/service-plans`} selectionId={detail.selection.id}

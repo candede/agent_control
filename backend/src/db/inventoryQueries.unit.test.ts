@@ -67,15 +67,31 @@ function fixture(beforeRead?: () => void) {
 }
 
 describe("selected inventory request snapshots", () => {
-  it.each([{ batches: [0] }, { batches: [4, 1, 0] }])(
-    "expires report history batches $batches before capturing and persisting the explicit report ID as inventory query context", async ({ batches }) => {
-    const setId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+  it.each([
+    { batches: [0], setId: undefined },
+    { batches: [0], setId: "abcdefab-1234-4567-89ab-abcdefabcdef" },
+    { batches: [4, 1, 0], setId: "abcdefab-1234-4567-89ab-abcdefabcdef" },
+  ])("reconciles the report head and expires history batches $batches before capturing report $setId", async ({ batches, setId }) => {
     const { inventory, readQuery, client, data } = fixture();
-    data.report = { ...data.report, setId, activeSetId: "11111111-1111-4111-8111-111111111111" };
+    if (setId) data.report = { ...data.report, setId, activeSetId: "11111111-1111-4111-8111-111111111111" };
+    const criteria = setId ? { setId } : {};
     vi.spyOn(inventory.reports.sources, "ensureScope").mockResolvedValue("source-scope");
     vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("history-scope");
+    let reconciled = false;
+    const reconcile = vi.spyOn(inventory.reports.history, "reconcileHead").mockResolvedValue({
+      active_set_id: data.report.activeSetId, revision: "1",
+    });
+    vi.spyOn(inventory.reports.history.connections, "run").mockImplementation(async work => {
+      const value = await work(client);
+      reconciled = true;
+      return value;
+    });
     const expire = vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
-    for (const count of batches) expire.mockResolvedValueOnce(count);
+    for (const count of batches) expire.mockImplementationOnce(async tenantId => {
+      expect(tenantId).toBe(identity.tenantId);
+      expect(reconciled).toBe(true);
+      return count;
+    });
     vi.spyOn(inventory.reports.history, "root").mockResolvedValue({
       kind: "tenant_history", scopeId: "history-scope", revision: "1", expiresAt: new Date(at.getTime() + 600_000),
     });
@@ -89,7 +105,7 @@ describe("selected inventory request snapshots", () => {
     });
     vi.spyOn(inventory.selections, "captureWith").mockImplementation(async (who, endpoint, filters, prepare) => {
       expect(expire.mock.calls).toEqual(batches.map(() => [identity.tenantId]));
-      expect(filters.values).toEqual({ inventoryQuery: digest(JSON.stringify({ setId })) });
+      expect(filters.values).toEqual({ inventoryQuery: digest(JSON.stringify(criteria)) });
       const prepared = await prepare(client, at);
       const selection = { id: "selection", revision: "1", endpoint, queryHash: "a".repeat(64),
         evaluatedAt: at, validatedAt: at, expiresAt: new Date(at.getTime() + 600_000) };
@@ -97,11 +113,28 @@ describe("selected inventory request snapshots", () => {
       expect(who).toEqual(identity);
       return selection;
     });
-    await inventory.capture(identity, "scope", { setId: setId.toUpperCase() });
+    await inventory.capture(identity, "scope", setId ? { setId: setId.toUpperCase() } : {});
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(client, identity.tenantId);
     expect(report).toHaveBeenCalledWith(client, identity, at, setId);
     const insert = readQuery.mock.calls.find(([sql]) => sql.startsWith("INSERT INTO inventory_read_contexts"))!;
-    expect(JSON.parse(String(insert[1]![2])).report).toMatchObject({ setId, activeSetId: data.report.activeSetId });
-    expect(JSON.parse(String(insert[1]![5]))).toEqual({ setId });
+    expect(JSON.parse(String(insert[1]![2])).report).toMatchObject({ setId: setId ?? null, activeSetId: data.report.activeSetId });
+    expect(JSON.parse(String(insert[1]![5]))).toEqual(criteria);
+  });
+
+  it("propagates report-head reconciliation failure without expiring history or capturing a selection", async () => {
+    const { inventory, client } = fixture();
+    const failure = new Error("Synthetic report-head reconciliation failure.");
+    vi.spyOn(inventory.reports.sources, "ensureScope").mockResolvedValue("source-scope");
+    vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("history-scope");
+    vi.spyOn(inventory.reports.history.connections, "run").mockImplementation(work => work(client));
+    const reconcile = vi.spyOn(inventory.reports.history, "reconcileHead").mockRejectedValue(failure);
+    const expire = vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
+    const capture = vi.spyOn(inventory.selections, "captureWith");
+
+    await expect(inventory.capture(identity, "scope")).rejects.toBe(failure);
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(client, identity.tenantId);
+    expect(expire).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
   });
 
   it.each(["exact", "usage"] as const)("retains the bounded %s IDs while acquiring the selection", async method => {

@@ -3,8 +3,8 @@ import { mockJobs } from "./jobsFixtures";
 
 test.afterEach(async ({ page }) => page.unrouteAll({ behavior: "wait" }));
 
-for (const path of ["/jobs", "/jobs/?source=package-controls"]) {
-  test(`retired ${path} opens Sync history without a duplicate dashboard or recovery actions`, async ({ page }) => {
+for (const path of ["/sync", "/sync?reports=manage"]) {
+  test(`current ${path} opens Sync history without a duplicate dashboard or recovery actions`, async ({ page }) => {
     const { unexpected, commands } = await mockJobs(page, () => ({
       value: [{
         id: "retained-sync", source: "data-sync", label: "Previous sync", target: "3 sources",
@@ -14,7 +14,11 @@ for (const path of ["/jobs", "/jobs/?source=package-controls"]) {
       unavailableSources: [], polledAt: "2026-09-20T13:05:00.000Z", requestId: "synthetic-history",
     }));
     await page.goto(path);
-    await expect(page).toHaveURL("/sync");
+    await expect(page).toHaveURL(path);
+    if (path.includes("reports=manage")) {
+      await page.locator("dialog.official-usage-modal").getByRole("button", { name: "Close reports", exact: true }).click();
+      await expect(page).toHaveURL("/sync");
+    }
     await expect(page.getByRole("table", { name: "Sync history" })).toContainText("Previous sync");
     await expect(page.getByRole("button", { name: "Jobs", exact: true })).toHaveCount(0);
     await expect(page.getByRole("button", { name: /retry incomplete/i })).toHaveCount(0);

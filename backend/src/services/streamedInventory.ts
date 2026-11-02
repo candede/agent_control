@@ -129,12 +129,12 @@ export class StreamedInventory {
 
   graphCatalog(input: BeginGeneration, token: string, options: Parameters<InventoryGenerations["execute"]>[3] & PackageReadOptions) {
     return this.stages.execute(input, { domain: "packages", mode: "baseline", channel: "catalog" }, async (lease, signal) => {
-      for await (const page of this.graph.catalogPages(token, { ...this.packageReadOptions(lease, options, signal, input.deadlineAt), visit: value => this.stages.visit(lease, value) })) {
-        for (let offset = 0; offset < page.records.length; offset += 100) {
-          await this.packageObservations(lease, page.records.slice(offset, offset + 100), "catalog");
-        }
-        await this.stages.acceptPage(lease, page, page.records.length);
-      }
+      await this.graph.collectCatalog(token, {
+        ...this.packageReadOptions(lease, options, signal, input.deadlineAt),
+        visit: value => this.stages.visit(lease, value),
+        onRecords: records => this.packageObservations(lease, records, "catalog"),
+        onPage: page => this.stages.acceptPage(lease, page, page.rawCount),
+      });
     }, options);
   }
 

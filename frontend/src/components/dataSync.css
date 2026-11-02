@@ -468,8 +468,8 @@
   .data-sync-source { grid-template-columns: minmax(0, 1fr); }
   .data-sync-source dl { gap: 12px; }
   .data-sync-attempt-count,
-  .data-sync-source-note > p[role="status"] { min-height: 3em; }
-  .data-sync-source dl > div:nth-child(2) > dd:first-of-type { min-height: 3em; line-height: 1.5; }
+  .data-sync-source-note > p[role="status"] { min-height: 4.5em; }
+  .data-sync-source dl > div:nth-child(2) > dd:first-of-type { min-height: 4.5em; line-height: 1.5; }
   .data-sync-workspace-footer { display: grid; }
   .data-sync-progress-heading strong { font-size: 16px; }
   .data-sync-live-source { grid-template-columns: minmax(0, 1fr) 95px; gap: 8px; padding: 12px 8px; }
@@ -480,6 +480,10 @@
   .sync-inventory-summary > svg { display: none; }
   .sync-inventory-summary > div { flex-basis: 100%; }
   .sync-inventory-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .sync-history-controls { width: 100%; justify-content: flex-start; }
+  .sync-history-controls > button { white-space: normal; }
+  .sync-history-filter { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; white-space: normal; }
+  .sync-history-filter select { width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

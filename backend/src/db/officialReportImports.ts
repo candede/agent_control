@@ -10,7 +10,7 @@ import { dataConnections } from "./dataConnections.js";
 import { retainDeletedReportRows, retireUnreferencedReportVersions } from "./dataRetention.js";
 import { digest, encodeBatch } from "./dataBounds.js";
 import { officialReportCount as exactCount } from "./officialReportBounds.js";
-import { generationHeartbeat } from "./dataGenerations.js";
+import { activeGenerationWritersSql, generationHeartbeat } from "./dataGenerations.js";
 import { OfficialReportHistory } from "./officialReportHistory.js";
 import { streamOfficialReport, officialReportLimits, type OfficialRow, type StreamedOfficialReport } from "../services/officialReportStream.js";
 import { reportBase } from "../services/officialReportFields.js";
@@ -142,8 +142,8 @@ export class OfficialReportImports {
         count(DISTINCT tenant_id||':'||CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END) FILTER(WHERE tenant_id=$1)::int AS tenant
         FROM official_usage_ingestions WHERE state IN ('streaming','validating','accepting') AND lease_until>clock_timestamp()`,
       [identity.tenantId])).rows[0];
-      const generations = (await client.query(`SELECT count(*)::int AS n,count(*) FILTER(WHERE tenant_id=$1)::int AS tenant
-        FROM data_generations WHERE state IN ('staging','validating') AND lease_until>clock_timestamp()`, [identity.tenantId])).rows[0];
+      const generations = (await client.query(`SELECT count(DISTINCT writer)::int AS n,count(DISTINCT writer) FILTER(WHERE tenant_id=$1)::int AS tenant
+        FROM (${activeGenerationWritersSql}) writers`, [identity.tenantId])).rows[0];
       if (counts.n + generations.n >= 4 || counts.tenant + generations.tenant >= 2) throw new AppError(429, "upload_admission_full", "Retry after an active stream finishes.");
       const drafts = (await client.query(`SELECT count(*)::int AS tenant,count(*) FILTER(WHERE principal_id=$2)::int AS actor
         FROM official_usage_ingestions WHERE tenant_id=$1 AND state NOT IN ('accepted','cancelled','failed') AND expires_at>clock_timestamp()`,
@@ -317,15 +317,32 @@ export class OfficialReportImports {
         sourceFreshness: base.sourceFreshness, rowCount: report.rowCount, wireBytes: report.wireBytes,
         expiresAt: (upload.expires_at as Date).toISOString(), examples: report.examples, warnings: [] as string[], reconciliation };
     }, false, signal);
-    for (let offset = 0; offset < report.rowCount; offset += 50) {
-      await this.connections.run(async client => {
+    for (let offset = 0; offset < report.rowCount;) {
+      offset = await this.connections.run(async client => {
         await this.fence(client, lease);
+        const end = await this.copyEnd(client, lease.id, offset, report.rowCount);
         await client.query(`INSERT INTO official_usage_staged_rows(staging_id,tenant_id,actor_principal_id,ordinal,row_data)
           SELECT $1,tenant_id,principal_id,ordinal,row_data FROM official_usage_ingestion_rows
-          WHERE ingestion_id=$2 AND ordinal>=$3 AND ordinal<$3+50 ORDER BY ordinal`, [id, lease.id, offset]);
+          WHERE ingestion_id=$2 AND ordinal>=$3 AND ordinal<$4 ORDER BY ordinal`, [id, lease.id, offset, end]);
+        return end;
       }, false, signal);
     }
     return preview;
+  }
+
+  private async copyEnd(client: pg.PoolClient, ingestionId: string, offset: number, rowCount: number): Promise<number> {
+    const batch = (await client.query<{ end: number | null; rows: number }>(`WITH candidates AS MATERIALIZED (
+      SELECT ordinal,octet_length(row_data::text) AS bytes FROM official_usage_ingestion_rows
+      WHERE ingestion_id=$1 AND ordinal>=$2 AND ordinal<$2+$3 ORDER BY ordinal
+    ), bounded AS (
+      SELECT ordinal,sum(bytes) OVER(ORDER BY ordinal) AS bytes FROM candidates
+    ) SELECT max(ordinal)+1 AS end,count(*)::int AS rows FROM bounded WHERE bytes<=$4`,
+    [ingestionId, offset, officialReportLimits.batchRows, officialReportLimits.batchBytes])).rows[0];
+    if (!batch || !Number.isInteger(batch.end) || batch.end === null || batch.end <= offset
+      || batch.end > Math.min(rowCount, offset + officialReportLimits.batchRows) || batch.rows !== batch.end - offset) {
+      throw new Error("official_report_count_mismatch");
+    }
+    return batch.end;
   }
 
   preview(identity: SelectionIdentity, stagingId: string) {
@@ -512,7 +529,7 @@ export class OfficialReportImports {
         if (!stages.length) {
           const admission = (await client.query(`SELECT count(*)::int AS active,count(*) FILTER(WHERE tenant_id=$1)::int AS tenant
             FROM (
-              SELECT tenant_id,'generation:'||id::text AS operation FROM data_generations WHERE state IN ('staging','validating') AND lease_until>clock_timestamp()
+              SELECT DISTINCT tenant_id,writer AS operation FROM (${activeGenerationWritersSql}) writers
               UNION ALL SELECT DISTINCT tenant_id,CASE WHEN state='accepting' THEN 'bundle:'||bundle_id::text ELSE 'file:'||id::text END
                 FROM official_usage_ingestions WHERE state IN ('streaming','validating','accepting') AND lease_until>clock_timestamp()
                   AND NOT(state='accepting' AND tenant_id=$1 AND bundle_id=$2)
@@ -560,13 +577,6 @@ export class OfficialReportImports {
           return { receipt: result, stages: [], cleanup: stages.map(stage => stage.ingestion_id as string) };
         }
       }
-      const counts = (await client.query(`SELECT
-        (SELECT count(*) FROM official_usage_sets WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS sets,
-        (SELECT count(*) FROM official_usage_versions WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS versions,
-        (SELECT COALESCE(sum(row_count),0) FROM official_usage_versions WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS rows`,
-      [identity.tenantId])).rows[0];
-      if (exactCount(counts.sets) + (set ? 0 : 1) > 5000 || exactCount(counts.versions) + stages.length > 15000
-        || exactCount(counts.rows) + stages.reduce((sum, stage) => sum + stage.row_count, 0) > 25000000) throw new AppError(429, "official_usage_history_quota", "Retained report quota exceeded.");
       if (!set) {
         set = (await client.query(`INSERT INTO official_usage_sets(id,tenant_id,bundle_id,actor_principal_id,
           reporting_start,reporting_end,period_provenance,supersedes_set_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
@@ -598,6 +608,13 @@ export class OfficialReportImports {
           JSON.stringify(stage.warnings), JSON.stringify(stage.reconciliation), identity.principalId, stage.correction_of_set_id]);
         await client.query("UPDATE official_usage_ingestions SET version_id=$2 WHERE id=$1", [stage.ingestion_id, stage.version]);
       }
+      const counts = (await client.query(`SELECT
+        (SELECT count(*) FROM official_usage_sets WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS sets,
+        (SELECT count(*) FROM official_usage_versions WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS versions,
+        (SELECT COALESCE(sum(row_count),0) FROM official_usage_versions WHERE tenant_id=$1 AND deleted_at IS NULL)::text AS rows`,
+      [identity.tenantId])).rows[0];
+      if (exactCount(counts.sets) > 5000 || exactCount(counts.versions) > 15000
+        || exactCount(counts.rows) > 25000000) throw new AppError(429, "official_usage_history_quota", "Retained report quota exceeded.");
       return { receipt: null, stages, setId: set.id as string, correctionOf: set.supersedes_set_id as string | null };
     }, false, parent);
     if (prepared.receipt) {
@@ -615,9 +632,10 @@ export class OfficialReportImports {
     try {
       for (const [index, stage] of prepared.stages.entries()) {
         if (!stage.copy) continue;
-        for (let offset = 0; offset < stage.row_count; offset += 50) {
-          await this.connections.run(async client => {
+        for (let offset = 0; offset < stage.row_count;) {
+          offset = await this.connections.run(async client => {
             await this.fence(client, leases[index]);
+            const end = await this.copyEnd(client, leases[index].id, offset, stage.row_count);
             await client.query(`INSERT INTO official_usage_row_facts(tenant_id,kind,payload_hash,row_data,first_observed_at,
               identity_key,agent_id,username,agent_name,display_name,creator_type,responses,agents_used,licensed_users,unlicensed_users,last_activity)
               SELECT tenant_id,$3,payload_hash,row_data,clock_timestamp(),
@@ -626,11 +644,12 @@ export class OfficialReportImports {
                 COALESCE(row_data->>'responsesSentToUsers',row_data->>'agentResponsesReceived')::bigint,
                 (row_data->>'numberOfAgentsUsed')::bigint,(row_data->>'activeUsersLicensed')::bigint,
                 (row_data->>'activeUsersUnlicensed')::bigint,(row_data->>'lastActivityDateUtc')::date
-              FROM official_usage_ingestion_rows WHERE ingestion_id=$1 AND ordinal>=$2 AND ordinal<$2+50
-              ON CONFLICT(tenant_id,kind,payload_hash) DO NOTHING`, [leases[index].id, offset, stage.kind]);
+              FROM official_usage_ingestion_rows WHERE ingestion_id=$1 AND ordinal>=$2 AND ordinal<$4
+              ON CONFLICT(tenant_id,kind,payload_hash) DO NOTHING`, [leases[index].id, offset, stage.kind, end]);
             await client.query(`INSERT INTO official_usage_version_rows(version_id,tenant_id,kind,ordinal,payload_hash)
-              SELECT $1,tenant_id,$3,ordinal,payload_hash FROM official_usage_ingestion_rows WHERE ingestion_id=$2 AND ordinal>=$4 AND ordinal<$4+50
-              ON CONFLICT(version_id,ordinal) DO NOTHING`, [stage.version, leases[index].id, stage.kind, offset]);
+              SELECT $1,tenant_id,$3,ordinal,payload_hash FROM official_usage_ingestion_rows WHERE ingestion_id=$2 AND ordinal>=$4 AND ordinal<$5
+              ON CONFLICT(version_id,ordinal) DO NOTHING`, [stage.version, leases[index].id, stage.kind, offset, end]);
+            return end;
           }, false, heartbeat.signal);
         }
       }

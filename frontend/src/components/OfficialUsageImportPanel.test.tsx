@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, useState } from "react";
+import { createRef, useLayoutEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OfficialReportAccepted, OfficialReportPreview } from "../../../backend/src/types/officialReportApi";
 import { ApiError, type SessionUser } from "../api/client";
@@ -208,6 +208,26 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.reportPages.agents).toHaveBeenCalledOnce();
     expect(api.confirmReportDeletion).not.toHaveBeenCalled();
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
+  });
+  it("focuses the saved summary in its publication commit before the parent observes refreshed content", async () => {
+    const publicationFocus = vi.fn();
+    function Host() {
+      const [revision, setRevision] = useState(0);
+      useLayoutEffect(() => {
+        if (revision) publicationFocus(screen.getByRole("heading", { name: "Reports imported" }), document.activeElement);
+      }, [revision]);
+      return <OfficialUsageImportPanel {...callbacks} onChanged={() => {
+        callbacks.onChanged();
+        setRevision(value => value + 1);
+      }} />;
+    }
+    render(<Host />);
+    await choose(); await accept(); await imported();
+    const heading = screen.getByRole("heading", { name: "Reports imported" });
+    expect(publicationFocus).toHaveBeenCalledExactlyOnceWith(heading, heading);
+    expect(callbacks.onChanged).toHaveBeenCalledOnce();
+    expect(api.acceptReportBundle).toHaveBeenCalledOnce();
+    expect(api.reportPages.agents).toHaveBeenCalledOnce();
   });
   it("keeps validated companions and shows only missing report kinds without automatic publication", async () => {
     render(<OfficialUsageImportPanel {...callbacks} />);
@@ -998,19 +1018,21 @@ describe("streamed complete-set import confirmation", () => {
     expect(api.acceptReportBundle).toHaveBeenCalledOnce();
     expect(api.stageReport).toHaveBeenCalledTimes(3);
   });
-  it("invalidates saved views after acceptance without waiting for readback or repeating invalidation on retries", async () => {
+  it("defers refresh work until exact readback succeeds without repeating invalidation on retries", async () => {
     const readback = deferred<Awaited<ReturnType<typeof api.reportPages.agents>>>();
     render(<OfficialUsageImportPanel {...callbacks} />);
     await choose();
     vi.mocked(api.reportPages.agents).mockReturnValueOnce(readback.promise);
     await accept();
-    await waitFor(() => expect(callbacks.onChanged).toHaveBeenCalledOnce());
+    await waitFor(() => expect(api.reportPages.agents).toHaveBeenCalledOnce());
+    expect(callbacks.onChanged).not.toHaveBeenCalled();
     expect(screen.queryByRole("heading", { name: "Reports imported" })).not.toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("Verifying import...");
     expect(screen.queryByText("The imported report is saved, but another report is currently selected.")).not.toBeInTheDocument();
     expect(callbacks.onDone).not.toHaveBeenCalled();
     await act(async () => readback.reject(new ApiError(503, "data_read_conflict", "Readback unavailable")));
     expect(await screen.findByRole("alert")).toHaveTextContent("saved");
+    expect(callbacks.onChanged).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Verify saved import" }));
     await imported();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));

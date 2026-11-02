@@ -14,18 +14,22 @@ const observedIdentifierFields = ["ownerId", "agentIdentityId"] as const;
 const facetCollections = ["supportedHosts", "elementTypes", "categories"] as const;
 const accessCollections = packagePrincipalCollections;
 
-export function parsePackageObservationJson(text: string): unknown {
+export function packageObservationJsonContexts() {
   const packageFields = ["@odata.type", "id", "displayName", "isBlocked", ...descriptionFields, ...facetFields,
     ...timestampFields, ...identifierFields, ...observedIdentifierFields, ...packageProviderUsageFields, ...facetCollections, ...accessCollections, "elementDetails"];
   const arrays = { elementDetails: "group", allowedUsersAndGroups: "principal", acquireUsersAndGroups: "principal",
     sharedWithUsersAndGroups: "principal" };
-  return parseProviderContractJson(text, {
+  return {
     root: { fields: ["value", "@odata.count", "@odata.nextLink", ...packageFields], arrays: { ...arrays, value: "package" } },
     package: { fields: packageFields, arrays },
     group: { fields: ["elementType", "elements"], arrays: { elements: "element" } },
     element: { fields: ["id", "definition"] },
     principal: { fields: ["resourceId", "resourceType"] },
-  }, 7);
+  };
+}
+
+export function parsePackageObservationJson(text: string): unknown {
+  return parseProviderContractJson(text, packageObservationJsonContexts(), 7);
 }
 
 export function allowlistedPackage(input: unknown): CopilotPackageDetail {

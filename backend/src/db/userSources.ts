@@ -17,6 +17,11 @@ import type {
 
 const queryFields = ["search", "company", "department", "entitlement", "serviceState", "activity", "sort", "order"] as const;
 const endpoint = "/user-source-facts";
+export function paidEntitlementSql(alias: string) {
+  return `CASE WHEN ${alias}.service_state='unknown' THEN 'unknown'
+    WHEN ${alias}.service_state IN ('enabled','warning','partially_enabled') THEN 'paid_active'
+    WHEN ${alias}.plan_count=0 THEN 'no_paid' ELSE 'paid_inactive' END`;
+}
 const activityMatchCounts = new WeakMap<pg.Pool, Map<string, number>>();
 export type UserSourceMetadataSet = { directory: UserSourceMetadata; app_activity: UserSourceMetadata };
 export type UserSourceReadContext = {
@@ -44,19 +49,19 @@ export function userSourceFilter(query: UserSourceFilter): UserSourceFilter {
 
 // Composable relational source, not a final users/report cohort. 02A adds real
 // report facts inside the SAME selected-read client and evaluated-at snapshot.
-export function userSourceFactsSql(selected = false) {
-  const projection = `SELECT d.identity,d.upn,d.upn_key,d.display_name,d.sort_key,d.company,d.department,
+export function userSourceFactsSql(selected = false, office = false) {
+  const projection = `SELECT ${office ? `d.residual AS directory_residual,a.residual AS activity_residual,a.period AS activity_period,
+    EXISTS(SELECT 1 FROM app_activity_rows candidate WHERE candidate.generation_id=$2
+      AND candidate.upn_key IN (d.identity,d.upn_key)) AS activity_candidate_exists,` : ""} d.identity,d.upn,d.upn_key,d.display_name,d.sort_key,d.company,d.department,
     d.account_enabled,d.user_type,d.employee_type,d.service_state,d.plan_count,
-    CASE WHEN d.service_state='unknown' THEN 'unknown'
-      WHEN d.service_state IN ('enabled','warning','partially_enabled') THEN 'paid_active'
-      WHEN d.plan_count=0 THEN 'no_paid' ELSE 'paid_inactive' END AS entitlement,
+    ${paidEntitlementSql("d")} AS entitlement,
     a.identity AS activity_identity,a.report_refresh_date,a.last_activity_date,a.chat_date,a.teams_date,
     a.word_date,a.excel_date,a.powerpoint_date,a.outlook_date,a.onenote_date,a.loop_date,
     CASE WHEN a.report_refresh_date IS NULL OR a.last_activity_date IS NULL
       OR $3::timestamptz >= ((a.report_refresh_date::timestamp+interval '5 days') AT TIME ZONE 'UTC') THEN 'unknown'
       WHEN a.last_activity_date BETWEEN a.report_refresh_date-(CASE a.period WHEN 'D28' THEN 27 ELSE 29 END) AND a.report_refresh_date THEN 'active'
       ELSE 'inactive' END AS activity_state`;
-  if (selected) return `${projection} FROM selected_directory d
+  if (selected) return `${projection} FROM ${office ? "directory_user_rows" : "selected_directory"} d
     LEFT JOIN LATERAL (
       SELECT candidate.* FROM app_activity_rows candidate WHERE candidate.generation_id=$2
         AND candidate.upn_key IN (d.identity,d.upn_key)

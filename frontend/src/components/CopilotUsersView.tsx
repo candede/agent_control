@@ -18,6 +18,7 @@ import { UsageReportContext } from "./UsageReportContext";
 import { WorkspaceSkeleton } from "./WorkspaceSkeleton";
 import { useUserSourceFailure, useUserSourceProgress } from "../publicationContext";
 import { AdoptionView } from "./AdoptionView";
+import { OfficeAdoptionView } from "./OfficeAdoptionView";
 import "./copilotUsers.css";
 import "./reportedUsers.css";
 
@@ -48,35 +49,53 @@ function CopilotUsersSession({ route, onRouteChange, dataRevision = 0, agentInve
   const adoptionTrigger = useRef<HTMLButtonElement>(null);
   const [internal, setInternal] = useState<UsersRouteState>({ view: "licenses", search: "", page: 0 });
   const current = route ?? internal;
-  const change = (next: UsersRouteState) => { setInternal(next); onRouteChange?.(next, false); };
+  const change = (next: UsersRouteState, replace = false) => { setInternal(next); onRouteChange?.(next, replace); };
   const reportContext = <div className="agent-report-context">
     <span className="agent-context-label">Report context</span>
     {reportSelector}
   </div>;
+  const changeDomain = (adoption: "agents" | "office") => {
+    if ((current.adoption ?? "agents") === adoption) return;
+    change({
+      ...current, adoption: adoption === "office" ? "office" : undefined,
+      company: undefined, department: undefined, app: undefined, adoptionChamps: undefined, adoptionAgents: undefined,
+      detailId: undefined, detailTab: undefined, officeGroup: undefined, search: "", page: 0,
+    });
+  };
   return <section className="copilot-users" aria-label="Users and adoption" aria-busy={false}>
     <header className="copilot-users-header"><div><h2>Users</h2><p className="sr-only" id={cohortDescriptionId}>{current.section === "adoption"
       ? "People and all agents used, grouped by company and department."
       : current.view === "licenses"
       ? "Effective paid M365 Copilot licenses and adoption."
       : "Agent activity by users without paid Copilot."}</p></div>
+      <div className={`copilot-users-view-controls${current.section === "adoption" ? " copilot-users-adoption-controls" : ""}`}>
       <div className="agent-inventory-scopes" role="group" aria-label="Users view">
       <button type="button" className="agent-inventory-scope" aria-label="Users view" aria-pressed={current.section !== "adoption"}
         onClick={() => change({ ...current, section: undefined, search: "", page: 0 })}><span>Users</span></button>
       <button ref={adoptionTrigger} type="button" className="agent-inventory-scope" aria-pressed={current.section === "adoption"}
         onClick={() => change({ ...current, section: "adoption", search: "", page: 0 })}><span>Adoption</span></button>
       </div>
+      {current.section === "adoption" ? <div className="agent-inventory-scopes" role="group" aria-label="Adoption domain">
+        <button type="button" className="agent-inventory-scope" aria-pressed={current.adoption !== "office"}
+          onClick={() => changeDomain("agents")}><span>Agents</span></button>
+        <button type="button" className="agent-inventory-scope" aria-pressed={current.adoption === "office"}
+          onClick={() => changeDomain("office")}><span>Office apps</span></button>
+      </div> : null}
+      </div>
       {current.section !== "adoption" ? <div className="copilot-users-header-actions"><label className="copilot-users-cohort"><span>User cohort</span><select ref={cohort} aria-label="User cohort" aria-describedby={cohortDescriptionId} value={current.view} onChange={event => {
         const view = event.target.value;
         if (view === "licenses" || view === "activity") change({ ...current, view, page: 0 });
       }}><option value="licenses">Paid M365 Copilot users</option><option value="activity">Active users without paid Copilot</option></select></label></div> : null}</header>
-    {current.section === "adoption" ? <AdoptionView route={current} change={change} revision={dataRevision + agentInventoryRevision}
+    {current.section === "adoption" ? <>
+      {current.adoption === "office" ? <OfficeAdoptionView route={current} change={change} revision={dataRevision} />
+        : <AdoptionView route={current} change={change} revision={dataRevision + agentInventoryRevision}
       reportContext={reportContext} onOpenAgent={onOpenAgent}
-      onOpenPerson={detailId => change({ ...current, detailId, detailTab: undefined })} />
+      onOpenPerson={detailId => change({ ...current, detailId, detailTab: undefined })} />}</>
       : <>{current.view === "activity" ? reportContext : null}
     {current.view === "activity" ? <ReportedUserActivity route={current} onRouteChange={change} dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} />
         : <LicensedUsers route={current} change={change} revision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} reportContext={reportContext} />}
     </>}
-    {current.detailId ? <UserDetailModal key={current.detailId} identity={current.detailId} kind="directory" reportSetId={current.reportSetId}
+    {current.detailId && !(current.section === "adoption" && current.adoption === "office") ? <UserDetailModal key={current.detailId} identity={current.detailId} kind="directory" reportSetId={current.reportSetId}
       activeTab={current.detailTab} onTabChange={detailTab => change({ ...current, detailTab })}
       returnFocusTo={current.section === "adoption" ? adoptionTrigger : cohort} closeLabel="Close user details" onClose={() => change({ ...current, detailId: undefined, detailTab: undefined })}
       dataRevision={dataRevision} agentInventoryRevision={agentInventoryRevision} onOpenAgent={onOpenAgent} onOpenAdoption={change} /> : null}
@@ -204,6 +223,7 @@ function LicensedUsers({ route, change, revision, agentInventoryRevision, onOpen
       </details>
     </> : null}
     {selected ? <UserDetailModal key={selected.id} identity={selected.id} selectionId={selected.selectionId} kind="directory"
+      reportSetId={route.reportSetId}
       returnFocusTo={trigger} closeLabel="Close user details" onClose={() => setSelected(undefined)} onOpenAgent={onOpenAgent} onOpenAdoption={change}
       dataRevision={revision} agentInventoryRevision={agentInventoryRevision} onRestartSelection={restartSelection}
       onSelectionInvalidated={() => { if (selected.selectionId === read.selectedData?.selection.id) read.invalidateSelection(); }} /> : null}

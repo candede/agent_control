@@ -3,7 +3,7 @@ import { LifecycleSlice } from "./lifecycleSlice.js";
 import { assertResidualDatabaseBounds, assertInventoryFactDatabaseBounds, dataLimitError, dataLimits, digest, encodeBatch,
   encodeInventoryFactBatch, exactCount } from "./dataBounds.js";
 import { DataGenerations, type BeginGeneration, type GenerationLease } from "./dataGenerations.js";
-import { inventoryLimits, type InventoryDomain, type InventoryPage, type InventoryRoot } from "../types/inventoryRecords.js";
+import { inventoryLimits, type InventoryDomain, type InventoryPageReceipt, type InventoryRoot } from "../types/inventoryRecords.js";
 import type { InventoryRecord } from "../services/inventoryRecordProjection.js";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
 
@@ -139,7 +139,6 @@ export class InventoryGenerations {
       if (generation.state !== "staging") throw new Error("data_not_staging");
       const previous = (await client.query("SELECT * FROM inventory_pages WHERE generation_id=$1 ORDER BY ordinal DESC LIMIT 1", [lease.id])).rows[0];
       const ordinal = (previous?.ordinal ?? 0) + 1;
-      if (ordinal > inventoryLimits.pages) throw dataLimitError("provider_page_limit", inventoryLimits.pages, ordinal);
       if (previous && (!previous.accepted || previous.next_hash !== digest(token))) throw new Error("inventory_continuation");
       await client.query(`INSERT INTO inventory_pages(generation_id,scope_id,tenant_id,ordinal,token_hash)
         VALUES($1,$2,$3,$4,$5)`, [lease.id, lease.scopeId, lease.tenantId, ordinal, digest(token)]);
@@ -152,22 +151,22 @@ export class InventoryGenerations {
     });
   }
 
-  async acceptPage<T>(lease: GenerationLease, page: InventoryPage<T>, inserted: number) {
+  async acceptPage(lease: GenerationLease, page: InventoryPageReceipt, inserted: number) {
     const omitted = page.omittedFieldCount ?? 0;
     if (!Number.isSafeInteger(page.rawCount) || page.rawCount < 0 || !Number.isSafeInteger(inserted)
-      || inserted < 0 || inserted > page.rawCount || inserted !== page.records.length
+      || inserted < 0 || inserted > page.rawCount
       || !Number.isSafeInteger(omitted) || omitted < 0) throw new Error("inventory_page_count");
     return this.generations.connections.run(async client => {
       const generation = await this.fence(client, lease);
-      if (page.expectedCount !== null && (!Number.isSafeInteger(page.expectedCount) || page.expectedCount < 0 || page.expectedCount > inventoryLimits.sourceRows)) {
-        throw dataLimitError("inventory_source_rows", inventoryLimits.sourceRows, page.expectedCount);
+      if (page.expectedCount !== null && (!Number.isSafeInteger(page.expectedCount) || page.expectedCount < 0)) {
+        throw new Error("inventory_expected_count");
       }
       const previous = (await client.query("SELECT expected_count,omitted_fields FROM inventory_attempts WHERE generation_id=$1 FOR UPDATE", [lease.id])).rows[0];
       if (previous.expected_count !== null && page.expectedCount !== null && previous.expected_count !== page.expectedCount) throw new Error("inventory_count_mismatch");
       if (previous.omitted_fields + omitted > 2_147_483_647) {
         throw dataLimitError("inventory_omitted_fields", 2_147_483_647, previous.omitted_fields + omitted);
       }
-      if (generation.wire_count + page.rawCount > inventoryLimits.wireRows) throw dataLimitError("inventory_wire_rows", inventoryLimits.wireRows, generation.wire_count + page.rawCount);
+      if (!Number.isSafeInteger(generation.wire_count + page.rawCount)) throw new Error("data_count_overflow");
       const result = await client.query(`UPDATE inventory_pages SET accepted=true,raw_count=$4,unique_count=$5,next_hash=$6,expected_count=$7
         WHERE generation_id=$1 AND ordinal=$2 AND token_hash=$3 AND NOT accepted`,
       [lease.id, page.page, digest(page.token), page.rawCount, inserted, page.nextToken === null ? null : digest(page.nextToken), page.expectedCount]);
@@ -205,8 +204,6 @@ export class InventoryGenerations {
         return { rows: 0, bytes: 0, replay: true };
       }
       if (index !== generation.batch_count) throw new Error("data_batch_order");
-      const limit = attempt.domain === "canonical" ? dataLimits.derivedRows : inventoryLimits.sourceRows;
-      if (generation.row_count + rows.length > limit) throw dataLimitError("inventory_source_rows", limit, generation.row_count + rows.length);
       await assertResidualDatabaseBounds(client, batch.json, "residual", rows);
       await client.query(`INSERT INTO inventory_keys(generation_id,scope_id,tenant_id,identity,schema_version,content_hash,deleted)
         SELECT $1,$2,$3,identity,1,content_hash,coalesce(deleted,false) FROM jsonb_to_recordset($4::jsonb) r(identity text,content_hash text,deleted boolean)`,
@@ -434,8 +431,6 @@ export class InventoryGenerations {
               FROM jsonb_to_recordset($5::jsonb) member(identity text,generation_id uuid)
               ON CONFLICT DO NOTHING`,[lease.id,lease.scopeId,lease.tenantId,revision,batch.json])).rowCount ?? 0;
             const count = exactCount((await client.query("SELECT row_count FROM inventory_roots WHERE baseline_id=$1",[lease.id])).rows[0].row_count)+inserted;
-            const limit = a.domain==="canonical" ? dataLimits.derivedRows : inventoryLimits.sourceRows;
-            if (count>limit) throw dataLimitError("inventory_effective_rows",limit,count);
             await client.query("UPDATE inventory_roots SET row_count=$2 WHERE baseline_id=$1",[lease.id,count]);
           }
           return { count: last ? 1 : 0,last,changed };
@@ -506,8 +501,6 @@ export class InventoryGenerations {
       [lease.id, lease.scopeId, lease.tenantId, revision, baseline])).rowCount ?? 0;
     const priorCount = exactCount((await client.query("SELECT row_count FROM inventory_roots WHERE baseline_id=$1", [baseline])).rows[0].row_count);
     const effectiveCount = priorCount + inserted - closed;
-    const effectiveLimit = a.domain === "canonical" ? dataLimits.derivedRows : inventoryLimits.sourceRows;
-    if (effectiveCount > effectiveLimit) throw dataLimitError("inventory_effective_rows", effectiveLimit, effectiveCount);
     return this.finishPublication(client,lease,baseline,revision,inserted,closed,changes,effectiveCount);
   }
 

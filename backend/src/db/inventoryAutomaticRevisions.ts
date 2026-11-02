@@ -26,6 +26,13 @@ export async function readAutomaticInventoryRevisions(scope: { tenantId: string;
         AND (s.source IN ('inventory_packages','inventory_power_platform','inventory_canonical') OR s.source IN ('directory','app_activity') AND s.selector='complete')
       UNION ALL SELECT 'agent_people',coalesce((SELECT revision FROM inventory_people_revisions WHERE tenant_id=$1),0)::text
       UNION ALL SELECT 'agent_usage',coalesce((SELECT revision FROM agent_usage_state WHERE tenant_id=$1),0)::text
+      UNION ALL SELECT 'office',jsonb_build_array(s.id,s.epoch,h.revision,h.generation_id,g.state,g.validated)::text
+        FROM data_scope_epochs s LEFT JOIN data_generation_heads h ON h.scope_id=s.id
+        LEFT JOIN data_generations g ON g.id=h.generation_id
+        WHERE s.tenant_id=$1 AND s.source IN ('office_app_adoption','office_history')
+      UNION ALL SELECT 'office',jsonb_build_array(a.generation_id,a.office_revision,a.office_status,a.office_error_code)::text
+        FROM user_source_attempts a JOIN data_generation_heads h ON h.generation_id=a.generation_id
+        WHERE a.tenant_id=$1 AND a.source='app_activity'
       UNION ALL SELECT 'authorization',coalesce((SELECT epoch FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2),0)::text
       UNION ALL SELECT 'reports',jsonb_build_array(coalesce(h.revision,0),coalesce(h.invalidation_epoch,0),coalesce(s.revision,1),s.active_set_id)::text
         FROM (SELECT $1::text AS tenant_id) tenant LEFT JOIN official_usage_history_state h USING(tenant_id)
@@ -42,7 +49,7 @@ export async function readAutomaticInventoryRevisions(scope: { tenantId: string;
       } else {
         const targets = row.source === "canonical" ? ["graph_packages", "power_platform"] as const
           : row.source === "directory" ? ["graph_packages", "power_platform", "users"] as const
-            : row.source === "app_activity" ? ["users"] as const
+            : ["app_activity", "office"].includes(row.source) ? ["users"] as const
               : ["agent_people", "agent_usage"].includes(row.source) ? ["graph_packages", "power_platform"] as const
                 : [row.source as "graph_packages" | "power_platform"];
         for (const target of targets) hashes[target].update(JSON.stringify(row));

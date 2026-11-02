@@ -6,7 +6,7 @@ import { layoutTime, mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { fulfillInventoryPage, inventoryFixtureQuery } from "./selectedInventoryFixture";
 
 const cachedPaths = new Set(["/api/agent-inventory/selections", "/api/agent-inventory", "/api/copilot-usage/users",
-  "/api/official-usage/overview", "/api/official-usage/history/options"]);
+  "/api/official-usage/overview"]);
 
 function primary(page: Page, name: string) {
   return page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name, exact: true });
@@ -59,6 +59,11 @@ test("recent Users and Agents revisits render within two frames without data req
   await expect(page.getByRole("button", { name: "Ada", exact: true })).toBeVisible();
   await expect(page.getByRole("combobox", { name: "Report set" })).toBeEnabled();
   const held = await holdRepeatedReads(page);
+  let optionCaptures=0;
+  await page.route(url=>url.pathname==="/api/official-usage/history/options",async route=>{
+    optionCaptures++;
+    await route.fallback();
+  });
   try {
     for (let index = 0; index < 3; index++) {
       await cachedClick(primary(page, "Agents"), "Service desk assistant",
@@ -70,6 +75,7 @@ test("recent Users and Agents revisits render within two frames without data req
       await expect(page.getByRole("combobox", { name: "Report set" })).toBeEnabled();
     }
     expect(held.reads).toEqual([]);
+    expect(optionCaptures).toBe(6);
     expect(unexpected).toEqual([]);
     await page.screenshot({ path: info.outputPath("cached-users.png") });
   } finally { held.release(); }

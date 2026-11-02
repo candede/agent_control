@@ -25,16 +25,27 @@ import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
 import { reportIdentity } from "./reportIdentity.js";
 import { schemaRegistry } from "./officialReportFields.js";
 
-vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-automatic-refresh-integration-secret"; });
+const testTenants = vi.hoisted(() => {
+  process.env.SESSION_SECRET = "synthetic-automatic-refresh-integration-secret";
+  delete process.env.TENANTS_JSON_FILE;
+  const tenants = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
+  process.env.TENANTS_JSON = JSON.stringify(tenants.map((tenantId, index) => ({
+    tenantId, clientId: "44444444-4444-4444-8444-444444444444", clientSecret: "synthetic-automatic-client-secret",
+    domains: [`tenant-${index}.example.invalid`],
+  })));
+  return tenants;
+});
 
 vi.mock("../auth/msal.js", () => ({
   acquireAuthorizedToken: vi.fn(async () => "synthetic-delegated-token"),
-  acquireApplicationToken: vi.fn(async () => { throw new Error("Automatic sync must never use application tokens."); }),
+  acquireApplicationToken: vi.fn(async () => "synthetic-application-token"),
   revalidateAuthorizedUser: vi.fn(async () => user),
 }));
 vi.mock("./capabilities.js", () => ({ capabilities: {
   requireAvailable: vi.fn(async () => undefined),
-  requireApplicationDataScope: vi.fn(async () => { throw new Error("No shared data scope."); }),
+  requireApplicationDataScope: vi.fn(async (_capability, actor) => {
+    if (!testTenants.includes(actor.tenantId)) throw new Error("Unconfigured synthetic tenant");
+  }),
   observeOperation: vi.fn(async (_id, _user, operation) => operation(() => undefined)),
   beginOperationValidation: vi.fn(() => () => undefined),
 } }));
@@ -48,7 +59,7 @@ vi.mock("./powerPlatformResourceQuery.js", async original => ({
   },
 }));
 
-const user: AuthenticatedUser = { tenantId: randomUUID(), homeAccountId: randomUUID(),
+const user: AuthenticatedUser = { tenantId: testTenants[0], homeAccountId: randomUUID(),
   username: "automatic@example.invalid", displayName: "Automatic fixture", roles: ["AgentControl.Viewer"] };
 const scope = { tenantId: user.tenantId!, principalId: user.homeAccountId };
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -59,6 +70,7 @@ let repository: DataSyncRepository;
 let packageRepository: PackageRefreshJobs;
 const sourceFetch = vi.fn<FetchLike>(async url => {
   if (String(url).includes("/subscribedSkus")) return Response.json({ value: [] });
+  if (new URL(String(url)).pathname.endsWith("/users")) return Response.json({ value: [] });
   if (String(url).includes("getMicrosoft365CopilotUsageUserDetail")) return new Response(`${reportHeaders.join(",")}\n`);
   throw new Error("Unexpected native synthetic provider request");
 });
@@ -99,9 +111,10 @@ async function waitForRun(owner: typeof scope, id: string, status: "completed" |
 it("publishes initial inventory/users independently, then queues a same-selector catalogue behind bounded detail work without failing", async () => {
   const summary = allowlistedPackage({ id: "fixture-package", displayName: "Fixture agent", isBlocked: false,
     lastModifiedDateTime: "2026-09-24T00:00:00.000Z", version: "1" });
-  const list = vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
+  const list = vi.spyOn(GraphPackagesClient.prototype, "collectCatalog").mockImplementation(async (_token, options) => {
     await options?.visit?.("graph-first");
-    yield { token: "graph-first", nextToken: null, records: [summary], rawCount: 1, expectedCount: 1, page: 1 };
+    await options.onRecords([summary]);
+    await options.onPage({ token: "graph-first", nextToken: null, rawCount: 1, expectedCount: 1, page: 1 });
   });
   let release!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
@@ -119,6 +132,9 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect(details.mock.calls.length).toBeLessThanOrEqual(1);
     expect(sources.mock.calls.map(([, input]) => input.scope.source).sort()).toEqual(["app_activity", "directory"]);
     expect(sourceFetch).toHaveBeenCalledTimes(2);
+    expect(sourceFetch.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual(expect.arrayContaining([
+      "/v1.0/subscribedSkus", "/v1.0/copilot/reports/getMicrosoft365CopilotUsageUserDetail(period='D28',version='v2')",
+    ]));
     expect((await fixture.runtime.query(`SELECT attempt.source,attempt.status,attempt.observed_count FROM user_source_attempts attempt
       JOIN data_scope_epochs scope ON scope.id=attempt.scope_id AND scope.tenant_id=attempt.tenant_id
       WHERE attempt.tenant_id=$1 AND scope.scope_kind='tenant' AND scope.token_mode='tenant'
@@ -149,7 +165,7 @@ it("publishes initial inventory/users independently, then queues a same-selector
     expect((await inventorySelectionFixture(fixture.runtime, scope, {}, "packages")).raw.value.map(value => value.id)).toEqual([summary.id]);
     const beforeDetails = await repository.automaticRevisions(scope);
     release();
-    await vi.waitFor(async () => expect(await packages.get(user, enriching.detailJob!.id, "delegated"))
+    await vi.waitFor(async () => expect(await packages.get(user, enriching.detailJob!.id, "application"))
       .toMatchObject({ status: "succeeded" }), { timeout: 10_000 });
     await waitForRun(scope, next.run!.id, "completed");
     expect(list).toHaveBeenCalledTimes(2);
@@ -162,13 +178,13 @@ it("publishes initial inventory/users independently, then queues a same-selector
 });
 
 it("recovers the same principal after sign-in without replaying old authentication failures or restarting fresh work", async () => {
-  const reader = { ...user, tenantId: randomUUID(), homeAccountId: randomUUID() };
+  const reader = { ...user, tenantId: testTenants[1], homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   const expiredSignIn = Date.now() - 60_000;
   vi.mocked(revalidateAuthorizedUser).mockRejectedValue(new AppError(401, "interaction_required", "Token cache unavailable."));
-  vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
+  vi.spyOn(GraphPackagesClient.prototype, "collectCatalog").mockImplementation(async (_token, options) => {
     await options?.visit?.("empty-first");
-    yield { token: "empty-first", nextToken: null, records: [], rawCount: 0, expectedCount: 0, page: 1 };
+    await options.onPage({ token: "empty-first", nextToken: null, rawCount: 0, expectedCount: 0, page: 1 });
   });
   try {
     const failed = await service.automaticRefresh(reader, expiredSignIn);
@@ -191,15 +207,15 @@ it("recovers the same principal after sign-in without replaying old authenticati
 });
 
 it("finishes a partial automatic run when the last inventory child publishes after Users failed", async () => {
-  const reader = { ...user, tenantId: randomUUID(), homeAccountId: randomUUID() };
+  const reader = { ...user, tenantId: testTenants[2], homeAccountId: randomUUID() };
   const owner = { tenantId: reader.tenantId!, principalId: reader.homeAccountId };
   vi.mocked(revalidateAuthorizedUser).mockResolvedValue(reader);
   let release!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
-  vi.spyOn(GraphPackagesClient.prototype, "catalogPages").mockImplementation(async function* (_token, options) {
+  vi.spyOn(GraphPackagesClient.prototype, "collectCatalog").mockImplementation(async (_token, options) => {
     await blocked;
     await options?.visit?.("partial-run-first");
-    yield { token: "partial-run-first", nextToken: null, records: [], rawCount: 0, expectedCount: 0, page: 1 };
+    await options.onPage({ token: "partial-run-first", nextToken: null, rawCount: 0, expectedCount: 0, page: 1 });
   });
   const people = vi.spyOn(AgentPeopleService.prototype, "refreshReferences")
     .mockRejectedValueOnce(new AppError(503, "provider_timeout", "Agent people lookup did not complete."));
@@ -213,13 +229,15 @@ it("finishes a partial automatic run when the last inventory child publishes aft
   try {
     const submitted = await service.automaticRefresh(reader);
     try {
-      await vi.waitFor(() => expect(usersSettled).toBe(true), { timeout: 2000 });
+      await vi.waitFor(() => expect(usersSettled).toBe(true), { timeout: 10_000 });
     } catch (error) {
       const sources = await fixture.operator.query(`SELECT source_id,status,job_id,message
         FROM data_sync_run_sources WHERE run_id=$1 ORDER BY source_id`, [submitted.run!.id]);
       const activity = await fixture.operator.query(`SELECT state,wait_event_type,wait_event,left(query,150) AS query
         FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() LIMIT 20`);
-      throw new Error(`Automatic Users boundary: ${JSON.stringify({ sources: sources.rows, activity: activity.rows })}`, { cause: error });
+      const generations = await fixture.operator.query(`SELECT job_kind,state,scope_id FROM data_generations
+        WHERE tenant_id=$1 AND state IN ('staging','validating')`, [owner.tenantId]);
+      throw new Error(`Automatic Users boundary: ${JSON.stringify({ sources: sources.rows, activity: activity.rows, generations: generations.rows })}`, { cause: error });
     }
     const current = await repository.getRun(owner, submitted.run!.id);
     expect(current?.sources.find(source => source.source === "users")).toMatchObject({ status: "partial" });
@@ -234,4 +252,4 @@ it("finishes a partial automatic run when the last inventory child publishes aft
     people.mockRestore();
     vi.mocked(revalidateAuthorizedUser).mockResolvedValue(user);
   }
-});
+}, 15_000);

@@ -43,11 +43,32 @@ function fixture(active: string | null, eligibleHead: string | null) {
 }
 
 describe("automatic report head reconciliation", () => {
-  it("repairs an existing manually selected head during ensure and leaves repeated reads unchanged", async () => {
+  it("initializes existing history without locking or scanning the report head", async () => {
     const { history, state, query } = fixture(older, latest);
     expect(await history.ensure(tenant)).toBe("history-scope");
-    expect(state).toEqual({ active_set_id: latest, revision: "5" });
     await history.ensure(tenant);
+    expect(state).toEqual({ active_set_id: older, revision: "4" });
+    expect(query.mock.calls.map(([sql]) => sql)).toEqual([
+      "SELECT scope_id FROM official_usage_history_state WHERE tenant_id=$1",
+      "SELECT scope_id FROM official_usage_history_state WHERE tenant_id=$1",
+    ]);
+  });
+
+  it("creates missing history without reconciling unrelated report content", async () => {
+    const { history, query, result } = fixture(null, null);
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (sql, values) => sql.startsWith("SELECT scope_id")
+      ? result() : original(sql, values));
+    expect(await history.ensure(tenant)).toBe("history-scope");
+    expect(query.mock.calls.some(([sql]) => sql.startsWith("INSERT INTO official_usage_history_state"))).toBe(true);
+    expect(query.mock.calls.some(([sql]) => sql.includes("SELECT s.id FROM ("))).toBe(false);
+  });
+
+  it("repairs an existing manually selected head on reconciliation and leaves repeated reads unchanged", async () => {
+    const { history, client, state, query } = fixture(older, latest);
+    await history.reconcileHead(client, tenant);
+    expect(state).toEqual({ active_set_id: latest, revision: "5" });
+    await history.reconcileHead(client, tenant);
     expect(query.mock.calls.filter(([sql]) => sql.startsWith("UPDATE official_usage_state"))).toHaveLength(1);
     const statements = query.mock.calls.map(([sql]) => sql);
     expect(statements.findIndex(sql => sql.includes("data_scope_epochs WHERE id=$1") && sql.includes("FOR UPDATE")))

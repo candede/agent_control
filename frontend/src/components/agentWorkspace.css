@@ -162,7 +162,7 @@
   white-space: nowrap;
 }
 
-:is(.agent-workspace, .copilot-users) .agent-inventory-scopes {
+:is(.agent-workspace, .copilot-users, .adoption-dashboard) .agent-inventory-scopes {
   display: flex;
   align-items: stretch;
   justify-self: start;
@@ -173,7 +173,7 @@
   background: #eaedf4;
 }
 
-:is(.agent-workspace, .copilot-users) .agent-inventory-scope {
+:is(.agent-workspace, .copilot-users, .adoption-dashboard) .agent-inventory-scope {
   justify-content: center;
   gap: 12px;
   padding: 6px 12px;
@@ -194,14 +194,14 @@
   line-height: 1.2;
 }
 
-:is(.agent-workspace, .copilot-users) .agent-inventory-scope[aria-pressed="true"] {
+:is(.agent-workspace, .copilot-users, .adoption-dashboard) .agent-inventory-scope[aria-pressed="true"] {
   color: var(--ink);
   background: #fff;
   border-color: #e1e3f1;
   box-shadow: 0 1px 3px rgb(24 35 56 / 7%);
 }
 
-:is(.agent-workspace, .copilot-users) .agent-inventory-scope:hover {
+:is(.agent-workspace, .copilot-users, .adoption-dashboard) .agent-inventory-scope:hover {
   color: var(--ink);
   background: #f8f8ff;
 }

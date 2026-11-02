@@ -176,8 +176,17 @@ export class TemporaryAgentSharingDiagnostic {
     let redactions = 0;
     const redact = (key: string, value: unknown): unknown => {
       if (credentialKey.test(key)) { redactions += 1; return "[REDACTED]"; }
+      if (accessToken && value && typeof value === "object" && !Array.isArray(value)
+        && Object.keys(value).some(field => field.includes(accessToken))) {
+        return Object.fromEntries(Object.entries(value).map(([field, member]) => {
+          const name = field.replaceAll(accessToken, "[REDACTED]");
+          if (name !== field) redactions += 1;
+          return [name, credentialKey.test(field) ? "[REDACTED]" : member];
+        }));
+      }
       if (typeof value !== "string") return value;
       const text = accessToken ? value.replaceAll(accessToken, "[REDACTED]") : value;
+      if (text !== value) redactions += 1;
       const trimmed = text.trimStart();
       // Provider definitions can contain another JSON document inside a string.
       if (trimmed.startsWith("{") || trimmed.startsWith("[")) {

@@ -76,7 +76,8 @@ describe("package scan diagnostics", () => {
     ["sharedWithUsersAndGroups", [], [{ resourceId: "private-recipient", resourceType: "user" }], "private-invalid"],
   ])("distinguishes missing, null, empty, populated and invalid raw %s fields", (field, empty, populated, invalid) => {
     const diagnostics = new PackageScanDiagnostics("broad");
-    diagnostics.catalogPage([{}, { [field]: null }, { [field]: empty }, { [field]: populated }, { [field]: invalid }], 1, false, 50);
+    diagnostics.catalogRecords([{}, { [field]: null }, { [field]: empty }, { [field]: populated }, { [field]: invalid }]);
+    diagnostics.catalogPage(5, 1, false, 50);
     expect(entries("package_catalog_field_coverage").find(entry => entry.field === field)).toMatchObject({
       page: 1, field, count: 5, missingCount: 1, nullCount: 1, emptyCount: 1, nonemptyCount: 1, invalidCount: 1,
     });
@@ -85,8 +86,22 @@ describe("package scan diagnostics", () => {
 
   it("reports only a category for unknown provider resource annotations", () => {
     const diagnostics = new PackageScanDiagnostics("broad");
-    diagnostics.catalogPage([{ "@odata.type": "private-provider-type" }], 1, false, 0);
+    diagnostics.catalogRecords([{ "@odata.type": "private-provider-type" }]);
+    diagnostics.catalogPage(1, 1, false, 0);
     expect(entries("package_catalog_response_type")).toMatchObject([{ actualType: "other", count: 1 }]);
+    expectPrivateValuesAbsent();
+  });
+
+  it.each([true, false])("marks catalog field and response-type coverage as complete=%s", complete => {
+    const diagnostics = new PackageScanDiagnostics("broad");
+    diagnostics.catalogRecords([rawPackage()]);
+    if (complete) diagnostics.catalogPage(1, 1, false, 0);
+    else diagnostics.catalogFailure(1);
+    for (const event of ["package_catalog_field_coverage", "package_catalog_response_type"]) {
+      const coverage = entries(event);
+      expect(coverage.length).toBeGreaterThan(0);
+      for (const entry of coverage) expect(entry).toMatchObject({ page: 1, count: 1, complete });
+    }
     expectPrivateValuesAbsent();
   });
 
@@ -173,8 +188,8 @@ describe("package scan diagnostics", () => {
       { jobId: "job-diagnostics", page: 2, pageSize: 1, observedCount: 3, totalRecords: 1, hasContinuation: false },
     ]);
     expect(entries("package_catalog_field_coverage").filter(entry => entry.field === "elementDetails")).toMatchObject([
-      { page: 1, count: 2, missingCount: 1, nonemptyCount: 1, emptyCount: 0 },
-      { page: 2, count: 1, missingCount: 0, nonemptyCount: 0, emptyCount: 1 },
+      { page: 1, count: 2, complete: true, missingCount: 1, nonemptyCount: 1, emptyCount: 0 },
+      { page: 2, count: 1, complete: true, missingCount: 0, nonemptyCount: 0, emptyCount: 1 },
     ]);
     expect(entries("package_catalog_field_coverage").find(entry => entry.field === "longDescription" && entry.page === 1))
       .toMatchObject({ count: 2, nullCount: 1, nonemptyCount: 1, missingCount: 0 });
@@ -294,7 +309,8 @@ describe("package scan diagnostics", () => {
     await expect(catalogue(new GraphPackagesClient(fetcher)))
       .rejects.toMatchObject({ code: "provider_schema" });
     expect(fetcher).toHaveBeenCalledOnce();
-    expect(entries("package_catalog_field_coverage").find(entry => entry.field === "elementDetails")).toMatchObject({ invalidCount: 1 });
+    expect(entries("package_catalog_field_coverage").find(entry => entry.field === "elementDetails"))
+      .toMatchObject({ invalidCount: 1, complete: false });
     expect(entries("package_scan_summary")).toMatchObject([{ stage: "catalog", outcome: "failed", requestCount: 1 }]);
     expect(entries("package_detail_comparison")).toHaveLength(0);
     expectPrivateValuesAbsent();
@@ -461,7 +477,10 @@ describe("package scan diagnostics", () => {
       let elapsed = 0;
       vi.spyOn(performance, "now").mockImplementation(() => elapsed);
       const diagnostics = new PackageScanDiagnostics(mode);
-      if (mode === "broad") diagnostics.catalogPage([rawPackage()], 1, false, 25);
+      if (mode === "broad") {
+        diagnostics.catalogRecords([rawPackage()]);
+        diagnostics.catalogPage(1, 1, false, 25);
+      }
       else {
         diagnostics.startDetails(100);
         for (let index = 0; index < 99; index += 1) diagnostics.completeDetail(true);
@@ -478,7 +497,8 @@ describe("package scan diagnostics", () => {
       diagnostics.recordWait("identity", "retryWaitMs", 50_000);
       diagnostics.startDetails(200);
       diagnostics.completeDetail(false);
-      diagnostics.catalogPage([rawPackage()], 2, false, 50_000);
+      diagnostics.catalogRecords([rawPackage()]);
+      diagnostics.catalogPage(1, 2, false, 50_000);
       diagnostics.compareDetail(allowlistedPackage(rawPackage()), allowlistedPackage(rawPackage()));
       diagnostics.finish("failed");
       diagnostics.finish("collected");

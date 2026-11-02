@@ -42,6 +42,9 @@ export class OfficialReportHistory {
 
   ensure(tenantId: string) {
     return this.connections.run(async client => {
+      const existing = (await client.query<{ scope_id: string }>(
+        "SELECT scope_id FROM official_usage_history_state WHERE tenant_id=$1", [tenantId])).rows[0];
+      if (existing) return existing.scope_id;
       const inserted = (await client.query(`INSERT INTO data_scope_epochs(id,tenant_id,scope_kind,principal_id,token_mode,source,selector)
         VALUES($1,$2,'tenant',NULL,'tenant','official_history','complete')
         ON CONFLICT(tenant_id,scope_kind,principal_id,token_mode,source,selector) DO NOTHING RETURNING id`,
@@ -51,7 +54,6 @@ export class OfficialReportHistory {
       [tenantId])).rows[0])?.id as string | undefined;
       if (!scope) throw new Error("official_history_scope_missing");
       await client.query(`INSERT INTO official_usage_history_state(tenant_id,scope_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [tenantId, scope]);
-      await this.reconcileHead(client, tenantId);
       return scope;
     });
   }

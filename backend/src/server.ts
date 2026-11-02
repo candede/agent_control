@@ -27,11 +27,15 @@ startupRecovery: if (operationalState.mode === "normal") {
   if (!await recoveryAdmissionsOpen()) break startupRecovery;
   await powerPlatformInventory.recover(recoveryAdmissionsOpen);
   if (!await recoveryAdmissionsOpen()) break startupRecovery;
-  await packageInventory.recover();
+  while (await recoveryAdmissionsOpen() && await packageInventory.recover() > 0) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
   if (!await recoveryAdmissionsOpen()) break startupRecovery;
   await dataSync.recover(recoveryAdmissionsOpen);
   if (!await recoveryAdmissionsOpen()) break startupRecovery;
-  await purviewAudit.recover();
+  while (await recoveryAdmissionsOpen() && await purviewAudit.recover() > 0) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
   if (!await recoveryAdmissionsOpen()) break startupRecovery;
   await defenderHunting.recover(recoveryAdmissionsOpen);
   for (const tenant of config.tenants) {
@@ -72,6 +76,7 @@ async function recoveryAdmissionsOpen() {
 const jobRecoveryTimer = setInterval(() => {
   if (shutdownStarted || maintenanceActive() || jobRecovery) return;
   jobRecovery = (async () => {
+    if (await recoveryAdmissionsOpen()) await dataSync.recoverOffice(recoveryAdmissionsOpen);
     for (const tenant of config.tenants) {
       if (!await recoveryAdmissionsOpen()) break;
       await bulkJobs.recover(tenant.tenantId);

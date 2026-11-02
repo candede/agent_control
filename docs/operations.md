@@ -44,6 +44,10 @@ proves provider access, successful sync, correct saved data or working user
 journeys. Provider outages/throttling leave the previous complete publication
 available and do not turn missing evidence into zero.
 
+Overlapping readiness requests share the in-flight full schema verification,
+including runtime grants. Completed results are not cached; each request still
+checks current operational and maintenance state.
+
 Persisted operational state is deployment-wide `normal` or `maintenance`.
 Process drain and maintenance markers take precedence. An unavailable state
 read pauses background dispatch until a successful reload. Completing verified
@@ -69,12 +73,20 @@ See the [permission reference](user-roles-and-permissions.md#app-registration-pe
 Freshness and collection admission are shared per tenant/source,
 so different accounts do not independently download the same source. The tenant's
 initial sync uses the first-sync modal, which closes automatically when all three
-inventory sources are saved. It is not repeated for each account. Subsequent
+inventory sources are saved. **Continue to workspace** is always available to
+dismiss this informational modal, even while collection is running; it neither
+cancels synchronization nor indicates a failure. A source failure changes the
+heading to **First sync needs attention**, not workspace access.
+It is not repeated for each account. Subsequent
 source progress is nonblocking; saved data remains accessible while a source is
 updating or failing. CSV imports and package-detail enrichment do not
 block the workspace. Retry/cancel and sign-in recovery appear only when needed;
 Permissions is recovery guidance after a genuine permission failure, not a
 prerequisite visit.
+The modal keeps last saved counts separate from newer attempt statuses and
+messages. A saved success still counts toward completion when a newer attempt
+fails or needs sign-in/permission recovery; that recovery remains visible even
+after the automatic run ends.
 
 Sync shows current-attempt observations separately from last saved counts and
 last successful publication, inline in the Users, Graph packages, Power Platform
@@ -84,11 +96,38 @@ in the workspace footer; package-detail cancellation stays in its row. A running
 count is not a provider total or ETA and may restart for a new collection stage.
 Failed/partial attempts do not replace a complete saved source.
 
+On narrow screens, Sync history stacks its Outcome label and selector above
+Refresh history; the refresh label can wrap when text is enlarged. Wide history
+rows scroll within the table, not the page.
+
+Graph package catalogs and directory/license collections stream records instead
+of buffering complete response pages. Microsoft controls catalog pagination;
+directory user requests retain their documented 100-row page size. Neither total
+response bytes nor tenant record/page counts have an application-owned ceiling.
+Activity CSV also streams without a total report-byte or row-count ceiling.
+Individual JSON records retain a 16-MiB parsing-work budget, CSV records retain
+their 64-KiB parser bound, and exact package-detail responses remain limited to
+2,000,000 bytes. Database writes stay within 250 rows and 1 MiB per batch, measured
+using PostgreSQL's actual parameter encoding plus each four-byte length prefix,
+not JSON representations of SQL arrays, timestamps or binary parameters. One
+package element fact may use a 5-MiB transfer budget; its stored JSONB payload
+remains bounded at 4 MiB, while other residuals/payloads retain their 256-KiB bound.
+Existing generation/tenant storage quotas and source-job deadlines remain enforced.
+
+Header and idle-body deadlines remain bounded; deliberate database backpressure
+does not consume the body idle deadline. A page is accepted only after its full
+JSON and continuation metadata validate. Failed/truncated attempts cannot replace
+the last complete saved source. A Graph page is not retried after any of its
+batches have been handed to staging. `provider_result_limit` describes a bounded
+individual record/detail response, not a tenant-size limit or permission denial.
+
 Retained package refresh jobs report deadline-expired waiting/running work as
 failed in job history, automatic-detail status and target pages, even before
 recovery settles the stored state. Target-page revisions change at that boundary;
 recapture the first target page instead of continuing an earlier cursor.
 Recovery also settles expired waiting jobs without restarting provider work.
+Startup completes all bounded package and Audit Search recovery batches before
+accepting HTTP requests, rechecking maintenance admissions between batches.
 
 Normal sign-out revokes the initiating account's session authority and unfinished
 writes, not complete saved tenant sources or other accounts' reads. Credentials,
@@ -144,6 +183,73 @@ hourly sync allowance or block automatic or explicit synchronization. Actual
 concurrent execution limits and provider retry/backoff still apply. Collection
 and authorization errors remain visible in Sync.
 
+## Office adoption automatic recovery
+
+Office adoption needs only the ordinary saved directory/paid-license and
+`D28`/`v2` app report sources. They may finish in either order. A healthy source
+publication is not failed by a local Office calculation error: Sync retains its
+source result and Office exposes its separate preparation error. Startup and the
+existing 30-second recovery owner retry locally, without a provider recopy.
+Successful recovery changes the existing `users` revision so open Office views
+refresh automatically. Two idle recovery passes must leave the canonical capture
+and source generations unchanged.
+
+Before any agent CSV import, use Dashboard > Copilot in Office apps and
+Users > Adoption > Office apps. If other inventory sources are still preparing,
+the existing **Continue to workspace** action dismisses their progress notice;
+it does not start, authorize or enable Office collection. Viewer access reads
+shared saved facts; collection still requires the configured application Graph
+permissions. Header-only, stale, denied or malformed reports are specific
+unavailable/partial evidence, never fabricated zero adoption.
+
+Weekly Office history retains aggregate app/group totals for twelve months, not
+individual-person archives. Current details remain available under Latest.
+Each weekly point is the latest measured rolling D28 report refreshed that week;
+do not sum overlapping points or treat them as weekly event totals.
+
+An accepted current person page or suggestion supplies its immutable captured
+detail without rescanning earlier people pages. Reuse requires the same account,
+observation and filters plus a currently validated Office selection. Direct
+bookmarks without accepted facts follow bounded people pages; changing account,
+filters, correction or clear cannot reuse the old evidence.
+
+Any count/ranking mismatch, duplicate UTC-week point, source-clear
+resurrection or cross-tenant result requires immediate repair. A reproducible
+Office 5xx or preparation failure surviving the next 30-second recovery pass
+requires fix-forward; inspect `office_derivation_failed`,
+`office_publication_cleanup_failed`, source diagnostics and the failing selected
+read. Invalid evidence remains unavailable under existing integrity checks;
+authentication, ordinary sync and unaffected agent views stay usable.
+
+The existing `report-source-scale` owner measures complete Office population,
+all group people pages, actual SQL plans, bounded memory/response sizes and
+persisted/accounted bytes. Its representative 100,000-row qualification measured
+65,109,025 charged bytes and 115,965,952 physical person bytes plus 81,920 header
+bytes per observation. Daily capture over the inclusive twelve-calendar-month
+span extrapolates to 42,473,521,152 physical bytes at 366 points, or
+42,589,569,024 at 367 points, including conservative header/index allocation.
+Corresponding charged bytes are 23,829,903,150 and 23,895,012,175, within the
+unchanged 64 GiB tenant limit; the single generation fits its unchanged 8 GiB
+limit. Physical footprint still requires independent filesystem headroom.
+This is measured representative
+data, not a guarantee for every maximum-width tenant or other retained domains.
+Monitor existing generation charges/reservations and filesystem space together;
+index/heap bytes are not interchangeable with charged logical bytes. Capacity
+failure must remain an explicit local derivation error with independently
+successful source synchronization preserved. Do not truncate the population,
+shorten retention or change resource bounds to make a failing workload appear
+qualified.
+
+The current isolated owner admitted/captured all 100,000 rows in 113,786.83ms.
+The 99,000-person department traversal took 6,936.55ms through ten numbered deep
+links and ordinary authenticated Next pages; every exact identity/position/count
+and the other 1,000 people's pages were asserted. Peak heap/RSS were
+87,612,576/208,109,568 bytes, largest page 68,552 bytes. Actual plans used the
+existing `office_person_group` index with the canonical label/identity row-seek
+condition, not an offset scan for Next. Current cases retain 120-second
+deadlines and the command retains 600 seconds; production provider/network
+latency and maximum-width tenants are not established by this synthetic proof.
+
 ## Resolve sign-in and permission problems
 
 Provider-specific MFA or token-renewal requirements are reported as capability
@@ -191,6 +297,10 @@ recaptures a selection; errors remain visible, and historical display rows
 cannot authorize actions. Logout clears the cache. Focus checks and read-lease
 renewal read PostgreSQL, not Microsoft. Exact administrative/detail queries and
 live access/progress evidence retain their separate current-read contracts.
+The personal report selector recaptures metadata on each visit and once a minute.
+During a pending recapture it retains only the previous choice's text, with the
+control disabled. That text does not extend a read lease, pin Latest, authorize
+actions or survive an account/role/selected-report change.
 
 Catalog refresh and exact/detail enrichment are independent. Catalog collection
 does not fan out detail reads; detail collection does not relist the catalog.
@@ -268,6 +378,8 @@ alone do not.
 Collection diagnostics include settled request/retry/throttle counts,
 request duration, admission wait, retry wait and collection wall time.
 Concurrent durations overlap: do not add them to derive elapsed time.
+Catalog field-coverage and response-type events retain `complete`: `false`
+marks observations from a failed partial page, not a successfully completed page.
 `data_residual_limit_exceeded` reports bounded byte counts/field labels,
 not payload contents. Preserve existing request/body/deadline/resource limits
 rather than raising them to conceal an error.
@@ -312,7 +424,14 @@ Invoke-LocalDeployment $context 'Backup' `
 
 The receipt binds dump checksum, current schema, table content and snapshot
 time. Backups contain sensitive retained data; never commit or publicly share
-them. Current-only restore does not convert incompatible schemas.
+them. The dump is reserved exclusively with owner-only permissions before
+PostgreSQL writes retained content; an existing target is never overwritten.
+Native recovery commands and restored connections use the supplied operator's
+server, port and credentials, not a different ambient database target.
+Current-only restore does not convert incompatible schemas.
+All three Office tables are in the current primary-key backup inventory. Nonempty
+history remains self-contained after original directory/app generations retire;
+provenance identifiers are evidence, not foreign-key/read prerequisites.
 
 ### Restore for review
 
@@ -326,6 +445,12 @@ Restore uses a separately named database. It revokes sessions/execution
 authority, fences owners, marks uncertain work honestly and compares current
 ownership/deletion/configuration before exposing restored caches. Review report
 selection, tenant/private scope, audit and job integrity, then reopen:
+
+For Office, also compare frozen facts, full paid/app counts and original dates.
+Reopen honors current source-clear epochs and same-date correction fences; it
+must not recreate a removed capture from an older restored source vector.
+Previously issued sessions/selections remain revoked. Run the existing isolated
+`restore` owner to qualify this current-schema path, not an old-schema upgrade.
 
 ```powershell
 Invoke-LocalDeployment $context 'Reopen' `
@@ -353,6 +478,12 @@ invalidated before parent deletion. Accepted live report history is not
 deleted merely for age; explicit confirmed Admin deletion governs that content.
 Sessions, ephemeral evidence, jobs, audit, staging and exports retain their
 code-defined expiries.
+Linked mutation stages keep their immutable job provenance until bounded
+child/stage cleanup permits job deletion. A cleanup failure is reported together
+with any rollback or connection-release failure; an unsafe connection is discarded.
+Office observations separately retain twelve UTC calendar months from provider
+refresh date (cutoff equality retained). User-data clear fences their staged and
+published evidence; ordinary source generation cleanup does not delete history.
 
 ## Existing installation maintenance
 
@@ -399,6 +530,12 @@ authorization. Re-enter required database-stored application-sharing settings
 and reimport official CSVs; provider sync cannot reconstruct report history or
 past audit/jobs. Empty/preparing states remain truthful until collection
 succeeds. No additional qualification/enable/acceptance step is required.
+This reset also deletes retained Office observations and their frozen people.
+Ordinary directory/app publication rebuilds the first current Office observation
+without CSV, inventory, administrator presence or a manual sync. It cannot
+reconstruct the deleted twelve-month Office timeline. A current-schema backup
+review is distinct from reimporting agent CSV reports; an incompatible pre-reset
+backup is not a supported input to the new schema.
 
 If a reset was attempted but its outcome is unknown, keep maintenance and inspect
 the exact target; do not blindly repeat destruction. If the reset completed but
@@ -486,6 +623,12 @@ database/browser/capacity fixtures; inspect its selectors and ownership guards
 before use. Tests must never target production databases, ports or volumes.
 Mock/source tests, real provider evidence and live browser evidence are distinct.
 Record `passed`, `failed`, `not_run`, `unavailable` or `inconclusive` accurately.
+The existing `cutover-browser-contract` selector builds the current
+`permission-browser-test` target from the separately verified locked-dependency
+baseline plus the exact protected Chromium image. The browser image alone is not
+a dependency baseline. Both this focused selector and the combined `browser`
+owner keep network-free builds, current source and original resource/deadline
+bounds; focused success never substitutes for the combined device/native proof.
 
 Local source-only examples:
 

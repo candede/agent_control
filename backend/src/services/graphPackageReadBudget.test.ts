@@ -47,6 +47,31 @@ describe("Graph inventory read budget", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each(["proxy", "revoked proxy", "native error with proxy prototype"] as const)(
+    "does not inspect a token callback rejection containing a %s", async kind => {
+      const trap = vi.fn(() => { throw new Error("Borrowed callback diagnostics must not execute."); });
+      const handlers = { get: trap, getPrototypeOf: trap, getOwnPropertyDescriptor: trap };
+      let failure: unknown;
+      if (kind === "revoked proxy") {
+        const revoked = Proxy.revocable(new Error("Synthetic token failure."), handlers);
+        revoked.revoke();
+        failure = revoked.proxy;
+      } else if (kind === "proxy") {
+        failure = new Proxy(new Error("Synthetic token failure."), handlers);
+      } else {
+        failure = Object.setPrototypeOf(new Error("Synthetic token failure."), new Proxy(Error.prototype, handlers));
+      }
+      const fetcher = vi.fn<FetchLike>();
+      let result: unknown;
+      await new GraphPackagesClient(fetcher).getPackageDetails("token", "package", {
+        getAccessToken: async () => { throw failure; },
+      }).catch(error => { result = error; });
+      expect(trap).not.toHaveBeenCalled();
+      expect(result === failure).toBe(true);
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["token", "preparation", "dispatch fence", "fetch", "body", "retry", "retry progress", "catalog progress", "catalog visit"])(
     "settles non-cooperative %s work under one caller execution budget", async stage => {
       vi.useFakeTimers();
@@ -72,9 +97,9 @@ describe("Graph inventory read budget", () => {
         : stage === "retry" || stage === "retry progress" ? throttledResponse({ "Retry-After": "0" }, 429)
         : stage.startsWith("catalog") ? Response.json({ value: [] }) : packageResponse());
       const client = new GraphPackagesClient(fetcher, { delay: () => stalled });
-      const result = stage === "catalog visit" ? (async () => {
-        for await (const _page of client.catalogPages("token", { ...options, visit: () => stalled })) {}
-      })() : stage === "catalog progress" ? tinyGraphCatalog(client, "token", options)
+      const result = stage === "catalog visit" ? client.collectCatalog("token", {
+        ...options, visit: () => stalled, onRecords: async () => {}, onPage: async () => {},
+      }) : stage === "catalog progress" ? tinyGraphCatalog(client, "token", options)
         : client.getPackageDetails("token", "package", options);
       const assertion = expect(result).rejects.toMatchObject({ name: "TimeoutError" });
       await vi.advanceTimersByTimeAsync(100);
@@ -150,6 +175,120 @@ describe("Graph inventory read budget", () => {
       .getPackageDetails("token", "package")).rejects.toMatchObject({ code: "provider_timeout" });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it.each((["probe", "inventory"] as const).flatMap(operation =>
+    [200, 403, 429].map(status => ({ operation, status }))))(
+    "enforces the elapsed header deadline for a streamed $operation HTTP $status response", async ({ operation, status }) => {
+      let elapsed = 0;
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+      const cancel = vi.fn();
+      const pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+        controller.enqueue(new TextEncoder().encode(JSON.stringify({ value: [] })));
+        controller.close();
+      });
+      const fetcher = vi.fn<FetchLike>(async () => {
+        elapsed = 30_001;
+        return new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+          status, headers: { "Retry-After": "120", "request-id": "bounded-headers" },
+        });
+      });
+      const client = new GraphPackagesClient(fetcher, { maxAttempts: 1, now: () => elapsed });
+      const result = operation === "probe" ? client.checkCatalogAccess("token") : tinyGraphCatalog(client, "token");
+      await expect(result).rejects.toMatchObject(status === 200
+        ? { code: "provider_timeout", status: 504 }
+        : { status, details: { httpStatus: status, correlationId: "bounded-headers", retryAfterMs: 120_000 } });
+      expect(pull).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["probe", "inventory"] as const)("retries expired streamed %s headers without replaying any delivered records", async operation => {
+    let elapsed = 0;
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
+    const cancel = vi.fn();
+    const fetcher = vi.fn<FetchLike>()
+      .mockImplementationOnce(async () => {
+        elapsed = 30_001;
+        return new Response(new ReadableStream({ cancel }, { highWaterMark: 0 }));
+      })
+      .mockResolvedValueOnce(Response.json({ value: [] }));
+    const client = new GraphPackagesClient(fetcher, { maxAttempts: 2, baseDelayMs: 0, now: () => elapsed, delay: async () => undefined });
+    await expect(operation === "probe" ? client.checkCatalogAccess("token") : tinyGraphCatalog(client, "token"))
+      .resolves.toEqual(operation === "probe" ? undefined : []);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each((["probe", "inventory"] as const).flatMap(operation =>
+    [200, 429].map(status => ({ operation, status }))))(
+    "disposes a late streamed $operation HTTP $status response after the header timer has settled the read", async ({ operation, status }) => {
+      vi.useFakeTimers();
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+        return controller.signal;
+      });
+      let complete!: (response: Response) => void;
+      const fetcher = vi.fn<FetchLike>()
+        .mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }))
+        .mockResolvedValueOnce(packageResponse());
+      const pull = vi.fn();
+      const cancel = vi.fn();
+      const caller = new AbortController();
+      const client = new GraphPackagesClient(fetcher, {
+        ...packageInventoryReadPolicy, maxAttempts: 1, delay: timerDelay,
+      });
+      const read = operation === "probe" ? client.checkCatalogAccess("token", caller.signal)
+        : tinyGraphCatalog(client, "token", { signal: caller.signal });
+      const assertion = expect(read).rejects.toMatchObject({ code: "provider_timeout" });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await assertion;
+      expect(caller.signal.aborted).toBe(false);
+      complete(new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+        status, headers: { "Retry-After": "2" },
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(pull).not.toHaveBeenCalled();
+      expect(fetcher).toHaveBeenCalledOnce();
+      if (status === 429) {
+        const next = client.getPackageDetails("token", "package");
+        const nextAssertion = expect(next).resolves.toMatchObject({ id: "package" });
+        await vi.advanceTimersByTimeAsync(1_999);
+        expect(fetcher).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(1);
+        await nextAssertion;
+        expect(fetcher).toHaveBeenCalledTimes(2);
+      }
+    },
+  );
+
+  it.each(["probe", "inventory"] as const)("allows a progressing streamed %s body beyond the header timeout", async operation => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException("deadline", "TimeoutError")), ms);
+      return controller.signal;
+    });
+    const parts = ['{"value":[', '{"id":"first","displayName":"First","isBlocked":false},',
+      '{"id":"second","displayName":"Second","isBlocked":false}]}'];
+    let nextPart = 0;
+    const fetcher = vi.fn<FetchLike>(async () => new Response(new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (nextPart > 0) await timerDelay(20_000);
+        controller.enqueue(new TextEncoder().encode(parts[nextPart++]));
+        if (nextPart === parts.length) controller.close();
+      },
+    }, { highWaterMark: 0 })));
+    const client = new GraphPackagesClient(fetcher, { maxAttempts: 1 });
+    const result = operation === "probe" ? client.checkCatalogAccess("token") : tinyGraphCatalog(client, "token");
+    const assertion = expect(result).resolves.toEqual(operation === "probe"
+      ? undefined : [expect.objectContaining({ id: "first" }), expect.objectContaining({ id: "second" })]);
+    await vi.advanceTimersByTimeAsync(40_000);
+    await assertion;
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("does not accept a parsed body after thirty elapsed seconds when timeout delivery is delayed", async () => {

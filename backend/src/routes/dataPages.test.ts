@@ -85,6 +85,7 @@ describe("users/report route-to-client boundary", () => {
     const accepted = await api(`/official-usage/bundles/${bundleId}/accept`, { method: "POST",
       body: JSON.stringify({ bundleHash: preview.bundleHash, expectedActiveRevision: preview.expectedActiveRevision }) });
     expect(accepted.status, await accepted.clone().text()).toBe(200);
+    return await accepted.json() as Awaited<ReturnType<OfficialReportImports["acceptBundle"]>>;
   }
   beforeAll(async () => {
     fixture = await testDatabase();
@@ -307,7 +308,9 @@ describe("users/report route-to-client boundary", () => {
     }
     const missing = randomUUID();
     for (const path of ["/official-usage/users", "/official-usage/agents/Report-A"]) {
-      expect((await api(`${path}?setId=${missing}`)).status).toBe(409);
+      const response=await api(`${path}?setId=${missing}`);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({code:"usage_report_unavailable"});
     }
   });
   it.each(["/official-usage/users.csv", "/official-usage/aggregate.csv", "/copilot-usage/users.csv", "/official-usage/admin"])(
@@ -444,12 +447,19 @@ describe("users/report route-to-client boundary", () => {
         .toMatch(/^[a-f0-9]{64}$/);
     }
     const target = history.value.find(row => row.id !== history.reports.activeSetId)!;
+    let expectedActive={activeSetId:history.reports.activeSetId,activeRevision:history.reports.activeRevision};
     if (operation === "deletion") {
       const confirmation = await (await api(`/official-usage/sets/${target.id}/preview`, { method: "POST", body: JSON.stringify({ operation: "delete" }) })).json() as { id: string };
       const deleted = await api(`/official-usage/confirmations/${confirmation.id}`, { method: "POST", body: JSON.stringify(confirmation) });
       expect(deleted.status, await deleted.clone().text()).toBe(200);
       expect(await deleted.json()).toMatchObject({ activeSetId: history.reports.activeSetId, activeRevision: history.reports.activeRevision });
-    } else await correctThroughHttp(target.id);
+    } else {
+      const accepted=await correctThroughHttp(target.id);
+      expect(accepted.complete).toBe(true);
+      expect(accepted.setId).not.toBe(history.reports.activeSetId);
+      expect(BigInt(accepted.activeRevision)).toBe(BigInt(history.reports.activeRevision)+1n);
+      expectedActive={activeSetId:accepted.setId,activeRevision:accepted.activeRevision};
+    }
     for (const [path, id] of [["/official-usage/history", history.selection.id], ["/official-usage/overview", overview.selection.id]] as const) {
       const response = await api(`${path}?selectionId=${id}`);
       expect(response.status).toBe(409); expect(response.headers.get("content-type")).toContain("application/problem+json");
@@ -463,7 +473,7 @@ describe("users/report route-to-client boundary", () => {
     expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM audit_events WHERE tenant_id=$1
       AND action IN ('export-official-usage-users','export-official-usage-aggregate') AND status='succeeded'`, [identity.tenantId])).rows[0].n).toBeGreaterThanOrEqual(6);
     const current = await reports.page((await reports.capture(identity, "history")).id, identity);
-    expect(current.reports).toMatchObject({ activeSetId: history.reports.activeSetId, activeRevision: history.reports.activeRevision });
+    expect(current.reports).toMatchObject(expectedActive);
     expect(current.counts.total).toBe(history.counts.total + (operation === "correction" ? 1 : -1));
   }, 30000);
 });

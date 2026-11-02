@@ -221,6 +221,28 @@ describe("automatic saved-data revision boundaries", () => {
     expect(sql).not.toMatch(/package_inventory_snapshots|object_id/);
   });
 
+  it.each(["office_app_adoption", "office_history"])("observes persisted %s retirement through Users without a head replacement", async source => {
+    const f = fixture();
+    const marker = {
+      source: "office", id: JSON.stringify([`${source}-scope`, "0", "1", `${source}-generation`, "published", true]),
+      observed_at: observedAt, expires_at: expiresAt,
+    };
+    f.state.markers.push(marker);
+    const before = await f.repository.automaticRevisions(scope);
+    const sql = String(f.query.mock.calls.find(([text]) => String(text).includes("WITH markers AS"))![0]);
+    const officeScopeSql = sql.split("UNION ALL SELECT 'office',")[1];
+    expect(officeScopeSql).toContain("g.state,g.validated");
+    expect(officeScopeSql).toContain("LEFT JOIN data_generations g ON g.id=h.generation_id");
+    for (const state of ["retired", "deleting"]) {
+      marker.id = JSON.stringify([`${source}-scope`, "0", "1", `${source}-generation`, state, true]);
+      const after = await f.repository.automaticRevisions(scope);
+      expect(after.users).not.toBe(before.users);
+      expect(after.graph_packages).toBe(before.graph_packages);
+      expect(after.power_platform).toBe(before.power_platform);
+      expect(await f.repository.automaticRevisions(scope)).toEqual(after);
+    }
+  });
+
   it.each([
     [250, ["", "0249"]],
     [251, ["", "0249", "0250"]],

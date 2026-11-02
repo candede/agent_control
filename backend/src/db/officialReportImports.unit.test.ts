@@ -255,10 +255,12 @@ describe("semantic-duplicate acceptance receipt authorization without a database
 describe("acceptance publication fences without a database", () => {
   function publication(options: {
     deletedDuringCopy?: boolean; base?: Record<string, unknown>; companion?: Record<string, unknown>;
+    pendingVersion?: string; reusableVersion?: string; retained?: { sets: string; versions: string; rows: string };
+    newSet?: boolean;
   } = {}) {
     const { imports, stages, query } = fixture();
     const stage = { ...stages[0], ...options.base, bundle_id: bundleId, ingestion_id: stages[0].id, owner: bundleId,
-      initiating_origin: unknownOrigin, ingestion_state: "ready", status: "active", pending_version: null };
+      initiating_origin: unknownOrigin, ingestion_state: "ready", status: "active", pending_version: options.pendingVersion ?? null };
     const set = { id: bundleId, actor_principal_id: identity.principalId, supersedes_set_id: null,
       complete: false, deleted_at: null };
     vi.spyOn(imports.history, "ensure").mockResolvedValue("scope");
@@ -267,19 +269,32 @@ describe("acceptance publication fences without a database", () => {
     vi.spyOn(imports, "cleanupIngestion").mockResolvedValue(0);
     const original = query.getMockImplementation()!;
     const result = (rows: object[]) => ({ command: "", oid: 0, fields: [], rowCount: rows.length, rows });
-    let copied = false;
+    const retained = { sets: options.newSet ? "0" : "1", versions: "0", rows: "0", ...options.retained };
+    let copied = Boolean(options.reusableVersion);
     query.mockImplementation(async (text, values) => {
       const sql = String(text);
       if (sql.startsWith("SELECT pg_advisory_xact_lock")) return result([]);
       if (sql.startsWith("SELECT s.*,i.id AS ingestion_id")) return result([stage]);
       if (sql.startsWith("SELECT count(*)::int AS active")) return result([{ active: 0, tenant: 0 }]);
-      if (sql.startsWith("SELECT * FROM official_usage_sets WHERE tenant_id=")) return result([set]);
+      if (sql.startsWith("SELECT * FROM official_usage_sets WHERE tenant_id=")) return result(options.newSet ? [] : [set]);
       if (sql.startsWith("SELECT v.* FROM official_usage_set_versions")) return result([]);
-      if (sql.startsWith("SELECT\n        (SELECT count(*)")) return result([{ sets: "1", versions: "0", rows: "0" }]);
-      if (sql.startsWith("SELECT v.id FROM official_usage_versions")) return result([]);
+      if (sql.startsWith("INSERT INTO official_usage_sets")) {
+        retained.sets = String(BigInt(retained.sets) + 1n);
+        return result([set]);
+      }
+      if (sql.startsWith("SELECT\n        (SELECT count(*)")) return result([{ ...retained }]);
+      if (sql.startsWith("SELECT v.id FROM official_usage_versions")) return result(options.reusableVersion ? [{ id: options.reusableVersion }] : []);
       if (sql.startsWith("INSERT INTO official_usage_artifacts")) return result([{ id: bundleId }]);
-      if (sql.startsWith("INSERT INTO official_usage_versions")) return result([]);
+      if (sql.startsWith("INSERT INTO official_usage_versions")) {
+        retained.versions = String(BigInt(retained.versions) + 1n);
+        retained.rows = String(BigInt(retained.rows) + BigInt(stage.row_count));
+        return result([]);
+      }
       if (sql.startsWith("SELECT * FROM official_usage_ingestions")) return result([{}]);
+      if (sql.startsWith("WITH candidates AS MATERIALIZED")) {
+        const offset = Number((values as unknown[])[1]);
+        return result([{ end: Math.min(stage.row_count, offset + 250), rows: Math.min(250, stage.row_count - offset) }]);
+      }
       if (sql.startsWith("INSERT INTO official_usage_row_facts")) return result([]);
       if (sql.startsWith("INSERT INTO official_usage_version_rows")) { copied = true; return result([]); }
       if (sql.startsWith("SELECT 1 FROM official_usage_sets")) {
@@ -304,6 +319,86 @@ describe("acceptance publication fences without a database", () => {
     const input = { stagingId: stage.id, revision: stage.revision, contentHash: stage.content_hash, expectedActiveRevision: "4" };
     return { imports, query, input, stage };
   }
+
+  it("copies an ordinary report in the supported 250-row batches, not 50-row transactions", async () => {
+    const { imports, query, input } = publication({ base: { row_count: 633 } });
+    await expect(imports.accept(identity, input)).resolves.toMatchObject({ complete: false });
+    const copies = query.mock.calls.filter(([sql]) => String(sql).startsWith("INSERT INTO official_usage_version_rows"));
+    expect(copies.map(([, values]) => (values as unknown[]).slice(3))).toEqual([[0, 250], [250, 500], [500, 633]]);
+    expect(query.mock.calls.filter(([sql]) => String(sql).startsWith("WITH candidates AS MATERIALIZED"))).toHaveLength(3);
+  });
+
+  it("counts a related Office pair as one writer while admitting report acceptance", async () => {
+    const { imports, query, input } = publication();
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => {
+      const sql = String(text);
+      if (sql.startsWith("SELECT count(*)::int AS active")) {
+        expect(sql).toContain("SELECT DISTINCT tenant_id,writer AS operation");
+        expect(sql).toContain("'office_app_adoption','office_history'");
+        expect(sql).toContain("g.tenant_id||':office:'||g.job_id::text");
+        return { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ active: 1, tenant: 1 }] };
+      }
+      return original(text, values);
+    });
+
+    await expect(imports.accept(identity, input)).resolves.toMatchObject({ complete: false });
+  });
+
+  it("still rejects report acceptance when two distinct tenant writers are active", async () => {
+    const { imports, query, input } = publication();
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => String(text).startsWith("SELECT count(*)::int AS active")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ active: 2, tenant: 2 }] } : original(text, values));
+
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ status: 429, code: "upload_admission_full" });
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("INSERT INTO official_usage_artifacts"))).toBe(false);
+  });
+
+  it.each(["pending", "reusable"] as const)("does not charge an existing %s version twice at retained-history limits", async version => {
+    const { imports, query, input } = publication({
+      ...(version === "pending" ? { pendingVersion: bundleId } : { reusableVersion: bundleId }),
+      retained: { sets: "5000", versions: "15000", rows: "25000000" },
+    });
+    await expect(imports.accept(identity, input)).resolves.toEqual({ setId: bundleId, activeRevision: "4", complete: false });
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_versions"))).toBe(false);
+  });
+
+  it.each([
+    { sets: "1", versions: "15000", rows: "0" },
+    { sets: "1", versions: "0", rows: "25000000" },
+  ])("still rejects an actual new allocation beyond retained-history limits: %j", async retained => {
+    const { imports, query, input } = publication({ retained });
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ status: 429, code: "official_usage_history_quota" });
+    expect(query.mock.calls.map(([sql]) => sql)).toContain("ROLLBACK");
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_set_versions"))).toBe(false);
+  });
+
+  it("allows the last available retained set without charging its reused version again", async () => {
+    const { imports, query, input } = publication({ newSet: true, reusableVersion: bundleId,
+      retained: { sets: "4999", versions: "15000", rows: "25000000" } });
+    await expect(imports.accept(identity, input)).resolves.toMatchObject({ complete: false });
+    expect(query.mock.calls.filter(([sql]) => String(sql).startsWith("INSERT INTO official_usage_sets"))).toHaveLength(1);
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_versions"))).toBe(false);
+  });
+
+  it("rolls back a new retained set that would exceed the set quota even when all versions are reusable", async () => {
+    const { imports, query, input } = publication({ newSet: true, reusableVersion: bundleId,
+      retained: { sets: "5000", versions: "1", rows: "1" } });
+    await expect(imports.accept(identity, input)).rejects.toMatchObject({ status: 429, code: "official_usage_history_quota" });
+    expect(query.mock.calls.map(([sql]) => sql)).toContain("ROLLBACK");
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_set_versions"))).toBe(false);
+  });
+
+  it("rejects missing copy rows without publishing or spinning on an empty range", async () => {
+    const { imports, query, input } = publication();
+    const original = query.getMockImplementation()!;
+    query.mockImplementation(async (sql, values) => String(sql).startsWith("WITH candidates AS MATERIALIZED")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ end: null, rows: 0 }] } : original(sql, values));
+    await expect(imports.accept(identity, input)).rejects.toThrow("official_report_count_mismatch");
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_row_facts"))).toBe(false);
+    expect(query.mock.calls.some(([sql]) => String(sql).startsWith("INSERT INTO official_usage_set_versions"))).toBe(false);
+  });
 
   it("cannot publish into a draft deleted while its rows were being copied", async () => {
     const { imports, query, input } = publication({ deletedDuringCopy: true });
@@ -626,6 +721,34 @@ describe("stream upload cancellation and batch rollback without a database", () 
     await expect(upload.receive(Readable.from([Buffer.from(csv)]))).resolves.toMatchObject({ kind: "users", rows: 1 });
     await upload.cancel();
     expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it("counts a related Office pair as one writer while opening a report upload", async () => {
+    const { imports, query } = ingestion(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => {
+      const sql = String(text);
+      if (sql.includes("FROM data_generations")) {
+        expect(sql).toContain("count(DISTINCT writer)");
+        expect(sql).toContain("'office_app_adoption','office_history'");
+        expect(sql).toContain("g.tenant_id||':office:'||g.job_id::text");
+        return { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ n: 1, tenant: 1 }] };
+      }
+      return original(text, values);
+    });
+
+    const upload = await imports.open(identity, { bundleId });
+    try {
+      expect(query.mock.calls.some(([text]) => String(text).startsWith("INSERT INTO official_usage_ingestions"))).toBe(true);
+    } finally { await upload.cancel(); }
+  });
+
+  it("still rejects report uploads when two distinct tenant writers are active", async () => {
+    const { imports, query } = ingestion(false), original = query.getMockImplementation()!;
+    query.mockImplementation(async (text, values) => String(text).includes("FROM data_generations")
+      ? { command: "", oid: 0, fields: [], rowCount: 1, rows: [{ n: 2, tenant: 2 }] } : original(text, values));
+
+    await expect(imports.open(identity, { bundleId })).rejects.toMatchObject({ status: 429, code: "upload_admission_full" });
+    expect(query.mock.calls.some(([text]) => String(text).startsWith("INSERT INTO official_usage_ingestions"))).toBe(false);
   });
 
   it("rejects joining a preexisting correction bundle without restating its correction intent", async () => {

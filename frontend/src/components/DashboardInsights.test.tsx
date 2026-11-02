@@ -63,7 +63,7 @@ describe("dashboard insights", () => {
       render(panel());
       await waitFor(() => expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/summary"))).toHaveLength(2));
       expect(within(screen.getByRole("region", { name: "People and engagement" })).getByText("40,000")).toBeVisible();
-      expect(within(screen.getByRole("region", { name: "Agents and champions" })).getByText("6")).toBeVisible();
+      expect(within(screen.getByRole("region", { name: "Agents and Agent Champs" })).getByText("6")).toBeVisible();
       expect(fetcher.mock.calls.filter(([input]) => new URL(input, "http://localhost").pathname.endsWith("/facets"))).toHaveLength(1);
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
       await act(async () => pending.resolve(Response.json(fresh)));
@@ -90,7 +90,9 @@ describe("dashboard insights", () => {
     expect(within(people).getByText("40,000")).toBeVisible();
     expect(within(people).getByText("20,000")).toBeVisible();
     expect(within(people).getByText("1,000")).toBeVisible();
-    const agents = screen.getByRole("region", { name: "Agents and champions" });
+    const agents = screen.getByRole("region", { name: "Agents and Agent Champs" });
+    expect(within(agents).getByRole("heading", { name: "Agent Champs" })).toBeVisible();
+    expect(within(agents).getByRole("link", { name: "Explore groups and Agent Champs" })).toBeVisible();
     expect(within(agents).getByText("244")).toBeVisible();
     expect(within(agents).getByText("9,693")).toBeVisible();
     expect(within(agents).getByText("6")).toBeVisible();
@@ -259,7 +261,7 @@ describe("dashboard insights", () => {
       ? Response.json({ code: "temporarily_unavailable", detail: "Saved departments could not be read." }, { status: 503 }) : base(input));
     render(<DashboardInsights snapshot={adoptionSnapshot()} revision={0} onCompanyChange={vi.fn()} />);
     expect((await screen.findAllByRole("alert"))[0]).toHaveTextContent("Saved departments could not be read.");
-    expect(within(screen.getByRole("region", { name: "Agents and champions" })).getByText("244")).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "Agents and Agent Champs" })).getByText("244")).toBeVisible();
     expect(await within(screen.getByRole("region", { name: "People and engagement" })).findByText("40,000")).toBeVisible();
     expect(screen.queryByRole("list", { name: "Department adoption" })).not.toBeInTheDocument();
     failed = false;
@@ -291,7 +293,7 @@ describe("dashboard insights", () => {
     const row = await within(department).findByRole("link", { name: /Finance/ });
     const list = within(department).getByRole("list", { name: "Department adoption" });
     const people = within(screen.getByRole("region", { name: "People and engagement" })).getByText("40,000");
-    const champion = within(screen.getByRole("region", { name: "Agents and champions" })).getByText("6");
+    const champion = within(screen.getByRole("region", { name: "Agents and Agent Champs" })).getByText("6");
     const nextButton = within(department).getByRole("button", { name: "Next departments" });
     fireEvent.click(within(department).getByRole("button", { name: "Next departments" }));
     await waitFor(() => expect(list).toHaveAttribute("aria-busy", "true"));
@@ -300,7 +302,7 @@ describe("dashboard insights", () => {
     expect(nextButton).toHaveAttribute("aria-disabled", "true");
     expect(people).toBeVisible();
     expect(champion).toBeVisible();
-    expect(within(screen.getByRole("region", { name: "Agents and champions" })).queryByText("Unknown")).not.toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Agents and Agent Champs" })).queryByText("Unknown")).not.toBeInTheDocument();
     await act(async () => pending.resolve(Response.json({ ...data, value: [data.value[1]], counts: { total: 2, filtered: 2 },
       page: { limit: 1, number: 2, offset: 1, nextCursor: null, previousCursor: "previous" } })));
     expect(await within(department).findByRole("link", { name: /Engineering/ })).toBeVisible();

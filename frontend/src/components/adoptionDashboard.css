@@ -5,7 +5,7 @@
   min-width: 0;
 }
 
-.dashboard-header,
+.dashboard-title-row,
 .dashboard-context {
   display: flex;
   align-items: center;
@@ -27,10 +27,14 @@
 }
 
 .dashboard-header h2 {
-  margin-bottom: 10px;
+  margin: 0;
   font-size: clamp(24px, 2.4vw, 34px);
   line-height: 1.2;
   letter-spacing: -0.8px;
+}
+
+.dashboard-header > p:last-child {
+  margin-top: 10px;
 }
 
 .dashboard-header p,
@@ -307,8 +311,66 @@
   border-radius: 12px;
 }
 
-.dashboard-trend-activeAgents {
+.dashboard-trend-activeAgents,
+.dashboard-trend-activeUserAppPairs {
   --dashboard-accent: #8a53ca;
+}
+
+.dashboard-domain-controls { display: flex; flex-wrap: wrap; min-width: 0; max-width: 100%; margin-left: auto; }
+.dashboard-domain-controls .agent-inventory-scope { width: auto; flex: 1 1 auto; }
+.office-observation-context { min-width: 0; }
+.office-observation-context > div { min-width: 0; flex: 1 1 320px; }
+.office-observation-context select { min-width: 0; width: 100%; }
+.office-observation-card > div { flex: 1 1 100%; }
+.office-observation-card strong { font-size: 12px; line-height: 1.4; }
+.office-observation-card label { display: grid; gap: 4px; min-width: 0; font-size: 12px; }
+.office-observation-card select { min-height: 32px; padding: 6px 26px 6px 8px; font-size: 12px; background-position: right 7px center; background-size: 14px; }
+.office-history-note { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.office-history-note button { font-size: 13px; font-weight: 600; }
+.office-app-breakdown { margin: 16px 0 0; min-width: 0; }
+.office-person-app-dates { list-style: none; margin: 16px 0 0; padding: 0; }
+.office-person-app-dates li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.office-person-app-dates small { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
+.office-overview-cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.office-coverage { margin-top: 16px; color: var(--muted); font-size: 12px; }
+.office-coverage summary { cursor: pointer; }
+.office-trend-controls { display: flex; flex-wrap: wrap; gap: 12px; }
+.office-trend-controls label { display: grid; gap: 6px; min-width: 0; flex: 0 1 240px; font-size: 13px; }
+.office-trend-controls select { width: 100%; min-width: 0; }
+.office-trends-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.office-trends-header .dashboard-panel-heading { margin-bottom: 0; }
+.office-trend-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+.office-app-trend-card { min-width: 0; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.office-app-trend-card .dashboard-chart { padding: 0; border: 0; background: transparent; }
+.office-app-trend-card .dashboard-chart h3 { font-size: 14px; line-height: 1.4; }
+.office-app-trend-card .dashboard-chart svg { max-height: 200px; margin: 8px 0; }
+.office-app-trend-card .dashboard-chart p { font-size: 11px; }
+.office-trend-current { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-top: 12px; }
+.office-trend-current strong { font-size: 24px; color: var(--text-h); font-variant-numeric: tabular-nums; }
+.office-trend-current span { font-size: 12px; color: var(--muted); }
+.office-app-trend-card .dashboard-change { margin-top: 8px; font-size: 12px; }
+.office-history-building p { margin: 0; }
+.office-adoption-view .adoption-group-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.office-adoption-view .adoption-group > header > small { max-width: 100%; white-space: normal; }
+.office-adoption-view .adoption-people li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+.office-adoption-view .adoption-people li > .office-person-identity { display: grid; gap: 4px; }
+.office-person-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+.office-person-heading .adoption-name { min-width: 0; max-width: 100%; }
+.office-person-heading .copilot-user-badge { white-space: nowrap; }
+.office-adoption-view .adoption-count { padding-top: 6px; text-align: right; white-space: nowrap; }
+.office-person-date { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.office-person-facts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 12px; font-size: 13px; }
+.office-person-facts dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 1150px) {
+  .office-trend-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .office-trend-grid { grid-template-columns: minmax(0, 1fr); }
+  .office-adoption-view .adoption-group-columns { grid-template-columns: minmax(0, 1fr); }
+  .dashboard-domain-controls { flex: 1 1 100%; }
+  .office-observation-context label { width: 100%; }
+  .office-person-facts { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .office-person-facts dd { margin-bottom: 10px; }
 }
 
 .dashboard-trend-tile .dashboard-metric,
@@ -629,6 +691,12 @@
 
 @media (max-width: 1150px) {
   .dashboard-overview-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .office-overview-cards {
     grid-template-columns: minmax(0, 1fr);
   }
 }

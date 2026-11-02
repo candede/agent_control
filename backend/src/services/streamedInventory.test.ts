@@ -26,31 +26,43 @@ describe("streamed inventory pages", () => {
         "@odata.count": 3, ...current < 3 ? { "@odata.nextLink": `${buildCopilotAgentsListUrl()}&$skiptoken=${current}` } : {} });
     });
     const visit = vi.fn(async () => {});
-    const producer = new GraphPackagesClient(fetcher).catalogPages("synthetic", { visit });
+    const arrived = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+    const accepted = Array.from({ length: 3 }, () => Promise.withResolvers<void>());
+    const producer = new GraphPackagesClient(fetcher).collectCatalog("synthetic", {
+      visit, onRecords: async records => { expect(records).toHaveLength(1); },
+      onPage: async receipt => {
+        arrived[receipt.page - 1].resolve();
+        await accepted[receipt.page - 1].promise;
+      },
+    });
     expect(fetcher).not.toHaveBeenCalled();
-    expect((await producer.next()).value?.page).toBe(1);
+    await arrived[0].promise;
     expect(fetcher).toHaveBeenCalledOnce();
-    expect((await producer.next()).value?.page).toBe(2);
-    expect((await producer.next()).value?.page).toBe(3);
-    expect((await producer.next()).done).toBe(true);
+    accepted[0].resolve();
+    await arrived[1].promise;
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    accepted[1].resolve();
+    await arrived[2].promise;
+    accepted[2].resolve();
+    await producer;
     expect(visit).toHaveBeenCalledTimes(3);
   });
-  it("rejects 100001 resources explicitly before publication", async () => {
+  it("still requires counts to reconcile above the former resource ceiling", async () => {
     const client = new PowerPlatformResourceQueryClient(async () => Response.json({
       totalRecords: 100001, count: 0, data: [], resultTruncated: false,
     }));
-    await expect(client.pages("synthetic", ["microsoft.copilotstudio/agents"], { visit: async () => {} }).next())
-      .rejects.toMatchObject({ code: "provider_result_limit" });
+    const read = async () => { for await (const _page of client.pages("synthetic", ["microsoft.copilotstudio/agents"], { visit: async () => {} })) {} };
+    await expect(read()).rejects.toMatchObject({ code: "provider_schema", message: expect.stringContaining("ended before") });
   });
-  it("streams more than 5000 scoped resources without a whole-source array", async () => {
+  it("streams more than 100000 scoped resources without a whole-source array", async () => {
     const tenant = "11111111-1111-1111-1111-111111111111";
     const environment = "22222222-2222-2222-2222-222222222222";
     let observed = 0;
     const client = new PowerPlatformResourceQueryClient(async (_url, init) => {
       const body = JSON.parse(String(init!.body));
-      const offset = Number(body.Options.SkipToken ?? 0), count = Math.min(100, 5001 - offset);
-      return Response.json({ totalRecords: 5001, count, resultTruncated: offset + count < 5001,
-        skipToken: offset + count < 5001 ? String(offset + count) : undefined,
+      const offset = Number(body.Options.SkipToken ?? 0), count = Math.min(100, 100001 - offset);
+      return Response.json({ totalRecords: 100001, count, resultTruncated: offset + count < 100001,
+        skipToken: offset + count < 100001 ? String(offset + count) : undefined,
         data: Array.from({ length: count }, (_, index) => ({ tenantId: tenant, name: `native-${offset + index}`,
           type: "microsoft.copilotstudio/agents", properties: { environmentId: environment } })) });
     });
@@ -58,16 +70,16 @@ describe("streamed inventory pages", () => {
       { expectedTenantId: tenant, environmentId: environment, visit: async () => {} })) {
       expect(page.records.length).toBeLessThanOrEqual(100); observed += page.records.length;
     }
-    expect(observed).toBe(5001);
-  });
-  it("enforces the 10000-page ceiling before issuing another request", async () => {
+    expect(observed).toBe(100001);
+  }, 30_000);
+  it("collects beyond 10000 physical pages without a tenant-size gate", async () => {
     let page = 0;
     const client = new GraphPackagesClient(async () => Response.json({ value: [{ id: String(++page), displayName: "X", isBlocked: false }],
-      "@odata.nextLink": `${buildCopilotAgentsListUrl()}&$skiptoken=${page}` }));
-    const read = async () => { for await (const result of client.catalogPages("synthetic", { visit: async () => {} })) expect(result.records).toHaveLength(1); };
-    await expect(read()).rejects.toMatchObject({ code: "provider_page_limit" });
-    expect(page).toBe(10000);
-  });
+      ...page < 10001 ? { "@odata.nextLink": `${buildCopilotAgentsListUrl()}&$skiptoken=${page}` } : {} }));
+    await client.collectCatalog("synthetic", { visit: async () => {},
+      onRecords: async records => { expect(records).toHaveLength(1); }, onPage: async () => {} });
+    expect(page).toBe(10001);
+  }, 30_000);
   it("renews independently through an accepted 600-second Retry-After", async () => {
     vi.useFakeTimers();
     const renew = vi.fn(async () => {});
@@ -108,8 +120,9 @@ describe("streamed inventory pages", () => {
   it("rejects a foreign/selector-changing continuation before another provider request", async () => {
     const fetcher = vi.fn(async () => Response.json({ value: [{ id: "one", displayName: "X", isBlocked: false }],
       "@odata.nextLink": "https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?$filter=other" }));
-    const pages = new GraphPackagesClient(fetcher).catalogPages("synthetic", { visit: async () => {} });
-    await expect(pages.next()).rejects.toMatchObject({ code: "invalid_provider_link" });
+    await expect(new GraphPackagesClient(fetcher).collectCatalog("synthetic", {
+      visit: async () => {}, onRecords: async () => {}, onPage: async () => {},
+    })).rejects.toMatchObject({ code: "invalid_provider_link" });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 

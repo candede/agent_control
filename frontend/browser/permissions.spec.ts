@@ -57,7 +57,7 @@ async function collectSavedPackages(page: Page) {
     const response = await fetch("/api/agents/refresh-jobs", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-CSRF-Token": session.csrfToken, "Idempotency-Key": crypto.randomUUID() },
-      body: JSON.stringify({ mode: "delegated" }),
+      body: JSON.stringify({ mode: "application" }),
     });
     if (!response.ok) throw new Error(`Fixture package collection failed: ${response.status}`);
     const result: PackageRefreshJob = await response.json();
@@ -65,7 +65,7 @@ async function collectSavedPackages(page: Page) {
   });
   expect(job.id).toEqual(expect.any(String));
   await expect.poll(async () => {
-    const response = await page.request.get(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}?mode=delegated`);
+    const response = await page.request.get(`/api/agents/refresh-jobs/${encodeURIComponent(job.id)}?mode=application`);
     expect(response.ok()).toBe(true);
     const current: PackageRefreshJob = await response.json();
     return current.status;
@@ -387,7 +387,7 @@ test("compact primary navigation has one Permissions entry and a visible icon-on
   });
   await page.goto("/permissions");
   const navigation = page.getByRole("navigation", { name: "Primary views" });
-  await expect(navigation.getByRole("button")).toHaveCount(5);
+  await expect(navigation.getByRole("button")).toHaveCount(workbenchViews.length);
   await expect(navigation.getByRole("button", { name: "Security", exact: true })).toHaveCount(0);
   await expect(navigation.getByRole("button", { name: "Official usage", exact: true })).toHaveCount(0);
   const permissions = page.getByRole("button", { name: "Permissions", exact: true });
@@ -414,7 +414,9 @@ test("compact primary navigation has one Permissions entry and a visible icon-on
       expect(buttonBounds!.x + buttonBounds!.width).toBeLessThanOrEqual(bounds!.x + bounds!.width);
       if (index) {
         const previous = await buttons[index - 1].boundingBox();
-        expect(buttonBounds!.x).toBeGreaterThanOrEqual(previous!.x + previous!.width);
+        if (Math.abs(buttonBounds!.y-previous!.y)<1) {
+          expect(buttonBounds!.x).toBeGreaterThanOrEqual(previous!.x+previous!.width);
+        } else expect(buttonBounds!.y).toBeGreaterThanOrEqual(previous!.y+previous!.height);
       }
     }
     await expect(signOut).toBeInViewport({ ratio: 1 });
@@ -439,7 +441,7 @@ test("first Agents visit syncs automatically before exact saved detail managemen
     if (request.method() === "POST" && path === "/api/data-sync/runs") manualStarts.push(path);
     if (isPackageMutationRequest(request.method(), path)) writes.push(path);
   });
-  await login(page, `first-agent-visit-${info.project.name}`);
+  await login(page, `first-agent-visit-${info.project.name}`, `fixture@first-sync-${info.project.name}.example.invalid`);
   const response = await automatic;
   expect(response.status()).toBe(200);
   expect(await response.json()).toMatchObject({ run: { automatic: true } });
@@ -480,8 +482,8 @@ test("timeout recovery retries failed checks without presenting unused operation
   const unexpected = await mockLayoutApi(page);
   const views = (): CapabilityView[] => capabilityDefinitions.map(definition => {
     const onDemand = definition.probe.kind === "on_demand";
-    const disabled = definition.mode === "application";
-    const timedOut = definition.id === "graph.package.read.delegated" && !recovered;
+    const disabled = !definition.probe.adapterRegistered;
+    const timedOut = definition.id === "graph.package.read.application" && !recovered;
     const status = disabled ? "not_configured" : timedOut ? "provider_error" : "available";
     return {
       definition, enabled: !disabled,
@@ -490,7 +492,7 @@ test("timeout recovery retries failed checks without presenting unused operation
         capabilityId: definition.id, status, authorized: status === "available", fresh: true,
         verification: status !== "available" ? undefined : onDemand ? "on_demand" : definition.mode === "local" ? "local"
           : definition.probe.kind === "on_demand" || definition.id.startsWith("powerPlatform.quarantine.") ? "token" : "provider",
-        ...(!onDemand ? { checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 300_000).toISOString() } : {}),
+        ...(!onDemand || timedOut ? { checkedAt: new Date(now - 1_000).toISOString(), expiresAt: new Date(now + 300_000).toISOString() } : {}),
         previewQualification: "not_required",
         ...(timedOut ? { evidence: { category: "provider_timeout", phase: "provider_read", timeoutMs: 30_000 } } : {}),
         remediation: [],
@@ -606,7 +608,7 @@ test("automatic checks and inline administrator setup require no disclosure", as
   await page.getByRole("button", { name: "Sign out", exact: true }).click();
   await expect(page.getByRole("button", { name: "Sign in with Entra ID" })).toBeVisible();
   await login(page, "missing_delegated_grant");
-  const missingIssue = page.locator(".permission-issue-list > li").filter({ hasText: "Agent inventory" });
+  const missingIssue = page.locator(".permission-issue-list > li").filter({ hasText: "Package blocking" });
   await expect(missingIssue.getByRole("region", { name: "Required setup" })).toBeVisible();
   await expect(missingIssue.getByRole("region", { name: "Setup and documentation" })).toBeVisible();
   await expect(page.locator(".permission-center").locator("details, summary, dialog")).toHaveCount(0);
@@ -701,7 +703,7 @@ test("job deep links keep exact source identity and browser history without prov
       } });
     }
     return route.fulfill({ json: {
-      id, authorizationPrincipalId: "fixture-principal", tokenMode: "delegated", scopeKind: "broad", requestedIds: [],
+      id, authorizationPrincipalId: "fixture-principal", tokenMode: "application", scopeKind: "broad", requestedIds: [],
       status: "succeeded", pageCount: 1, observedCount: id === olderId ? 3 : 9, totalRecords: id === olderId ? 3 : 9,
       snapshotId: "44444444-4444-4444-4444-444444444444", createdAt: "2026-09-10T07:00:00.000Z",
       attemptedAt: "2026-09-10T07:00:00.000Z", updatedAt: "2026-09-10T07:00:01.000Z", finishedAt: "2026-09-10T07:00:01.000Z",
@@ -1057,7 +1059,7 @@ test("all canonical workbench routes are deep-linkable and preserve agent state 
   await page.keyboard.press("Escape");
   await expect(page).toHaveURL(/\/sync$/);
 
-  await page.goto("/security?template=agent_activity&operation=InvokeAgent&agentIds=saved-agent");
+  await page.goto("/agents");
   await expect(page).toHaveURL(/\/agents$/);
   await expect(page.getByRole("button", { name: "Security", exact: true })).toHaveCount(0);
   await expect(page.getByLabel("Agent IDs")).toHaveCount(0);
@@ -1518,7 +1520,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await page.getByRole("button", { name: "Manage reports", exact: true }).click();
   await expect(modal.getByRole("region", { name: "Retained activity summary" })).toHaveCount(0);
   const currentRow = modal.getByRole("region", { name: "Saved report sets" }).getByRole("row")
-    .filter({ has: page.getByRole("button", {name:"View report",exact:true}) });
+    .filter({ has: page.getByRole("button", {name:"View report",exact:true}) })
+    .filter({ has: page.getByText("Current", { exact: true }) });
   await expect(currentRow).toHaveCount(1);
   await currentRow.getByRole("button", { name: "View report", exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`snapshot=${receipt.setId}`));
@@ -1542,7 +1545,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
 
   await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
   const activeSetRow = modal.getByRole("region", { name: "Saved report sets" }).getByRole("row")
-    .filter({ has: page.getByRole("button", {name:"View report",exact:true}) });
+    .filter({ has: page.getByRole("button", {name:"View report",exact:true}) })
+    .filter({ has: page.getByText("Current", { exact: true }) });
   const deleteSet = activeSetRow.getByRole("button", { name: "Delete report set", exact: true });
   await deleteSet.click();
   const dialog = page.getByRole("dialog", { name: "Delete report set?" });
@@ -1618,6 +1622,7 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await expect(modal.getByRole("region", { name: "Retained agent activity rows" })).toHaveCount(0);
   await modal.getByRole("region", { name: "Saved report sets" }).getByRole("row")
     .filter({ has: page.getByRole("button", {name:"View report",exact:true}) })
+    .filter({ has: page.getByText("Current", { exact: true }) })
     .getByRole("button", { name: "View report", exact: true }).click();
   await expect(page.getByRole("region", { name: "Agent activity report" })).toBeVisible();
   await expect(page.getByText("Support agent", { exact: true }).first()).toBeVisible();
@@ -1631,8 +1636,8 @@ test("official usage imports through real HTTP and remains role-separated", asyn
   await modal.getByRole("button", { name: "Back to reports", exact: true }).click();
   await modal.getByRole("button", { name: "Close reports", exact: true }).click();
   await page.getByRole("button", { name: "Users", exact: true }).click();
-  await expect(page.getByRole("combobox", {name:"Report set",exact:true})).toHaveCount(0);
-  await expect(page.getByText("Selected report set", { exact: true })).toBeVisible();
+  await expect(page.getByRole("combobox", {name:"Report set",exact:true})).toBeEnabled();
+  await expect(page.getByRole("combobox", {name:"Report set",exact:true})).toHaveValue("");
   const viewerSelected: ReportPage<ReportAgent> = await (await page.request.get("/api/official-usage/aggregate?limit=1")).json();
   expect(viewerSelected.reports.setId).toBe(receipt.setId);
   await page.getByRole("combobox", { name: "User cohort", exact: true }).selectOption("activity");

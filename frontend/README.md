@@ -62,7 +62,7 @@ does not establish live browser or provider behavior.
   unambiguously matched people by saved directory members, not a workforce census.
   Missing evidence shows **Unknown**, not zero. Paid-user and attention metrics
   reuse the existing user-source definitions; entitlement/app observations are
-  not historical license evidence. Champions are up to three usage-based
+  not historical license evidence. Agent Champs are up to three usage-based
   suggestions per company / department, not assigned roles. All panels use saved
   data and require no extra provider calls, approvals, or synchronization steps.
 - **Agents**: browse inventory, inspect details and usage, manage package access,
@@ -145,7 +145,7 @@ Users and Adoption share the Agents header layout, with the view selectors next
 to the title and summary cards starting at the same height. Adoption uses the
 same search bar and Filters popover. Company and Department options are read
 from all matching saved groups, not just the visible page; missing values can
-also be selected. Copilot Champs and Group agents filters each offer all groups,
+also be selected. Agent Champs and Group agents filters each offer all groups,
 groups with evidence, or groups without evidence. Filters combine before group
 paging and survive reloads in the URL. Summary counts reflect all matching
 groups, and the agent count deduplicates agents shared across groups.
@@ -167,7 +167,7 @@ when Users publishes new data, without closing the modal or manually starting sy
 
 The compact `agents/responses` counts mean distinct report agents with positive
 responses, and total reported agent responses in the selected report (not
-lifetime usage). Up to three colleagues with reported usage are marked **Copilot
+lifetime usage). Up to three colleagues with reported usage are marked **Agent
 Champ**, ordered by reported responses, agents used, name and exact identity.
 Creation does not qualify or boost a person. This is a suggestion, not a
 competition or an assigned role. Missing relationship reports show unknown agent

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { AppError } from "../errors.js";
 import { peakCheckpoint } from "../services/peakMemory.js";
 import { operationalLog } from "../services/telemetry.js";
+import pgUtils from "pg/lib/utils.js";
 import type pg from "pg";
 
 export const dataLimits = Object.freeze({
@@ -9,7 +10,7 @@ export const dataLimits = Object.freeze({
   agentDefinitionBytes: 4 * 1024 ** 2, agentDefinitionTransferBytes: 5 * 1024 ** 2,
   agentDefinitionWorkBytes: 16 * 1024 ** 2,
   generationBytes: 8 * 1024 ** 3, tenantBytes: 64 * 1024 ** 3,
-  sourceRows: 100_000, derivedRows: 200_000, plansPerUser: 1000, pages: 10_000, wireRows: 5_000_000,
+  plansPerUser: 1000,
   pageRows: 100, roots: 16, selectionRoots: 20, queue: 32, acquireMs: 5_000,
   leaseMs: 60_000, heartbeatMs: 20_000,
 });
@@ -69,10 +70,12 @@ function encodeBoundedBatch(rows: readonly unknown[], parameters: readonly unkno
   peakCheckpoint("batch.stringify");
   const json = JSON.stringify(rows);
   peakCheckpoint("batch.stringify");
-  // PostgreSQL's text Bind parameters: four-byte length prefix plus UTF-8
-  // content, not a JSON-escaped copy of the complete parameter array.
-  const bytes = [ ...parameters, json ].reduce<number>((total, value) => total + 4 + (value === null || value === undefined
-    ? 0 : Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value))), 0);
+  // Use the Bind mapper itself: SQL arrays, timestamps and binary parameters
+  // do not have their JSON representations' byte lengths.
+  const bytes = [ ...parameters, json ].reduce<number>((total, value) => {
+    const encoded = pgUtils.prepareValue(value);
+    return total + 4 + (encoded == null ? 0 : Buffer.byteLength(encoded));
+  }, 0);
   if (bytes > maximumBytes) throw dataLimitError("data_batch_bytes", maximumBytes, bytes);
   return { json, bytes, hash: digest(json) };
 }

@@ -106,13 +106,17 @@ The selected read contract is:
 
 - `GET https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages`
   with exactly `$filter=supportedHosts/any(h:h eq 'Copilot')`;
-- detail GET at that path plus one encoded exact opaque package ID;
+- detail GET at that path plus one encoded exact opaque package ID, whose case
+  and whitespace remain significant in normal and diagnostic responses;
 - no caller origin, headers, selection, expansion or arbitrary query;
 - no `$top`; continuation may add only one nonempty `$skiptoken`, preserving
   endpoint/filter. Redirects and equivalent-link loops fail closed.
 
 Duplicate exact identities, unsupported declared resource types and malformed
-security fields reject collection. Access principals require user/group type
+security fields reject collection. Streaming catalog callers enforce canonical
+page-token and exact-record uniqueness through their durable staging callbacks;
+the transport does not retain catalog-sized in-memory sets. Access principals
+require user/group type
 (case-insensitive validation) and a bounded nonblank control-free identity;
 provider ID spelling is retained without imposing directory GUID rules.
 Delegated control readback uses the administrator's read/write grant.
@@ -145,6 +149,12 @@ distinct-flow counts and flow/trigger array lengths remain tagged `observed`.
 The provider's exact lowercase `isWebSearchEnabledForKnowledge` is retained.
 No instruction text, unverified flow/trigger item schema or generic raw resource
 archive is added. Malformed typed values and duplicate members reject collection.
+
+Power Platform access checks retain a ten-second logical deadline. Exact agent
+diagnostics retain a sixty-second logical deadline even when the caller supplies
+a cancellation signal, shortened by any earlier caller execution deadline.
+Token renewal, dispatch hooks, retry waits and final synchronous field projection
+remain inside these budgets; expired reads cannot release successful observations.
 
 Graph owner/agent identity metadata and usage counters are separate observed
 evidence. Counters have no established report window/exception-rate unit and
@@ -236,6 +246,11 @@ requires no provider probe. See [usage import](official-usage-import.md) and
 - Pacing covers actual dispatch, token renewal and durable admission. Graph 429
   establishes shared cooldown independently of body timing; token-service
   throttling does not change Graph-wide pacing.
+- Streamed package reads enforce a 30-second elapsed header deadline separately
+  from body idle timeouts and the caller's overall execution budget.
+  Late responses from non-cooperative transports are disposed after that deadline;
+  an observed Graph throttle still establishes shared cooldown. Read-retry
+  classification does not inspect borrowed error proxies or proxy prototypes.
 - Read bodies are byte-bounded and strictly UTF-8 validated. Duplicate JSON
   contract members, including escaped spellings, are rejected. Cancellation
   remains authoritative through parse/publication.

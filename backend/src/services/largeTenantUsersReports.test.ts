@@ -28,6 +28,14 @@ import { errorHandler } from "../errors.js";
 import { createOfficialReportDataRouter } from "../routes/officialReportData.js";
 import { declaredRoutePolicies } from "../routes/policy.js";
 import { checkpointQueries, observePeakMemory, observeQueryWork } from "./peakMemory.js";
+import { officeFixturePerson } from "../../scripts/officeAppAdoptionFixtures.js";
+import { OfficeAppAdoptionReads } from "./officeAppAdoptionReads.js";
+import { UserSourceProvider } from "./userSourceProvider.js";
+import { reportHeaders } from "./userSourceGraphFields.js";
+import { dataLimits } from "../db/dataBounds.js";
+import { verifyDataGenerationCharges } from "../db/dataGenerationAccountingSchema.js";
+import { verifySchema } from "../db/schema.js";
+import type { OfficeGroup } from "../types/officeAppAdoption.js";
 
 const secret = "candidate-report-secret-never-production-000000";
 vi.hoisted(() => {
@@ -37,6 +45,176 @@ vi.hoisted(() => {
     clientSecret: "synthetic-candidate-secret", domains: ["example.invalid"],
   }]);
   process.env.SESSION_SECRET = "candidate-synthetic-session-secret";
+});
+
+describe("Office 100000-row report-source qualification", () => {
+  let fixture: Awaited<ReturnType<typeof testDatabase>>, reads: OfficeAppAdoptionReads;
+  const identity = { ...selectionIdentity, tenantId: "office-source-scale" };
+  const size = 100000, groups: OfficeGroup[] = [];
+  const perApp = { word: 0, excel: 0, powerpoint: 0, outlook: 0, onenote: 0, loop: 0, teams: 0 };
+  let observationId: string, returned = 0, maximumPageBytes = 0, maximumHeap = 0, maximumRss = 0;
+  let readMs = 0, sqlMs = 0, queries = 0, maximumSqlRows = 0, maximumParameterBytes = 0;
+  const queryExamples = new Map<string, { sql: string; parameters?: unknown[] }>();
+  const dates = (n: number) => [1, 2, 3, 4, 5, 6, 7].map(divisor => n <= 3 || n % divisor === 0 ? today : "");
+  beforeAll(async () => {
+    fixture = await testDatabase();
+    reads = new OfficeAppAdoptionReads(fixture.runtime, secret);
+  }, 30000);
+  afterAll(async () => { await fixture?.close(); });
+  const measure = async <T,>(work: () => Promise<T>) => {
+    const stopMemory = observePeakMemory(point => {
+      maximumHeap = Math.max(maximumHeap, point.heapUsed); maximumRss = Math.max(maximumRss, point.rss);
+    });
+    const stopSql = observeQueryWork(point => {
+      sqlMs += point.milliseconds; queries++; maximumSqlRows = Math.max(maximumSqlRows, point.rows);
+      maximumParameterBytes = Math.max(maximumParameterBytes, Buffer.byteLength(JSON.stringify(point.parameters ?? [])));
+      if (/office_person_facts/.test(point.sql) && !queryExamples.has(point.sql)) queryExamples.set(point.sql, point);
+    });
+    fixture.runtime.on("acquire", checkpointQueries);
+    try { return await work(); }
+    finally { stopMemory(); stopSql(); fixture.runtime.off("acquire", checkpointQueries); }
+  };
+  it("automatically freezes every paid person from a faithful bounded streamed D28/v2 report", async () => {
+    await verifySchema(fixture.runtime);
+    const started = performance.now(), stages = new UserSourceStages(fixture.runtime);
+    await measure(async () => {
+      await stages.execute(generationInput({ scope: { tenantId: identity.tenantId, kind: "tenant", principalId: null,
+        tokenMode: "tenant", source: "directory", selector: "complete" }, reserveBytes: dataLimits.generationBytes }), async lease => {
+        const key = await stages.query(lease, "discovery", "https://fixture.invalid/office-directory");
+        await stages.page(lease, key, "https://fixture.invalid/office-directory", size, size);
+        for (let offset = 0; offset < size; offset += 250) {
+          const people = Array.from({ length: 250 }, (_, index) => {
+            const n = offset + index + 1, person = officeFixturePerson(n);
+            person.identity.displayName = `Person ${String(n).padStart(6, "0")}`;
+            person.identity.department = n <= 99000 ? "Big department" : `Department ${Math.floor((n - 99001) / 10)}`;
+            return person;
+          });
+          await stages.directory(lease, key, people);
+        }
+        await stages.finishQuery(lease, key);
+      }, { beforePublish: async () => {} });
+      let offset = 0;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(Buffer.from(`${reportHeaders.join(",")}\n`)); },
+        pull(controller) {
+          if (offset === size) { controller.close(); return; }
+          let text = "";
+          for (let index = 0; index < 250; index++) {
+            const n = ++offset, appDates = dates(n);
+            if (n % 10 !== 0) Object.keys(perApp).forEach((app, index) => {
+              if (appDates[index]) perApp[app as keyof typeof perApp]++;
+            });
+            const upn = n % 10 === 0 ? `concealed-${n}` : `person-${n}@example.invalid`;
+            text += [today, upn, `Person ${n}`, today, today, appDates[6], ...appDates.slice(0, 6), "28"].join(",") + "\n";
+          }
+          controller.enqueue(Buffer.from(text));
+        },
+      });
+      const provider = new UserSourceProvider(async () => new Response(body, { headers: { "content-type": "text/csv" } }));
+      const result = await provider.refresh(stages, generationInput({ scope: { tenantId: identity.tenantId,
+        kind: "tenant", principalId: null, tokenMode: "tenant", source: "app_activity", selector: "complete" },
+        reserveBytes: dataLimits.generationBytes }), { authorize: async () => "synthetic-scale-token" });
+      expect(result.rows).toBe(size);
+    });
+    const summary = await reads.summary(identity, {});
+    observationId = summary.context.observation!.id;
+    expect(summary.organization).toMatchObject({ savedLicensedPeople: size, reportedActiveUsers: 90000,
+      noRecentEvidencePeople: 10000, unknownEvidencePeople: 10000, perApp,
+      activeUserAppPairs: Object.values(perApp).reduce((sum, count) => sum + count, 0) });
+    expect(summary.context.observation?.coverage).toMatchObject({ directoryPeople: size, reportedRows: size,
+      unknownReasons: { missing_row: 10000 } });
+    expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM office_person_facts WHERE generation_id=$1", [observationId])).rows[0].n).toBe(size);
+    await verifyDataGenerationCharges(fixture.operator);
+    process.stdout.write(`OFFICE_SCALE_CAPTURE ${JSON.stringify({ rows: size, durationMs: performance.now() - started,
+      maximumHeap, maximumRss, maximumSqlRows, maximumParameterBytes, perApp })}\n`);
+  }, 120000);
+  it("aggregates complete groups/facets and champion ties before pagination without app denominator drift", async () => {
+    expect(observationId).toBeTruthy();
+    const context = await reads.context(identity, { officeSnapshot: observationId });
+    for (let pageNumber = 1; pageNumber <= 21; pageNumber++) {
+      const page = await reads.groups(identity, context.query, context.selection.id, { pageNumber });
+      expect(page.counts).toEqual({ total: 101, filtered: 101 });
+      groups.push(...page.value);
+    }
+    expect(groups).toHaveLength(101);
+    expect(new Set(groups.map(group => group.id)).size).toBe(101);
+    const big = groups.find(group => group.department === "Big department")!;
+    expect(big.metrics).toMatchObject({ savedLicensedPeople: 99000, reportedActiveUsers: 89100 });
+    expect(big.champions.map(person => person.displayName)).toEqual(["Person 000001", "Person 000002", "Person 000003"]);
+    const query = { officeSnapshot: observationId, department: "Big department", app: "word" as const };
+    const filtered = (await reads.groups(identity, query)).value[0];
+    expect(filtered.metrics).toEqual(big.metrics);
+    expect(filtered.filteredPeople).toBe(89100);
+    const facets = [];
+    for (let pageNumber = 1; pageNumber <= 2; pageNumber++) {
+      const page = await reads.facets(identity, context.query, "department", context.selection.id, { limit: 100, pageNumber });
+      expect(page.counts.filtered).toBe(101); facets.push(...page.value);
+    }
+    expect(facets.reduce((sum, facet) => sum + facet.people, 0)).toBe(size);
+    expect(new Set(facets.map(facet => facet.value)).size).toBe(101);
+  }, 120000);
+  it.each(Array.from({ length: 10 }, (_, index) => index))(
+    "reads every bounded people page in partition %s, including the late-page frozen identity", async partition => {
+      const context = await reads.context(identity, { officeSnapshot: observationId });
+      const big = groups.find(group => group.department === "Big department")!;
+      const start = performance.now();
+      await measure(async () => {
+        let cursor: string | undefined;
+        for (let pageNumber = partition * 100 + 1; pageNumber <= Math.min(990, (partition + 1) * 100); pageNumber++) {
+          const page = await reads.people(identity, context.query, big.id, context.selection.id,
+            cursor ? { limit:100,cursor } : { limit:100,pageNumber });
+          expect(page.page.number).toBe(pageNumber);
+          expect(page.counts).toEqual({ total: 99000, filtered: 99000 });
+          expect(page.value).toHaveLength(100);
+          for (const [offset, person] of page.value.entries()) {
+            const n = (pageNumber - 1) * 100 + offset + 1;
+            expect(person.identity).toBe(officeFixturePerson(n).identity.objectId);
+            expect(person.groupId).toBe(big.id);
+          }
+          returned += page.value.length;
+          maximumPageBytes = Math.max(maximumPageBytes, Buffer.byteLength(JSON.stringify(page)));
+          expect(maximumPageBytes).toBeLessThanOrEqual(1048576);
+          expect(Boolean(page.page.nextCursor)).toBe(pageNumber<990);
+          cursor=page.page.nextCursor ?? undefined;
+        }
+      });
+      readMs += performance.now() - start;
+    }, 120000);
+  it("reports measured persisted capacity and actual scan plans against unchanged twelve-month/resource budgets", async () => {
+    expect(returned).toBe(99000);
+    const otherGroups = groups.filter(group => group.department !== "Big department");
+    const context = await reads.context(identity, { officeSnapshot: observationId });
+    await measure(async () => {
+      for (const group of otherGroups) {
+        const page = await reads.people(identity, context.query, group.id, context.selection.id, { limit: 100 });
+        expect(page.value).toHaveLength(10); returned += page.value.length;
+      }
+    });
+    expect(returned).toBe(size);
+    const storage = (await fixture.runtime.query(`SELECT g.byte_count::text AS charged,
+      (SELECT sum(pg_column_size(p))::text FROM office_person_facts p WHERE generation_id=$1) AS fact_bytes,
+      pg_total_relation_size('office_person_facts')::text AS persisted,
+      pg_total_relation_size('office_observations')::text AS headers
+      FROM data_generations g WHERE id=$1`, [observationId])).rows[0];
+    const plans = [];
+    for (const example of [...queryExamples.values()].filter(point => point.sql.startsWith("SELECT payload")).slice(-1)) {
+      plans.push((await fixture.operator.query(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) ${example.sql}`, example.parameters)).rows[0]["QUERY PLAN"]);
+    }
+    const dailyObservations = 366, chargedTwelveMonths = Number(storage.charged) * dailyObservations;
+    const physicalTwelveMonths = (Number(storage.persisted) + Number(storage.headers)) * dailyObservations;
+    process.stdout.write(`OFFICE_SCALE_CAPACITY ${JSON.stringify({ rows: size, returned, maximumPageBytes, maximumHeap, maximumRss,
+      readMs, sqlMs, queries, maximumSqlRows, maximumParameterBytes, storage, dailyObservations,
+      chargedTwelveMonths, physicalTwelveMonths, generationBudget: dataLimits.generationBytes, tenantBudget: dataLimits.tenantBytes, plans })}\n`);
+    expect(plans).toHaveLength(1);
+    expect(JSON.stringify(plans)).toContain("office_person_group");
+    expect(maximumSqlRows).toBeLessThanOrEqual(250);
+    expect(maximumParameterBytes).toBeLessThanOrEqual(1048576);
+    expect(maximumHeap).toBeLessThan(768 * 1024 ** 2);
+    expect(Number(storage.charged)).toBeLessThan(dataLimits.generationBytes);
+    expect(chargedTwelveMonths).toBeLessThan(dataLimits.tenantBytes);
+    expect(physicalTwelveMonths).toBeLessThan(dataLimits.tenantBytes);
+    await verifyDataGenerationCharges(fixture.operator);
+  }, 120000);
 });
 
 async function plannerSettings(database: pg.Pool) {

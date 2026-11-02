@@ -5,6 +5,169 @@ import { reportPage, reportSelection, source } from "../src/test/reportDataFixtu
 import { mockLayoutApi, unifiedAgents } from "./layoutFixtures";
 import { deferred } from "../src/test/deferred";
 import { automaticRefreshFixture } from "./automaticRefreshFixtures";
+import { officeContext, officeFixtureContext, officeGroup, officeHistory, officePage, officePerson, officeSummary } from "../src/test/officeAdoptionFixture";
+
+test("Office groups keep complete denominators and suggestions across paged people, app filters, bookmarks and keyboard navigation", async ({ page }, info) => {
+  const unexpected = await mockLayoutApi(page);
+  let peopleReads = 0;
+  const peopleRequests: Record<string, string>[] = [];
+  await page.route(url => url.pathname.startsWith("/api/office-app-adoption/"), route => {
+    const url = new URL(route.request().url()), input = Object.fromEntries(url.searchParams);
+    for (const field of ["company", "department"]) if (input[field]?.startsWith("~string:")) input[field] = input[field].slice(8);
+    const context = officeFixtureContext(input);
+    if (url.pathname.endsWith("/context")) return route.fulfill({ json: context });
+    expect(input.selectionId).toBe(context.selection.id);
+    if (url.pathname.endsWith("/summary")) return route.fulfill({ json: officeSummary(context, { filteredPeople: input.app ? 40 : 54 }) });
+    if (url.pathname.endsWith("/history")) return route.fulfill({ json: officePage(officeHistory(context), context) });
+    if (url.pathname.endsWith("/facets")) return route.fulfill({ json: officePage([
+      { value: input.kind === "company" ? "Contoso" : "Engineering", groups: 1, people: 54 },
+    ], context) });
+    if (url.pathname.endsWith("/groups")) return route.fulfill({ json: officePage([officeGroup(1, { filteredPeople: input.app ? 40 : 54 })], context, {
+      page: { limit: 5, number: Number(input.pageNumber ?? 1), pages: 2, offset: input.pageNumber === "2" ? 5 : 0,
+        anchor: officeGroup().id, previousCursor: input.pageNumber === "2" ? "first" : null, nextCursor: input.pageNumber === "2" ? null : "next" },
+      counts: { total: 6, filtered: 6 },
+    }) });
+    if (url.pathname.endsWith("/people")) {
+      peopleReads++;
+      peopleRequests.push(input);
+      const second = input.cursor === "next-person" || input.pageNumber === "2";
+      return route.fulfill({ json: officePage(second ? [officePerson(54)] : [officePerson(1)], context, {
+        counts: { total: 54, filtered: input.app ? 40 : 54 },
+        page: { limit: Number(input.limit), number: second ? 2 : 1, pages: input.app ? 1 : 2, offset: second ? 50 : 0, anchor: null,
+          nextCursor: second || input.app ? null : "next-person", previousCursor: second ? "first-person" : null },
+      }) });
+    }
+    return route.fulfill({ status: 400, json: { code: "invalid_office_query", detail: "Unexpected Office route." } });
+  });
+  await page.goto("/users?section=adoption&adoption=office");
+  const group = page.getByRole("region", { name: "Contoso / Engineering" });
+  await expect(group.getByRole("button", { name: "Office Person 1", exact: true })).toBeVisible();
+  await group.getByRole("button", { name: "Next people" }).focus(); await page.keyboard.press("Enter");
+  await expect(group.getByRole("button", { name: "Office Person 54", exact: true })).toBeVisible();
+  await expect(group.getByText("40 reported active / 54 saved licensed", { exact: true })).toBeVisible();
+  await expect(group.getByRole("button", { name: "3. Office Person 3", exact: true })).toBeVisible();
+  expect(peopleRequests[1]).toEqual({ selectionId:officeContext().selection.id,limit:"50",cursor:"next-person" });
+  const readsBeforeOpen = peopleReads, started = performance.now();
+  await group.getByRole("button", { name: "Office Person 54", exact: true }).click();
+  const frozen = page.getByRole("region", { name: "Frozen Office person evidence" });
+  await expect(frozen.getByText("2 of 7", { exact: true })).toBeVisible();
+  await expect.poll(() => peopleReads).toBe(readsBeforeOpen + 1);
+  const openedMs = performance.now() - started;
+  expect(peopleRequests.slice(readsBeforeOpen)).toEqual([{
+    officeSnapshot: officeContext().observation!.id, selectionId: officeContext().selection.id, limit: "50", pageNumber: "2",
+  }]);
+  expect(openedMs).toBeLessThan(5000);
+  await info.attach("office-late-page-person-open", { contentType: "application/json",
+    body: Buffer.from(JSON.stringify({ person: 54, peopleReadsBefore: readsBeforeOpen, peopleReadsAfter: peopleReads,
+      repinnedListingRequests: peopleRequests.slice(readsBeforeOpen), openedMs })) });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Office Person 54", exact: true })).toHaveCount(0);
+  await expect(group.getByRole("button", { name: "Office Person 54", exact: true })).toBeFocused();
+  await group.getByRole("link", { name: "Word", exact: true }).click();
+  await expect(page).toHaveURL(/app=word/);
+  await expect(page.getByText(/People and suggestions are filtered/)).toBeVisible();
+  await expect(group.getByText("40 reported active / 54 saved licensed", { exact: true })).toBeVisible();
+  await expect(group.getByRole("list", { name: "Seven Office app active-user counts" }).getByRole("listitem")).toHaveCount(7);
+  await expect(group.getByRole("button", { name: "3. Office Person 3", exact: true })).toBeVisible();
+  for (const width of [360, 760, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
+    await page.screenshot({ path: info.outputPath(`office-groups-${width}.png`), fullPage: true });
+  }
+  await page.getByRole("button", { name: "Remove office app filter" }).click();
+  await page.getByRole("navigation", { name: "groups pages", exact: true }).getByRole("button", { name: "Page 2", exact: true }).click();
+  await expect(page).toHaveURL(/page=2/);
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Page 2", exact: true })).toHaveAttribute("aria-current", "page");
+  await page.goBack();
+  await expect(page).not.toHaveURL(/page=2/);
+  expect(unexpected).toEqual([]);
+});
+
+test("invalid and removed Office pins show explicit Latest recovery without overwriting agent pins", async ({ page }) => {
+  await mockLayoutApi(page);
+  const removed = "b0000000-0000-4000-8000-000000000099";
+  const agentPin = "10000000-0000-4000-8000-000000000001";
+  await page.route(url => url.pathname.startsWith("/api/office-app-adoption/"), route => {
+    const url = new URL(route.request().url()), input = Object.fromEntries(url.searchParams);
+    if (input.officeSnapshot === removed) return route.fulfill({ status: 409, json: { code: "selection_invalidated", detail: "Removed Office observation", details: { reason: "unavailable" } } });
+    const context = officeFixtureContext(input);
+    if (url.pathname.endsWith("/context")) return route.fulfill({ json: context });
+    if (url.pathname.endsWith("/summary")) return route.fulfill({ json: officeSummary(context) });
+    if (url.pathname.endsWith("/history")) return route.fulfill({ json: officePage(officeHistory(context), context) });
+    return route.fulfill({ json: officePage([], context) });
+  });
+  await page.goto(`/users?section=adoption&adoption=office&officeSnapshot=${removed}&snapshot=${agentPin}`);
+  await expect(page.getByText(/corrected, removed, or is no longer retained/)).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Office observation" })).toHaveValue("");
+  await expect(page).toHaveURL(new RegExp(`snapshot=${agentPin}`));
+  await expect(page).not.toHaveURL(/officeSnapshot=/);
+  await page.goto(`/users?section=adoption&adoption=office&officeSnapshot=invalid&snapshot=${agentPin}`);
+  await expect(page.getByText(/invalid observation or baseline/)).toBeVisible();
+  await expect(page.getByRole("group", { name: "Office adoption summary" }).getByText("54", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`snapshot=${agentPin}`));
+  await page.goto(`/dashboard?adoption=office&snapshot=${agentPin}&baseline=${agentPin}`);
+  await expect(page.getByRole("region", { name: "Active users", exact: true }).getByText("40", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Agent adoption", exact: true }).click();
+  await page.reload();
+  await page.getByRole("button", { name: "Copilot in Office apps", exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`snapshot=${agentPin}`));
+  await expect(page).toHaveURL(new RegExp(`baseline=${agentPin}`));
+  await expect(page.getByRole("combobox", { name: "Office observation", exact: true })).toHaveValue("");
+  expect(officeContext().observation).not.toBeNull();
+});
+
+test("Office idle selection renewal retains groups and totals without stale facet requests, focus movement or manual restart", async ({ page }) => {
+  const unexpected = await mockLayoutApi(page);
+  await page.clock.install();
+  let renewed = false, contextReads = 0, obsoleteReads = 0;
+  let release: () => void = () => {};
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const original = officeContext();
+  original.selection.expiresAt = new Date(Date.now() + 60_000).toISOString();
+  await page.route(url => url.pathname.startsWith("/api/office-app-adoption/"), async route => {
+    const url = new URL(route.request().url()), input = Object.fromEntries(url.searchParams);
+    const context = renewed ? officeFixtureContext(input) : original;
+    if (renewed) context.selection.id = "20000000-0000-4000-8000-000000000099";
+    if (url.pathname.endsWith("/context")) {
+      contextReads++;
+      if (renewed) await pending;
+      return route.fulfill({ json: context });
+    }
+    if (renewed && input.selectionId === original.selection.id) obsoleteReads++;
+    if (url.pathname.endsWith("/summary")) return route.fulfill({ json: officeSummary(context) });
+    if (url.pathname.endsWith("/history")) return route.fulfill({ json: officePage(officeHistory(context), context) });
+    if (url.pathname.endsWith("/groups")) return route.fulfill({ json: officePage([officeGroup()], context, {
+      page: { limit: 5, number: 1, pages: 1, offset: 0, anchor: officeGroup().id, previousCursor: null, nextCursor: null },
+    }) });
+    if (url.pathname.endsWith("/people")) return route.fulfill({ json: officePage([officePerson()], context) });
+    if (url.pathname.endsWith("/facets")) return route.fulfill({ json: officePage([{ value: "Contoso", groups: 1, people: 54 }], context) });
+    return route.fulfill({ status: 400, json: { code: "invalid_office_query", detail: "Unexpected Office route" } });
+  });
+  try {
+    await page.goto("/users?section=adoption&adoption=office");
+    const group = page.getByRole("region", { name: "Contoso / Engineering" });
+    await expect(group.getByRole("button", { name: "Office Person 1", exact: true })).toBeVisible();
+    await group.evaluate(element => element.setAttribute("data-continuity", "original"));
+    const domain = page.getByRole("group", { name: "Adoption domain" }).getByRole("button", { name: "Office apps", exact: true });
+    await domain.focus();
+    renewed = true;
+    await page.clock.fastForward(40 * 60_000);
+    await expect.poll(() => contextReads).toBe(2);
+    await expect(group).toHaveAttribute("data-continuity", "original");
+    await expect(group.getByText("40 reported active / 54 saved licensed", { exact: true })).toBeVisible();
+    await expect(domain).toBeFocused();
+    release();
+    await expect(group.getByRole("button", { name: "Office Person 1", exact: true })).toHaveAttribute("aria-disabled", "false");
+    await expect(group).toHaveAttribute("data-continuity", "original");
+    await expect(page.getByRole("button", { name: "Restart selection", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(domain).toBeFocused();
+    expect(obsoleteReads).toBe(0);
+    expect(unexpected).toEqual([]);
+  } finally { release(); }
+});
 
 test("Adoption keeps all group content visible, searches groups, and opens existing agent details", async ({ page }, info) => {
   const unexpected = await mockLayoutApi(page);
@@ -61,7 +224,7 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
   await expect(hr).toBeVisible();
   expect(Math.abs((await page.getByRole("group", { name: "Adoption summary" }).boundingBox())!.y - agentsSummaryY)).toBeLessThanOrEqual(1);
   await expect(hr.getByText("10/200")).toBeVisible();
-  await expect(hr.getByText("Copilot Champ", { exact: true })).toHaveCount(3);
+  await expect(hr.getByText("Agent Champ", { exact: true })).toHaveCount(3);
   await expect(hr.getByRole("button", { name: "Sam Patel" })).toBeVisible();
   await expect(hr.getByText("Microsoft", { exact: true })).toBeVisible();
   await expect(hr.getByText("Third-party", { exact: true })).toBeVisible();
@@ -83,7 +246,7 @@ test("Adoption keeps all group content visible, searches groups, and opens exist
   expect(Math.abs((await filters.boundingBox())!.height - panelHeight)).toBeLessThanOrEqual(1);
   expect(Math.abs((await filters.getByRole("combobox", { name: "Company", exact: true }).boundingBox())!.height - companyHeight)).toBeLessThanOrEqual(1);
   expect((await new AxeBuilder({ page }).include(".copilot-users").analyze()).violations).toEqual([]);
-  await filters.getByRole("combobox", { name: "Copilot Champs", exact: true }).selectOption("with");
+  await filters.getByRole("combobox", { name: "Agent Champs", exact: true }).selectOption("with");
   await expect(page.getByRole("region", { name: "Contoso / Finance" })).toHaveCount(0);
   expect(Math.abs((await filters.boundingBox())!.height - panelHeight)).toBeLessThanOrEqual(1);
   await filters.getByRole("button", { name: "Close filters" }).click();

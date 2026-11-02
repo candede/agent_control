@@ -63,11 +63,12 @@ for (const scenario of cases) {
       await expect(page).toHaveURL(/\/agents\?.*detailTab=audit-security/);
     }
     if (scenario.name === "permissions") {
-      await expect(page.getByRole("region", { name: "Issues", exact: true }).getByRole("button", { name: "Details: Agent inventory", exact: true })).toBeVisible();
-      const prerequisites = page.getByRole("region", { name: "App prerequisites" });
-      await prerequisites.getByText("Required API permissions", { exact: true }).click();
-      await prerequisites.getByText("Optional application permissions", { exact: true }).click();
+      const issue=page.getByRole("region",{name:"Issues",exact:true}).getByRole("article",{name:"Agent inventory",exact:true});
+      await expect(issue.getByRole("region",{name:"Required setup"})).toBeVisible();
+      await expect(issue.getByRole("region",{name:"Technical details"})).toBeVisible();
+      const prerequisites = page.getByRole("region", { name: "App registration permissions" });
       await expect(prerequisites.getByRole("region", { name: "Microsoft Graph / Application", exact: true })).toBeVisible();
+      await expect(prerequisites.locator("details,summary")).toHaveCount(0);
       await expect(page.getByRole("region", { name: "Log setup" })).toHaveCount(0);
       await expect(page.getByRole("link", { name: "Log setup", exact: true })).toHaveCount(0);
     }
@@ -211,6 +212,10 @@ test("the compact metric strip distinguishes unavailable sources and missing rep
     analytics: { ...reports.analytics, overview: { ...reports.analytics.overview!, retainedSets: 0, usedAgents: 0, active30Days: 0 } },
   } }));
   await page.route("**/api/official-usage/history?*", route => route.fulfill({ json: { ...selectedHistoryPage([], null), reports: metadata } }));
+  await page.route("**/api/official-usage/history/options?*",route=>{
+    const {value,page,counts,selection}=selectedHistoryPage([],null);
+    return route.fulfill({json:{value,page,counts,selection,reports:metadata}});
+  });
   await page.goto("/agents");
   const overview = page.getByRole("region", { name: "Agent inventory overview" });
   await expect(overview.locator(".metric")).toHaveCount(4);

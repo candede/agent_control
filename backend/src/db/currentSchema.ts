@@ -1,9 +1,9 @@
 import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
-import { inventoryLimits } from "../types/inventoryRecords.js";
 import { auditOriginIntegritySql, auditOriginValidationSql } from "./auditOriginSchema.js";
 import { agentControlReceiptsSql } from "./agentControlReceiptsSchema.js";
 import { unknownOrigin } from "../types/actionOrigin.js";
 import { readableReportVersionSql } from "./reportCapacitySchema.js";
+import { officeAppAdoptionSchemaSql } from "./officeAppAdoptionSchema.js";
 
 const schemaBaseSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
@@ -429,10 +429,8 @@ CREATE TABLE power_platform_refresh_jobs (
   , CONSTRAINT power_platform_refresh_jobs_idempotency_key_check CHECK (length(idempotency_key) >= 1
                                                                     AND length(idempotency_key) <= 128)
   , CONSTRAINT power_platform_refresh_jobs_message_check CHECK (length(message) <= 1024)
-  , CONSTRAINT power_platform_refresh_jobs_observed_count_check CHECK (observed_count >= 0
-                                                                   AND observed_count <= ${inventoryLimits.sourceRows})
-  , CONSTRAINT power_platform_refresh_jobs_page_count_check CHECK (page_count >= 0
-                                                               AND page_count <= ${inventoryLimits.pages})
+  , CONSTRAINT power_platform_refresh_jobs_observed_count_check CHECK (observed_count >= 0)
+  , CONSTRAINT power_platform_refresh_jobs_page_count_check CHECK (page_count >= 0)
   , CONSTRAINT power_platform_refresh_jobs_principal_id_check CHECK (length(principal_id) >= 1
                                                                  AND length(principal_id) <= 256)
   , CONSTRAINT power_platform_refresh_jobs_request_hash_check CHECK (request_hash ~ CAST('^[a-f0-9]{64}$' AS text))
@@ -450,10 +448,8 @@ CREATE TABLE power_platform_refresh_jobs (
                                                                                 , CAST('cancelled' AS text)]))
   , CONSTRAINT power_platform_refresh_jobs_tenant_id_check CHECK (length(tenant_id) >= 1
                                                               AND length(tenant_id) <= 128)
-  , CONSTRAINT power_platform_refresh_jobs_total_records_check CHECK (total_records >= 0
-                                                                  AND total_records <= ${inventoryLimits.sourceRows})
-  , CONSTRAINT power_platform_refresh_jobs_unknown_field_count_check CHECK (unknown_field_count >= 0
-                                                                        AND unknown_field_count <= 1000000)
+  , CONSTRAINT power_platform_refresh_jobs_total_records_check CHECK (total_records >= 0)
+  , CONSTRAINT power_platform_refresh_jobs_unknown_field_count_check CHECK (unknown_field_count >= 0)
   , CONSTRAINT power_platform_refresh_jobs_pkey PRIMARY KEY (id)
   , CONSTRAINT power_platform_refresh_jobs_tenant_id_principal_id_idempote_key UNIQUE (tenant_id, principal_id, idempotency_key)
 );
@@ -489,9 +485,8 @@ CREATE TABLE package_refresh_jobs (
   , CONSTRAINT package_refresh_jobs_idempotency_key_check CHECK (length(idempotency_key) >= 1
                                                              AND length(idempotency_key) <= 128)
   , CONSTRAINT package_refresh_jobs_message_check CHECK (length(message) <= 1024)
-  , CONSTRAINT package_refresh_jobs_observed_count_check CHECK (observed_count >= 0
-                                                            AND observed_count <= ${inventoryLimits.sourceRows})
-  , CONSTRAINT package_refresh_jobs_page_count_check CHECK (page_count >= 0 AND page_count <= ${inventoryLimits.pages})
+  , CONSTRAINT package_refresh_jobs_observed_count_check CHECK (observed_count >= 0)
+  , CONSTRAINT package_refresh_jobs_page_count_check CHECK (page_count >= 0)
   , CONSTRAINT package_refresh_jobs_principal_id_check CHECK (length(principal_id) >= 1
                                                           AND length(principal_id) <= 256)
   , CONSTRAINT package_refresh_jobs_query_hash_check CHECK (query_hash ~ CAST('^[a-f0-9]{64}$' AS text))
@@ -506,8 +501,7 @@ CREATE TABLE package_refresh_jobs (
   , CONSTRAINT package_refresh_jobs_tenant_id_check CHECK (length(tenant_id) >= 1
                                                        AND length(tenant_id) <= 128)
   , CONSTRAINT package_refresh_jobs_token_mode_check CHECK (token_mode = CAST('application' AS text))
-  , CONSTRAINT package_refresh_jobs_total_records_check CHECK (total_records >= 0
-                                                           AND total_records <= ${inventoryLimits.sourceRows})
+  , CONSTRAINT package_refresh_jobs_total_records_check CHECK (total_records >= 0)
   , CONSTRAINT package_refresh_jobs_pkey PRIMARY KEY (id)
   , CONSTRAINT package_refresh_jobs_tenant_id_principal_id_token_mode_idem_key UNIQUE (tenant_id, principal_id, token_mode, idempotency_key)
 );
@@ -2194,7 +2188,7 @@ CREATE TABLE data_scope_epochs (
                                            AND principal_id IS NOT NULL
                                            AND token_mode <> CAST('tenant' AS text)))
   , CONSTRAINT data_scope_epochs_epoch_check CHECK (epoch >= 0)
-  , CONSTRAINT tenant_inventory_owner CHECK (source NOT IN ('directory','app_activity','user_sources','agent_people',
+  , CONSTRAINT tenant_inventory_owner CHECK (source NOT IN ('directory','app_activity','user_sources','agent_people','office_app_adoption','office_history',
       'inventory_packages','inventory_power_platform','inventory_canonical') OR scope_kind='tenant')
   , CONSTRAINT tenant_inventory_selector CHECK (source NOT IN ('inventory_packages','inventory_power_platform','inventory_canonical')
       OR selector='complete')
@@ -2257,10 +2251,7 @@ CREATE TABLE data_generations (
   , CONSTRAINT data_generations_check CHECK (byte_count >= 0
                                          AND byte_count <= CAST('8589934592' AS bigint)
                                          AND byte_count <= reserved_bytes)
-  , CONSTRAINT data_generations_check1 CHECK (row_count >= 0
-                                          AND row_count <= 200000
-                                          AND (job_kind = CAST('derived' AS text)
-                                            OR row_count <= 100000))
+  , CONSTRAINT data_generations_check1 CHECK (row_count >= 0)
   , CONSTRAINT data_generations_check2 CHECK (expires_at > observed_at)
   , CONSTRAINT data_generations_check3 CHECK (deadline_at > created_at)
   , CONSTRAINT data_generations_check4 CHECK (collected_at IS NULL
@@ -2274,7 +2265,7 @@ CREATE TABLE data_generations (
                                                                          , CAST('derived' AS text)
                                                                          , CAST('fixture' AS text)]))
   , CONSTRAINT data_generations_lease_version_check CHECK (lease_version > 0)
-  , CONSTRAINT data_generations_page_count_check CHECK (page_count >= 0 AND page_count <= 10000)
+  , CONSTRAINT data_generations_page_count_check CHECK (page_count >= 0)
   , CONSTRAINT data_generations_reserved_bytes_check CHECK (reserved_bytes >= 0
                                                         AND reserved_bytes <= CAST('8589934592' AS bigint))
   , CONSTRAINT data_generations_schema_version_check CHECK (schema_version > 0)
@@ -2285,15 +2276,13 @@ CREATE TABLE data_generations (
                                                                    , CAST('deleting' AS text)
                                                                    , CAST('failed' AS text)
                                                                    , CAST('cancelled' AS text)]))
-  , CONSTRAINT data_generations_validated_children_check CHECK (validated_children >= 0
-                                                            AND validated_children <= 100000000)
-  , CONSTRAINT data_generations_validated_rows_check CHECK (validated_rows >= 0
-                                                        AND validated_rows <= 200000)
+  , CONSTRAINT data_generations_validated_children_check CHECK (validated_children >= 0)
+  , CONSTRAINT data_generations_validated_rows_check CHECK (validated_rows >= 0)
   , CONSTRAINT data_generations_validation_cursor_check CHECK (length(validation_cursor) <= 512)
   , CONSTRAINT data_generations_validation_phase_check CHECK (validation_phase = ANY(ARRAY[CAST('directory' AS text)
                                                                                          , CAST('activity' AS text)
                                                                                          , CAST('complete' AS text)]))
-  , CONSTRAINT data_generations_wire_count_check CHECK (wire_count >= 0 AND wire_count <= 5000000)
+  , CONSTRAINT data_generations_wire_count_check CHECK (wire_count >= 0)
   , CONSTRAINT data_generations_id_scope_id_tenant_id_key UNIQUE (id, scope_id, tenant_id)
   , CONSTRAINT data_generations_pkey PRIMARY KEY (id)
 );
@@ -2330,9 +2319,9 @@ CREATE TABLE data_generation_pages (
   , ordinal integer NOT NULL
   , token_hash text NOT NULL
   , wire_rows integer NOT NULL
-  , CONSTRAINT data_generation_pages_ordinal_check CHECK (ordinal >= 0 AND ordinal <= 9999)
+  , CONSTRAINT data_generation_pages_ordinal_check CHECK (ordinal >= 0)
   , CONSTRAINT data_generation_pages_token_hash_check CHECK (token_hash ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT data_generation_pages_wire_rows_check CHECK (wire_rows >= 0 AND wire_rows <= 5000000)
+  , CONSTRAINT data_generation_pages_wire_rows_check CHECK (wire_rows >= 0)
   , CONSTRAINT data_generation_pages_generation_id_token_hash_key UNIQUE (generation_id, token_hash)
   , CONSTRAINT data_generation_pages_pkey PRIMARY KEY (generation_id, ordinal)
 );
@@ -2493,17 +2482,21 @@ CREATE TABLE data_generation_pins (
   , revision bigint NOT NULL
   , expires_at timestamp with time zone NOT NULL
   , CONSTRAINT data_generation_pins_check CHECK ((root_kind = ANY(ARRAY[CAST('tenant_history' AS text)
-                                                                      , CAST('user_sources' AS text)])
+                                                                      , CAST('user_sources' AS text)
+                                                                      , CAST('office_history' AS text)])
                                               AND generation_id IS NULL)
                                               OR (root_kind = ANY(ARRAY[CAST('generation' AS text)
-                                                                      , CAST('inventory_delta' AS text)])
+                                                                      , CAST('inventory_delta' AS text)
+                                                                      , CAST('office_observation' AS text)])
                                               AND generation_id IS NOT NULL))
   , CONSTRAINT data_generation_pins_ordinal_check CHECK (ordinal >= 0 AND ordinal <= 19)
   , CONSTRAINT data_generation_pins_revision_check CHECK (revision >= 0)
   , CONSTRAINT data_generation_pins_root_kind_check CHECK (root_kind = ANY(ARRAY[CAST('generation' AS text)
                                                                                , CAST('tenant_history' AS text)
                                                                                , CAST('inventory_delta' AS text)
-                                                                               , CAST('user_sources' AS text)]))
+                                                                               , CAST('user_sources' AS text)
+                                                                               , CAST('office_history' AS text)
+                                                                               , CAST('office_observation' AS text)]))
   , CONSTRAINT data_generation_pins_pkey PRIMARY KEY (selection_id, ordinal)
 );
 
@@ -2609,10 +2602,14 @@ CREATE TABLE user_source_attempts (
   , retained_count integer DEFAULT 0 NOT NULL CHECK (retained_count>=0)
   , report_refresh_date date
   , report_period text DEFAULT CAST('D30' AS text) NOT NULL
+  , office_vector text CHECK (office_vector ~ '^[a-f0-9]{64}$')
+  , office_status text CHECK (office_status IN ('preparing','available','unavailable','waiting_sources','failed'))
+  , office_error_code text CHECK (office_error_code ~ '^[a-z][a-z0-9_]{0,127}$')
+  , office_updated_at timestamptz
+  , office_revision bigint NOT NULL DEFAULT 0 CHECK (office_revision>=0)
   , CONSTRAINT user_source_attempts_error_code_check CHECK (error_code ~ CAST('^[a-z][a-z0-9_]{0,127}$' AS text))
   , CONSTRAINT user_source_attempts_message_check CHECK (length(message) <= 1024)
-  , CONSTRAINT user_source_attempts_observed_count_check CHECK (observed_count >= 0
-                                                            AND observed_count <= 100000)
+  , CONSTRAINT user_source_attempts_observed_count_check CHECK (observed_count >= 0)
   , CONSTRAINT user_source_attempts_report_period_check CHECK (report_period = ANY(ARRAY[CAST('D28' AS text)
                                                                                        , CAST('D30' AS text)]))
   , CONSTRAINT user_source_attempts_source_check CHECK (source = ANY(ARRAY[CAST('directory' AS text)
@@ -2636,16 +2633,14 @@ CREATE TABLE user_source_queries (
   , wire_count integer DEFAULT 0 NOT NULL
   , page_count integer DEFAULT 0 NOT NULL
   , complete boolean DEFAULT FALSE NOT NULL
-  , CONSTRAINT user_source_queries_expected_count_check CHECK (expected_count >= 0
-                                                           AND expected_count <= 100000)
+  , CONSTRAINT user_source_queries_expected_count_check CHECK (expected_count >= 0)
   , CONSTRAINT user_source_queries_kind_check CHECK (kind = ANY(ARRAY[CAST('catalog' AS text)
                                                                     , CAST('discovery' AS text)
                                                                     , CAST('identity' AS text)
                                                                     , CAST('activity' AS text)]))
-  , CONSTRAINT user_source_queries_page_count_check CHECK (page_count >= 0 AND page_count <= 10000)
+  , CONSTRAINT user_source_queries_page_count_check CHECK (page_count >= 0)
   , CONSTRAINT user_source_queries_query_key_check CHECK (query_key ~ CAST('^[a-f0-9]{64}$' AS text))
-  , CONSTRAINT user_source_queries_wire_count_check CHECK (wire_count >= 0
-                                                       AND wire_count <= 5000000)
+  , CONSTRAINT user_source_queries_wire_count_check CHECK (wire_count >= 0)
   , CONSTRAINT user_source_queries_pkey PRIMARY KEY (generation_id, query_key)
 );
 
@@ -2811,8 +2806,6 @@ CREATE TABLE inventory_attempts (
                                                                          , CAST('detail' AS text)
                                                                          , CAST('control' AS text)
                                                                          , CAST('canonical' AS text)]))
-  , CONSTRAINT inventory_attempts_check1 CHECK (domain = CAST('canonical' AS text)
-                                             OR expected_count <= 100000)
   , CONSTRAINT inventory_attempts_check2 CHECK (domain <> CAST('power_platform' AS text)
                                              OR (cardinality(resource_types) > 0
                                              AND resource_types <@ ARRAY[CAST('microsoft.copilotstudio/agents' AS text)
@@ -2821,14 +2814,12 @@ CREATE TABLE inventory_attempts (
                                                                        , CAST('power_platform' AS text)
                                                                        , CAST('canonical' AS text)]))
   , CONSTRAINT inventory_attempts_exact_targets_check CHECK (cardinality(exact_targets) <= 100)
-  , CONSTRAINT inventory_attempts_expected_count_check CHECK (expected_count >= 0
-                                                          AND expected_count <= 200000)
+  , CONSTRAINT inventory_attempts_expected_count_check CHECK (expected_count >= 0)
   , CONSTRAINT inventory_attempts_mode_check CHECK (mode = ANY(ARRAY[CAST('baseline' AS text)
                                                                    , CAST('delta' AS text)
                                                                    , CAST('compact' AS text)]))
   , CONSTRAINT inventory_attempts_omitted_fields_check CHECK (omitted_fields >= 0)
-  , CONSTRAINT inventory_attempts_prepared_changed_count_check CHECK (prepared_changed_count >= 0
-                                                                  AND prepared_changed_count <= 200000)
+  , CONSTRAINT inventory_attempts_prepared_changed_count_check CHECK (prepared_changed_count >= 0)
   , CONSTRAINT inventory_attempts_role_scope_check CHECK (role_scope = ANY(ARRAY[CAST('full' AS text)
                                                                                , CAST('ai' AS text)
                                                                                , CAST('unknown' AS text)]))
@@ -2857,10 +2848,7 @@ CREATE TABLE inventory_roots (
   , catalog_page_count integer DEFAULT 0 NOT NULL
   , catalog_omitted_fields integer DEFAULT 0 NOT NULL
   , CONSTRAINT inventory_roots_catalog_omitted_fields_check CHECK (catalog_omitted_fields >= 0)
-  , CONSTRAINT inventory_roots_catalog_page_count_check CHECK (catalog_page_count >= 0
-                                                           AND catalog_page_count <= 10000)
-  , CONSTRAINT inventory_roots_check CHECK (domain = CAST('canonical' AS text)
-                                         OR row_count <= 100000)
+  , CONSTRAINT inventory_roots_catalog_page_count_check CHECK (catalog_page_count >= 0)
   , CONSTRAINT inventory_roots_check1 CHECK (NOT catalog_complete
                                           OR (catalog_observed_at IS NOT NULL
                                           AND catalog_expires_at IS NOT NULL))
@@ -2870,7 +2858,7 @@ CREATE TABLE inventory_roots (
                                                                     , CAST('power_platform' AS text)
                                                                     , CAST('canonical' AS text)]))
   , CONSTRAINT inventory_roots_observation_epoch_check CHECK (observation_epoch >= 0)
-  , CONSTRAINT inventory_roots_row_count_check CHECK (row_count >= 0 AND row_count <= 200000)
+  , CONSTRAINT inventory_roots_row_count_check CHECK (row_count >= 0)
   , CONSTRAINT inventory_roots_baseline_id_scope_id_tenant_id_key UNIQUE (baseline_id, scope_id, tenant_id)
   , CONSTRAINT inventory_roots_pkey PRIMARY KEY (baseline_id)
 );
@@ -3110,7 +3098,7 @@ CREATE TABLE inventory_revisions (
   , CONSTRAINT inventory_revisions_inputs_check CHECK (jsonb_typeof(inputs) = CAST('array' AS text)
                                                    AND jsonb_array_length(inputs) <= 16
                                                    AND octet_length(CAST(inputs AS text)) <= 16384)
-  , CONSTRAINT inventory_revisions_row_count_check CHECK (row_count >= 0 AND row_count <= 200000)
+  , CONSTRAINT inventory_revisions_row_count_check CHECK (row_count >= 0)
   , CONSTRAINT inventory_revisions_pkey PRIMARY KEY (scope_id, revision)
 );
 
@@ -3152,12 +3140,9 @@ CREATE TABLE inventory_pages (
   , unique_count integer
   , expected_count integer
   , accepted boolean DEFAULT FALSE NOT NULL
-  , CONSTRAINT inventory_pages_check CHECK (raw_count >= 0
-                                        AND raw_count <= 5000000
-                                        AND (unique_count >= 0 AND unique_count <= 100000))
-  , CONSTRAINT inventory_pages_expected_count_check CHECK (expected_count >= 0
-                                                       AND expected_count <= 100000)
-  , CONSTRAINT inventory_pages_ordinal_check CHECK (ordinal >= 1 AND ordinal <= 10000)
+  , CONSTRAINT inventory_pages_check CHECK (raw_count >= 0 AND unique_count >= 0 AND unique_count <= raw_count)
+  , CONSTRAINT inventory_pages_expected_count_check CHECK (expected_count >= 0)
+  , CONSTRAINT inventory_pages_ordinal_check CHECK (ordinal >= 1)
   , CONSTRAINT inventory_pages_generation_id_token_hash_key UNIQUE (generation_id, token_hash)
   , CONSTRAINT inventory_pages_pkey PRIMARY KEY (generation_id, ordinal)
 );
@@ -3896,7 +3881,7 @@ BEGIN
   THEN RAISE EXCEPTION USING ERRCODE='PDS01',
     MESSAGE='Finish or cancel active Graph package and Power Platform refresh jobs before clearing saved data.'; END IF;
   FOR source_scope IN SELECT id,source FROM public.data_scope_epochs WHERE tenant_id=NEW.tenant_id AND scope_kind='tenant'
-    AND source IN ('directory','app_activity','user_sources','agent_people','inventory_packages','inventory_power_platform','inventory_canonical')
+    AND source IN ('directory','app_activity','user_sources','agent_people','office_app_adoption','office_history','inventory_packages','inventory_power_platform','inventory_canonical')
     ORDER BY id FOR UPDATE
   LOOP
     PERFORM scope_id FROM public.data_generation_heads WHERE scope_id=source_scope.id FOR UPDATE;
@@ -4073,6 +4058,9 @@ BEGIN
     OR EXISTS(SELECT 1 FROM user_source_query_members WHERE generation_id=NEW.id)
     OR EXISTS(SELECT 1 FROM user_source_skus WHERE generation_id=NEW.id)
     OR EXISTS(SELECT 1 FROM user_source_identity_inputs WHERE generation_id=NEW.id)
+    OR EXISTS(SELECT 1 FROM office_observations WHERE generation_id=NEW.id)
+    OR EXISTS(SELECT 1 FROM office_person_facts WHERE generation_id=NEW.id)
+    OR EXISTS(SELECT 1 FROM office_group_facts WHERE generation_id=NEW.id)
     OR EXISTS(SELECT 1 FROM data_generation_pins WHERE generation_id=NEW.id))
   THEN RAISE EXCEPTION 'data_generation_not_collected'; END IF;
   RETURN NEW;
@@ -4192,6 +4180,11 @@ BEGIN
       OR (TG_TABLE_NAME NOT IN ('user_source_attempts','user_source_queries','user_source_identity_inputs')))
     THEN RAISE EXCEPTION 'user_source_immutable'; END IF;
   IF TG_TABLE_NAME='user_source_attempts' AND TG_OP='UPDATE' THEN
+    IF OLD.status='available' AND OLD.source='app_activity'
+      AND (to_jsonb(NEW)-ARRAY['office_vector','office_status','office_error_code','office_updated_at','office_revision'])
+        IS NOT DISTINCT FROM (to_jsonb(OLD)-ARRAY['office_vector','office_status','office_error_code','office_updated_at','office_revision'])
+      AND NEW.office_revision=OLD.office_revision+1 AND g.validated AND g.state IN ('published','retired')
+    THEN RETURN NEW; END IF;
     IF (NEW.scope_id,NEW.tenant_id,NEW.source) IS DISTINCT FROM (OLD.scope_id,OLD.tenant_id,OLD.source)
       OR OLD.status<>'running'
       OR (NEW.status='available' AND (g.state<>'published' OR NOT g.validated))
@@ -6704,4 +6697,5 @@ VALUES ('records')
      , ('report_payloads')
      , ('report_staging');
 `;
-export const currentSchemaSql: string = auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql;
+export const currentSchemaSql: string = auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql
+  + officeAppAdoptionSchemaSql;

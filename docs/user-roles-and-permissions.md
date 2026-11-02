@@ -15,6 +15,11 @@ provider access, consent, licensing or data visibility; actual operations report
 their own failures. The static permission reference describes required setup,
 not verified grants.
 
+Permission-check progress distinguishes the busy track from reviewed totals in
+both Chromium/WebKit and Firefox. Forced-color themes use contrasting system
+colors for the track, fill and pending indicators; reduced motion stops animation
+without hiding the reviewed count or check labels.
+
 Read-only sync starts automatically after sign-in while the browser is visible
 and online. Visiting Permissions, checking status, an administrator staying
 signed in, or an approval/enable step is not required.

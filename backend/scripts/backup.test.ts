@@ -217,7 +217,7 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect((await restoredReader.page(restoredOverview.id,restoredCorrectionIdentity)).analytics.overview)
       .toMatchObject({ retainedSets: 0, reportedAgents: 0 });
     await expect(restoredReader.capture(restoredCorrectionIdentity,"official_users",{setId:laterCorrectedOriginal.setId}))
-      .rejects.toMatchObject({ code: "selection_invalidated" });
+      .rejects.toMatchObject({ status: 404, code: "usage_report_unavailable" });
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[
       historicalOnlyVersionIds])).rows[0].count).toBe(0);
     expect((await restoredOperator.query("SELECT count(*)::int AS count FROM official_usage_version_rows WHERE version_id=ANY($1::uuid[])",[

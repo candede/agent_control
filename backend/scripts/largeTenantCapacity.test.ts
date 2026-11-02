@@ -299,8 +299,8 @@ describe("fixed-budget capacity instrumentation and workload", () => {
     expect(capacityInput("capacity-contract", "directory").reserveBytes).toBe(8*1024**3);
     const runtime = readFileSync(new URL("../src/services/inventoryRuntime.ts",import.meta.url),"utf8");
     expect([...runtime.matchAll(/reserveBytes:\s*1024\s*\*\*\s*3/g)]).toHaveLength(2);
-    expect(dataLimits.sourceRows).toBe(100_000);
-    expect(dataLimits.derivedRows).toBe(200_000);
+    expect(dataLimits).not.toHaveProperty("sourceRows");
+    expect(dataLimits).not.toHaveProperty("derivedRows");
   });
   it("generates overlapping IDs and sparse observed facts independently", () => {
     expect(packageValue(99999).id).toBe("package-099999");

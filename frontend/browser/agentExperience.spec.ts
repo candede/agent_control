@@ -69,7 +69,6 @@ test("selected About reads retain exact source and complete Unicode text beyond 
   await page.goto("/agents");
   await page.getByRole("button", { name: record.displayName, exact: true }).click();
   const dialog = page.getByRole("dialog", { name: record.displayName });
-  await dialog.getByRole("button", { name: "Load more About text" }).click();
   await expect(dialog.getByLabel("Agent description")).toContainText("FINAL VERIFIED ABOUT");
   expect(await dialog.getByLabel("Agent description").textContent()).toBe(fullText);
   await expect(dialog.getByRole("button", { name: "Load more About text" })).toHaveCount(0);
@@ -175,7 +174,7 @@ test("users can switch cohorts and traverse nonpaid activity without losing rout
   await expect(page.getByRole("dialog", { name: "Emery" }).getByLabel("User summary")).toContainText("No active M365 Copilot license");
   await page.getByRole("dialog", { name: "Emery" }).getByRole("tab", { name: "Usage & agents", exact: true }).click();
   await page.getByRole("dialog", { name: "Emery" }).getByRole("button", { name: "Researcher: active users without paid Copilot", exact: true }).click();
-  const selectedAgentUrl = new RegExp(`agent=synthetic-researcher&snapshot=${usageFixtureSetId}$`);
+  const selectedAgentUrl = /agent=synthetic-researcher$/;
   await expect(page).toHaveURL(selectedAgentUrl);
   await expect(activity.locator("tbody tr")).toHaveCount(1);
   await activity.getByRole("button", { name: "Emery", exact: true }).click();
@@ -243,7 +242,7 @@ test("fresh activity links keep their search, page and snapshot separate from ot
   await expect(page.getByRole("searchbox", { name: "Search reported users or agents" })).toHaveValue("Emery");
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByRole("searchbox", { name: "Search", exact: true })).toHaveValue("");
-  await expect(page).toHaveURL(/\/agents$/);
+  await expect(page).toHaveURL(new RegExp(`/agents\\?snapshot=${usageFixtureSetId}$`));
   await expect(page.getByLabel("Tenant report totals")).toHaveCount(0);
   await page.getByRole("navigation", { name: "Primary views" }).getByRole("button", { name: /^Sync/ }).click();
   const reportRead = page.waitForRequest(request => new URL(request.url()).pathname === "/api/official-usage/history");

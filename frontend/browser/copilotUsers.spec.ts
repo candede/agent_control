@@ -914,7 +914,7 @@ for (const { view, exporting } of (["licenses", "activity"] as const).flatMap(vi
   try {
     await page.clock.runFor(600_001);
     await expect.poll(() => reads.length).toBe(initialReads + 1);
-    await expect.poll(() => optionReads.length).toBe(initialOptions + 1);
+    await expect.poll(() => optionReads.length).toBe(initialOptions + 10);
     expect(reads.at(-1)?.has("selectionId")).toBe(false);
     expect(optionReads.at(-1)?.has("selectionId")).toBe(false);
     await expect(user).toBeVisible();

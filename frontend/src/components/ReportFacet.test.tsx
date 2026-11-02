@@ -785,7 +785,10 @@ describe.each(["licenses", "activity"] as const)("%s cohort facet ownership", co
     const view = render(<CopilotUsersView route={route} />);
     await screen.findByRole("button", { name: "User 1" });
     fireEvent.click(screen.getByRole("button", { name: "Next users" }));
-    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(2));
+    const reads = cohort === "licenses" ? 3 : 2;
+    await waitFor(() => expect(api.readReportPage).toHaveBeenCalledTimes(reads));
+    expect(vi.mocked(api.readReportPage).mock.calls.filter(([, query]) => !query?.search)).toHaveLength(cohort === "licenses" ? 1 : 0);
+    expect(vi.mocked(api.readReportPage).mock.calls.filter(([, query]) => query?.search)).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Filters" }));
     const company = screen.getByRole("combobox", { name: "Company" });
     await waitFor(() => expect(company).toHaveAttribute("aria-disabled", "false"));
@@ -797,7 +800,7 @@ describe.each(["licenses", "activity"] as const)("%s cohort facet ownership", co
     for (const search of [" Contoso ", "CONTOSO", "ＣＯＮＴＯＳＯ", "Contoso"]) {
       view.rerender(<CopilotUsersView route={{ ...route, search }} />);
       expect(signal?.aborted).toBe(false);
-      expect(api.readReportPage).toHaveBeenCalledTimes(2);
+      expect(api.readReportPage).toHaveBeenCalledTimes(reads);
       expect(api.readReportFacet).toHaveBeenCalledTimes(3);
     }
     if (pendingPage) await act(async () => pending.resolve(facetPage(["Tail"], { previousCursor: "previous" })));

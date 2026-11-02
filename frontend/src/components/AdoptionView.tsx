@@ -42,7 +42,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
   }, [normalizedSearch, searchPending]);
   const fields = [{ key: "company", label: "Company" }, { key: "department", label: "Department" }] as const;
   const evidenceFilters = [
-    { key: "adoptionChamps", label: "Copilot Champs", with: "With Copilot Champs", without: "Without Copilot Champs" },
+    { key: "adoptionChamps", label: "Agent Champs", with: "With Agent Champs", without: "Without Agent Champs" },
     { key: "adoptionAgents", label: "Group agents", with: "With agent usage", without: "Without agent usage" },
   ] as const;
   const chips = [
@@ -81,7 +81,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
       {([
         ["Groups", data?.counts.filtered, "Company / department"],
         ["People", data?.summary.people, "In matching groups"],
-        ["Copilot Champs", data?.summary.champs, "Up to 3 per group"],
+        ["Agent Champs", data?.summary.champs, "Up to 3 per group"],
         ["Agents used", data?.summary.agents, "Distinct agents with reported responses"],
       ] as const).map(([label, count, hint]) => <div key={label} className="metric"><span>{label}</span>
         <strong>{usageCount(count)}</strong><small>{hint}</small></div>)}
@@ -138,7 +138,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
     </p> : null}
     <div className="adoption-results-heading">
       <h3 ref={resultsHeading} id={resultsId} tabIndex={-1}>Company &amp; department adoption</h3>
-      <p>Explore people, Copilot Champs, and all agents used in each group, including Microsoft and third-party agents.</p>
+      <p>Explore people, Agent Champs, and all agents used in each group, including Microsoft and third-party agents.</p>
       <ReportPageControls {...navigation} compact />
     </div>
     <section className="adoption-groups" aria-labelledby={resultsId} aria-busy={loading}>
@@ -151,7 +151,7 @@ export function AdoptionView({ route, change, revision, reportContext, onOpenAge
             <div><button type="button" className="adoption-name" onClick={() => {
               if (read.isCurrentData(true)) onOpenPerson(person.id);
             }}>{person.name}</button>
-              {person.champion ? <span className="copilot-user-badge">Copilot Champ</span> : null}</div>
+              {person.champion ? <span className="copilot-user-badge">Agent Champ</span> : null}</div>
             <span className="adoption-count" title={`${person.agents ?? "Unknown"} agents used with reported responses; ${person.responses === null ? "responses unavailable" : `${person.responses} responses`}`}>
               {usageCount(person.agents)}/{usageCount(person.responses)}
             </span>

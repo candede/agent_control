@@ -1214,9 +1214,9 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
   return capacityWithCleanup(async () => {
     await stream.stages.execute(capacityInput("capacity-idle","inventory_packages",randomUUID()), { domain: "packages", mode: "baseline", channel: "catalog" }, async (lease, signal) => {
       leaseId = lease.id; validationSignal = signal;
-      for await (const page of provider.catalogPages("synthetic", { signal, visit: token => stream.stages.visit(lease, token) })) {
-        await stream.stages.acceptPage(lease, page, 0);
-      }
+      await provider.collectCatalog("synthetic", { signal, visit: token => stream.stages.visit(lease, token),
+        onRecords: async () => { throw new Error("idle_retry_unexpected_records"); },
+        onPage: page => stream.stages.acceptPage(lease, page, 0) });
     }, { authorize: async () => {} });
   assert.ok(Date.now() - started >= 600_000); assert.ok(renewals >= 30);
   const long = (await database.query("SELECT state,row_count,batch_count FROM data_generations WHERE id=$1", [leaseId])).rows[0];
@@ -1235,9 +1235,9 @@ async function heartbeatWorkload(database: pg.Pool, telemetry: CapacityTelemetry
   const pending = stream.stages.execute(capacityInput("capacity-cancel","inventory_packages",randomUUID()), { domain: "packages", mode: "baseline", channel: "catalog" },
     async (lease, signal) => {
       cancelLease = lease;
-      for await (const _page of cancelProvider.catalogPages("synthetic", { signal, visit: token => stream.stages.visit(lease, token) })) {
-        throw new Error("cancelled_retry_unexpected_page");
-      }
+      await cancelProvider.collectCatalog("synthetic", { signal, visit: token => stream.stages.visit(lease, token),
+        onRecords: async () => { throw new Error("cancelled_retry_unexpected_records"); },
+        onPage: async () => { throw new Error("cancelled_retry_unexpected_page"); } });
     },
     { authorize: async () => {}, signal: cancelled.signal });
   void pending.catch(rejectReady);

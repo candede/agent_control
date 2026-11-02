@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, createReadStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, createReadStream, existsSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import pg from "pg";
 import { verifyDataGenerationCharges } from "../src/db/dataGenerationAccountingSchema.js";
-import { databaseSettings, secretValue, transaction } from "../src/db/pool.js";
+import { databaseSettings, transaction } from "../src/db/pool.js";
 import { schemaFingerprint, verifySchema } from "../src/db/schema.js";
 import { verifyReportMembershipCounts } from "../src/db/reportMembershipCountsSchema.js";
 import { grantRuntime, preflightSchema, retainUntilConverged } from "./database.js";
@@ -47,7 +47,9 @@ function databaseTargetIdentity(database: Pick<pg.Pool, "options">) {
 export function assertDistinctDatabaseTargets(current: Pick<pg.Pool, "options">, restored: Pick<pg.Pool, "options">) {
   const currentIdentity = databaseTargetIdentity(current);
   const restoredIdentity = databaseTargetIdentity(restored);
-  if (currentIdentity.host === restoredIdentity.host && currentIdentity.database === restoredIdentity.database) {
+  const defaultPort = Number(process.env.PGPORT ?? 5432);
+  if (currentIdentity.host === restoredIdentity.host && currentIdentity.database === restoredIdentity.database
+    && (current.options.port ?? defaultPort) === (restored.options.port ?? defaultPort)) {
     throw new Error("Restore reopening requires an exact separate server/database target.");
   }
   return { current: currentIdentity, restored: restoredIdentity };
@@ -94,12 +96,16 @@ export async function fingerprints(database: Pick<pg.Pool,"query">, selectedTabl
   }
   return result;
 }
-async function command(name: string, args: string[], database: string) {
-  const settings = databaseSettings();
+async function command(name: string, args: string[], database: pg.Pool) {
+  const settings = database.options;
+  const password = typeof settings.password === "function" ? await settings.password() : settings.password;
   await new Promise<void>((resolve, reject) => {
     const started = performance.now();
     const child = spawn(name,args,{ env:{...process.env,NPM_CONFIG_REGISTRY:"https://packagefeedproxy.microsoft.io/npm/",
-      PGHOST:settings.host,PGPORT:String(settings.port),PGUSER:settings.user,PGDATABASE:database,PGPASSWORD:secretValue("PGPASSWORD")},
+      PGHOST:settings.host ?? process.env.PGHOST,PGPORT:settings.port === undefined ? process.env.PGPORT : String(settings.port),
+      PGUSER:settings.user ?? process.env.PGUSER,PGDATABASE:settings.database ?? process.env.PGDATABASE,
+      PGPASSWORD:password ?? process.env.PGPASSWORD,PGOPTIONS:settings.options ?? process.env.PGOPTIONS,
+      PGSSLMODE:settings.ssl === false ? "disable" : process.env.PGSSLMODE},
       stdio:["ignore","pipe","pipe"],timeout:120000 });
     let outputBytes = 0;
     for (const stream of [child.stdout, child.stderr]) stream.on("data", (chunk: Buffer) => {
@@ -117,6 +123,7 @@ export async function backup(database: pg.Pool, filename: string) {
   if (!preflight.currentFingerprint) throw new Error("Backup requires the initialized current schema.");
   const fingerprint = preflight.currentFingerprint;
   const client = await database.connect();
+  let discard: Error | undefined;
   try {
     checkpointQueries(client);
     await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -124,14 +131,21 @@ export async function backup(database: pg.Pool, filename: string) {
     const snapshot = await client.query("SELECT pg_export_snapshot() AS snapshot,transaction_timestamp() AS snapshot_at");
     await verifyReportMembershipCounts(client);
     const counts = await fingerprints(client, await validateBackupInventory(client));
-    await command("pg_dump",["--format=custom","--no-owner","--no-privileges",`--snapshot=${snapshot.rows[0].snapshot}`,"--file",filename],String(database.options.database));
+    closeSync(openSync(filename, "wx", 0o600));
+    await command("pg_dump",["--format=custom","--no-owner","--no-privileges",`--snapshot=${snapshot.rows[0].snapshot}`,"--file",filename],database);
     chmodSync(filename,0o600);
     writeFileSync(`${filename}.json`,JSON.stringify({format:"agent-control-backup-v1",fingerprintAlgorithm,sha256:await checksum(filename),schemaFingerprint:fingerprint,tables:counts,
       snapshotAt:new Date(snapshot.rows[0].snapshot_at).toISOString(),createdAt:new Date().toISOString()}),{flag:"wx",mode:0o600});
     await client.query("COMMIT");
     return counts;
-  } catch (error) { await client.query("ROLLBACK"); throw error; }
-  finally { client.release(); }
+  } catch (error) {
+    try { await client.query("ROLLBACK"); }
+    catch (rollback) {
+      discard = rollback instanceof Error ? rollback : new Error("database_connection_unusable", { cause: rollback });
+      throw new AggregateError([error, rollback], "database_backup_failed");
+    }
+    throw error;
+  } finally { client.release(discard); }
 }
 
 export async function restore(operator: pg.Pool, filename: string, target: string) {
@@ -150,9 +164,9 @@ export async function restore(operator: pg.Pool, filename: string, target: strin
     throw new Error("Backup schema inventory mismatch.");
   }
   await operator.query(`CREATE DATABASE "${target}"`);
-  const database = new pg.Pool({...databaseSettings(),database:target});
+  const database = restoredPool(operator, target);
   try {
-    await command("pg_restore",["--no-owner","--no-privileges","--exit-on-error","--single-transaction","--dbname",target,filename],target);
+    await command("pg_restore",["--no-owner","--no-privileges","--exit-on-error","--single-transaction","--dbname",target,filename],database);
     await grantRuntime(database);
     const restored = await preflightSchema(database);
     if (restored.currentFingerprint !== receipt.schemaFingerprint) throw new Error("Backup schema differs from its receipt.");
@@ -259,18 +273,10 @@ async function mutateReviewRows(database: pg.PoolClient, table: string, predicat
 }
 
 async function withCurrentReview<T>(current: pg.Pool, operation: (review: pg.PoolClient) => Promise<T>) {
-  const review = await current.connect();
-  try {
-    await review.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    const result = await operation(review);
-    await review.query("COMMIT");
-    return result;
-  } catch (error) {
-    try { await review.query("ROLLBACK"); } catch { /* preserve the review failure */ }
-    throw error;
-  } finally {
-    review.release();
-  }
+  return transaction(current, async review => {
+    await review.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+    return operation(review);
+  });
 }
 
 async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolClient, history: OfficialReportHistory) {
@@ -279,6 +285,7 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
   if (!currentIdentity.rows[0]?.database || !restoredIdentity.rows[0]?.database) {
     throw new Error("Restore reopening requires available current and restored database identities.");
   }
+  await reconcileRestoredOffice(current, restored);
   await purgeMismatched(restored, "package_inventory_snapshots", await exactCurrentIds(current, restored, `
     SELECT snapshot.id,md5(jsonb_build_array(snapshot.id,snapshot.tenant_id,snapshot.principal_id,snapshot.token_mode,
       snapshot.query_hash,snapshot.scope_kind,snapshot.requested_ids)::text) AS signature
@@ -341,7 +348,48 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
     if (!invalid.length) break;
     for (const row of invalid) await history.invalidate(restored, row.tenant_id, row.set_id, true);
   }
+
   await reconcileOfficialSelection(current, restored, safeSets);
+}
+
+export async function reconcileRestoredOffice(current: pg.PoolClient, restored: pg.PoolClient) {
+    let after = "";
+    for (;;) {
+      const scopes = (await restored.query(`SELECT id,tenant_id,source,epoch::text FROM data_scope_epochs
+        WHERE source IN ('directory','app_activity') AND id::text>$1 ORDER BY id LIMIT 250`, [after])).rows;
+      if (!scopes.length) break;
+      for (const scope of scopes) {
+        const live = (await current.query(`SELECT epoch::text FROM data_scope_epochs WHERE tenant_id=$1
+          AND source=$2 AND scope_kind='tenant' AND selector='complete'`, [scope.tenant_id,scope.source])).rows[0];
+        if (!live || BigInt(live.epoch)>BigInt(scope.epoch)) {
+          // The source epoch trigger fences all derived Office captures before GC.
+          await restored.query("UPDATE data_scope_epochs SET epoch=epoch+1 WHERE id=$1", [scope.id]);
+          await restored.query("UPDATE data_generations SET state='retired' WHERE scope_id=$1 AND state='published'", [scope.id]);
+          await restored.query("DELETE FROM data_generation_heads WHERE scope_id=$1", [scope.id]);
+        }
+      }
+      after = scopes.at(-1)!.id;
+    }
+    after = "";
+    for (;;) {
+      const captures = (await restored.query(`SELECT o.generation_id,o.scope_id,o.tenant_id FROM office_observations o
+        JOIN data_generations g ON g.id=o.generation_id WHERE g.state='published'
+        AND o.generation_id::text>$1 ORDER BY o.generation_id LIMIT 250`, [after])).rows;
+      if (!captures.length) break;
+      const live = new Set((await current.query(`SELECT o.generation_id FROM office_observations o
+        JOIN data_generations g ON g.id=o.generation_id JOIN data_generation_heads h ON h.generation_id=g.id
+        WHERE o.generation_id=ANY($1::uuid[]) AND g.state='published' AND g.expires_at>clock_timestamp()`,
+      [captures.map(row=>row.generation_id)])).rows.map(row=>row.generation_id));
+      for (const capture of captures.filter(row=>!live.has(row.generation_id))) {
+        await restored.query("UPDATE data_generations SET state='retired' WHERE id=$1", [capture.generation_id]);
+        await restored.query("DELETE FROM data_generation_heads WHERE scope_id=$1 AND generation_id=$2", [capture.scope_id,capture.generation_id]);
+        // Keep the acknowledged vector: old restored heads must not recreate a superseded capture.
+        await restored.query(`UPDATE user_source_attempts SET office_status='unavailable',office_error_code='office_restore_superseded',
+          office_revision=office_revision+1 WHERE tenant_id=$1 AND source='app_activity' AND office_status='available'
+            AND generation_id IN (SELECT generation_id FROM data_generation_heads)`, [capture.tenant_id]);
+      }
+      after = captures.at(-1)!.generation_id;
+    }
 }
 
 async function exactCurrentIds(current: pg.PoolClient, restored: pg.PoolClient, query: string, reportRows = false) {
@@ -452,10 +500,19 @@ export async function reopenPreparedRestoredDatabase(current: pg.Pool, restored:
 
 export async function reopenRestoredDatabase(operator: pg.Pool, target: string) {
   if (!/^agentcontrol_restore_[a-z0-9_]{1,40}$/.test(target) || target === operator.options.database) throw new Error("Reopen requires an isolated agentcontrol_restore_* database.");
-  const database = new pg.Pool({ ...databaseSettings(), database: target });
+  const database = restoredPool(operator, target);
   try {
     return await reopenPreparedRestoredDatabase(operator, database);
   } finally { await database.end(); }
+}
+
+function restoredPool(operator: pg.Pool, target: string) {
+  const settings = operator.options;
+  return new pg.Pool({
+    ...databaseSettings(),
+    host: settings.host, port: settings.port, user: settings.user, password: settings.password,
+    ssl: settings.ssl, options: settings.options, database: target,
+  });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

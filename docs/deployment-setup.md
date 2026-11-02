@@ -616,7 +616,8 @@ publication, the separate function requests only these two agents in tenant
 Six response artifacts retain unprojected **parsed JSON**, including unknown
 properties and missing/null/empty distinctions. They are not byte-for-byte wire
 captures. Credential-named fields and the active access token are redacted,
-including credential fields with escaped names inside stringified JSON definitions.
+including tokens in property names and escaped values, and credential fields
+with escaped names inside stringified JSON definitions.
 Request headers, cookies and authentication responses are never captured.
 Responses that fail identity/scope validation are rejected rather than saved.
 Denied or missing targets are recorded explicitly in the manifest.
@@ -695,6 +696,9 @@ pwsh ./deploy-local.ps1 start -Project contoso
 ```
 
 Initialization accepts either a fresh database or this build's current schema.
+A fresh database must have no public relations, functions, types, or collations;
+an unmarked schema containing any of them is rejected without converting or
+removing its objects.
 A retry preserves the current schema and existing secrets. Use `-DbReset` only
 when an incompatible schema requires an intentional, destructive reset; do not
 repeat it merely because initialization failed.

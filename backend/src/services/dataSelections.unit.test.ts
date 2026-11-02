@@ -1,5 +1,5 @@
 import pg from "pg";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InventoryQueries, type InventoryQuery } from "../db/inventoryQueries.js";
 import { getAgents, getUnifiedAgents } from "../../../frontend/src/api/client.js";
@@ -90,10 +90,14 @@ describe("inventory selection dependency capacity", () => {
     vi.spyOn(inventory.reports.sources, "ensureScope").mockResolvedValue("people");
     vi.spyOn(inventory.reports.sources, "validateRoot").mockResolvedValue();
     vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("history");
+    const reconcile = vi.spyOn(inventory.reports.history, "reconcileHead").mockResolvedValue({
+      active_set_id: null, revision: "1",
+    });
     vi.spyOn(inventory.reports.history, "root").mockResolvedValue({
       kind: "tenant_history", scopeId: "history", revision: "1", expiresAt,
     });
     vi.spyOn(inventory.reports.history, "validateRoot").mockResolvedValue();
+    vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
     vi.spyOn(inventory.reports, "currentInventoryData").mockResolvedValue({
       identity, evaluatedAt: at, query: { lowResponseThreshold: 5 },
       metadata: {
@@ -136,6 +140,7 @@ describe("inventory selection dependency capacity", () => {
     });
 
     const captured = await inventory.capture(identity, "canonical", { sortBy });
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(expect.any(pg.Client), identity.tenantId);
     expect(rootCount).toBe(pinCount);
     expect(pins.filter(pin => pin.root_kind === "inventory_delta")).toHaveLength(17);
     expect(pins.map(pin => pin.ordinal)).toEqual(Array.from({ length: pinCount }, (_, index) => index));
@@ -270,6 +275,9 @@ describe("selection scope-before-domain lock order", () => {
       return "z";
     });
     vi.spyOn(inventory.reports.history, "ensure").mockResolvedValue("m");
+    vi.spyOn(inventory.reports.history.connections, "run").mockImplementation(work => work(client));
+    vi.spyOn(inventory.reports.history, "reconcileHead").mockResolvedValue({ active_set_id: null, revision: "1" });
+    vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
     vi.spyOn(inventory.reports.history, "root").mockResolvedValue({ ...roots[0], scopeId: "m" });
     const source = (kind: UserSourceMetadata["source"]): UserSourceMetadata => ({
       source: kind, generationId: null, scopeId: null, revision: null, expiresAt: null, observedAt: null,
@@ -412,6 +420,72 @@ describe("selected-read completion fences", () => {
       && statement.startsWith("SELECT *,clock_timestamp() AS validated_at"))).toHaveLength(1);
     expect(query).toHaveBeenCalledWith("ROLLBACK");
     expect(query.mock.calls.some(([statement]) => statement === "COMMIT")).toBe(false);
+  });
+});
+
+describe("selection filter storage bounds", () => {
+  it.each(["\0", "\ud800", "\udfff", "label\ud800x"])("rejects text that PostgreSQL JSONB cannot store (%j)", value => {
+    expect(() => canonicalQuery({ filter: value }, ["filter"])).toThrow("invalid_cursor");
+    expect(() => canonicalQuery({ filter: [value] }, ["filter"])).toThrow("invalid_cursor");
+    expect(() => canonicalQuery({ [value]: "label" }, [value])).toThrow("invalid_cursor");
+  });
+
+  it("rejects sparse arrays instead of hashing unbudgeted null entries", async () => {
+    const sparse = new Array<string>(2);
+    sparse[1] = "label";
+    const text = "x".repeat(4096 - Buffer.byteLength('{"filter": ["label", ], "text": ""}'));
+    expect(Buffer.byteLength(`{"filter": ["label", null], "text": "${text}"}`)).toBe(4100);
+    const { selections, database } = fixture();
+    await expect(selections.capture(identity, "history", { values: { filter: sparse, text }, allowed: ["filter", "text"] }, roots))
+      .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
+    expect(database.connect).not.toHaveBeenCalled();
+  });
+
+  it("rolls back invalid prepared filters before saving a selection", async () => {
+    const { selections, query, events } = fixture();
+    await expect(selections.captureWith(identity, "history", { values: {}, allowed: ["filter"] },
+      async () => ({ roots, queryValues: { filter: "\ud800" } })))
+      .rejects.toMatchObject({ status: 400, code: "invalid_cursor" });
+    expect(events).toEqual([]);
+    expect(query).toHaveBeenCalledWith("ROLLBACK");
+    expect(query.mock.calls.some(([statement]) => typeof statement === "string"
+      && (statement.startsWith("INSERT INTO data_read_selections") || statement === "COMMIT"))).toBe(false);
+  });
+
+  it("preserves valid Unicode, escaped text and dense string-array hashes", () => {
+    const text = "Label\t\b\f\n\r\u0001\\\"界😀";
+    const query = { filter: text, labels: [text, "other"] };
+    expect(canonicalQuery(query, ["filter", "labels"]))
+      .toBe(createHash("sha256").update(JSON.stringify(query)).digest("hex"));
+  });
+
+  it.each(["界", "😀", "\t", "\u0001"])("accepts exactly 4096 JSONB bytes of supported %j text", character => {
+    const available = 4096 - Buffer.byteLength('{"filter": ""}');
+    const encodedBytes = Buffer.byteLength(JSON.stringify(character).slice(1, -1));
+    const filter = character.repeat(Math.floor(available / encodedBytes)) + "x".repeat(available % encodedBytes);
+    const query = { filter };
+    expect(canonicalQuery(query, ["filter"])).toBe(createHash("sha256").update(JSON.stringify(query)).digest("hex"));
+    expect(() => canonicalQuery({ filter: `${filter}x` }, ["filter"])).toThrow("invalid_cursor");
+  });
+
+  it("accepts exactly the persisted JSONB byte budget without changing canonical hashes", () => {
+    const query = { filter: "x".repeat(4096 - Buffer.byteLength('{"filter": ""}')) };
+    expect(canonicalQuery(query, ["filter"])).toBe(createHash("sha256").update(JSON.stringify(query)).digest("hex"));
+    expect(() => canonicalQuery({ filter: `${query.filter}x` }, ["filter"])).toThrow("invalid_cursor");
+  });
+
+  it("charges array separator spaces after canonical deduplication", () => {
+    const text = "x".repeat(4096 - Buffer.byteLength('{"filter": ["", ""]}'));
+    expect(canonicalQuery({ filter: [text, "", text] }, ["filter"])).toBe(canonicalQuery({ filter: ["", text] }, ["filter"]));
+    expect(() => canonicalQuery({ filter: [`${text}x`, ""] }, ["filter"])).toThrow("invalid_cursor");
+  });
+
+  it.each([1e100, -1e100, 1e-100, -1e-100])("charges PostgreSQL's expanded numeric representation for %s", number => {
+    const decimal = `${number < 0 ? "-" : ""}${Math.abs(number) > 1 ? `1${"0".repeat(100)}` : `0.${"0".repeat(99)}1`}`;
+    const text = "x".repeat(4096 - Buffer.byteLength(`{"number": ${decimal}, "text": ""}`));
+    const query = { number, text };
+    expect(canonicalQuery(query, ["number", "text"])).toMatch(/^[a-f0-9]{64}$/);
+    expect(() => canonicalQuery({ ...query, text: `${text}x` }, ["number", "text"])).toThrow("invalid_cursor");
   });
 });
 

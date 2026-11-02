@@ -46,7 +46,7 @@ describe("bounded provider observations", () => {
     it("rejects malformed UTF-8 reports before activity publication", async () => {
       const fetcher = vi.fn<FetchLike>(async () => new Response(Uint8Array.of(0xff)));
       await expect(readActivity(fetcher))
-        .rejects.toMatchObject({ status: 502, code: "provider_schema", message: "Invalid activity CSV or UTF-8." });
+        .rejects.toMatchObject({ status: 502, code: "provider_schema", message: expect.stringContaining("UTF-8") });
       expect(fetcher).toHaveBeenCalledOnce();
     });
 

@@ -50,11 +50,23 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
+function officeReadShape(file: string, node: ts.Node) {
+  if (!file.endsWith("/frontend/src/api/officeAppAdoption.ts") || !ts.isCallExpression(node)
+    || !ts.isIdentifier(node.expression) || node.expression.text !== "read") return undefined;
+  const suffix = node.arguments[0];
+  if (ts.isStringLiteral(suffix)) return `/api/office-app-adoption/${suffix.text}`;
+  if (ts.isTemplateExpression(suffix)) return `/api/office-app-adoption/${suffix.head.text}${suffix.templateSpans
+    .map(span => `:parameter${span.literal.text}`).join("")}`;
+  throw new Error("Unclassified Office read path");
+}
+
 function frontendPathShapes() {
   const paths = new Set<string>();
   for (const file of sourceFiles(resolve(root, "frontend/src"))) {
     const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
     const visit = (node: ts.Node) => {
+      const officeRead = officeReadShape(file, node);
+      if (officeRead) paths.add(officeRead);
       let text = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : undefined;
       if (ts.isTemplateExpression(node)) {
         text = node.head.text;
@@ -64,7 +76,7 @@ function frontendPathShapes() {
             && [span.expression.whenTrue, span.expression.whenFalse].some(value =>
               ts.isStringLiteral(value) && value.text.startsWith("?") || ts.isTemplateExpression(value) && value.head.text.startsWith("?"));
           const queryFunction = ts.isCallExpression(span.expression)
-            && ts.isIdentifier(span.expression.expression) && span.expression.expression.text === "reportQueryString";
+            && ts.isIdentifier(span.expression.expression) && ["reportQueryString", "officeQueryString"].includes(span.expression.expression.text);
           if (querySuffix || queryFunction) break;
           text += ":parameter" + span.literal.text;
         }
@@ -97,7 +109,7 @@ function frontendHttpOperations() {
     let text = node.head.text;
     for (const span of node.templateSpans) {
       if (text.includes("?") || ts.isCallExpression(span.expression)
-        && ts.isIdentifier(span.expression.expression) && span.expression.expression.text === "reportQueryString"
+        && ts.isIdentifier(span.expression.expression) && ["reportQueryString", "officeQueryString"].includes(span.expression.expression.text)
         || ts.isConditionalExpression(span.expression)
         && [span.expression.whenTrue, span.expression.whenFalse].some(value =>
           ts.isStringLiteral(value) && value.text.startsWith("?")
@@ -115,6 +127,8 @@ function frontendHttpOperations() {
   for (const file of sourceFiles(resolve(root, "frontend/src"))) {
     const source = ts.createSourceFile(file, readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
     const visit = (node: ts.Node) => {
+      const officeRead = officeReadShape(file, node);
+      if (officeRead) operations.push({ file: file.slice(root.length), method: "GET", path: officeRead });
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.arguments[0]) {
         const name = node.expression.text;
         if (["request", "post", "readReportPage", "readReportDetail", "readReportFacet"].includes(name)) {
@@ -203,7 +217,8 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         return `${method} ${path.startsWith("/api/") || path === "/{*path}" ? path : `/api${path}`}`;
       });
       expect(new Set(currentRoutes).size).toBe(currentRoutes.length);
-      expect(currentRoutes).toHaveLength(163);
+      expect(currentRoutes).toHaveLength(171);
+      expect(currentRoutes.filter(route => route.includes("/office-app-adoption/"))).toHaveLength(8);
       expect(currentRoutes).not.toContain("GET /security");
       expect(currentRoutes).not.toContain("POST /api/auth/consent");
       expect(currentRoutes).toEqual(expect.arrayContaining([

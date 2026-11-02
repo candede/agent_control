@@ -155,6 +155,7 @@ export class LargeTenantUsersReports {
 
   private async prepareHistoryCapture(tenantId: string) {
     await this.history.ensure(tenantId);
+    await this.history.connections.run(client => this.history.reconcileHead(client, tenantId));
     while (await this.history.expire(tenantId) > 0) { /* bounded maintenance transactions */ }
   }
 

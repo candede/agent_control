@@ -35,6 +35,7 @@ function Selector({ revision, selectedId, onSelect, onLatestReportObserved, onRe
   const available = useBrowserAvailability();
   const [denied, setDenied] = useState<ApiError>();
   const [notice, setNotice] = useState<string>();
+  const [labels, setLabels] = useState<{ selected?: string; latest: string; current: string }>();
   const selected = selectedId?.toLowerCase();
   const read = useReportPage<ReportHistorySet, ReportListPage<ReportHistorySet>>("official-usage/history/options",
     { sort: "reportingPeriod", order: "desc", setId: selected }, revision, canRead && !denied, undefined, false, true);
@@ -72,6 +73,15 @@ function Selector({ revision, selectedId, onSelect, onLatestReportObserved, onRe
   const chosen = data?.value.find(set => set.id.toLowerCase() === selected);
   const latestLabel = latest ? `Latest report - ${reportLabel(latest)}` : "Latest report";
   const currentLabel = chosen ? reportLabel(chosen) : data ? `${usageCoverageLabel(data.reports)} | ${selected?.slice(0, 8)}` : "Selected report";
+  const currentOptionLabel = chosen ? currentLabel : `${currentLabel} (outside this page)`;
+  const latestOptionLabel = data && !data.counts.filtered ? "Latest report - no reports available" : latestLabel;
+  if (data && !loading && !error && isCurrentData() && (!labels || labels.selected !== selected
+    || labels.latest !== latestOptionLabel || labels.current !== currentOptionLabel)) {
+    setLabels({ selected, latest: latestOptionLabel, current: currentOptionLabel });
+  }
+  // Retained text never restores the authority of restarting options.
+  const pendingLabels = !data && loading && !error && !denied && canRead && labels?.selected === selected ? labels : undefined;
+  const visibleCurrentLabel = pendingLabels?.current ?? currentLabel;
   const disabled = !canRead || Boolean(denied) || read.loading || read.leaseEnded || !data || Boolean(read.error);
   function change(id: string) {
     if (disabled || !read.isCurrentData()) return;
@@ -84,11 +94,11 @@ function Selector({ revision, selectedId, onSelect, onLatestReportObserved, onRe
   }
   return <section className="usage-report-selector" aria-label="Report set selection" aria-busy={read.loading}>
     <select aria-label="Report set" value={selected ?? ""} disabled={disabled}
-      title={`${selected ? currentLabel : latestLabel}. This changes only your Users and Agents view.`}
+      title={`${selected ? visibleCurrentLabel : pendingLabels?.latest ?? latestLabel}. This changes only your Users and Agents view.`}
       onChange={event => change(event.target.value)}>
-      <option value="">{!data ? read.loading ? "Loading report sets..." : "Latest report - report sets unavailable"
-        : !data.counts.filtered ? "Latest report - no reports available" : latestLabel}</option>
-      {selected && !chosen ? <option value={selected}>{currentLabel} (outside this page)</option> : null}
+      <option value="">{!data ? pendingLabels?.latest ?? (read.loading ? "Loading report sets..." : "Latest report - report sets unavailable")
+        : latestOptionLabel}</option>
+      {selected && !chosen ? <option value={selected}>{pendingLabels?.current ?? currentOptionLabel}</option> : null}
       {data?.value.map(set => <option key={set.id.toLowerCase()} value={set.id.toLowerCase()}>{reportLabel(set)}</option>)}
       {data?.page.previousCursor ? <option value="newer-reports">Newer report sets...</option> : null}
       {data?.page.nextCursor ? <option value="older-reports">Older report sets...</option> : null}

@@ -81,7 +81,9 @@ for (const outcome of ["running", "failed"] as const) {
       expect(pages.at(-1)!.counts).toEqual(first.counts);
       expect(pages.at(-1)!.summary).toEqual(first.summary);
       expect(pages.at(-1)!.value).toEqual(first.value.map(row => ({ ...row, observations: { ...row.observations,
-        graphPackages: row.observations.graphPackages ? { ...row.observations.graphPackages, current: false } : null } })));
+        graphPackages: row.observations.graphPackages ? { ...row.observations.graphPackages, current: false } : null,
+        packageSnapshots:Object.fromEntries(Object.entries(row.observations.packageSnapshots).map(([id,snapshot])=>
+          [id,{...snapshot,current:false}])) } })));
       await control("canonical");
       await page.reload();
       await expect(page.getByText("After 0000", { exact: true })).toBeVisible();
@@ -101,6 +103,8 @@ for (const outcome of ["running", "failed"] as const) {
       people: { owner: { displayName: "Retained person" } } });
     expect(captures).toBe(outcome === "running" ? 6 : 4);
     expect(pageRequests).toBe(captures);
+    const onboarding=page.getByRole("dialog",{name:"Set up your workspace"});
+    if(await onboarding.isVisible()) await onboarding.getByRole("button",{name:"Continue to workspace",exact:true}).click();
     await page.getByRole("button", { name: "Retained native", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Retained native", exact: true });
     const historyResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith("/usage-history"));

@@ -18,6 +18,9 @@ CREATE TABLE agent_control_receipts (
   initiating_actor jsonb,
   origin jsonb,
   accepted_at timestamptz,
+  CONSTRAINT agent_control_receipts_actor_identity_check CHECK (initiating_actor IS NULL
+    OR (jsonb_typeof(initiating_actor->'tenantId')='string'
+      AND jsonb_typeof(initiating_actor->'homeAccountId')='string') IS TRUE),
   CHECK (expires_at>created_at AND retained_until>expires_at),
   CHECK ((accepted_at IS NULL AND idempotency_key IS NULL AND initiating_actor IS NULL AND origin IS NULL)
     OR (accepted_at IS NOT NULL AND idempotency_key IS NOT NULL AND initiating_actor IS NOT NULL AND origin IS NOT NULL
@@ -60,13 +63,20 @@ export async function verifyAgentControlReceiptsSchema(database: Pick<pg.Pool, "
     AND (SELECT array_agg(indexdef ORDER BY indexname)=$1::text[] FROM pg_indexes WHERE tablename='agent_control_receipts')
     AND (SELECT count(*)=8 AND bool_and(convalidated)
       AND md5(string_agg(conname||':'||pg_get_constraintdef(oid),chr(10) ORDER BY conname))='694dc72f67a193b52f011d352ae5f65b'
-      FROM pg_constraint WHERE conrelid=to_regclass('agent_control_receipts'))
+      FROM pg_constraint WHERE conrelid=to_regclass('agent_control_receipts')
+        AND conname<>'agent_control_receipts_actor_identity_check')
+    AND EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid=to_regclass('agent_control_receipts')
+      AND conname='agent_control_receipts_actor_identity_check' AND contype='c' AND convalidated
+      AND pg_get_expr(conbin,conrelid)=$3)
     AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('protect_agent_control_receipt()') AND prosrc=$2 AND NOT prosecdef)
     AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('agent_control_receipts')
       AND tgname='protect_agent_control_receipt' AND NOT tgisinternal AND tgenabled IN ('O','A')
       AND tgfoid=to_regprocedure('protect_agent_control_receipt()') AND tgtype=19 AND tgnargs=0 AND tgqual IS NULL)
     AND (current_user<>'agentcontrol_app' OR (
-      has_table_privilege(current_user,'agent_control_receipts','SELECT,INSERT,UPDATE,DELETE')
+      has_table_privilege(current_user,'agent_control_receipts','SELECT')
+      AND has_table_privilege(current_user,'agent_control_receipts','INSERT')
+      AND has_table_privilege(current_user,'agent_control_receipts','UPDATE')
+      AND has_table_privilege(current_user,'agent_control_receipts','DELETE')
       AND NOT has_table_privilege(current_user,'agent_control_receipts','TRUNCATE')
       AND NOT has_function_privilege(current_user,'protect_agent_control_receipt()','EXECUTE')))
     AS valid`, [[
@@ -74,6 +84,7 @@ export async function verifyAgentControlReceiptsSchema(database: Pick<pg.Pool, "
       "CREATE UNIQUE INDEX agent_control_receipts_idempotency ON public.agent_control_receipts USING btree (tenant_id, principal_id, idempotency_key) WHERE (idempotency_key IS NOT NULL)",
       "CREATE UNIQUE INDEX agent_control_receipts_pkey ON public.agent_control_receipts USING btree (id)",
       "CREATE INDEX agent_control_receipts_retention ON public.agent_control_receipts USING btree (retained_until, id)",
-    ], agentControlReceiptsSql.split("AS $$")[1].split("$$;")[0]])).rows[0];
+    ], agentControlReceiptsSql.split("AS $$")[1].split("$$;")[0],
+    "((initiating_actor IS NULL) OR (((jsonb_typeof((initiating_actor -> 'tenantId'::text)) = 'string'::text) AND (jsonb_typeof((initiating_actor -> 'homeAccountId'::text)) = 'string'::text)) IS TRUE))"])).rows[0];
   if (!result?.valid) throw new Error("agent_control_receipt_schema_invalid");
 }

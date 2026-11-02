@@ -16,6 +16,16 @@
 }
 
 .copilot-users-header > div:first-child { min-width: 0; }
+.copilot-users-view-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
+.copilot-users-adoption-controls { grid-column: 2 / -1; }
+.copilot-users-view-controls .agent-inventory-scope { width: auto; white-space: nowrap; }
+@media (max-width: 1150px) {
+  .copilot-users-view-controls { grid-column: 1 / -1; grid-row: 2; }
+}
+@media (max-width: 760px) {
+  .copilot-users-view-controls { gap: 8px; }
+  .copilot-users .copilot-users-view-controls .agent-inventory-scope { padding: 6px 8px; font-size: 11px; }
+}
 .copilot-users-header-actions { justify-content: flex-end; min-width: 0; max-width: 100%; }
 .copilot-users-cohort { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; min-width: 0; max-width: 100%; font-size: 13px; font-weight: 700; }
 .copilot-users-cohort select { width: 100%; min-width: 0; min-height: 42px; }

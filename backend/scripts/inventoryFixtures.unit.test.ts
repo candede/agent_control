@@ -118,7 +118,8 @@ describe("streamed package fixture provider contracts", () => {
     const value = allowlistedPackage({ id, displayName: "Agent", isBlocked: false });
     const catalog: CopilotPackageDetail[] = [], exact: CopilotPackageDetail[] = [];
     const catalogRead = vi.spyOn(StreamedInventory.prototype, "graphCatalog").mockImplementation(async function (this: StreamedInventory, _input, token) {
-      for await (const page of this.graph.catalogPages(token, { visit: async () => {} })) catalog.push(...page.records);
+      await this.graph.collectCatalog(token, { visit: async () => {}, onPage: async () => {},
+        onRecords: async records => { catalog.push(...records); } });
       return f.root;
     });
     const exactRead = vi.spyOn(StreamedInventory.prototype, "exact").mockImplementation(async function (this: StreamedInventory, _input, token, ids) {

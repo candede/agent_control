@@ -26,6 +26,10 @@ export function inventoryFixtureSelection(route: Route) {
   return selected(route).selection;
 }
 
+export function inventoryFixtureRecord(route: Route, recordId: string) {
+  return selected(route).records.get(recordId);
+}
+
 export async function captureInventorySelection(route: Route, metadata: UnifiedAgentInventoryPage["selection"]) {
   if (route.request().method() !== "POST") return route.fulfill({ status: 405, json: { code: "method_not_allowed" } });
   if (!route.request().headers()["x-csrf-token"]) return route.fulfill({ status: 403, json: { code: "csrf_required" } });
@@ -67,7 +71,7 @@ export function fulfillInventoryPage(route: Route, data: UnifiedAgentInventoryPa
 }
 
 export function fulfillInventoryDetail(route: Route, recordId: string) {
-  const record = selected(route).records.get(recordId);
+  const record = inventoryFixtureRecord(route, recordId);
   return record ? route.fulfill({ json: record }) : route.fulfill({ status: 404, json: { code: "inventory_record_unavailable" } });
 }
 

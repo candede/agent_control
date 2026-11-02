@@ -177,6 +177,8 @@ describe("saved report history", () => {
     const data = history(0, 3);
     data.value[0].reportingStart = "2026-10-01";
     data.value[0].reportingEnd = "2026-10-30";
+    data.value[1].reportingStart = "2026-09-01";
+    data.value[1].reportingEnd = "2026-09-30";
     data.value[1].periodProvenance = "operator_asserted";
     data.value[2].reportingStart = data.value[2].reportingEnd = null;
     for (const set of data.value) set.acceptedAt = "2026-10-31T12:00:00Z";

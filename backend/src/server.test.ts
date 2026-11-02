@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   log: vi.fn(),
   resources: vi.fn(),
   recover: vi.fn(),
+  syncRecover: vi.fn(),
   dataSyncDrain: vi.fn<() => Promise<void>>(),
   bulkDrain: vi.fn<() => Promise<void>>(),
   quarantineDrain: vi.fn<() => Promise<void>>(),
@@ -39,7 +40,7 @@ vi.mock("./services/copilotStudioQuarantineJobs.js", () => ({
 }));
 vi.mock("./services/maintenance.js", () => ({ enterMaintenance: mocks.enterMaintenance, maintenanceActive: mocks.maintenanceActive }));
 vi.mock("./services/defenderHunting.js", () => ({ defenderHunting: { recover: mocks.recover, drain: mocks.defenderDrain } }));
-vi.mock("./services/dataSync.js", () => ({ dataSync: { recover: mocks.recover, drain: mocks.dataSyncDrain } }));
+vi.mock("./services/dataSync.js", () => ({ dataSync: { recover: mocks.recover, recoverOffice: mocks.syncRecover, drain: mocks.dataSyncDrain } }));
 vi.mock("./services/packageInventory.js", () => ({ packageInventory: { recover: mocks.recover, drain: mocks.packageDrain } }));
 vi.mock("./services/powerPlatformInventory.js", () => ({ powerPlatformInventory: { recover: mocks.recover, drain: mocks.powerPlatformDrain } }));
 vi.mock("./services/purviewAudit.js", () => ({ purviewAudit: { recover: mocks.recover, drain: mocks.purviewDrain } }));
@@ -327,6 +328,15 @@ describe("maintenance shutdown lifecycle", () => {
     mocks.loadOperationalState.mockResolvedValue({ mode: "maintenance" });
     await vi.advanceTimersByTimeAsync(30_000);
     expect(mocks.recover).not.toHaveBeenCalled();
+  });
+  it("retries derived Office work through the same admitted periodic pass", async () => {
+    mocks.syncRecover.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(mocks.syncRecover).toHaveBeenCalledExactlyOnceWith(expect.any(Function));
+    const [admission] = mocks.syncRecover.mock.calls[0];
+    expect(await admission()).toBe(true);
+    mocks.loadOperationalState.mockResolvedValue({ mode:"maintenance" });
+    expect(await admission()).toBe(false);
   });
   it.each(["bulk", "quarantine"] as const)("stops the recovery pass when persisted maintenance closes during %s recovery", async stage => {
     mocks.recover.mockClear();

@@ -118,7 +118,7 @@ test("CSV section reflects retained observed activity dates across history after
   await expect(selector.getByRole("button", { name: "Confirm report selection" })).toHaveCount(0);
   await expect(selector.getByRole("button")).toHaveCount(0);
   await expect(selector.getByRole("navigation")).toHaveCount(0);
-  await expect(page).toHaveURL(/\/agents$/);
+  await expect(page).toHaveURL(new RegExp(`/agents\\?snapshot=${first}$`));
   await navigation.getByRole("button", { name: "Users", exact: true }).click();
   await expect(selector.getByRole("combobox")).toHaveValue(first);
   await navigation.getByRole("button", { name: /^Sync/ }).click();

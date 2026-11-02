@@ -4,6 +4,7 @@ import { testDatabase } from "../../scripts/testDatabase.js";
 import type { FrozenQuarantineTarget, InventoryQuarantineTarget, QuarantineAction, QuarantineActor, QuarantineAuthority } from "../types/copilotStudioQuarantine.js";
 import { NativeInventory } from "./nativeInventory.js";
 import { nativeInventoryFixture, reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { InventoryRuntime } from "../services/inventoryRuntime.js";
 import { CopilotStudioQuarantineRepository, createQuarantineConfirmation } from "./copilotStudioQuarantine.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -177,7 +178,8 @@ describe.sequential("Copilot Studio quarantine repository", () => {
     }));
     const root = await nativeInventoryFixture(fixture.runtime, owner, agents.map(agent => ({
       nativeId: agent.nativeId, environmentId: agent.environmentId, displayName: agent.nativeId,
-      identifiers: [{ kind: "environment_id", value: agent.environmentId }, { kind: "cds_bot_id", value: agent.botId }],
+      identifiers: [{ kind: "power_platform_resource_id", value: agent.nativeId },
+        { kind: "environment_id", value: agent.environmentId }, { kind: "cds_bot_id", value: agent.botId }],
     })));
     await reconcileInventoryFixture(fixture.runtime, owner);
     const targets = (await inventory.resolveQuarantineTargets(owner, root.baselineId, agents.map(agent => agent.nativeId))).map(target => frozen(target));
@@ -193,6 +195,11 @@ describe.sequential("Copilot Studio quarantine repository", () => {
       environmentId: first.item.environment_id, botId: first.item.bot_id, isBotQuarantined: true,
       lastUpdateTimeUtc: "2026-09-09T19:00:01Z", observedAt: new Date().toISOString(), correlationId: randomUUID(),
     }, "Provider GET confirmed the first item.");
+    await expect(inventory.withRead(read => inventory.exact(owner, agents[1].nativeId, read)))
+      .rejects.toMatchObject({ code: "quarantine_target_unavailable" });
+    await new InventoryRuntime(fixture.runtime, async () => {}).settleControls(owner, AbortSignal.timeout(5000));
+    await expect(inventory.withRead(read => inventory.exact(owner, agents[1].nativeId, read)))
+      .resolves.toMatchObject({ native_id: agents[1].nativeId });
     const active = second ?? (await repository.beginItem(lease))!;
     await repository.markSent(lease, active.item, authority);
 

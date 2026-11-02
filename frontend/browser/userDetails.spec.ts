@@ -59,6 +59,12 @@ for (const origin of ["licensed users", "Adoption", "reported users", "agent use
       const cohort = selectedCohortData();
       if (origin === "agent users") cohort.directory.reports = unifiedAgents.usageContext!.reports;
       const directory = origin === "reported users" || origin === "agent users" ? cohort.directory : selectedUsersPage();
+      await page.route("**/api/data-sync/auto-refresh", route => route.fulfill({ json: {
+        ...automaticRefreshFixture(directory.selection.publicationRevisions),
+        nextCheckAt: new Date(Date.parse(layoutTime) + 60_000).toISOString(),
+      } }));
+      await page.route(url=>url.pathname==="/api/official-usage/history/options",route=>
+        route.fulfill({json:selectedFixtureRead(route.request().url(),directory)}));
       const person = directory.value.find(user => user.directory.displayName === (origin === "reported users" ? "Emery" : "Ada"))!;
       const company = person.directory.companyName!, department = person.directory.department!;
       const group: AdoptionGroup = { id: "operations", company, department,
@@ -137,7 +143,7 @@ for (const origin of ["licensed users", "Adoption", "reported users", "agent use
       const link = dialog.getByRole("link", { name: `View adoption for ${field.toLowerCase()} ${value}` });
       await expect(link).toBeVisible();
       const destination = workbenchUrl("users", usersRouteSearch({ view: "licenses", section: "adoption", company,
-        ...(field === "Department" ? { department } : {}), reportSetId: directory.reports.setId!, search: "", page: 0 }));
+        ...(field === "Department" ? { department } : {}), search: "", page: 0 }));
       await expect(link).toHaveAttribute("href", destination);
       requests.length = 0;
       await page.evaluate(() => { document.documentElement.dataset.organizationNavigation = "in-app"; });
@@ -152,7 +158,7 @@ for (const origin of ["licensed users", "Adoption", "reported users", "agent use
       const query = requests.at(-1)!;
       expect(query.get("company")).toBe(`~string:${company}`);
       expect(query.get("department")).toBe(field === "Department" ? `~string:${department}` : null);
-      expect(query.get("setId")).toBe(directory.reports.setId);
+      expect(query.has("setId")).toBe(false);
       for (const unrelated of ["search", "agentId", "adoptionChamps", "adoptionAgents", "cursor"]) {
         expect(query.has(unrelated), unrelated).toBe(false);
       }

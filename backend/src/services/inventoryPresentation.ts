@@ -41,7 +41,6 @@ function status(source: Source | undefined, kind: "graph_packages" | "power_plat
     error: { source: kind, code: "snapshot_unavailable", message: "No complete authorized saved source is available." } };
   const common = inventoryObservation(source.generation_id, source.observed_at, source.expires_at, source.current, evaluatedAt);
   const rowCount = savedCount(source.row_count);
-  if (rowCount > dataLimits.sourceRows) throw dataLimitError("inventory_source_rows", dataLimits.sourceRows, rowCount);
   if (source.expected_count !== null && source.expected_count !== undefined) savedCount(source.expected_count);
   if (typeof source.catalog_complete !== "boolean" || typeof source.catalog_scope_complete !== "boolean" || typeof source.complete !== "boolean") {
     return invalid("Saved inventory source completeness is invalid.");
@@ -74,7 +73,6 @@ function status(source: Source | undefined, kind: "graph_packages" | "power_plat
     || source.environment_id !== null && typeof source.environment_id !== "string") return invalid("Saved native source scope is invalid.");
   const requested = source.resource_types.includes("microsoft.copilotstudio/agents");
   const agentCount = savedCount(source.agent_count), pageCount = savedCount(source.page_count);
-  if (pageCount > dataLimits.pages) throw dataLimitError("inventory_source_pages", dataLimits.pages, pageCount);
   if (agentCount > rowCount || !requested && collectedCount > rowCount - agentCount) return invalid("Saved native source counts disagree with its requested types.");
   const expectedCount = source.expected_count === null ? null : savedCount(source.expected_count);
   if (source.channel === "catalog" && source.complete && expectedCount !== null && expectedCount !== collectedCount) {
@@ -98,8 +96,8 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
   if (compareInventoryTimestamps(evaluatedAt, expiresAt) >= 0) return invalid("Saved inventory selection expiry is invalid.");
   if (page.value.length > dataLimits.pageRows) throw dataLimitError("inventory_presentation_rows", dataLimits.pageRows, page.value.length);
   const { graphPackages: graph, powerPlatform: native } = inventorySourceStatuses(page.freshness.sources, evaluatedAt);
-  const counts = Object.fromEntries(["packages", "native_agents", "represented", "unique_sources", "checked_packages",
-    "stale_packages", "invalidated_packages", "invalid_packages"].map(key => [key, savedCount(page.verificationCounts[key])]));
+  const counts = Object.fromEntries((["packages", "native_agents", "native_source_agents", "represented", "unique_sources", "checked_packages",
+    "stale_packages", "invalidated_packages", "invalid_packages"] as const).map(key => [key, savedCount(page.verificationCounts[key])]));
   validateSummaries(page);
   if (counts.checked_packages + counts.stale_packages + counts.invalidated_packages > counts.packages
     || counts.invalid_packages > counts.packages || counts.unique_sources > counts.represented) {
@@ -120,7 +118,7 @@ export function inventoryPresentation(page: Page): UnifiedAgentInventoryPage {
     && counts.native_agents === page.summary.linked + page.summary.powerPlatformOnly
     && (counts.packages === 0 ? page.summary.linked + page.summary.graphOnly === 0 : page.summary.linked + page.summary.graphOnly > 0)
     && (graph.observation ? graph.observation.totalRecords === counts.packages : counts.packages === 0)
-    && (nativeSourceRow ? savedCount(nativeSourceRow.agent_count) === counts.native_agents : counts.native_agents === 0);
+    && (nativeSourceRow ? counts.native_source_agents === counts.native_agents : counts.native_agents === 0);
   const rowIds = new Set<string>(), visibleSources = new Set<string>();
   let visiblePackages = 0, visibleNativeAgents = 0;
   let memberSourcesAvailable = true, memberSourcesFresh = true;

@@ -19,6 +19,7 @@ import { usagePeriodLabel } from "../agentUsageTrends";
 import "./agentInsights.css";
 
 type Props = { record: UnifiedAgentRecord; view: "usage" | "users"; context?: InventoryReportContext; inventoryRevision?: string; dataRevision?: number;
+  personalReportSetId?: string;
   inventorySelectionId?: string; onReloadInventory?: () => void; onOpenAdoption?: (route: UsersRouteState) => void;
   canRemoveReviewedAssociations: boolean; disabled?: boolean; onChanged?: () => void };
 const contextFields = ["selectionId", "reportSetId", "usageRevision", "inventoryRevision"] as const;
@@ -117,6 +118,7 @@ export function AgentUsagePanel(props: Props) {
     canRemoveReviewedAssociations={props.canRemoveReviewedAssociations && (!capability || hasRole(user, "AgentControl.Admin"))} />
     {investigatedUser ? <UserDetailModal key={investigatedUser} identity={investigatedUser} kind="report"
       investigationAgent={{ recordId: props.record.id, name: props.record.displayName }}
+      reportSetId={props.personalReportSetId}
       onOpenAdoption={props.onOpenAdoption}
       returnFocusTo={investigationTrigger} closeLabel="Close user details" onClose={() => setNavigation(previous => ({ ...previous, investigatedUser: undefined }))} /> : null}
   </>;

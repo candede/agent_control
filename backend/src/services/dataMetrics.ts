@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { operationalLog, safeTelemetry, withTelemetryContext } from "./telemetry.js";
 
-const stages = ["record_gc", "inventory_gc", "generation", "selection", "export", "admission"] as const;
+const stages = ["record_gc", "inventory_gc", "generation", "selection", "export", "admission", "office_capture"] as const;
 type Stage = typeof stages[number];
 type Measurement = { rows?: number; bytes?: number; pins?: number; queueDepth?: number; backlogRoots?: number; durationMs?: number; oldestAgeMs?: number };
 type Measurements = Map<Stage, Measurement & { count: number }>;

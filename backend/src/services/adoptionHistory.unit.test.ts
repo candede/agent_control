@@ -179,6 +179,8 @@ describe("history-only dashboard capture", () => {
     const { client, query } = fixture(), roots = [{ kind: "tenant_history" as const, scopeId: "history", revision: "5",
       expiresAt: new Date("2026-10-01T00:30:00Z") }];
     vi.spyOn(reports.history, "ensure").mockResolvedValue("history");
+    vi.spyOn(reports.history.connections, "run").mockImplementation(work => work(client));
+    const reconcile = vi.spyOn(reports.history, "reconcileHead").mockResolvedValue({ active_set_id: row().id, revision: "9" });
     vi.spyOn(reports.history, "expire").mockResolvedValue(0);
     vi.spyOn(reports.history, "root").mockResolvedValue(roots[0]);
     const sourceRead = vi.spyOn(reports.sources, "metadataInRead").mockRejectedValue(new Error("Unexpected source dependency"));
@@ -200,6 +202,8 @@ describe("history-only dashboard capture", () => {
         evaluatedAt: at, validatedAt: at, expiresAt: new Date(context().selection.expiresAt) };
     });
     await reports.capture(identity, "adoption_history");
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(client, identity.tenantId);
+    expect(database.connect).not.toHaveBeenCalled();
     expect(sourceRead).not.toHaveBeenCalled();
     const saved = query.mock.calls.find(([sql]) => sql.startsWith("INSERT INTO official_usage_read_contexts"))![1]!;
     expect(saved[4]).toBeNull();

@@ -26,7 +26,7 @@ export function ReportReadStatus({ read, quietLoading = false }: { read: Pick<Re
   return null;
 }
 type PageControlsProps = {
-  data?: Pick<ReportPage<unknown>, "page" | "counts" | "value">; previous: () => void; next: () => void;
+  data?: Pick<ReportPage<unknown>, "counts" | "value"> & { page: Pick<ReportPage<unknown>["page"], "limit" | "number" | "offset" | "nextCursor" | "previousCursor"> }; previous: () => void; next: () => void;
   loading?: boolean; disabled?: boolean; leaseEnded?: boolean; label?: string; compact?: boolean;
   showPageNumbers?: boolean;
   goToPage?: (page: number) => boolean;

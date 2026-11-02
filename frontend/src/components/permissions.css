@@ -1,6 +1,6 @@
 .permission-center { min-width: 0; color: var(--text); }
-.permission-center *, .permission-details * { box-sizing: border-box; }
-.permission-center p, .permission-center dd, .permission-center code, .permission-center li, .permission-center a, .permission-center .error-banner, .permission-details { overflow-wrap: anywhere; }
+.permission-center * { box-sizing: border-box; }
+.permission-center p, .permission-center dd, .permission-center code, .permission-center li, .permission-center a, .permission-center .error-banner, .permission-center .permission-notice { overflow-wrap: anywhere; }
 .permission-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; margin-bottom: 20px; }
 .permission-heading-copy { flex: 1 1 260px; min-width: 0; }
 .permission-heading h2 { margin: 3px 0 6px; color: var(--text-h); font-size: 28px; line-height: 1.25; letter-spacing: -0.5px; }
@@ -97,6 +97,7 @@
 .permission-progress progress::-moz-progress-bar { background: #28685b; }
 .permission-progress progress:indeterminate { background: linear-gradient(90deg, #dce8e2 20%, #28685b 50%, #dce8e2 80%); background-size: 200% 100%; animation: permission-sweep 1.6s linear infinite; }
 .permission-progress progress:indeterminate::-webkit-progress-bar { background: transparent; }
+.permission-progress progress:indeterminate::-moz-progress-bar { background: transparent; }
 .permission-progress-checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin: 0; padding: 0; list-style: none; }
 .permission-progress-checks li { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; min-width: 0; }
 .permission-progress-checks li > span:last-child { display: grid; gap: 3px; }
@@ -110,6 +111,14 @@
   .permission-spinner, .permission-progress-dot, .permission-progress progress:indeterminate { animation: none; }
   .permission-progress progress::-webkit-progress-value { transition: none; }
 }
+@media (forced-colors: active) {
+  .permission-progress progress { forced-color-adjust: none; border: 1px solid CanvasText; color: CanvasText; background: Canvas; }
+  .permission-progress progress::-webkit-progress-bar { background: Canvas; }
+  .permission-progress progress::-webkit-progress-value { background: CanvasText; }
+  .permission-progress progress::-moz-progress-bar { background: CanvasText; }
+  .permission-progress progress:indeterminate { background: linear-gradient(90deg, transparent 20%, currentColor 50%, transparent 80%) Canvas; background-size: 200% 100%; }
+  .permission-progress-dot { forced-color-adjust: none; background: CanvasText; }
+}
 .preview-badge { display: inline-flex; padding: 4px 8px; font-size: 13px; font-weight: 700; border: 1px solid #786650; border-radius: 4px; background: #fff8e6; color: #594313; position: relative; cursor: help; }
 .preview-badge [role="tooltip"] { display: none; position: absolute; left: 0; top: 100%; width: 230px; max-width: 65vw; padding: 12px; background: #fffdf7; color: #10211f; border: 1px solid #53605a; z-index: 10; font-weight: 400; }
 .preview-badge:hover [role="tooltip"], .preview-badge:focus [role="tooltip"] { display: block; }
@@ -120,7 +129,7 @@ button.permission-link { padding: 2px 0; min-height: 28px; border: 0; background
 .view-switcher { box-sizing: border-box; max-width: 100%; flex-wrap: wrap; }
 .view-switcher > .capability-gate, .view-switcher > button { flex: 1 1 0; min-width: 0; }
 .view-switcher > .capability-gate > button { height: 100%; width: 100%; }
-.permission-center button, .permission-details button { min-height: 44px; white-space: normal; }
+.permission-center button { min-height: 44px; white-space: normal; }
 :focus-visible { outline: 3px solid #156e9a; outline-offset: 3px; }
 @media (max-width: 1120px) {
   .view-switcher > .capability-gate, .view-switcher > button { flex-basis: calc(25% - 4px); }

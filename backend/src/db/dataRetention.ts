@@ -59,6 +59,30 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
   const update = async (name: string, table: string, where: string, values: string, scopeCharge?: "reservation" | "collection") => {
     affected[name] = await slice.change(name, table, where, values, [], "ctid", scopeCharge);
   };
+  await update("officeInvalidSelections", "data_read_selections", `target.invalidated_at IS NULL AND (EXISTS(
+    SELECT 1 FROM data_generation_pins pin JOIN office_observations office ON office.generation_id=pin.generation_id
+    JOIN data_generations generation ON generation.id=office.generation_id
+    WHERE pin.selection_id=target.id AND (generation.expires_at<=clock_timestamp() OR generation.state<>'published'))
+    OR (target.endpoint='office-app-adoption' AND EXISTS(
+      SELECT 1 FROM data_generation_pins selected_pin JOIN office_observations selected ON selected.generation_id=selected_pin.generation_id
+      JOIN office_observations expired ON expired.tenant_id=target.tenant_id AND expired.report_refresh_date<=selected.report_refresh_date
+      JOIN data_generations expired_generation ON expired_generation.id=expired.generation_id
+      WHERE selected_pin.selection_id=target.id AND expired.kind='weekly' AND expired_generation.expires_at<=clock_timestamp()
+        AND expired_generation.state='published'
+        AND EXISTS(SELECT 1 FROM data_generation_heads head WHERE head.generation_id=expired_generation.id)
+        AND expired_generation.expires_at>target.evaluated_at
+        AND expired_generation.observed_at<=target.evaluated_at)))`,
+  "invalidated_at=clock_timestamp()");
+  await update("officeExpiredCaptures", "data_generations", `target.state='published' AND target.expires_at<=clock_timestamp()
+    AND EXISTS(SELECT 1 FROM office_observations office WHERE office.generation_id=target.id)
+    AND NOT EXISTS(SELECT 1 FROM data_generation_pins pin JOIN data_read_selections selection ON selection.id=pin.selection_id
+      WHERE pin.generation_id=target.id AND selection.invalidated_at IS NULL)
+    AND NOT EXISTS(SELECT 1 FROM office_observations expired JOIN office_observations selected
+      ON selected.tenant_id=expired.tenant_id AND selected.report_refresh_date>=expired.report_refresh_date
+      JOIN data_generation_pins selected_pin ON selected_pin.generation_id=selected.generation_id
+      JOIN data_read_selections selection ON selection.id=selected_pin.selection_id
+      WHERE expired.generation_id=target.id AND expired.kind='weekly' AND selection.endpoint='office-app-adoption' AND selection.invalidated_at IS NULL
+        AND target.observed_at<=selection.evaluated_at AND target.expires_at>selection.evaluated_at)`, "state='retired'");
   const protectedSelection = `EXISTS(SELECT 1 FROM data_read_selections s
     LEFT JOIN data_principal_epochs p ON p.tenant_id=s.tenant_id AND p.principal_id=s.principal_id
     WHERE s.id=target.selection_id AND s.invalidated_at IS NULL AND s.session_epoch=p.epoch
@@ -77,16 +101,19 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
       OR (status IN ('queued','building') AND deadline_at<=clock_timestamp())
       OR (status='building' AND lease_until<=clock_timestamp()) OR ${invalidExportSelectionSql})
     ORDER BY expires_at,id LIMIT $1 FOR UPDATE SKIP LOCKED`, [Math.min(limit, 4)])).rows;
-  for (const row of exports) {
-    await client.query("UPDATE data_exports SET status='expired',error_code='export_expired' WHERE id=$1", [row.id]);
-    if (row.status !== "ready" && row.actor) {
-      await reportExportAudit(client, { id: row.id, exportId: row.id, kind: row.kind, phase: "build", status: "failed",
-        rows: row.row_count, bytes: exactCount(row.byte_count), errorCode: "export_expired" });
+  const exportRows = exports.reduce((sum, row) => sum + 1 + (row.status !== "ready" && row.actor ? 1 : 0), 0);
+  const exportBytes = exports.reduce((sum, row) => sum + exactCount(row.bytes) + 16_384, 0);
+  affected.recordExpiredExports = 0;
+  if (slice.reserve(exportRows, exportBytes)) {
+    for (const row of exports) {
+      await client.query("UPDATE data_exports SET status='expired',error_code='export_expired' WHERE id=$1", [row.id]);
+      if (row.status !== "ready" && row.actor) {
+        await reportExportAudit(client, { id: row.id, exportId: row.id, kind: row.kind, phase: "build", status: "failed",
+          rows: row.row_count, bytes: exactCount(row.byte_count), errorCode: "export_expired" });
+      }
     }
+    affected.recordExpiredExports = exports.length;
   }
-  affected.recordExpiredExports = exports.length;
-  slice.rows += exports.length * 2;
-  slice.bytes += exports.reduce((sum, row) => sum + row.bytes + 16_384, 0);
   for (const table of ["data_export_chunks", "data_export_items"]) {
     await remove(`record_${table}`, table, `EXISTS(SELECT 1 FROM data_exports e
       WHERE e.id=target.export_id AND e.status IN ('failed','cancelled','expired'))`);
@@ -143,7 +170,27 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
   await update("recordDeletingGenerations", "data_generations", `target.state IN ('retired','failed','cancelled')
     AND NOT EXISTS(SELECT 1 FROM inventory_attempts a WHERE a.generation_id=target.id)
     AND NOT EXISTS(SELECT 1 FROM inventory_mutation_targets t WHERE t.source_generation_id=target.id)
-    AND NOT EXISTS(SELECT 1 FROM data_generation_pins p WHERE p.generation_id=target.id)`, "state='deleting'");
+    AND NOT EXISTS(SELECT 1 FROM data_generation_pins p WHERE p.generation_id=target.id)
+    AND NOT EXISTS(SELECT 1 FROM office_observations expired JOIN office_observations selected
+      ON selected.tenant_id=expired.tenant_id AND selected.report_refresh_date>=expired.report_refresh_date
+      JOIN data_generation_pins selected_pin ON selected_pin.generation_id=selected.generation_id
+      JOIN data_read_selections selection ON selection.id=selected_pin.selection_id
+      WHERE expired.generation_id=target.id AND expired.kind='weekly' AND target.expires_at<=clock_timestamp()
+        AND EXISTS(SELECT 1 FROM data_generation_heads head WHERE head.generation_id=target.id)
+        AND selection.endpoint='office-app-adoption' AND selection.invalidated_at IS NULL
+        AND selection.expires_at>clock_timestamp() AND target.observed_at<=selection.evaluated_at
+        AND target.expires_at>selection.evaluated_at)
+    AND NOT EXISTS(SELECT 1 FROM office_observations office JOIN data_generations staging ON staging.id=office.generation_id
+      WHERE target.id IN (office.directory_generation_id,office.app_generation_id)
+        AND staging.state IN ('staging','validating') AND staging.lease_until>clock_timestamp())`, "state='deleting'");
+  await remove("officePeople", "office_person_facts", `EXISTS(SELECT 1 FROM data_generations generation
+    WHERE generation.id=target.generation_id AND generation.state='deleting')`);
+  await remove("officeGroups", "office_group_facts", `EXISTS(SELECT 1 FROM data_generations generation
+    WHERE generation.id=target.generation_id AND generation.state='deleting')`);
+  await remove("officeObservations", "office_observations", `EXISTS(SELECT 1 FROM data_generations generation
+    WHERE generation.id=target.generation_id AND generation.state='deleting')
+    AND NOT EXISTS(SELECT 1 FROM office_person_facts person WHERE person.generation_id=target.generation_id)
+    AND NOT EXISTS(SELECT 1 FROM office_group_facts group_fact WHERE group_fact.generation_id=target.generation_id)`);
   for (const table of recordTables) {
     const children = table === "directory_user_rows" ? `AND NOT EXISTS(SELECT 1 FROM directory_service_plan_rows p
       WHERE p.generation_id=target.generation_id AND p.user_id=target.identity)`
@@ -154,7 +201,10 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
   }
   const empty = recordTables.map(table => `NOT EXISTS(SELECT 1 FROM ${table} r WHERE r.generation_id=target.id)`).join(" AND ");
   await update("recordCollectedGenerations", "data_generations", `target.state='deleting' AND target.collected_at IS NULL
-    AND ${empty} AND NOT EXISTS(SELECT 1 FROM data_generation_pins p WHERE p.generation_id=target.id)`, "collected_at=clock_timestamp()", "collection");
+    AND ${empty} AND NOT EXISTS(SELECT 1 FROM office_person_facts person WHERE person.generation_id=target.id)
+    AND NOT EXISTS(SELECT 1 FROM office_group_facts group_fact WHERE group_fact.generation_id=target.id)
+    AND NOT EXISTS(SELECT 1 FROM office_observations office WHERE office.generation_id=target.id)
+    AND NOT EXISTS(SELECT 1 FROM data_generation_pins p WHERE p.generation_id=target.id)`, "collected_at=clock_timestamp()", "collection");
   await remove("recordOldAttempts", "user_source_attempts", `EXISTS(SELECT 1 FROM data_generations g
     JOIN data_scope_epochs s ON s.id=g.scope_id WHERE g.id=target.generation_id AND g.collected_at IS NOT NULL
       AND (g.scope_epoch<>s.epoch OR g.session_epoch<>s.session_epoch OR EXISTS(

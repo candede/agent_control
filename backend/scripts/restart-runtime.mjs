@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 
 // This mode is piped only into the exact owned, read-only fresh-installation container.
-if (process.argv[2] === "first-sync") {
+if (process.argv[2] === "first-sync" || process.argv[2] === "office-idle") {
   assert.match(process.env.AGENT_CONTROL_FRESH_FIXTURE ?? "", /^ac-ltdp-install-[a-f0-9]{12}$/);
   assert.equal(process.env.PGDATABASE, "agentcontrol");
   assert.equal(process.env.PGUSER, "agentcontrol_app");
@@ -19,14 +19,137 @@ if (process.argv[2] === "first-sync") {
   const { DataGenerations } = await import("/app/backend/dist/db/dataGenerations.js");
   const { beginAccountSessionValidation, assertAccountSessionValidation } = await import("/app/backend/dist/db/sessions.js");
   const { loadOperationalState } = await import("/app/backend/dist/services/operationalState.js");
+  const { DataSyncService } = await import("/app/backend/dist/services/dataSync.js");
+  const { DataSyncRepository } = await import("/app/backend/dist/db/dataSync.js");
+  const { CopilotUsageService } = await import("/app/backend/dist/services/copilotUsage.js");
+  const { UserSourceProvider } = await import("/app/backend/dist/services/userSourceProvider.js");
+  const { OfficialReportStatusRepository } = await import("/app/backend/dist/db/officialReportStatus.js");
+  const { AgentPeopleService } = await import("/app/backend/dist/services/agentPeople.js");
+  const { OfficeAppAdoptionReads } = await import("/app/backend/dist/services/officeAppAdoptionReads.js");
+  const { buildCopilotReportUrl, reportHeaders } = await import("/app/backend/dist/services/userSourceGraphFields.js");
+  const { AppError } = await import("/app/backend/dist/errors.js");
   const tenant = config.tenants[0];
   assert.equal(config.tenants.length, 1);
   assert.deepEqual(tenant.domains, ["example.invalid"]);
-  assert.equal((await pool.query("SELECT count(*)::int AS count FROM inventory_roots")).rows[0].count, 0);
+  if (process.argv[2] === "first-sync") assert.equal((await pool.query("SELECT count(*)::int AS count FROM inventory_roots")).rows[0].count, 0);
   await loadOperationalState(pool);
   const user = { tenantId: tenant.tenantId, homeAccountId: "fresh-installation-reader",
     displayName: "Synthetic first collection", username: "fixture@example.invalid", roles: ["AgentControl.Viewer"] };
   const scope = { tenantId: user.tenantId, principalId: user.homeAccountId };
+  const reader = new OfficeAppAdoptionReads(pool, config.sessionSecret);
+  const readIdentity = { ...scope, sessionEpoch: "0", authorizationHash: createHash("sha256").update("synthetic-first-sync-viewer").digest("hex") };
+  if (process.argv[2] === "office-idle") {
+    const before = await reader.summary(readIdentity, {});
+    assert.ok(before.context.observation);
+    const checkpoint = await pool.query("SELECT id FROM data_generations ORDER BY id");
+    const previousFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => { calls++; throw new Error("Idle recovery must not read a provider"); };
+    try {
+      const service = new DataSyncService(pool);
+      await service.recover(); await service.recover();
+      assert.deepEqual((await reader.summary(readIdentity, {})).context.observation, before.context.observation);
+      assert.deepEqual((await pool.query("SELECT id FROM data_generations ORDER BY id")).rows, checkpoint.rows);
+      assert.equal(calls, 0);
+      console.log(JSON.stringify({ event: "fresh_office_restart_idle", outcome: "passed",
+        observation: before.context.observation.id, ticks: 2, providerCalls: calls, recopy: false }));
+    } finally { globalThis.fetch = previousFetch; await pool.end(); }
+    process.exit(0);
+  }
+  const order = process.argv[3] ?? "directory-first";
+  assert.ok(["directory-first", "app-first"].includes(order));
+  const skuId = "10000000-0000-4000-8000-000000000001", planId = "a62f8878-de10-42f3-b68f-6149a25ceb97";
+  const refresh = new Date().toISOString().slice(0, 10), publications = [];
+  let userProviderCalls = 0;
+  const waitForSource = async source => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const head = await pool.query(`SELECT 1 FROM data_scope_epochs s JOIN data_generation_heads h ON h.scope_id=s.id
+        WHERE s.tenant_id=$1 AND s.source=$2`, [scope.tenantId, source]);
+      if (head.rowCount) { publications.push(source); return; }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    throw new Error(`Synthetic publication order deadline: ${source}`);
+  };
+  const userProvider = new UserSourceProvider(async input => {
+    const url = new URL(String(input)); assert.equal(url.origin, "https://graph.microsoft.com"); userProviderCalls++;
+    if (url.pathname.endsWith("/subscribedSkus")) {
+      if (order === "app-first") await waitForSource("app_activity");
+      return Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] });
+    }
+    if (url.pathname.endsWith("/users")) return Response.json({ value: [1, 2, 3].map(n => ({
+      id: `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`, userPrincipalName: `office-${n}@example.invalid`,
+      displayName: `Office ${n}`, companyName: "Fresh company", department: "Fresh department", accountEnabled: true,
+      assignedLicenses: [{ skuId, disabledPlans: [] }],
+      assignedPlans: [{ servicePlanId: planId, service: "M365_COPILOT_APPS", capabilityStatus: "Enabled" }],
+    })), "@odata.count": 3 });
+    assert.equal(url.href, new URL(buildCopilotReportUrl()).href);
+    if (order === "directory-first") await waitForSource("directory");
+    const text = `${reportHeaders.join(",")}\n` + [1, 2, 3].map(n =>
+      [refresh, `office-${n}@example.invalid`, `Office ${n}`, refresh, refresh,
+        n === 1 ? refresh : "", n <= 2 ? refresh : "", n === 1 ? refresh : "", "", "", "", "", "28"].join(",")).join("\n");
+    return new Response(text, { headers: { "content-type": "text/csv" } });
+  });
+  const users = new CopilotUsageService(pool, {
+    provider: userProvider, revalidateUser: async () => user, applicationToken: async () => "synthetic-application",
+    requireAvailable: async () => {}, observeOperation: async (_capability, _user, work) => work(),
+    beginOperationValidation: () => () => {},
+  });
+  const repository = new DataSyncRepository(pool);
+  const providerDenied = async () => { throw new AppError(403, "missing_permission", "Synthetic independent inventory provider denial"); };
+  const sync = new DataSyncService(pool, {
+    repository, officialUsage: new OfficialReportStatusRepository(pool), copilotUsage: users,
+    agentPeople: new AgentPeopleService(pool), wait: async () => {},
+    packages: { submit: providerDenied, start: providerDenied, get: providerDenied, cancel: async () => {},
+      waitForPrincipalAuthorization: providerDenied, refreshDueDetails: async () => null, startDetailSync: async () => null },
+    powerPlatform: { submit: providerDenied, start: providerDenied, get: providerDenied, cancel: async () => {},
+      waitForPrincipalAuthorization: providerDenied },
+  });
+  assert.equal((await reader.context(readIdentity, {})).observation, null);
+  const automatic = await sync.automaticRefresh(user, Date.now());
+  assert.ok(automatic.run?.automatic);
+  const deadline = Date.now() + 90000;
+  let office;
+  do {
+    office = await reader.summary(readIdentity, {});
+    if (office.context.observation || office.context.status.state === "failed") break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  if (order === "app-first") {
+    assert.equal(office.context.status.state, "failed");
+    assert.equal(office.context.observation, null);
+    const providerCallsBefore = userProviderCalls;
+    const beforeRecovery = await repository.automaticRevisions(scope);
+    await new DataSyncService(pool).recover();
+    office = await reader.summary(readIdentity, {});
+    const afterRecovery = await repository.automaticRevisions(scope);
+    assert.notEqual(afterRecovery.users, beforeRecovery.users);
+    assert.equal(userProviderCalls, providerCallsBefore);
+    const generationIds = (await pool.query("SELECT id FROM data_generations WHERE state='published' ORDER BY id")).rows;
+    await new DataSyncService(pool).recover(); await new DataSyncService(pool).recover();
+    assert.equal(userProviderCalls, providerCallsBefore);
+    assert.deepEqual((await pool.query("SELECT id FROM data_generations WHERE state='published' ORDER BY id")).rows, generationIds);
+    console.log(JSON.stringify({ event: "fresh_office_recovery_only_revision", outcome: "passed",
+      before: beforeRecovery.users, after: afterRecovery.users, additionalProviderCalls: 0, idleTicks: 2 }));
+  }
+  assert.ok(office.context.observation, JSON.stringify(office.context.status));
+  assert.equal(office.organization.savedLicensedPeople, 3);
+  assert.equal(office.organization.reportedActiveUsers, 2);
+  assert.equal(office.organization.activeUserAppPairs, 4);
+  assert.equal(office.organization.unknownEvidencePeople, 1);
+  assert.equal(office.organization.perApp.word, 2);
+  assert.equal(office.organization.perApp.teams, 1);
+  assert.equal(office.organization.perApp.excel, 1);
+  assert.deepEqual((await pool.query(`SELECT (SELECT count(*)::int FROM official_usage_sets) AS reports,
+    (SELECT count(*)::int FROM inventory_roots) AS inventory`)).rows[0], { reports: 0, inventory: 0 });
+  assert.equal((await pool.query(`SELECT count(*)::int AS n FROM data_scope_epochs s JOIN data_generation_heads h ON h.scope_id=s.id
+    WHERE s.tenant_id=$1 AND s.source IN ('directory','app_activity')`, [scope.tenantId])).rows[0].n, 2);
+  publications.push(order === "directory-first" ? "app_activity" : "directory");
+  assert.deepEqual(publications, order === "directory-first" ? ["directory", "app_activity"] : ["app_activity", "directory"]);
+  await sync.drain();
+  console.log(JSON.stringify({ event: "fresh_office_automatic_first_sync", outcome: "passed",
+    order, publications, providerCalls: userProviderCalls, observation: office.context.observation.id,
+    metrics: office.organization, importedAgents: 0, inventory: 0, admission: "DataSyncService.automaticRefresh" }));
   const signedInAt = Date.now();
   const runtime = new InventoryRuntime(pool, async () => {});
   let providerCalls = 0;
@@ -43,16 +166,19 @@ if (process.argv[2] === "first-sync") {
   const jobs = new PackageRefreshJobs(pool);
   const service = new PackageInventoryService(jobs, {
     observeOperation: async (_capability, _user, operation) => operation(() => {}),
-    delegatedToken: async () => "synthetic-first-collection", revalidateUser: async () => user,
-    requireAvailable: async () => {}, applicationPrincipalId: () => undefined,
+    revalidateUser: async () => user,
+    requireAvailable: async () => {}, applicationPrincipalId: () => tenant.clientId,
     beginOperationValidation: (_capability, actor) => {
       assert.equal(actor.tenantId, scope.tenantId);
       assert.equal(actor.homeAccountId, scope.principalId);
       const validation = beginAccountSessionValidation(actor.tenantId, actor.homeAccountId);
       return () => assertAccountSessionValidation(validation);
     },
-    applicationToken: async () => { throw new Error("Unexpected application authentication"); },
-    requireApplicationDataScope: async () => { throw new Error("Unexpected application scope"); },
+    applicationToken: async () => "synthetic-first-collection",
+    requireApplicationDataScope: async (capability, actor) => {
+      assert.equal(capability, "graph.package.read.application");
+      assert.equal(actor.tenantId, tenant.tenantId);
+    },
     streams: database => new StreamedInventory(database, provider), wait: async () => {},
   });
   const app = express();
@@ -85,12 +211,12 @@ if (process.argv[2] === "first-sync") {
     const served = Buffer.from(await (await fetch(`http://127.0.0.1:3001${entry}`)).arrayBuffer());
     assert.deepEqual(served, readFileSync(`/app/frontend/dist${entry}`));
     await capture("not_collected");
-    const job = await service.submit(user, { tokenMode: "delegated", idempotencyKey: randomUUID() });
-    await service.start(user, job.id, "delegated");
+    const job = await service.submit(user, { tokenMode: "application", idempotencyKey: randomUUID() });
+    await service.start(user, job.id, "application");
     const deadline = Date.now() + 90_000;
     let status;
     do {
-      status = await jobs.getJob(scope, job.id);
+      status = await jobs.getJob({ tenantId: scope.tenantId, principalId: tenant.clientId, tokenMode: "application" }, job.id);
       if (["succeeded", "failed", "cancelled"].includes(status.status)) break;
       await new Promise(resolve => setTimeout(resolve, 25));
     } while (Date.now() < deadline);
@@ -100,7 +226,8 @@ if (process.argv[2] === "first-sync") {
     await runtime.enqueue(scope, false);
     await capture("preparing");
     const canonical = await runtime.reconciliation.runNext({
-      scope: { ...scope, kind: "principal", tokenMode: "delegated", source: "inventory_canonical", selector: "complete" },
+      scope: { tenantId: scope.tenantId, principalId: null, kind: "tenant", tokenMode: "tenant", source: "inventory_canonical", selector: "complete" },
+      actorPrincipalId: scope.principalId,
       schemaVersion: 1, sessionEpoch: await new DataGenerations(pool).sessionEpoch(scope.tenantId, scope.principalId),
       jobId: randomUUID(), jobKind: "derived", observedAt: new Date(), expiresAt: new Date(Date.now() + 86_400_000),
       deadlineAt: new Date(Date.now() + 1_799_000), reserveBytes: 1024 ** 3,

@@ -1,6 +1,7 @@
 import pg from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataGenerations, type BeginGeneration, type GenerationLease } from "./dataGenerations.js";
+import { dataLimits } from "./dataBounds.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -49,7 +50,7 @@ function fixture({ existingScope = true } = {}) {
     if (statement.includes("INSERT INTO data_generation_heads")) return result();
     if (statement.includes("SELECT revision FROM data_generation_heads")) return result([{ revision: "4" }]);
     if (statement.includes("SELECT scope_id FROM data_generation_heads")) return result([{ scope_id: scope.id }]);
-    if (statement.includes("SELECT count(*)::int AS active")) return result([{ active: 0, tenant_active: 0, scope_active: 0 }]);
+    if (statement.includes("count(DISTINCT writer)::int AS active")) return result([{ active: 0, tenant_active: 0, related_active: 0, scope_active: 0 }]);
     if (statement.includes("FROM data_generation_charges")) return result([{ bytes: "0" }]);
     if (statement.includes("FROM official_usage_ingestions")) return result([{ active: 0, tenant_active: 0 }]);
     if (statement.includes("INSERT INTO data_generations")) return result([], "INSERT");
@@ -73,6 +74,42 @@ function fixture({ existingScope = true } = {}) {
 }
 
 describe("generation admission and retained source contracts", () => {
+  it.each(["office_app_adoption", "office_history"].flatMap(source =>
+    [false, true].map(existingScope => ({ source, existingScope })),
+  ))(
+    "locks tenant sync before global admission or source locks for $source, existingScope=$existingScope", async ({ source, existingScope }) => {
+      const { store, query, input } = fixture({ existingScope });
+      await store.begin({
+        ...input,
+        scope: { ...input.scope, kind: "tenant", principalId: null, tokenMode: "tenant", source,
+          selector: source === "office_app_adoption" ? "current" : "2026-10-26:D28:v2" },
+        sessionEpoch: "0",
+      });
+
+      const statements = query.mock.calls;
+      const sync = statements.findIndex(([statement, values]) => typeof statement === "string"
+        && statement.includes("pg_advisory_xact_lock")
+        && (values?.[0] === `data-sync:${lease.tenantId}` || statement.includes("'data-sync:'||s.tenant_id")));
+      const admission = statements.findIndex(([statement]) => typeof statement === "string"
+        && statement.includes("pg_advisory_xact_lock(3650147)"));
+      const scope = statements.findIndex(([statement]) => typeof statement === "string"
+        && statement.includes("INSERT INTO data_scope_epochs"));
+      expect(sync).toBeGreaterThanOrEqual(0);
+      expect(admission).toBeGreaterThan(sync);
+      expect(scope).toBeGreaterThan(admission);
+      expect(query).toHaveBeenCalledWith("COMMIT");
+    },
+  );
+
+  it("includes both Office scopes in the tenant sync fence", async () => {
+    const { store, query, client } = fixture();
+    await store.fence(client, lease);
+    const sync = query.mock.calls.find(([statement]) => typeof statement === "string"
+      && statement.includes("'data-sync:'||s.tenant_id"))?.[0];
+    expect(sync).toContain("'office_app_adoption'");
+    expect(sync).toContain("'office_history'");
+  });
+
   it.each([false, true])("caps the initial lease at its deadline for existingScope=%s", async existingScope => {
     const { store, query, input, client } = fixture({ existingScope });
 
@@ -106,6 +143,29 @@ describe("generation admission and retained source contracts", () => {
     expect(query.mock.calls.some(([statement]) =>
       typeof statement === "string" && statement.includes("INSERT INTO data_generations"))).toBe(false);
     expect(query).toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it.each([false, true])("shares Office writer admission without exempting its byte reservation (overQuota=%s)", async overQuota => {
+    const { store, query, input } = fixture();
+    const execute = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      if (String(statement).includes("count(DISTINCT writer)::int AS active")) {
+        return result([{ active: 4, tenant_active: 2, related_active: 1, scope_active: 0 }]);
+      }
+      if (String(statement).includes("FROM data_generation_charges")) {
+        return result([{ bytes: overQuota ? String(dataLimits.tenantBytes) : "0" }]);
+      }
+      return execute(statement, values);
+    });
+    const pending = store.begin({
+      ...input, sessionEpoch: "0",
+      scope: { ...input.scope, kind: "tenant", principalId: null, tokenMode: "tenant",
+        source: "office_history", selector: "2026-10-26:D28:v2" },
+    });
+    if (overQuota) {
+      await expect(pending).rejects.toMatchObject({ status: 413, code: "data_tenant_bytes" });
+      expect(query.mock.calls.some(([statement]) => String(statement).includes("INSERT INTO data_generations"))).toBe(false);
+    } else await expect(pending).resolves.toMatchObject({ tenantId: lease.tenantId });
   });
 });
 
@@ -230,5 +290,93 @@ describe("duplicate generation page fencing", () => {
 
     expect(abort).not.toHaveBeenCalled();
     expect(query).toHaveBeenCalledWith("ROLLBACK");
+  });
+});
+
+describe("related generation publication completion", () => {
+  function publication(weeklyScopeId: string, invalidWeekly = false) {
+    const { store, query, input } = fixture();
+    const weekly = { ...lease, id: "55555555-5555-4555-8555-555555555555", scopeId: weeklyScopeId };
+    const published = new Set<string>(), retired = new Set<string>();
+    const execute = query.getMockImplementation()!;
+    query.mockImplementation(async (statement, values) => {
+      if (typeof statement !== "string") throw new Error("Unexpected query shape");
+      const id = String(values?.[0]);
+      if (statement.startsWith("SELECT job_id FROM data_generations")) return result([{ job_id: "office-job" }]);
+      if (statement.includes("SELECT g.* FROM selected_generation")) return result([{
+        id, job_id: "office-job", job_kind: "derived", run_id: null, state: "validating",
+        validated: !(invalidWeekly && id === weekly.id), row_count: 10, byte_count: "100",
+      }]);
+      if (statement.startsWith("SELECT generation_id FROM data_generation_heads")) return result([{ generation_id: `old:${id}` }]);
+      if (statement.startsWith("UPDATE data_generation_heads")) return result([{ revision: "5" }], "UPDATE");
+      if (statement.startsWith("UPDATE data_generations SET state='published'")) published.add(id);
+      if (statement.startsWith("UPDATE data_generations SET state='retired'")) retired.add(id);
+      return execute(statement, values);
+    });
+    return { store, query, input, weekly, published, retired };
+  }
+
+  it.each([
+    "00000000-0000-4000-8000-000000000000",
+    "99999999-9999-4999-8999-999999999999",
+  ])("completes the Office job after both heads and retirement states advance with weekly scope %s", async weeklyScopeId => {
+    const { store, query, weekly, published, retired } = publication(weeklyScopeId);
+    const completeJob = vi.fn(async (_client: pg.PoolClient, completed: { jobId: string; rows: number; bytes: number }) => {
+      expect(published).toEqual(new Set([lease.id, weekly.id]));
+      expect(retired).toEqual(new Set([`old:${lease.scopeId}`, `old:${weekly.scopeId}`]));
+      expect(completed).toEqual({ jobId: "office-job", runId: null, rows: 10, bytes: 100 });
+      expect(query).not.toHaveBeenCalledWith("COMMIT");
+    });
+
+    await expect(store.publish(lease, {
+      relatedLeases: [weekly], validateInputs: async () => {}, completeJob,
+    })).resolves.toBe("5");
+
+    expect(completeJob).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenCalledWith("COMMIT");
+  });
+
+  it("does not invoke completion when a later related lease cannot publish", async () => {
+    const { store, query, weekly } = publication("99999999-9999-4999-8999-999999999999", true);
+    const completeJob = vi.fn(async () => {});
+
+    await expect(store.publish(lease, {
+      relatedLeases: [weekly], validateInputs: async () => {}, completeJob,
+    })).rejects.toThrow("data_not_validated");
+
+    expect(completeJob).not.toHaveBeenCalled();
+    expect(query).toHaveBeenCalledWith("ROLLBACK");
+    expect(query).not.toHaveBeenCalledWith("COMMIT");
+  });
+
+  it("keeps managed cancellation armed through job completion after renewal is paused", async () => {
+    const { store, query, input } = publication("99999999-9999-4999-8999-999999999999");
+    vi.spyOn(store, "begin").mockResolvedValue(lease);
+    const abort = vi.spyOn(store, "abort");
+    const parent = new AbortController(), reason = new Error("cancel-during-completion");
+    const onCommitted = vi.fn();
+
+    await expect(store.execute(input, active => store.publish(active, {
+      validateInputs: async () => {}, completeJob: async () => { parent.abort(reason); }, onCommitted,
+    }), parent.signal)).rejects.toBe(reason);
+
+    expect(onCommitted).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith(lease, true);
+    expect(query).toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it("does not cancel a managed generation when its parent aborts after the durable commit", async () => {
+    const { store, input } = publication("99999999-9999-4999-8999-999999999999");
+    vi.spyOn(store, "begin").mockResolvedValue(lease);
+    const abort = vi.spyOn(store, "abort");
+    const parent = new AbortController();
+    const onCommitted = vi.fn(() => parent.abort(new Error("after-commit")));
+
+    await expect(store.execute(input, active => store.publish(active, {
+      validateInputs: async () => {}, completeJob: async () => {}, onCommitted,
+    }), parent.signal)).resolves.toBe("5");
+
+    expect(onCommitted).toHaveBeenCalledExactlyOnceWith("5");
+    expect(abort).not.toHaveBeenCalled();
   });
 });

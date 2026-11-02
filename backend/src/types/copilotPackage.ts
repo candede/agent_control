@@ -197,8 +197,3 @@ export function formatAgentAuthoringTool(value: string) {
   return normalized === "copilotstudio" ? "Copilot Studio"
     : normalized === "microsoft365copilotagentbuilder" ? "Microsoft 365 Copilot Agent Builder" : formatPackageFacetLabel(value);
 }
-
-export type GraphCollectionResponse<T> = {
-  value: T[];
-  "@odata.nextLink"?: string;
-};

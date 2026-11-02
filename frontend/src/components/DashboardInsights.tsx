@@ -51,24 +51,24 @@ export function DashboardInsights({ snapshot, baseline, revision, company, onCom
       </> : null}
     </section>
     <section className="dashboard-panel dashboard-panel-gold" aria-labelledby={agentsTitle}>
-      <DashboardPanelHeading id={agentsTitle} icon={Trophy} title="Agents and champions"
+      <DashboardPanelHeading id={agentsTitle} icon={Trophy} title="Agents and Agent Champs"
         description="Explore what is being used and who is helping adoption grow." />
       <div className="dashboard-insight-cards">
         <InsightCard icon={Bot} tone="purple" label="Agents being used" value={snapshot.activeAgents}
           description="Distinct reported agent IDs with positive responses in this saved report." unit="agents" />
         <InsightCard icon={MessageSquareText} tone="blue" label="Reported responses" value={snapshot.responses}
           description="Responses from the Agents export only. Companion reports are never added together." unit="responses" />
-        <InsightCard icon={Trophy} tone="gold" label="Copilot champions" value={data?.champions}
+        <InsightCard icon={Trophy} tone="gold" label="Agent Champs" value={data?.champions}
           description="Up to three usage-based suggestions per company / department, not assigned roles." unit="people" />
       </div>
       <p className="dashboard-panel-note">{baseline ? <>Responses: {adoptionChange(baseline.id === snapshot.id ? undefined : baseline, snapshot, "responses").label}
         {" "}vs baseline. </> : null}Organization-wide, for the same saved report. Usage is not a direct measure of productivity or ROI.</p>
-      <a className="dashboard-text-link" href={adoptionLink}>Explore groups and champions <ArrowUpRight size={15} aria-hidden="true" /></a>
+      <a className="dashboard-text-link" href={adoptionLink}>Explore groups and Agent Champs <ArrowUpRight size={15} aria-hidden="true" /></a>
     </section>
   </>;
 }
 
-function InsightCard({ icon: Icon, tone, label, value, description, unit }: {
+export function InsightCard({ icon: Icon, tone, label, value, description, unit }: {
   icon: LucideIcon; tone: string; label: string; value: number | null | undefined; description: string; unit: string;
 }) {
   return <div className={`dashboard-insight-card dashboard-tone-${tone}`}>

@@ -54,7 +54,7 @@ function savedPage(pendingPackages: number, invalidPackages: number): Parameters
         observed_at: observedAt, expires_at: expiresAt, catalog_complete: true, row_count: 0, collected_count: 0, agent_count: 0,
         resource_types: ["microsoft.copilotstudio/agents"], environment_id: null, page_count: 1 },
     ] },
-    verificationCounts: { packages, native_agents: 0, represented: packages, unique_sources: packages,
+    verificationCounts: { packages, native_agents: 0, native_source_agents: 0, represented: packages, unique_sources: packages,
       checked_packages: 1, stale_packages: 0, invalidated_packages: 0, invalid_packages: invalidPackages },
     partial: false,
   };
@@ -88,7 +88,7 @@ function memberPage(native = false): Parameters<typeof inventoryPresentation>[0]
     raw.summary = { ...raw.summary, graphOnly: 0, linked: 1 };
     raw.scopeSummary = { ...raw.summary };
     raw.filteredSummary = { ...raw.summary };
-    Object.assign(raw.verificationCounts, { native_agents: 1, represented: 2, unique_sources: 2 });
+    Object.assign(raw.verificationCounts, { native_agents: 1, native_source_agents: 1, represented: 2, unique_sources: 2 });
     Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
     raw.value[0].members.push({ ...powerPlatformInventoryRecord(resource), domain: "power_platform", scope_id: "native-scope",
       source_identity: "native-exact-key", generation_id: "native-member", observed_at: observedAt, expires_at: expiresAt,
@@ -437,9 +437,47 @@ describe("saved inventory row structure", () => {
 });
 
 describe("saved inventory projection invariants", () => {
+  it.each([false, true])("checks the deduplicated union of native source scopes (overlap: %s)", overlap => {
+    for (const filtered of [false, true]) {
+      const raw = memberPage(true);
+      const source = { ...raw.freshness.sources[1], scope_id: "environment-agent-scope", generation_id: "environment-agent-root",
+        environment_id: "Environment-A", agent_count: overlap ? 2 : 1, row_count: overlap ? 2 : 1,
+        collected_count: overlap ? 2 : 1, expected_count: overlap ? 2 : 1 };
+      raw.freshness.sources.push(source);
+      const native = structuredClone(raw.value[0]);
+      Object.assign(native, { id: "second-canonical", nativeId: "second-canonical", presence: "power_platform",
+        linkState: "unmatched", environmentId: "Environment-A" });
+      native.members = [native.members[1]];
+      Object.assign(native.members[0], { scope_id: source.scope_id, native_id: "Second-Native",
+        source_identity: "second-native-key" });
+      Object.assign(native.members[0].residual, { nativeId: "Second-Native", environmentId: "Environment-A" });
+      raw.value.push(native);
+      raw.summary = { ...raw.summary, total: 2, powerPlatformOnly: 1 };
+      raw.scopeSummary = { ...raw.summary };
+      raw.filteredSummary = { ...raw.summary };
+      Object.assign(raw.counts, { total: 2, scoped: 2, filtered: 2 });
+      Object.assign(raw.verificationCounts, { native_agents: 2, native_source_agents: 2, represented: 3, unique_sources: 3 });
+      if (filtered) {
+        raw.value = [];
+        raw.counts.filtered = 0;
+        raw.counts.packageTargets = 0;
+        raw.filteredSummary = { total: 0, linked: 0, graphOnly: 0, powerPlatformOnly: 0, ambiguous: 0, conflicting: 0 };
+      }
+      const page = inventoryPresentation(raw);
+      expect(page.sources.powerPlatform.observation?.id).toBe("native");
+      expect(page.verification).toMatchObject({ status: "verified", powerPlatformAgentCount: 2,
+        checks: { sourceMemberships: true } });
+      expect(inventoryAttentionReasons(page)).toEqual([]);
+      raw.verificationCounts.native_source_agents = 3;
+      const incomplete = inventoryPresentation(raw);
+      expect(incomplete.verification).toMatchObject({ status: "needs_attention", checks: { sourceMemberships: false } });
+      expect(inventoryAttentionReasons(incomplete).join(" ")).toContain("membership accounting");
+    }
+  });
+
   it("does not verify source counts when a native target has no logical row, including empty filtered pages", () => {
     const raw = savedPage(0, 0);
-    Object.assign(raw.verificationCounts, { native_agents: 1, represented: 2, unique_sources: 2 });
+    Object.assign(raw.verificationCounts, { native_agents: 1, native_source_agents: 1, represented: 2, unique_sources: 2 });
     Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
     const page = inventoryPresentation(raw);
     expect(page.verification).toMatchObject({ status: "needs_attention", checks: { sourceMemberships: false } });
@@ -697,6 +735,7 @@ describe("saved inventory projection invariants", () => {
 
   it.each([
     { name: "negative count", change: (raw: ReturnType<typeof memberPage>) => { raw.verificationCounts.packages = -1; } },
+    { name: "negative native source count", change: (raw: ReturnType<typeof memberPage>) => { raw.verificationCounts.native_source_agents = -1; } },
     { name: "unsafe count", change: (raw: ReturnType<typeof memberPage>) => { raw.verificationCounts.packages = Number.MAX_SAFE_INTEGER + 1; } },
     { name: "null source count", change: (raw: ReturnType<typeof memberPage>) => { raw.freshness.sources[0].row_count = null; } },
     { name: "missing catalog source provenance", change: (raw: ReturnType<typeof memberPage>) => { raw.freshness.sources[0].catalog_observed_at = null; } },
@@ -793,7 +832,7 @@ describe("saved inventory person evidence", () => {
         raw.scopeSummary = { ...raw.summary };
         raw.filteredSummary = { ...raw.summary };
         raw.counts.packageTargets = 0;
-        Object.assign(raw.verificationCounts, { packages: 0, checked_packages: 0, native_agents: 1 });
+        Object.assign(raw.verificationCounts, { packages: 0, checked_packages: 0, native_agents: 1, native_source_agents: 1 });
         Object.assign(raw.freshness.sources[0], { row_count: 0, collected_count: 0, expected_count: 0 });
         Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });
         const identity = { tenantId: "tenant", principalId: "reader", sessionEpoch: "1", authorizationHash: "viewer" };
@@ -973,7 +1012,7 @@ describe("saved inventory metadata verification", () => {
       raw.scopeSummary = { ...raw.summary };
       raw.filteredSummary = { ...raw.summary };
       Object.assign(raw.counts, { total: 1, scoped: 1, filtered: 1 });
-      Object.assign(raw.verificationCounts, { native_agents: 1, represented: 3, unique_sources: 3 });
+      Object.assign(raw.verificationCounts, { native_agents: 1, native_source_agents: 1, represented: 3, unique_sources: 3 });
       if (scenario === "future_detail") Object.assign(raw.verificationCounts, { checked_packages: 0, stale_packages: 2 });
       raw.reports.setId = "usage-report";
       Object.assign(raw.freshness.sources[0], { scope_id: packageScope, current: scenario !== "superseded" });
@@ -1204,10 +1243,24 @@ describe("saved inventory exact export selection", () => {
     return { database, inventory, client, identity, context, raw, result };
   }
 
-  it("counts captured memberships independently of freshness while exposing source-accounting gaps", async () => {
+  it.each(["graph_gap", "native_union", "native_gap"] as const)(
+    "counts captured memberships independently of freshness while exposing source-accounting gaps (%s)", async scenario => {
     const { database, inventory, client, context, raw, result } = fixture();
     try {
-      Object.assign(raw.freshness.sources[0], { row_count: 2, collected_count: 2, expected_count: 2 });
+      if (scenario === "graph_gap") {
+        Object.assign(raw.freshness.sources[0], { row_count: 2, collected_count: 2, expected_count: 2 });
+      } else {
+        Object.assign(raw.freshness.sources[1], { row_count: 1, agent_count: 1, collected_count: 1, expected_count: 1 });
+        raw.freshness.sources.push({ ...raw.freshness.sources[1], scope_id: "additional-native-scope",
+          generation_id: "additional-native-root", environment_id: "Environment-A",
+          row_count: 2, agent_count: 2, collected_count: 2, expected_count: 2 });
+        raw.summary = { ...raw.summary, total: 3, powerPlatformOnly: 2 };
+        raw.scopeSummary = { ...raw.summary };
+        raw.filteredSummary = { ...raw.summary };
+        Object.assign(raw.counts, { total: 3, scoped: 3, filtered: 3 });
+        Object.assign(raw.verificationCounts, { native_agents: 2, native_source_agents: scenario === "native_union" ? 2 : 3,
+          represented: 3, unique_sources: 3 });
+      }
       const query = vi.spyOn(client, "query").mockImplementation(async (statement: unknown, values?: unknown[]) => {
         const sql = String(statement);
         if (sql.startsWith("SELECT set_config")) return result();
@@ -1225,14 +1278,24 @@ describe("saved inventory exact export selection", () => {
           expect(sql).toContain("(r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3");
           expect(sql).toContain("IN ('fresh','stale')");
           expect(sql).not.toContain("(r.residual->'detailFreshness'->>'expiresAt')::timestamptz>$3");
-          expect(values).toEqual([context.baselineId, context.revision, new Date(observedAt)]);
+          expect(sql).toContain('jsonb_to_recordset(revision.inputs) input("scopeId" uuid,"baselineId" uuid,revision bigint)');
+          expect(sql).toContain("revision.scope_id=$4 AND revision.revision=$2");
+          expect(sql).toContain("member.baseline_id=root.baseline_id");
+          expect(sql).toContain("member.valid_from_revision<=root.revision");
+          expect(sql).toContain("(member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)");
+          expect(sql).toContain(`count(DISTINCT (${normalizeNativeIdentitySql("native.native_id")},`);
+          expect(sql).toContain(`coalesce(${normalizeEnvironmentIdentitySql("native.environment_id")},'')))::int`);
+          expect(sql).toContain("root.kind='microsoft.copilotstudio/agents' AND native.resource_type=root.kind) AS native_source_agents");
+          expect(values).toEqual([context.baselineId, context.revision, new Date(observedAt), context.scopeId]);
           return result([raw.verificationCounts]);
         }
         throw new Error("Unexpected saved accounting query.");
       });
       const summary = await inventory["summaries"](client, context);
+      expect(summary.verificationCounts.native_source_agents).toBe(raw.verificationCounts.native_source_agents);
       expect(inventoryPresentation({ ...raw, ...summary }).verification).toMatchObject({
-        status: "needs_attention", graphPackageCount: 1, checks: { sourceMemberships: false },
+        status: scenario === "native_union" ? "verified" : "needs_attention", graphPackageCount: 1,
+        checks: { sourceMemberships: scenario === "native_union" },
       });
       expect(query).toHaveBeenCalled();
       expect(database.connect).not.toHaveBeenCalled();
@@ -1516,7 +1579,7 @@ describe("frontend inventory verification fixture contract", () => {
   ])("matches backend and attention presentation for $state even with an empty filtered page", scenario => {
     const raw = savedPage(1, scenario.invalid);
     Object.assign(raw.verificationCounts, {
-      native_agents: 1, represented: 3, unique_sources: 3, checked_packages: scenario.checked,
+      native_agents: 1, native_source_agents: 1, represented: 3, unique_sources: 3, checked_packages: scenario.checked,
       stale_packages: scenario.stale, invalidated_packages: scenario.invalidated,
     });
     Object.assign(raw.freshness.sources[1], { row_count: 1, collected_count: 1, agent_count: 1, expected_count: 1 });

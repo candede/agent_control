@@ -59,7 +59,7 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
   const cancelPrompt = useRef<HTMLElement>(null);
   useEffect(() => { if (cancelConfirm) cancelPrompt.current?.focus(); }, [cancelConfirm]);
   const readyToFinish = Boolean(verified && accepted && !error);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (readyToFinish && !previouslyReady.current) successTitle.current?.focus();
     previouslyReady.current = readyToFinish;
   }, [readyToFinish]);
@@ -222,7 +222,7 @@ function ImportFlow({ ref, initialStagingId, initialBundleId, correctionOfSetId,
     setAttempt(admitted); setRecovery(undefined);
     return begin("accepting", async signal => {
       const receipt = await acceptReportBundle(admitted.bundleId, admitted.input, signal); signal.throwIfAborted();
-      setAccepted(receipt); setBusy("verifying"); notifyChanged();
+      setAccepted(receipt); setBusy("verifying");
       for (const [key, value] of receipts.current) receipts.current.set(key, { ...value, status: "accepted" });
       try { await inspect(receipt, signal); }
       catch (cause) {

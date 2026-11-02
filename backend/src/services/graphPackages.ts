@@ -1,5 +1,7 @@
-import { AppError, errorName, errorTelemetry, isTimeoutError } from "../errors.js";
-import { allowlistedPackage, parsePackageObservationJson } from "./packageObservation.js";
+import { AppError, errorName, errorTelemetry, isApplicationError, isTimeoutError } from "../errors.js";
+import { allowlistedPackage, packageObservationJsonContexts, parsePackageObservationJson } from "./packageObservation.js";
+import { streamProviderCollection, type ProviderCollectionMetadata } from "./providerCollection.js";
+import { dataLimits } from "../db/dataBounds.js";
 import { canonicalAccessEntities, capturePackageMutationState, packageMutationStatesEqual, requirePreservablePackageAccessScope, validatePackageAccessUpdate, type PackageMutationState } from "./packageMutationState.js";
 import { boundedProviderJson, boundedProviderText, parseProviderContractJson } from "./providerJson.js";
 import { operationalLog } from "./telemetry.js";
@@ -9,11 +11,9 @@ import { randomUUID } from "node:crypto";
 import { types } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { isPackageAccessEntity, isPackageId, normalizePackageStatus, packageAccessCollectionLimit } from "../types/copilotPackage.js";
-import { inventoryLimits, type InventoryPage } from "../types/inventoryRecords.js";
+import { inventoryLimits, type InventoryPageReceipt } from "../types/inventoryRecords.js";
 import type {
-  CopilotPackage,
   CopilotPackageDetail,
-  GraphCollectionResponse,
   PackageAccessEntity,
   PackageAccessUpdate,
   PackageAccessUpdateResult,
@@ -121,72 +121,103 @@ export class GraphPackagesClient {
     const budget = this.readBudget({ signal, assertCurrent });
     try {
       budget.assertCurrent();
-      const page = await this.requestReadWithRetry<GraphCollectionResponse<CopilotPackage>>(
-        buildCopilotAgentsListUrl(),
-        accessToken,
-        budget,
-        "catalog",
-      );
-      budget.assertCurrent();
-      if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Package access check returned an invalid collection.");
-      page.value.forEach(allowlistedPackage);
+      await this.requestReadWithRetry(buildCopilotAgentsListUrl(), accessToken, budget, "catalog", {
+        canRetry: () => true,
+        read: async (response, signal) => {
+          for await (const event of streamProviderCollection(response, {
+            signal, assertCurrent: () => budget.assertCurrent(), contexts: packageObservationJsonContexts(),
+            recordContext: "package", idleTimeoutMs: packageReadTimeoutMs,
+          })) {
+            if (event.kind === "record") allowlistedPackage(event.value);
+          }
+        },
+      });
       budget.assertCurrent();
     } finally { budget.dispose(); }
   }
 
-  async *catalogPages(accessToken: string, options: PackageReadOptions & {
+  async collectCatalog(accessToken: string, options: PackageReadOptions & {
+    /** Admit canonical page tokens, rejecting revisits without retaining an unbounded in-memory set. */
     visit: (token: string) => Promise<void>;
-  }): AsyncGenerator<InventoryPage<CopilotPackageDetail>> {
-    const budget = this.readBudget(options, inventoryLimits.graphDeadlineMs);
+    /** Stage records with exact-identity uniqueness; failures must prevent publication. */
+    onRecords: (records: CopilotPackageDetail[]) => Promise<void>;
+    onPage: (page: InventoryPageReceipt) => Promise<void>;
+  }): Promise<void> {
+    const budget = this.readBudget(options, inventoryLimits.graphDeadlineMs, true);
     options = { ...options, ...budget.options };
+    let pages = 0;
     try {
       let url: string | undefined = buildCopilotAgentsListUrl();
-      let pages = 0;
       let observed = 0;
-      const visited = new Set<string>();
-      const identities = new Set<string>();
       while (url) {
         budget.assertCurrent();
-        if (++pages > inventoryLimits.pages) throw new AppError(502, "provider_page_limit", "Inventory exceeds 10000 pages.");
+        pages += 1;
+        if (!Number.isSafeInteger(pages)) throw new Error("data_count_overflow");
         url = catalogUrl(url, pages > 1);
-        if (visited.has(url)) throw new AppError(502, "provider_continuation", "Package catalog repeated a continuation.");
-        visited.add(url);
         await budget.callback(() => options.visit(url!));
         budget.assertCurrent();
         const started = this.retryPolicy.now();
-        const page: GraphCollectionResponse<CopilotPackage> & { "@odata.count"?: number } = await this.requestReadWithRetry(
-          url, accessToken, budget, "catalog");
+        let delivered = false;
+        const page = await this.requestReadWithRetry<ProviderCollectionMetadata>(
+          url, accessToken, budget, "catalog", {
+            canRetry: () => !delivered,
+            read: async (response, signal) => {
+              options.diagnostics?.beginCatalogPage();
+              let records: CopilotPackageDetail[] = [];
+              let bytes = 2;
+              const flush = async () => {
+                if (!records.length) return;
+                delivered = true;
+                await budget.callback(() => options.onRecords(records));
+                records = [];
+                bytes = 2;
+              };
+              for await (const event of streamProviderCollection(response, {
+                signal, assertCurrent: () => budget.assertCurrent(), contexts: packageObservationJsonContexts(),
+                recordContext: "package", idleTimeoutMs: packageReadTimeoutMs,
+              })) {
+                if (event.kind === "complete") {
+                  await flush();
+                  return event.metadata;
+                }
+                options.diagnostics?.catalogRecords([event.value]);
+                const record = allowlistedPackage(event.value);
+                const recordBytes = Buffer.byteLength(JSON.stringify(record)) + 1;
+                if (records.length && (records.length === 100 || bytes + recordBytes > dataLimits.batchBytes)) await flush();
+                records.push(record);
+                bytes += recordBytes;
+              }
+              throw new AppError(502, "provider_schema", "Package catalog ended without a complete response.");
+            },
+          });
         budget.assertCurrent();
-        if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Invalid catalog page.");
-        const count = page["@odata.count"];
+        const count = page.count;
         if (count !== undefined) {
-          if (!Number.isSafeInteger(count) || count < 0) throw new AppError(502, "provider_schema", "Invalid catalog count.");
+          if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) throw new AppError(502, "provider_schema", "Invalid catalog count.");
         }
-        const next: string | undefined = page["@odata.nextLink"];
+        const next = page.nextLink;
         if (next !== undefined && (typeof next !== "string" || !next.trim() || next.length > 8192)) {
           throw new AppError(502, "provider_schema", "Invalid catalog continuation.");
         }
         const nextUrl = next === undefined ? undefined : catalogUrl(next, true);
-        if (nextUrl && visited.has(nextUrl)) throw new AppError(502, "provider_continuation", "Package catalog repeated a continuation.");
-        observed += page.value.length;
-        if (observed > inventoryLimits.sourceRows) throw new AppError(502, "provider_result_limit", "Inventory exceeds 100000 source records.");
-        options.diagnostics?.catalogPage(page.value, pages, next !== undefined, this.retryPolicy.now() - started, count);
-        const records = page.value.map(allowlistedPackage);
-        for (const record of records) {
-          if (identities.has(record.id)) throw new AppError(502, "provider_schema", "Package catalog repeated an exact package identity.");
-          identities.add(record.id);
-        }
+        observed += page.rows;
+        if (!Number.isSafeInteger(observed)) throw new Error("data_count_overflow");
+        options.diagnostics?.catalogPage(page.rows, pages, next !== undefined, this.retryPolicy.now() - started,
+          typeof count === "number" ? count : undefined);
         // This filtered endpoint is server-paged: only the opaque nextLink establishes completion.
         const expected = next === undefined ? observed : null;
         budget.assertCurrent();
-        yield { token: url, nextToken: nextUrl ?? null, records,
-          rawCount: page.value.length, expectedCount: expected, page: pages };
+        await budget.callback(() => options.onPage({ token: url!, nextToken: nextUrl ?? null,
+          rawCount: page.rows, expectedCount: expected, page: pages }));
         budget.assertCurrent();
         if (options.onProgress) await budget.callback(async () =>
           options.onProgress!({ pages, observedCount: observed, totalRecords: expected }));
         budget.assertCurrent();
         url = nextUrl;
       }
+    } catch (error) {
+      options.diagnostics?.catalogFailure(pages);
+      throw error;
     } finally { budget.dispose(); }
   }
 
@@ -221,14 +252,14 @@ export class GraphPackagesClient {
       );
       budget.assertCurrent();
       if (!observation || typeof observation !== "object" || Array.isArray(observation)
-        || !("id" in observation) || typeof observation.id !== "string" || observation.id.toLowerCase() !== id.toLowerCase()) {
+        || !("id" in observation) || observation.id !== id) {
         throw new AppError(502, "diagnostic_scope_mismatch", "Package diagnostic response did not identify the requested package.");
       }
       return observation;
     } finally { budget.dispose(); }
   }
 
-  private readBudget(options: PackageReadOptions, maximumDurationMs = Infinity) {
+  private readBudget(options: PackageReadOptions, maximumDurationMs = Infinity, collection = false) {
     if ((options.executionDeadlineAt !== undefined && !Number.isSafeInteger(options.executionDeadlineAt))
       || (options.retryThrottlingUntilAborted && (!options.signal || options.executionDeadlineAt === undefined))) {
       throw new AppError(500, "invalid_read_policy", "Extended throttling retries require a caller execution deadline and cancellation signal.");
@@ -236,7 +267,7 @@ export class GraphPackagesClient {
     const ordinaryDuration = this.retryPolicy.maxRetryAfterMs + packageReadTimeoutMs;
     const callerDuration = options.executionDeadlineAt === undefined ? Infinity : options.executionDeadlineAt - Date.now();
     const duration = Math.min(maximumDurationMs,
-      options.retryThrottlingUntilAborted ? callerDuration : Math.min(ordinaryDuration, callerDuration));
+      collection || options.retryThrottlingUntilAborted ? callerDuration : Math.min(ordinaryDuration, callerDuration));
     return new PackageReadBudget(options, duration, this.retryPolicy.now,
       callerDuration <= duration ? new DOMException("Package execution deadline expired.", "TimeoutError")
         : new AppError(504, "provider_timeout", "Microsoft Graph package read exceeded its logical read budget."));
@@ -296,6 +327,7 @@ export class GraphPackagesClient {
     readBudget?: PackageReadBudget,
     observeResponse?: (response: Response) => void,
     observeDispatch?: () => void,
+    consumeResponse?: (response: Response, signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const target = URL.parse(url);
     if (!target || target.origin !== "https://graph.microsoft.com" || target.username || target.password || !/^\/(v1\.0|beta)\/copilot\/admin\/catalog\/packages(?:\/|$)/.test(target.pathname)) {
@@ -304,10 +336,16 @@ export class GraphPackagesClient {
     const correlationId = options.correlationId ?? randomUUID();
     const read = !init.method || init.method === "GET";
     const budget = new PackageReadBudget(options, read
-      ? Math.min(packageReadTimeoutMs, readBudget?.remainingMs() ?? packageReadTimeoutMs)
+      ? consumeResponse ? readBudget?.remainingMs() ?? packageReadTimeoutMs
+        : Math.min(packageReadTimeoutMs, readBudget?.remainingMs() ?? packageReadTimeoutMs)
       : Math.min(10_000, options.executionDeadlineAt === undefined ? Infinity : options.executionDeadlineAt - Date.now()),
       this.retryPolicy.now, undefined, readBudget);
-    const { signal } = budget;
+    const headerDeadline = new AbortController();
+    let headerTimer: NodeJS.Timeout | undefined;
+    let headerExpiresAt: number | undefined;
+    const expireHeaders = () => headerDeadline.abort(
+      new DOMException("Package response headers exceeded 30 seconds.", "TimeoutError"));
+    const signal = consumeResponse ? AbortSignal.any([budget.signal, headerDeadline.signal]) : budget.signal;
     let response: Response | undefined;
     let undeliveredResponse: Response | undefined;
     let responseDisposed = false;
@@ -320,6 +358,11 @@ export class GraphPackagesClient {
     let removeAbort = () => {};
     try {
       budget.assertCurrent();
+      if (consumeResponse) {
+        headerExpiresAt = this.retryPolicy.now() + packageReadTimeoutMs;
+        headerTimer = setTimeout(expireHeaders, packageReadTimeoutMs);
+        headerTimer.unref();
+      }
       observeDispatch?.();
       const fetching = this.fetcher(url, {
         ...init,
@@ -342,19 +385,23 @@ export class GraphPackagesClient {
       void fetching.then(value => {
         undeliveredResponse = value;
         observeResponse?.(value);
-        try { budget.assertCurrent(); } catch { disposeResponse(value); }
+        try { budget.assertCurrent(); signal.throwIfAborted(); } catch { disposeResponse(value); }
       }, () => undefined);
       response = await Promise.race([fetching, aborted]);
+      clearTimeout(headerTimer);
       undeliveredResponse = undefined;
       try {
         budget.assertCurrent();
+        if (headerExpiresAt !== undefined && this.retryPolicy.now() >= headerExpiresAt) expireHeaders();
+        signal.throwIfAborted();
       } catch (error) {
         disposeResponse(response);
         throw error;
       }
       if (!response.ok) throw await graphError(response, signal);
-      if (response.status === 204) return undefined as T;
-      const result = await boundedProviderJson<T>(response, signal, undefined, parsePackageObservationJson);
+      if (response.status === 204 && !consumeResponse) return undefined as T;
+      const result = consumeResponse ? await consumeResponse(response, signal)
+        : await boundedProviderJson<T>(response, signal, undefined, parsePackageObservationJson);
       budget.assertCurrent();
       return result;
     } catch (error) {
@@ -372,10 +419,11 @@ export class GraphPackagesClient {
           : "Microsoft Graph did not finish the package mutation within ten seconds.");
       }
       signal.throwIfAborted();
-      if (error instanceof AppError) throw error;
+      if (isApplicationError(error)) throw error;
       throw new AppError(502, "provider_network_error", "Microsoft Graph could not be reached.");
     } finally {
       removeAbort();
+      clearTimeout(headerTimer);
       budget.dispose();
     }
   }
@@ -385,6 +433,7 @@ export class GraphPackagesClient {
     accessToken: string,
     budget: PackageReadBudget,
     stage: PackageReadStage,
+    consumeResponse?: { read: (response: Response, signal: AbortSignal) => Promise<T>; canRetry: () => boolean },
   ): Promise<T> {
     const pathname = URL.parse(url)?.pathname;
     const options = budget.options;
@@ -441,7 +490,7 @@ export class GraphPackagesClient {
                 requestStartedAt = this.retryPolicy.now();
                 dispatchedAt = requestStartedAt;
                 this.nextReadAt = requestStartedAt + this.readIntervalMs;
-              });
+              }, consumeResponse?.read);
             } finally {
               if (requestStartedAt !== undefined) options.diagnostics?.recordAttempt(stage,
                 this.retryPolicy.now() - requestStartedAt, dispatchedAttempts, readIntervalMs);
@@ -458,14 +507,15 @@ export class GraphPackagesClient {
       } catch (error) {
         budget.assertCurrent();
         if (phase === "admission") throw error;
-        const throttled = error instanceof AppError && isGraphThrottling(error);
+        const application = isApplicationError(error);
+        const throttled = application && isGraphThrottling(error);
         if (throttled && observedThrottle && this.cooldownError === observedThrottle) this.cooldownError = error;
         if (throttled && phase === "request" && !observedThrottle) options.diagnostics?.recordThrottle(stage);
-        const retryable = error instanceof AppError && isRetryableGraphError(error);
+        const retryable = application && isRetryableGraphError(error) && (consumeResponse?.canRetry() ?? true);
         const failureCount = throttled ? ++throttleFailures : ++transientFailures;
         const retryDelayMs = retryable ? getRetryDelayMs(error, failureCount, this.retryPolicy,
           options.retryThrottlingUntilAborted ? budget.remainingMs() : this.retryPolicy.maxRetryAfterMs) : undefined;
-        const retryAfterMs = error instanceof AppError ? retryAfterFromDetails(error.details) : undefined;
+        const retryAfterMs = application ? retryAfterFromDetails(error.details) : undefined;
         if (throttled && phase === "request" && !observedThrottle) this.throttleReadPacing(error, retryDelayMs, stage, pacingGeneration);
         const fields = {
           provider: "graph_packages",

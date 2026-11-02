@@ -283,18 +283,17 @@ describe("immutable inventory record storage", () => {
       AND kind='fixture:mixed' AND value=(payload->>'index')||':'||(payload->>'ordinal')`, [root.baselineId])).rows[0].count).toBe(300);
     expect(store.maximumParameterBytes).toBeLessThanOrEqual(1_048_576);
   });
-  it("atomically rejects the 100001 effective-count boundary on an exact append", async () => {
+  it("supports effective-count accounting above 100000 on an exact append", async () => {
     const principal = randomUUID(), root = await inventoryBaseline(store, principal, 1);
     // Exercise the counter boundary without presenting this sparse fixture as 100k qualification.
     await fixture.operator.query("UPDATE inventory_roots SET row_count=100000 WHERE baseline_id=$1", [root.baselineId]);
-    await expect(store.execute(inventoryInput(principal),
+    await store.execute(inventoryInput(principal),
       { domain: "packages", mode: "delta", channel: "exact", targets: ["package-000001"] },
-      lease => store.appendBounded(lease, [packageRecord(1)]).then(() => {}), { authorize: async () => {} }))
-      .rejects.toMatchObject({ code: "inventory_effective_rows", details: { limit: 100000, observed: 100001 } });
+      lease => store.appendBounded(lease, [packageRecord(1)]).then(() => {}), { authorize: async () => {} });
     expect((await fixture.runtime.query("SELECT revision,row_count FROM inventory_roots WHERE baseline_id=$1", [root.baselineId])).rows[0])
-      .toEqual({ revision: root.revision, row_count: 100000 });
+      .toEqual({ revision: String(BigInt(root.revision) + 1n), row_count: 100001 });
     expect((await fixture.runtime.query("SELECT identity FROM inventory_memberships WHERE baseline_id=$1", [root.baselineId])).rows)
-      .toEqual([{ identity: "package-000000" }]);
+      .toEqual(expect.arrayContaining([{ identity: "package-000000" }, { identity: "package-000001" }]));
   });
 
   it("splits legal wide Graph catalog projection work without dropping records or changing encoded limits", async () => {
@@ -312,6 +311,39 @@ describe("immutable inventory record storage", () => {
       [root.baselineId, publisher])).rows[0].count).toBe(total);
     expect((await fixture.runtime.query("SELECT batch_count FROM data_generations WHERE id=$1", [root.baselineId])).rows[0].batch_count).toBeGreaterThan(1);
     expect(stream.stages.maximumParameterBytes).toBeLessThanOrEqual(1_048_576);
+  });
+
+  it.each(["malformed-json", "transport-failure"])("keeps the published catalog when %s follows committed staging batches", async failure => {
+    const principal = randomUUID(), previous = await inventoryBaseline(store, principal, 1);
+    const committed = Promise.withResolvers<void>();
+    const body = JSON.stringify({ value: Array.from({ length: 201 }, (_, index) => ({
+      id: `partial-${index}`, displayName: "Never published", isBlocked: false,
+    })) });
+    const fetcher = vi.fn(async () => {
+      let first = true;
+      return new Response(new ReadableStream<Uint8Array>({ async pull(controller) {
+        if (first) { first = false; controller.enqueue(Buffer.from(body.slice(0, -2))); return; }
+        await committed.promise;
+        if (failure === "transport-failure") controller.error(new TypeError("Synthetic interrupted transfer."));
+        else { controller.enqueue(Buffer.from("] invalid")); controller.close(); }
+      } }));
+    });
+    const stream = new StreamedInventory(fixture.runtime, new GraphPackagesClient(fetcher));
+    const append = stream.stages.appendBounded.bind(stream.stages);
+    let stagedRows = 0;
+    vi.spyOn(stream.stages, "appendBounded").mockImplementation(async (lease, records) => {
+      await append(lease, records);
+      stagedRows += records.length;
+      if (stagedRows === 200) committed.resolve();
+    });
+    await expect(stream.graphCatalog(inventoryInput(principal), "synthetic", { authorize: async () => {} }))
+      .rejects.toMatchObject({ code: failure === "transport-failure" ? "provider_network_error" : "provider_schema" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect((await fixture.runtime.query("SELECT baseline_id,revision,row_count FROM inventory_roots WHERE scope_id=$1 AND current",
+      [previous.scopeId])).rows).toEqual([{ baseline_id: previous.baselineId, revision: previous.revision, row_count: 1 }]);
+    expect((await fixture.runtime.query(`SELECT g.state,g.row_count FROM data_generations g
+      JOIN inventory_attempts a ON a.generation_id=g.id WHERE g.scope_id=$1 AND g.id<>$2`,
+    [previous.scopeId, previous.baselineId])).rows).toEqual([{ state: "failed", row_count: 200 }]);
   });
 
   it("pins operation-reference reads through unrelated and newer audit writes but fences deletion of matching retained evidence", async () => {

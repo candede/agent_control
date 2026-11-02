@@ -442,8 +442,9 @@ describe("selected active users without paid Copilot", () => {
     await userEvent.click(modal.getByRole("button", { name: "Show all this user's agents" }));
     await waitFor(() => expect(vi.mocked(api.readReportPage).mock.calls.at(-1)?.[1]?.agentId).toBeUndefined());
   });
-  it("clears prior user filters when focusing an agent from details while preserving sorting and the exact report", async () => {
-    const { changed } = renderActivity({ ...initial, search: "Ada", agentId: "previous-agent", page: 3 });
+  it.each([false,true])("clears prior user filters while preserving the reader's explicit report pin (%s)", async pinned => {
+    const pin=pinned ? { reportSetId } : {};
+    const { changed } = renderActivity({ ...initial, ...pin, search: "Ada", agentId: "previous-agent", page: 3 });
     await screen.findByRole("button", { name: "Ada" });
     const controls = await filters();
     await controls.findByRole("option", { name: "Contoso" });
@@ -458,8 +459,8 @@ describe("selected active users without paid Copilot", () => {
     await userEvent.click(await modal.findByRole("button", { name: "Show all this user's agents" }));
     await userEvent.click(await modal.findByRole("button", { name: "Researcher: active users without paid Copilot" }));
     await screen.findByRole("button", { name: "Ada" });
-    expect(changed).toHaveBeenLastCalledWith({ ...initial, agentId: "agent-1", reportSetId });
-    assertQuery({ agentId: "agent-1", setId: reportSetId, licenseCohort: "active_without_paid",
+    expect(changed).toHaveBeenLastCalledWith({ ...initial, ...pin, agentId: "agent-1" });
+    assertQuery({ agentId: "agent-1", setId: pinned ? reportSetId : undefined, licenseCohort: "active_without_paid",
       cohort: "all", lowResponseThreshold: 5, sort: "name", order: "asc" });
     const query = vi.mocked(api.readReportPage).mock.calls.at(-1)![1]!;
     for (const field of ["company", "department", "search", "cursor", "selectionId"] as const) expect(query[field]).toBeUndefined();

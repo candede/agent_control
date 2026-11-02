@@ -22,7 +22,7 @@ const integerFields = new Set([
   "pageSize", "pageLimit", "rowLimit", "length", "maximumLength", "resourceIndex", "firstSeenPage", "catalogScopedCount", "targetIndex",
 ]);
 const durationFields = new Set(["durationMs", "ageMs", "deadlineMs", "retryDelayMs"]);
-const booleanFields = new Set(["hasContinuation", "resultTruncated", "environmentScoped"]);
+const booleanFields = new Set(["hasContinuation", "resultTruncated", "environmentScoped", "complete"]);
 const labels: Record<string, ReadonlySet<string>> = {
   capabilityId: new Set(capabilityIds),
   provider: new Set(["graph", "graph_packages", "power_platform"]),
@@ -34,7 +34,7 @@ const labels: Record<string, ReadonlySet<string>> = {
     "local_administrative_audit", "microsoft_defender_hunting", "microsoft_purview_audit", "agent_sharing_diagnostic"]),
   apiVersion: new Set(["v1.0", "beta", "2024-10-01"]),
   errorKind: new Set(["timeout", "aborted", "application", "unexpected"]),
-  stage: new Set(["record_gc", "inventory_gc", "generation", "selection", "export", "admission",
+  stage: new Set(["record_gc", "inventory_gc", "generation", "selection", "export", "admission", "office_capture",
     "catalog", "identity", "pagination", "load_job", "revalidate_user", "authorization", "delegated_token", "mark_running",
     "dispatch", "query", "inventory_collection", "collection_authorization", "publication_authorization", "publication",
     "canonical_reconciliation", "reconciliation", "request", "validation", "save_page", "record_progress", "completion",

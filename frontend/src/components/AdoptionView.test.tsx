@@ -54,7 +54,10 @@ describe("Adoption", () => {
     const section = within(await screen.findByRole("region", { name: "Contoso / HR" }));
     expect(section.getByRole("button", { name: "Maya" })).toBeVisible();
     expect(section.getByRole("button", { name: "Robin" })).toBeVisible();
-    expect(section.getAllByText("Copilot Champ")).toHaveLength(2);
+    const badges = section.getAllByText("Agent Champ");
+    expect(badges).toHaveLength(2);
+    for (const badge of badges) expect(badge).toHaveClass("copilot-user-badge");
+    expect(within(screen.getByRole("group", { name: "Adoption summary" })).getByText("Agent Champs")).toBeVisible();
     expect(section.getByText("10/200")).toBeVisible();
     expect(section.getByText("0/Unknown")).toBeVisible();
     expect(section.getByText("3 users · 1 agent")).toBeVisible();
@@ -151,7 +154,7 @@ describe("Adoption", () => {
     expect(search).toHaveValue("");
     expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove company filter" })).toHaveTextContent("Contoso");
-    expect(screen.getByRole("button", { name: "Remove copilot champs filter" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Remove agent champs filter" })).toBeVisible();
   });
   it("pages groups with one numbered request pinned to the existing selection", async () => {
     const first = page(undefined, 1, 6);
@@ -408,7 +411,7 @@ describe("Adoption", () => {
     expect(change).toHaveBeenLastCalledWith({ ...route, company: "Contoso" });
     fireEvent.change(filters.getByRole("combobox", { name: "Department" }), { target: { value: "~string:HR" } });
     expect(change).toHaveBeenLastCalledWith({ ...route, department: "HR" });
-    fireEvent.change(filters.getByRole("combobox", { name: "Copilot Champs" }), { target: { value: "with" } });
+    fireEvent.change(filters.getByRole("combobox", { name: "Agent Champs" }), { target: { value: "with" } });
     expect(change).toHaveBeenLastCalledWith({ ...route, adoptionChamps: "with" });
     fireEvent.change(filters.getByRole("combobox", { name: "Group agents" }), { target: { value: "without" } });
     expect(change).toHaveBeenLastCalledWith({ ...route, adoptionAgents: "without" });

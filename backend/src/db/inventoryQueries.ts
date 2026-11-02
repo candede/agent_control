@@ -104,7 +104,9 @@ const primaryMembersSql = `SELECT f.identity,member.identity AS source_identity,
     WHERE membership.generation_id=f.generation_id AND membership.identity=f.identity
   ) member WHERE member.ordinal=1`;
 
-type InventorySummaryCache = Map<string,{ expiresAt: number;row: pg.QueryResultRow;verificationCounts: pg.QueryResultRow }>;
+type InventoryVerificationCounts = Record<"packages" | "native_agents" | "native_source_agents" | "represented" | "unique_sources"
+  | "checked_packages" | "stale_packages" | "invalidated_packages" | "invalid_packages", number>;
+type InventorySummaryCache = Map<string,{ expiresAt: number;row: pg.QueryResultRow;verificationCounts: InventoryVerificationCounts }>;
 const summaryCaches = new WeakMap<pg.Pool,InventorySummaryCache>();
 
 export class InventoryQueries {
@@ -134,6 +136,7 @@ export class InventoryQueries {
       ...criteria.operationIdPrefix === undefined ? {} : { operationIdPrefix: criteria.operationIdPrefix } };
     const sourceScope = await this.reports.sources.ensureScope(identity);
     await this.reports.history.ensure(identity.tenantId);
+    await this.reports.history.connections.run(client => this.reports.history.reconcileHead(client, identity.tenantId));
     while (await this.reports.history.expire(identity.tenantId) > 0) { /* bounded maintenance transactions */ }
     return this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
       const pinUntil = new Date(at.getTime() + 30 * 60_000);
@@ -804,8 +807,20 @@ export class InventoryQueries {
         AND coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz
           >(r.residual->'detailFreshness'->>'observedAt')::timestamptz
           AND (r.residual->'detailFreshness'->>'observedAt')::timestamptz<=$3,false))`;
-    const verificationCounts = cached?.verificationCounts ?? (await client.query(`SELECT count(*) FILTER(WHERE r.domain='packages')::int AS packages,
+    const verificationCounts = cached?.verificationCounts ?? (await client.query<InventoryVerificationCounts>(`SELECT count(*) FILTER(WHERE r.domain='packages')::int AS packages,
       count(*) FILTER(WHERE r.domain='power_platform' AND r.resource_type='microsoft.copilotstudio/agents')::int AS native_agents,
+      (WITH input_roots AS (
+        SELECT input."scopeId" AS scope_id,input."baselineId" AS baseline_id,input.revision FROM inventory_revisions revision
+          CROSS JOIN LATERAL jsonb_to_recordset(revision.inputs) input("scopeId" uuid,"baselineId" uuid,revision bigint)
+          WHERE revision.scope_id=$4 AND revision.revision=$2
+        UNION SELECT $4::uuid,$1::uuid,$2::bigint
+      ), native_roots AS (${inventoryNativeRootChoicesSql("input_roots")})
+      SELECT count(DISTINCT (${normalizeNativeIdentitySql("native.native_id")},
+        coalesce(${normalizeEnvironmentIdentitySql("native.environment_id")},'')))::int
+      FROM native_roots root JOIN inventory_memberships member ON member.baseline_id=root.baseline_id
+        AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
+      JOIN power_platform_record_rows native ON native.generation_id=member.generation_id AND native.identity=member.identity
+      WHERE root.kind='microsoft.copilotstudio/agents' AND native.resource_type=root.kind) AS native_source_agents,
       count(*)::int AS represented,
       count(DISTINCT (r.domain,CASE WHEN r.domain='packages' THEN r.native_id ELSE ${normalizeNativeIdentitySql("r.native_id")} END,
         CASE WHEN r.domain='packages' THEN '' ELSE coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'') END))::int AS unique_sources,
@@ -817,7 +832,7 @@ export class InventoryQueries {
       FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
       JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
       JOIN inventory_records r ON r.generation_id=s.source_generation_id AND r.identity=s.source_identity
-      WHERE ${inventoryAsOf()}`, [context.baselineId, context.revision, context.data.evaluatedAt])).rows[0];
+      WHERE ${inventoryAsOf()}`, [context.baselineId, context.revision, context.data.evaluatedAt, context.scopeId])).rows[0];
     if (cacheable && !cached) {
       peakCheckpoint("response.serialize");
       const serialized = JSON.stringify({ row,verificationCounts }); peakCheckpoint("response.serialize");

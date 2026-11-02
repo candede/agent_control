@@ -9,7 +9,7 @@ export class ProviderResponseLimitError extends AppError {
   }
 }
 
-type ProviderJsonContext = {
+export type ProviderJsonContext = {
   fields: readonly string[] | "*";
   objects?: Readonly<Record<string, string | ((parent: unknown) => string | undefined)>>;
   arrays?: Readonly<Record<string, string>>;

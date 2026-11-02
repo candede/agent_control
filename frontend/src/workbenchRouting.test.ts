@@ -18,6 +18,54 @@ import {
 } from "./workbenchRouting";
 
 describe("workbench routing", () => {
+  it("keeps Office and agent pins independent through dashboard and numbered Users bookmarks", () => {
+    const officeSnapshot = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", officeBaseline = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const agent = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const query = `adoption=office&officeSnapshot=${officeSnapshot}&officeBaseline=${officeBaseline}&snapshot=${agent}&baseline=${agent}&app=word&section=adoption&page=3&company=~null`;
+    const dashboard = parseDashboardRoute(query), users = parseUsersRoute(query);
+    expect(dashboard).toMatchObject({ adoption: "office", officeSnapshot: officeSnapshot.toLowerCase(), officeBaseline, baselineId: agent, reportSetId: agent, company: null });
+    expect(users).toMatchObject({ adoption: "office", officeSnapshot: officeSnapshot.toLowerCase(), officeBaseline, reportSetId: agent, baselineId: agent, page: 2, app: "word" });
+    expect(parseDashboardRoute(dashboardRouteSearch(dashboard).toString())).toEqual(dashboard);
+    expect(parseUsersRoute(usersRouteSearch(users).toString())).toEqual(users);
+    expect(dashboardRouteSearch({ ...dashboard, adoption: undefined }).get("baseline")).toBe(agent);
+    expect(usersRouteSearch({ ...users, adoption: undefined }).get("snapshot")).toBe(agent);
+  });
+  it.each([2_002, 20_000, Number.MAX_SAFE_INTEGER])("round trips supported Office group page %s without the Agents offset limit", page => {
+    const query = new URLSearchParams({ section: "adoption", adoption: "office", page: String(page) });
+    const route = parseUsersRoute(query.toString());
+    expect(route.page).toBe(page - 1);
+    expect(usersRouteSearch(route).get("page")).toBe(String(page));
+    expect(parseUsersRoute(usersRouteSearch(route).toString())).toEqual(route);
+    expect(parseAgentRoute(`page=${page}`).page).toBe(0);
+    expect(parseUsersRoute(`section=adoption&page=${page}`).page).toBe(0);
+    expect(parseUsersRoute(`adoption=office&page=${page}`).page).toBe(0);
+  });
+  it.each(["0", "-1", "2.5", "Infinity", "9007199254740992"])("rejects unsupported Office group page %s", page => {
+    const route = parseUsersRoute(`section=adoption&adoption=office&page=${page}`);
+    expect(route.page).toBe(0);
+    expect(usersRouteSearch(route).has("page")).toBe(false);
+  });
+  it("does not serialize an Office page whose one-based value exceeds the safe-integer contract", () => {
+    const route = parseUsersRoute("section=adoption&adoption=office");
+    expect(usersRouteSearch({ ...route, page: Number.MAX_SAFE_INTEGER }).has("page")).toBe(false);
+  });
+  it("recovers invalid or repeated Office pins explicitly without aliases or agent pin changes", () => {
+    for (const query of ["officeSnapshot=bad", "officeBaseline=bad", "officeSnapshot=a&officeSnapshot=b"]) {
+      expect(parseDashboardRoute(`adoption=office&${query}`).officeNotice).toMatch(/invalid.*Latest/);
+      expect(parseUsersRoute(`section=adoption&adoption=office&${query}`).officeSnapshot).toBeUndefined();
+    }
+    expect(parseDashboardRoute("adoption=office&app=chat").app).toBeUndefined();
+    expect(parseDashboardRoute("domain=office").adoption).toBeUndefined();
+  });
+  it("retains an inert agent snapshot when Latest Office changes domain and the Dashboard bookmark reloads", () => {
+    const agent = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const office = parseDashboardRoute(`adoption=office&snapshot=${agent}&baseline=${agent}`);
+    const agents = parseDashboardRoute(dashboardRouteSearch({ ...office, adoption: undefined }).toString());
+    expect(agents).toMatchObject({ reportSetId: agent, baselineId: agent });
+    expect(agents.adoption).toBeUndefined();
+    expect(agents.officeSnapshot).toBeUndefined();
+    expect(agents.officeBaseline).toBeUndefined();
+  });
   it("round trips personal report selection on Agents and Users without treating Sync management as the same route", () => {
     const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const agent = parseAgentRoute(`snapshot=${id}&access=available`);

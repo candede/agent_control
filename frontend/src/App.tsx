@@ -166,6 +166,7 @@ function publicRouteSearch() {
     "detail", "detailTab", "tab", "person", "agent", "page", "selected", "selectionState", "selectionCount",
     "selectedResource", "inventorySnapshot", "quarantineJob", "controlJob", "refreshJob", "mode",
     "syncRun", "powerPlatformJob", "reports", "staging", "snapshot", "correction", "window", "baseline",
+    "officeSnapshot", "officeBaseline", "officeGroup", "app",
   ]) search.delete(key);
   return search;
 }
@@ -177,6 +178,7 @@ function selectedPackagePreview(record: UnifiedAgentRecord, detail: CopilotPacka
     || source.sourceIdentity !== detail.id || !source.generationId) {
     throw new Error("The selected published version does not belong to the displayed inventory group.");
   }
+
   const primary = record.packages[0];
   return { ...record, packages: [...(primary ? [primary] : []), detail], packagesComplete: false,
     identity: { ...record.identity, packageEvidence: [
@@ -190,6 +192,10 @@ function selectedPackagePreview(record: UnifiedAgentRecord, detail: CopilotPacka
         observedAt: observed.observedAt, expiresAt: observed.expiresAt, current: observed.current === true, identityDetails: null },
     } },
   };
+}
+
+function officeNavigation(route: DashboardRouteState | UsersRouteState) {
+  return { adoption: route.adoption, officeSnapshot: route.officeSnapshot, officeBaseline: route.officeBaseline, officeNotice: route.officeNotice };
 }
 
 function LinkedAgentJobStatus({
@@ -265,13 +271,18 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   const selectPowerPlatformJob = useCallback((id: string | undefined, initialJob?: InventoryRefreshJob) => {
     setPowerPlatformJobSelection({ id, initialJob });
   }, []);
-  const [usersRoute, setUsersRoute] = useState(() => parseUsersRoute(readViewSearch("users")));
+  const [usersRoute, setUsersRoute] = useState<UsersRouteState>(() => ({ ...parseUsersRoute(readViewSearch("users")), ...officeNavigation(parseDashboardRoute(window.location.search)) }));
   const [personalReportSetId, setPersonalReportSetId] = useState(() => {
     const view = parseWorkbenchView(window.location.pathname);
-    return view === "agents" ? initialAgentRoute.reportSetId : view === "users" ? usersRoute.reportSetId : undefined;
+    return view === "agents" ? initialAgentRoute.reportSetId : view === "users" ? usersRoute.reportSetId
+      : view === "dashboard" ? parseDashboardRoute(window.location.search).reportSetId : undefined;
   });
   const observedReportDefault = useRef<{ owner: string; id: string | null; revision: string; viewRevision: number } | undefined>(undefined);
-  const [dashboardRoute, setDashboardRoute] = useState(() => parseDashboardRoute(readViewSearch("dashboard")));
+  const [dashboardRoute, setDashboardRoute] = useState<DashboardRouteState>(() => {
+    const office = parseDashboardRoute(window.location.search);
+    return { ...parseDashboardRoute(readViewSearch("dashboard")), ...officeNavigation(office),
+      ...(office.adoption === "office" ? { baselineId: office.baselineId, reportSetId: office.reportSetId } : {}) };
+  });
   const [user, setUser] = useState<SessionUser>();
   const [sessionEpoch, setSessionEpoch] = useState(0);
   const [initialRouteSession] = useState(() => crypto.randomUUID());
@@ -748,8 +759,14 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const route = parseUsersRoute(window.location.search);
         setPersonalReportSetId(route.reportSetId);
         setUsersRoute(route);
+        shareOfficeNavigation(route, "users");
       } else if (view === "dashboard") {
-        setDashboardRoute(parseDashboardRoute(window.location.search));
+        const route = parseDashboardRoute(window.location.search);
+        if (route.adoption === "office" || route.officeSnapshot || route.officeBaseline || route.reportSetId) {
+          setPersonalReportSetId(route.reportSetId);
+        }
+        setDashboardRoute(route);
+        shareOfficeNavigation(route, "dashboard");
       } else if (view === "sync") {
         const route = parseDataSyncRoute(window.location.search);
         const next = workbenchUrl("sync", dataSyncRouteSearch(route));
@@ -1432,6 +1449,19 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setActiveView(view);
     const savedSearch = savedViewSearches.current.get(view) ?? "";
     const search = new URLSearchParams(savedSearch.startsWith("?") ? savedSearch.slice(1) : savedSearch);
+    if (view === "dashboard" || view === "users") {
+      const context = officeNavigation(view === "dashboard" ? dashboardRoute : usersRoute);
+      for (const key of ["adoption", "officeSnapshot", "officeBaseline"] as const) {
+        if (context[key]) search.set(key, context[key]!); else search.delete(key);
+      }
+      if (context.adoption === "office" || context.officeSnapshot || context.officeBaseline) {
+        if (view === "dashboard") {
+          if (personalReportSetId) search.set("snapshot", personalReportSetId);
+          else search.delete("snapshot");
+        }
+        if (view === "users" && dashboardRoute.baselineId) search.set("baseline", dashboardRoute.baselineId);
+      }
+    }
     if (view === "agents" || view === "users") {
       if (personalReportSetId) search.set("snapshot", personalReportSetId);
       else search.delete("snapshot");
@@ -1469,9 +1499,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       else window.history.pushState(routeHistoryState("users"), "", next);
     }
     setUsersRoute(route);
+    shareOfficeNavigation(route, "users");
   }
 
   function handleDashboardRouteChange(route: DashboardRouteState) {
+    if (route.adoption === "office" || route.officeSnapshot || route.officeBaseline) route = { ...route, reportSetId: personalReportSetId };
     const search = dashboardRouteSearch(route);
     savedViewSearches.current.set("dashboard", search.toString());
     const next = workbenchUrl("dashboard", search);
@@ -1479,6 +1511,24 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
       window.history.pushState(routeHistoryState("dashboard"), "", next);
     }
     setDashboardRoute(route);
+    shareOfficeNavigation(route, "dashboard");
+  }
+
+  function shareOfficeNavigation(route: DashboardRouteState | UsersRouteState, source: "dashboard" | "users") {
+    const context = officeNavigation(route);
+    if (source === "users") {
+      const next = { ...dashboardRoute, ...context,
+        ...(context.adoption === "office" || context.officeSnapshot || context.officeBaseline ? { reportSetId: route.reportSetId } : {}),
+        ...(route.baselineId ? { baselineId: route.baselineId } : {}) };
+      setDashboardRoute(next);
+      savedViewSearches.current.set("dashboard", dashboardRouteSearch(next).toString());
+    } else {
+      const next = { ...usersRoute, ...context, page: 0, detailId: undefined, officeGroup: undefined,
+        ...(context.adoption === "office" || context.officeSnapshot || context.officeBaseline || usersRoute.baselineId !== undefined ? { baselineId: route.baselineId } : {}),
+        ...(usersRoute.adoption !== route.adoption ? { company: undefined, department: undefined, app: undefined, search: "", adoptionAgents: undefined, adoptionChamps: undefined } : {}) };
+      setUsersRoute(next);
+      savedViewSearches.current.set("users", usersRouteSearch(next).toString());
+    }
   }
 
   function handleSyncReportRouteChange(reports: SyncReportRouteState | undefined) {
@@ -1511,6 +1561,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     const nextUsers = { ...usersRoute, reportSetId: id, page: 0 };
     setUsersRoute(nextUsers);
     savedViewSearches.current.set("users", usersRouteSearch(nextUsers).toString());
+    if (dashboardRoute.reportSetId || dashboardRoute.adoption === "office" || dashboardRoute.officeSnapshot || dashboardRoute.officeBaseline) {
+      const nextDashboard = { ...dashboardRoute, reportSetId: id };
+      setDashboardRoute(nextDashboard);
+      savedViewSearches.current.set("dashboard", dashboardRouteSearch(nextDashboard).toString());
+    }
     const search = activeView === "users" ? usersRouteSearch(nextUsers)
       : agentRouteSearch({ ...parseAgentRoute(window.location.search), reportSetId: id, page: 0 });
     savedViewSearches.current.set(activeView, search.toString());
@@ -1740,7 +1795,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     setAgentPageIndex(0);
     setUsersRoute(current => ({
       ...current, detailId: undefined, detailTab: undefined, agentId: undefined, reportSetId: undefined, page: 0,
+      officeSnapshot: undefined, officeBaseline: undefined, officeGroup: undefined, officeNotice: undefined, app: undefined,
+      baselineId: undefined,
     }));
+    setDashboardRoute(current => ({ ...current, baselineId: undefined, reportSetId: undefined, officeSnapshot: undefined, officeBaseline: undefined, officeNotice: undefined, app: undefined }));
     savedViewSearches.current.clear();
     const view = parseWorkbenchView(window.location.pathname);
     window.history.replaceState(routeHistoryState(view), "", workbenchUrl(view, publicRouteSearch()));
@@ -3540,6 +3598,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           ? <WorkspaceSkeleton view="agents" showSummary={canReadSensitiveUsage} />
         : visibleActiveView === "dashboard" ? <AdoptionDashboard key={`dashboard:${principalKey}`}
           revision={officialUsageDashboardRevision} baselineId={dashboardRoute.baselineId} company={dashboardRoute.company}
+          route={dashboardRoute} officeRevision={copilotUsersDataRevision} onRouteChange={handleDashboardRouteChange}
           onBaselineChange={baselineId => handleDashboardRouteChange({ ...dashboardRoute, baselineId })}
           onCompanyChange={company => handleDashboardRouteChange({ ...dashboardRoute, company })} />
         : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
@@ -3839,6 +3898,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
       {selectedUnifiedAgent && !singleAccessAgentDetail && !bulkAccessAgentIds && (!bulkConfirmation || inlinePackageConfirmation) ? (
         <UnifiedAgentDetailModal
+          personalReportSetId={personalReportSetId}
           selectionId={unifiedAgentDetailPage?.sourcePage?.selection?.id}
           key={principalKey}
           returnFocusTo={userAgentOverlay ? agentDetailReturnFocus : undefined}

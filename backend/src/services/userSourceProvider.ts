@@ -1,14 +1,14 @@
-import { Readable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { parse } from "csv-parse";
-import { AppError, errorTelemetry, hasNativeErrorPrototype, isApplicationError } from "../errors.js";
+import { AppError, errorTelemetry, isApplicationError } from "../errors.js";
 import { dataLimitError, encodeBatch } from "../db/dataBounds.js";
 import type { ActivityRecord, BeginGeneration, GenerationLease } from "../db/dataGenerations.js";
 import { UserSourceStages, type UserSourceCompletion } from "../db/userSourceStages.js";
 import type { UserSourceKind } from "../types/userSources.js";
 import { graphError, graphResponseError, retryAfterMs, type FetchLike } from "./graphPackages.js";
 import { operationalLog } from "./telemetry.js";
-import { boundedProviderJson, parseProviderContractJson, ProviderResponseLimitError } from "./providerJson.js";
+import { streamProviderCollection, type ProviderCollectionMetadata } from "./providerCollection.js";
+import { providerTextStream } from "./providerTextStream.js";
 import {
   buildCopilotReportUrl, buildCopilotUsersUrl, buildReportedUsersUrl, buildSubscribedSkusUrl,
   parseDirectoryUser, parseReportUser, parseSubscribedSku, reportHeaders, validateGraphUrl, validateReportDownloadUrl,
@@ -19,7 +19,6 @@ import { isGraphGuid, type CopilotDirectoryUser } from "../types/copilotUsage.js
 import type { UserSourcesRepository } from "../db/userSources.js";
 import type { SelectionIdentity } from "./dataSelections.js";
 
-type Collection = { value?: unknown[]; "@odata.count"?: unknown; "@odata.nextLink"?: unknown };
 export type UserSourceAuthorization = (source: UserSourceKind, signal: AbortSignal) => Promise<string>;
 
 export class UserSourceProvider {
@@ -78,21 +77,23 @@ export class UserSourceProvider {
     const catalogKey = await stages.query(lease, "catalog", buildSubscribedSkusUrl());
     fence();
     let url: string | undefined = buildSubscribedSkusUrl();
-    let catalogWire = 0;
     while (url) {
       fence();
       await stages.assertNewPage(lease, catalogKey, url);
       fence();
-      const page = await this.collection(url, token, "catalog", signal, fence);
-      fence();
-      catalogWire += page.value!.length;
-      if (catalogWire > 1000) throw dataLimitError("provider_sku_limit", 1000, catalogWire);
-      await stages.page(lease, catalogKey, url, page.value!.length, count(page));
-      fence();
-      for (let offset = 0; offset < page.value!.length; offset += 250) {
-        await stages.skus(lease, catalogKey, page.value!.slice(offset, offset + 250).map(parseSubscribedSku));
+      let skus: ReturnType<typeof parseSubscribedSku>[] = [];
+      const page = await this.collection(url, token, "catalog", signal, fence, async value => {
+        skus.push(parseSubscribedSku(value));
+        if (skus.length < 100) return;
+        await stages.skus(lease, catalogKey, skus);
         fence();
-      }
+        skus = [];
+      });
+      fence();
+      if (skus.length) await stages.skus(lease, catalogKey, skus);
+      fence();
+      await stages.page(lease, catalogKey, url, page.rows, count(page));
+      fence();
       url = continuation(page, "catalog");
     }
     await stages.finishQuery(lease, catalogKey);
@@ -138,17 +139,8 @@ export class UserSourceProvider {
       assertCurrent();
       await stages.assertNewPage(lease, key, url);
       assertCurrent();
-      const page = await this.collection(url, token, "directory", signal, assertCurrent);
-      assertCurrent();
-      if (page.value!.length > 100) throw dataLimitError("provider_page_rows", 100, page.value!.length);
-      const total = count(page);
-      if (filter.kind === "reported" && total !== undefined && total > filter.identities.length) {
-        throw new AppError(502, "provider_count_mismatch", "Exact identity count exceeds its requested batch.");
-      }
-      await stages.page(lease, key, url, page.value!.length, total);
-      assertCurrent();
       let batch: CopilotDirectoryUser[] = [];
-      for (const value of page.value!) {
+      const page = await this.collection(url, token, "directory", signal, assertCurrent, async value => {
         assertCurrent();
         const licenses = (value as { assignedLicenses?: unknown })?.assignedLicenses;
         if (!Array.isArray(licenses) || licenses.length > 1000) throw new AppError(502, "provider_schema", "Invalid license assignments.");
@@ -170,8 +162,21 @@ export class UserSourceProvider {
           batch = [];
         }
         batch.push(user);
-      }
+        if (batch.length === 100) {
+          await stages.directory(lease, key, batch);
+          assertCurrent();
+          batch = [];
+        }
+      });
+      assertCurrent();
       if (batch.length) await stages.directory(lease, key, batch);
+      assertCurrent();
+      if (page.rows > 100) throw dataLimitError("provider_page_rows", 100, page.rows);
+      const total = count(page);
+      if (filter.kind === "reported" && total !== undefined && total > filter.identities.length) {
+        throw new AppError(502, "provider_count_mismatch", "Exact identity count exceeds its requested batch.");
+      }
+      await stages.page(lease, key, url, page.rows, total);
       assertCurrent();
       const observed = await stages.progress(lease);
       assertCurrent();
@@ -230,30 +235,28 @@ export class UserSourceProvider {
     fence();
   }
 
-  private async collection(url: string, token: string, kind: "catalog" | "directory", signal: AbortSignal, assertCurrent: () => void) {
+  private async collection(url: string, token: string, kind: "catalog" | "directory", signal: AbortSignal,
+    assertCurrent: () => void, onRecord: (value: unknown) => Promise<void>) {
     validateUrl(url, kind);
     const { response, requestSignal } = await this.request(url, token, signal, false, kind === "directory", assertCurrent);
-    try {
-      const page = await boundedProviderJson<Collection>(response, requestSignal, kind === "directory" ? 16 * 1024 ** 2 : 2_000_000,
-        text => parseUserSourceJson(text, kind));
+    for await (const event of streamProviderCollection(response, {
+      signal: requestSignal, assertCurrent, contexts: userSourceJsonContexts(kind), recordContext: kind, idleTimeoutMs: 15_000,
+    })) {
       assertCurrent();
-      if (!page || !Array.isArray(page.value)) throw new AppError(502, "provider_schema", "Invalid Graph collection.");
-      return page;
-    } catch (error) {
+      if (event.kind === "complete") return event.metadata;
+      await onRecord(event.value);
       assertCurrent();
-      if (requestSignal.aborted) throw new AppError(504, "provider_timeout", "Graph page exceeded its 15-second deadline.");
-      if (hasNativeErrorPrototype(error, ProviderResponseLimitError.prototype)) throw new AppError(502, "provider_response_size_limit", "Graph page exceeds its byte limit.");
-      throw error;
     }
+    throw new AppError(502, "provider_schema", "Graph collection ended without a complete response.");
   }
 
   private async request(url: string, token: string | null, signal: AbortSignal, report: boolean, directory: boolean, assertCurrent: () => void) {
     for (let attempt = 0; ; attempt++) {
       assertCurrent();
       const headerDeadline = new AbortController();
-      const timer = report ? setTimeout(() => headerDeadline.abort(new DOMException("Report headers exceeded 15 seconds.","TimeoutError")),15_000) : undefined;
+      const timer = setTimeout(() => headerDeadline.abort(new DOMException("Provider headers exceeded 15 seconds.","TimeoutError")),15_000);
       timer?.unref();
-      const requestSignal = AbortSignal.any([signal,report ? headerDeadline.signal : AbortSignal.timeout(15_000)]);
+      const requestSignal = AbortSignal.any([signal, headerDeadline.signal]);
       let removeAbort = () => {};
       try {
       const fetching = this.fetcher(url, {
@@ -340,8 +343,8 @@ export class UserSourceProvider {
   }
 }
 
-function parseUserSourceJson(text: string, kind: "catalog" | "directory"): unknown {
-  return parseProviderContractJson(text, {
+function userSourceJsonContexts(kind: "catalog" | "directory") {
+  return {
     root: { fields: ["value", "@odata.count", "@odata.nextLink"], arrays: { value: kind } },
     catalog: { fields: ["skuId", "appliesTo", "servicePlans"], arrays: { servicePlans: "skuPlan" } },
     skuPlan: { fields: ["servicePlanId"] },
@@ -352,74 +355,18 @@ function parseUserSourceJson(text: string, kind: "catalog" | "directory"): unkno
     },
     license: { fields: ["skuId", "disabledPlans"] },
     assignedPlan: { fields: ["servicePlanId", "service", "capabilityStatus", "assignedDateTime"] },
-  }, 5);
+  };
 }
 
 export async function* streamAppActivity(response: Response, signal: AbortSignal, assertCurrent?: () => void) {
-  let cancelBody = (reason: unknown) => { void response.body?.cancel(reason).catch(() => {}); };
-  const fence = () => {
-    try { signal.throwIfAborted(); assertCurrent?.(); }
-    catch (error) { cancelBody(error); throw error; }
-  };
-  fence();
-  if (!response.body) throw new AppError(502, "provider_schema", "Empty activity response.");
-  const reader = response.body.getReader();
-  cancelBody = reason => { void reader.cancel(reason).catch(() => {}); };
-  const decoder = new TextDecoder("utf-8", { fatal: true });
-  let bytes = 0;
-  let bodyFailure: unknown;
-  const abort = () => cancelBody(signal.reason);
-  async function* text() {
-    try {
-      for (;;) {
-        fence();
-        let timer: NodeJS.Timeout | undefined;
-        const pending = reader.read();
-        const deadline = new Promise<never>((_resolve,reject) => {
-          timer = setTimeout(() => {
-            const error = new AppError(504,"provider_timeout","Activity report body made no progress for 15 seconds.");
-            reject(error);
-            void reader.cancel(error).catch(() => {});
-          },15_000);
-          timer.unref();
-        });
-        // Database backpressure is covered by the source deadline and lease,
-        // not an HTTP-body timer running while no network read is pending.
-        const chunk = await Promise.race([pending,deadline]).finally(() => clearTimeout(timer));
-        fence();
-        if (chunk.done) break;
-        bytes += chunk.value.byteLength;
-        if (bytes > 64 * 1024 ** 2) throw dataLimitError("provider_report_bytes", 64 * 1024 ** 2, bytes);
-        const owned = Buffer.from(chunk.value);
-        for (let offset = 0; offset < owned.byteLength; offset += 16 * 1024) {
-          yield decoder.decode(owned.subarray(offset, offset + 16 * 1024), { stream: true });
-        }
-      }
-      yield decoder.decode();
-    } catch (error) {
-      bodyFailure = error;
-      // Node streams inspect error.message; never hand them a borrowed error or accessor.
-      throw new AppError(502, "provider_schema", "Invalid activity CSV or UTF-8.");
-    } finally {
-      void reader.cancel().catch(() => {});
-      reader.releaseLock();
-    }
-  }
-  fence();
-  signal.addEventListener("abort", abort, { once: true });
-  const input = Readable.from(text(), { highWaterMark: 1 });
-  let parsedRecords = 0;
+  const body = providerTextStream(response, { signal, assertCurrent, idleTimeoutMs: 15_000 });
+  const { input, fence } = body;
   const parserOptions = { bom: true, skip_empty_lines: true, relax_column_count: false, max_record_size: 64 * 1024,
-    on_record: (record: string[]) => {
-      if (++parsedRecords>100_001) throw dataLimitError("provider_report_rows",100_000,parsedRecords-1);
-      return record;
-    },
     readableHighWaterMark: 1, writableHighWaterMark: 16 * 1024 };
   const parser = parse(parserOptions);
   input.on("error", error => parser.destroy(error));
   input.pipe(parser);
   let columns: number[] | undefined;
-  let rows = 0;
   try {
     for await (const value of parser) {
       fence();
@@ -430,36 +377,35 @@ export async function* streamAppActivity(response: Response, signal: AbortSignal
           || columns.some(index => index < 0)) throw new AppError(502, "provider_schema", "Unsupported activity CSV headers.");
         continue;
       }
-      if (++rows > 100_000) throw dataLimitError("provider_report_rows", 100_000, rows);
-      yield parseReportUser(columns.map(index => row[index]));
+      body.pause();
+      try { yield parseReportUser(columns.map(index => row[index])); }
+      finally { body.resume(); }
     }
     fence();
     if (!columns) throw new AppError(502, "provider_schema", "Empty activity CSV.");
   } catch (error) {
     fence();
-    if (isApplicationError(bodyFailure)) throw bodyFailure;
+    if (isApplicationError(body.state.failure?.error)) throw body.state.failure.error;
     if (isApplicationError(error)) throw error;
     throw new AppError(502, "provider_schema", "Invalid activity CSV or UTF-8.");
   } finally {
-    signal.removeEventListener("abort", abort);
     parser.destroy();
-    input.destroy();
-    void reader.cancel().catch(() => {});
+    body.close();
   }
 }
 
-function count(page: Collection) {
-  const value = page["@odata.count"];
+function count(page: ProviderCollectionMetadata) {
+  const value = page.count;
   if (value === undefined) return undefined;
-  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new AppError(502, "provider_count_mismatch", "Invalid Graph count.");
-  return value as number;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new AppError(502, "provider_count_mismatch", "Invalid Graph count.");
+  return value;
 }
 function validateUrl(url: string, kind: "directory" | "catalog" | "report") {
   validateGraphUrl(url, kind);
   if (url.length > 8192 || new URL(url).hash) throw new AppError(502, "invalid_provider_link", "Invalid Graph URL.");
 }
-function continuation(page: Collection, kind: "directory" | "catalog") {
-  const value = page["@odata.nextLink"];
+function continuation(page: ProviderCollectionMetadata, kind: "directory" | "catalog") {
+  const value = page.nextLink;
   if (value === null || value === undefined) return undefined;
   if (typeof value !== "string") throw new AppError(502, "invalid_provider_link", "Invalid continuation.");
   validateUrl(value, kind);

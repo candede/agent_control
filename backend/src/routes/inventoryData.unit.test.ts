@@ -46,7 +46,7 @@ function emptyPage(): Awaited<ReturnType<InventoryQueries["page"]>> {
       availability: "never_imported", staleAfterDays: 7, periodAgeDays: null, acceptedAgeDays: null,
       reportingPeriod: null, acceptedAt: null, expiresAt: null, lineages: [] },
     freshness: { state: "idle", capturedRevision: "1", sources: [] },
-    verificationCounts: { packages: 0, native_agents: 0, represented: 0, unique_sources: 0, checked_packages: 0,
+    verificationCounts: { packages: 0, native_agents: 0, native_source_agents: 0, represented: 0, unique_sources: 0, checked_packages: 0,
       stale_packages: 0, invalidated_packages: 0, invalid_packages: 0 },
     partial: false,
   };

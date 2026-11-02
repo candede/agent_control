@@ -303,6 +303,38 @@ describe("personal saved report selection", () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
+  it.each([{ initialId: undefined, outside: false }, { initialId: older.id, outside: false },
+    { initialId: older.id, outside: true }])("retains only the disabled choice label through ten pending minute captures: $initialId / outside=$outside", async ({ initialId, outside }) => {
+    vi.useFakeTimers();
+    const initial = page(initialId), pending = deferred<ReturnType<typeof page>>(), onSelect = vi.fn();
+    if (outside) {
+      initial.value = [latest];
+      initial.page.nextCursor = "older-options";
+    }
+    vi.mocked(api.readReportPage).mockResolvedValueOnce(initial).mockReturnValue(pending.promise);
+    render(<Harness initialId={initialId} onSelect={onSelect} />);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    const label = select.selectedOptions[0].textContent;
+    for (let minute = 0; minute < 10; minute += 1) {
+      await act(() => vi.advanceTimersByTimeAsync(60_000));
+      expect(api.readReportPage).toHaveBeenCalledTimes(minute + 2);
+    }
+    expect(api.readReportPage).toHaveBeenCalledTimes(11);
+    expect(select).toBeDisabled();
+    expect(select).toHaveValue(initialId ?? "");
+    expect(select.selectedOptions[0]).toHaveTextContent(label!);
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(vi.mocked(api.readReportPage).mock.calls.slice(1).every(call => !call[1]?.selectionId)).toBe(true);
+    await act(async () => {
+      pending.resolve({ ...initial, selection: reportSelection(20, Date.now()) });
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(select).toBeEnabled();
+    expect(select.selectedOptions[0]).toHaveTextContent(label!);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
   it("does not allow a late unavailable response from an obsolete principal to change the replacement reader", async () => {
     const pending = deferred<ReturnType<typeof page>>(), oldSelect = vi.fn(), newSelect = vi.fn();
     vi.mocked(api.readReportPage).mockReturnValueOnce(pending.promise);

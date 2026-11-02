@@ -132,7 +132,6 @@ for (const scenario of [
   { name: "agent details", path: "/agents?detail=graph_packages%3Alayout-package-1", dialog: "Service desk assistant", body: ".inventory-detail-section" },
   { name: "user details", path: "/users", trigger: "Ada", dialog: "Ada", body: ".user-detail-panel:not([hidden])" },
   { name: "inventory diagnostics", path: "/sync", trigger: "View diagnostics", dialog: "Inventory diagnostics", body: ".workbench-dialog-body" },
-  { name: "permission details", path: "/permissions", trigger: "Details: Agent inventory", dialog: "Agent inventory", body: ".workbench-dialog-body" },
   { name: "report management", path: "/sync?reports=manage", dialog: "Manage reports", body: ".usage-manage-reports", bodyInset: 12 },
   { name: "report snapshot", path: "/sync?reports=snapshot", dialog: "Report details", body: ".usage-snapshot", bodyInset: 12 },
 ] as const) {
@@ -154,6 +153,7 @@ for (const scenario of [
       const value = (await metric.locator(":scope > strong").boundingBox())!;
       expect(value.y - label.y - label.height).toBeGreaterThanOrEqual(4);
     }
+
     if (scenario.name === "agent details") {
       await expect(dialog.getByRole("tabpanel")).not.toContainText("Reload saved inventory");
       await expect(dialog.getByRole("region", { name: "Inventory source members" })).toHaveCount(0);
@@ -170,6 +170,27 @@ for (const scenario of [
     expect(unexpected).toEqual([]);
   });
 }
+
+test("inline permission evidence retains header and body gutters without a superseded details dialog", async ({ page }, info) => {
+  await page.clock.setFixedTime(new Date(layoutTime));
+  const unexpected = await mockLayoutApi(page);
+  await page.goto("/permissions");
+  const issue = page.getByRole("article", { name: "Agent inventory", exact: true });
+  await expect(issue.getByRole("region", { name: "Required setup" })).toBeVisible();
+  await expect(issue.getByRole("region", { name: "Technical details" })).toBeVisible();
+  await expectInsets(issue);
+  for (const content of [issue.locator(".permission-issue-heading"), issue.getByRole("region", { name: "Required setup" }),
+    issue.getByRole("region", { name: "Technical details" })]) {
+    const outer = (await issue.boundingBox())!, inner = (await content.boundingBox())!;
+    expect(inner.x - outer.x).toBeGreaterThanOrEqual(16);
+    expect(outer.x + outer.width - inner.x - inner.width).toBeGreaterThanOrEqual(16);
+    expect(await content.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  }
+  expect(await issue.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  await expect(page.locator(".permission-center").locator("dialog,details,summary")).toHaveCount(0);
+  expect(unexpected).toEqual([]);
+  await issue.screenshot({ path: info.outputPath("permission-inline-evidence.png") });
+});
 
 for (const scenario of [
   { name: "audit event", path: "/audit", trigger: /^View event details:/, dialog: "Event details" },

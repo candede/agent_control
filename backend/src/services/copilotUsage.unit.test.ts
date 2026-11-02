@@ -392,7 +392,9 @@ describe("Users source deadline and durable publication boundaries", () => {
       });
       await expect(f.stages.execute(f.input, async () => undefined, { beforePublish: async () => undefined }))
         .resolves.toEqual({ generationId: f.lease.id, scopeId: f.lease.scopeId, revision: "8", ...f.counts });
-      expect(f.commits()).toBe(2);
+      expect(f.commits()).toBe(4);
+      expect(f.query.mock.calls.filter(([sql]) => typeof sql === "string"
+        && sql.includes("office_vector"))).toHaveLength(2);
       expect(f.readCounts).toHaveBeenCalledOnce();
       expect(f.query.mock.calls.some(([sql]) => typeof sql === "string" && sql.includes("AND status='running'"))).toBe(false);
       if (boundary !== "late-count-read") expect(warning).toHaveBeenCalledWith(expect.stringContaining("user_source_publication_cleanup_failed"));
@@ -489,6 +491,53 @@ describe("Users provider HTTP failure boundaries", () => {
     delivery.resolve(new Response(null));
     expect(fetcher).toHaveBeenCalledOnce();
     expect(f.wait).not.toHaveBeenCalled();
+  });
+
+  it.each((["catalog", "directory"] as const).flatMap(source =>
+    (["cancelled", "authority", "current"] as const).map(boundary => ({ source, boundary })),
+  ))("fences the final $source batch across $boundary collection cleanup", async ({ source, boundary }) => {
+    const controller = new AbortController();
+    const reason = new AppError(boundary === "cancelled" ? 409 : 401,
+      boundary === "cancelled" ? "read_job_cancelled" : "authorization_expired", "Source collection stopped.");
+    const skuId = "639dec6b-bb19-468b-871c-c5c441c4b0cb", planId = "a62f8878-de10-42f3-b68f-6149a25ceb97";
+    let current = true, releases = 0;
+    const response = Response.json({
+      value: source === "catalog" ? [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }]
+        : [{ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", userPrincipalName: "person@example.invalid",
+          assignedLicenses: [{ skuId, disabledPlans: [] }], assignedPlans: [] }],
+      "@odata.count": 1,
+    });
+    const reader = response.body!.getReader(), release = reader.releaseLock.bind(reader);
+    vi.spyOn(reader, "releaseLock").mockImplementation(() => {
+      release();
+      if (++releases === 2) {
+        if (boundary === "cancelled") controller.abort(reason);
+        else if (boundary === "authority") current = false;
+      }
+    });
+    vi.spyOn(response.body!, "getReader").mockReturnValue(reader);
+    const fetcher = vi.fn<FetchLike>();
+    if (source === "directory") fetcher.mockResolvedValueOnce(Response.json({ value: [] }));
+    fetcher.mockResolvedValueOnce(response).mockResolvedValue(Response.json({ value: [], "@odata.count": 0 }));
+    const f = providerFixture(fetcher);
+    const skus = vi.spyOn(f.stages, "skus").mockResolvedValue(undefined);
+    const directory = vi.spyOn(f.stages, "directory").mockResolvedValue(undefined);
+    const page = vi.spyOn(f.stages, "page").mockResolvedValue(undefined);
+    const finish = vi.spyOn(f.stages, "finishQuery").mockResolvedValue(undefined);
+    vi.spyOn(f.stages, "skuBatch").mockResolvedValueOnce([{ skuId, servicePlanIds: [planId] }]).mockResolvedValue([]);
+    vi.spyOn(f.stages, "skuEvidence").mockResolvedValue(new Map([[skuId, [planId]]]));
+    vi.spyOn(f.stages, "verificationBatch").mockResolvedValue([]);
+    vi.spyOn(f.stages, "progress").mockResolvedValue(0);
+    const pending = f.provider.directory(f.stages, f.lease, "synthetic-token", controller.signal,
+      undefined, () => { if (!current) throw reason; });
+    if (boundary === "current") await expect(pending).resolves.toBeUndefined();
+    else await expect(pending).rejects.toBe(reason);
+    expect(releases).toBe(2);
+    expect(skus).toHaveBeenCalledTimes(boundary === "current" && source === "catalog" ? 1 : 0);
+    expect(directory).toHaveBeenCalledTimes(boundary === "current" && source === "directory" ? 1 : 0);
+    expect(page).toHaveBeenCalledTimes(boundary === "current" ? 2 : source === "catalog" ? 0 : 1);
+    expect(finish).toHaveBeenCalledTimes(boundary === "current" ? 2 : source === "catalog" ? 0 : 1);
+    expect(fetcher).toHaveBeenCalledTimes(boundary === "current" || source === "directory" ? 2 : 1);
   });
 
   it.each(["catalog", "discovery", "identity"] as const)(
@@ -858,7 +907,7 @@ describe("Users provider HTTP failure boundaries", () => {
     } finally { await rows.return(undefined); }
   });
 
-  it("preserves the CSV byte-limit error through Node stream isolation and releases its reader", async () => {
+  it("retains individual CSV record limits and releases oversized-record streams", async () => {
     const limit = 64 * 1024 ** 2;
     const cancel = vi.fn();
     const body = new ReadableStream<Uint8Array>({
@@ -868,7 +917,7 @@ describe("Users provider HTTP failure boundaries", () => {
     const consume = async () => {
       for await (const row of streamAppActivity(new Response(body), new AbortController().signal)) void row;
     };
-    await expect(consume()).rejects.toMatchObject({ code: "provider_report_bytes", details: { limit, observed: limit + 1 } });
+    await expect(consume()).rejects.toMatchObject({ code: "provider_schema" });
     expect(body.locked).toBe(false);
     expect(cancel).toHaveBeenCalledOnce();
   });

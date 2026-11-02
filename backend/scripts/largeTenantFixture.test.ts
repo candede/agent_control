@@ -14,6 +14,16 @@ import { schemaFingerprint } from "../src/db/schema.js";
 import { testSchemaTemplateIdentity } from "./testDatabaseTemplate.js";
 
 describe("large tenant fixture and frozen semantic seeds", () => {
+  it("discovers Office SQL/API/publication/lifecycle proof in the isolated existing owner", () => {
+    const commands = fixtureCommands("office-app-adoption");
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toContain("src/db/officeAppAdoption.test.ts");
+    expect(commands[0]).toContain("src/routes/officeAppAdoption.test.ts");
+    for (const file of commands[0].filter(value => /\.test\.ts$/.test(value))) {
+      expect(existsSync(new URL(`../${file}`,import.meta.url))).toBe(true);
+    }
+    expect(commands[1]).toEqual(["run","typecheck","--workspace","backend"]);
+  });
   it("keeps the approved registry in the production runtime, not only dependency stages", () => {
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
     const runtime = dockerfile.split("FROM node:24-bookworm-slim AS runtime\n")[1].split("\nFROM runtime AS runtime-inspection")[0];

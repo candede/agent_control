@@ -128,7 +128,9 @@ describe("live relational official history selection", () => {
     const set = await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
     const confirmation = await imports.previewDeletion(identity, set.setId);
     await fixture.operator.query("UPDATE official_usage_sets SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", [set.setId]);
-    await imports.history.ensure(identity.tenantId);
+    const reports = new LargeTenantUsersReports(fixture.runtime, "synthetic-history-first-read-secret", 30);
+    const selection = await reports.capture(identity, "official_agents");
+    expect((await reports.page(selection.id, identity)).reports.setId).toBeNull();
     expect((await fixture.runtime.query("SELECT active_set_id,revision::text FROM official_usage_state WHERE tenant_id=$1", [identity.tenantId])).rows[0])
       .toEqual({ active_set_id: null, revision: String(BigInt(confirmation.activeRevision) + 1n) });
     await expect(imports.confirmDeletion(identity, confirmation)).rejects.toMatchObject({ code: "confirmation_mismatch" });

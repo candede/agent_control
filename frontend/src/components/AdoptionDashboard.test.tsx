@@ -27,7 +27,12 @@ describe("adoption dashboard", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(reportPage([]))));
     renderDashboard();
 
-    expect(screen.getByRole("heading", { name: "Understand adoption. Empower your people." })).toBeVisible();
+    const title = screen.getByRole("heading", { name: "Understand adoption. Empower your people." });
+    expect(title).toBeVisible();
+    const domain = screen.getByRole("group", { name: "Dashboard adoption domain" });
+    expect(title.closest(".dashboard-title-row")).toContainElement(domain);
+    expect(within(domain).getByRole("button", { name: "Agent adoption" })).toHaveAttribute("aria-pressed", "true");
+    expect(within(domain).getByRole("button", { name: "Copilot in Office apps" })).toHaveAttribute("aria-pressed", "false");
     expect(await screen.findByRole("link", { name: "Open Sync" })).toHaveAttribute("href", "/sync");
     expect(screen.queryByRole("link", { name: "View saved reports" })).not.toBeInTheDocument();
   });
@@ -44,6 +49,7 @@ describe("adoption dashboard", () => {
     const table = within(await screen.findByRole("region", { name: "Report snapshots and comparisons" }));
     const dates = table.getByRole("rowheader");
     expect(dates).toHaveTextContent(adoptionSnapshotLabel(snapshot));
+    expect(screen.getByText("Agent Champs:", { selector: "strong" })).toBeInTheDocument();
     expect(table.queryByText("Observed activity", { exact: true })).not.toBeInTheDocument();
     if (annotation) expect(within(dates).getByText(annotation)).toBeVisible();
     else expect(dates.textContent).toBe(adoptionSnapshotLabel(snapshot));

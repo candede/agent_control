@@ -59,23 +59,24 @@ describe("user detail lifecycle", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     } finally { vi.unstubAllGlobals(); }
   });
-  it.each(["Company", "Department"] as const)("links %s to a clean, report-scoped Adoption route", async field => {
+  it.each((["Company", "Department"] as const).flatMap(field => [false, true].map(pinned => ({ field, pinned }))))(
+    "links $field to a clean Adoption route while preserving only an explicit personal pin ($pinned)", async ({ field, pinned }) => {
     const saved = evidence(combinedUser());
     saved.value.directory.companyName = "  H\u00f4pital & Health / +  ";
     saved.value.directory.department = "  R&D + Nursing (Dep)  ";
     saved.reports.setId = "10000000-0000-4000-8000-000000000099";
     vi.mocked(readReportDetail).mockResolvedValue(saved);
-    const onOpenAdoption = vi.fn(), settings = props({ onOpenAdoption });
+    const onOpenAdoption = vi.fn(), settings = props({ onOpenAdoption, reportSetId: pinned ? saved.reports.setId! : undefined });
     render(<UserDetailModal {...settings} />);
     const value = (field === "Company" ? saved.value.directory.companyName : saved.value.directory.department).trim();
     const link = await screen.findByRole<HTMLAnchorElement>("link", { name: `View adoption for ${field.toLowerCase()} ${value}` });
     const url = new URL(link.href);
     expect(url.pathname).toBe("/users");
     expect([...url.searchParams.keys()].sort()).toEqual(
-      (field === "Company" ? ["section", "company", "snapshot"] : ["section", "company", "department", "snapshot"]).sort());
+      ["section", "company", ...(field === "Department" ? ["department"] : []), ...(pinned ? ["snapshot"] : [])].sort());
     const destination = { view: "licenses", section: "adoption", company: "H\u00f4pital & Health / +",
       ...(field === "Department" ? { department: "R&D + Nursing (Dep)" } : {}),
-      reportSetId: saved.reports.setId, search: "", page: 0 };
+      reportSetId: pinned ? saved.reports.setId : undefined, search: "", page: 0 };
     expect(parseUsersRoute(url.search)).toMatchObject(destination);
     fireEvent.click(link);
     expect(onOpenAdoption).toHaveBeenCalledExactlyOnceWith(destination);
@@ -138,7 +139,7 @@ describe("user detail lifecycle", () => {
     render(<UserDetailModal {...props({ kind: "report", identity: reported.value.username, selectionId: reported.selection.id })} />);
     const link = await screen.findByRole<HTMLAnchorElement>("link", { name: "View adoption for department Engineering" });
     expect(parseUsersRoute(new URL(link.href).search)).toMatchObject({ company: "Contoso", department: "Engineering",
-      reportSetId: reported.reports.setId });
+      reportSetId: undefined });
     expect(screen.queryByRole("link", { name: /Report company|Report department/ })).not.toBeInTheDocument();
   });
 

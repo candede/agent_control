@@ -19,6 +19,174 @@ separate experience and is not measured as a paid entitlement.
 
 ## Required access
 
+### Office adoption saved-read contract
+
+The separate `/api/office-app-adoption` dataset automatically retains genuine
+Word, Excel, PowerPoint, Outlook, OneNote, Loop and Teams evidence from existing
+directory/license and `D28`/`v2` collection. Chat, Edge, overall last activity and
+agent activity never contribute. Dashboard and Users read this evidence independently
+of imported agent CSVs, inventory, the reader's provider permissions, or an
+administrator's session.
+
+Recent means provider refresh date minus 27 days through that refresh date,
+inclusive in UTC. Saved licensed people are exact directory identities with the
+existing verified-active-paid classification at capture (enabled, warning or
+partially enabled), not tenant headcount. One person active in three apps is one
+reported active user and three user-app pairs. Per-app counts overlap; do not add
+them to obtain distinct people. There are no prompt-volume, ROI or productivity
+metrics, and overlapping observations are never summed into lifetime activity.
+
+Paid eligibility and company/department are captured context, not daily licensing
+or workforce history. Department participation is **Reported active / saved
+licensed**; partial coverage makes it a confirmed-participation lower bound.
+Older dates remain visible but are not recent. Missing, ambiguous, concealed,
+retained unseen, blank, malformed or future evidence carries explicit reasons.
+**Unknown Office evidence is a subset of no recent reported Office evidence**,
+not a separate disjoint population or proof of inactivity/license waste. Missing
+or invalid source evidence produces null/unavailable metrics, not a dated zero.
+
+History retains one aggregate snapshot per UTC Monday-start week of the provider
+refresh date for twelve calendar months. Each point preserves the latest real
+D28/v2 report refreshed in that week, its enabled-user denominator, coverage and
+seven app/group totals.
+It is a rolling 28-day measurement, not a count of activity during that week.
+The current person dataset is replaced on publication; historical person records
+are not archived. Current licenses or departments never recompute older weekly
+totals. Semantic replays preserve a capture; newer reports and corrections within
+the same week replace its aggregate point. Selection/cursor
+invalidation uses the existing unavailable/expired-context recovery. Office
+navigation is reader-personal `adoption=office`, `officeSnapshot`, `officeBaseline`,
+separate from agent `snapshot`/`baseline`. Baselines precede the selected point;
+history/comparisons exclude later observations.
+Every panel and every history/person page must match the owner's selected query,
+selection identity, observation and baseline. A mismatch withdraws the shared
+Office evidence instead of combining pages from different contexts.
+
+Group APIs preserve all seven totals and full-group paid denominators when an app
+filter selects recent users/suggestions. Office Champs have positive app
+breadth and rank by breadth, qualifying recency, normalized display label and exact
+identity, at most three per group. They are suggestions, not assigned roles or
+activity-volume rankings. Frozen Office person facts remain distinct from today's
+user-details licenses and agent relationships.
+People cursors are opaque signed boundaries bound to the selected read, filters,
+group and page size. They carry bounded person identities; normalized display
+sort keys are resolved from that same frozen dataset, not embedded in cursors.
+Literal company/department filters preserve accepted directory labels, including
+embedded tabs. NUL, carriage return, newline and unpaired surrogate characters
+remain invalid, and search/identifier/cursor validation remains strict.
+Selected filters share the persisted 4,096-byte JSONB budget, including escaped
+and multibyte text, so complete supported company/department and search filters
+can be combined without truncation. The budget includes JSONB separator spaces
+and decimal expansion of numbers without changing the compact canonical hashes.
+Filter keys, scalar text and string-array entries reject NUL and unpaired
+surrogates before persistence; sparse or non-string array entries are invalid.
+Summary champion counts are calculated across all groups before paging; the
+unfiltered organization count and filtered suggestion count are separate.
+Current stale-source status does not recompute historical participation.
+
+### Dashboard and Office Users navigation
+
+Dashboard defaults to **Agent adoption**. Choose **Copilot in Office apps** for
+enabled paid Copilot users, active Office users and participation percentage,
+people without recent reported activity, consistent per-app adoption bars,
+department participation gaps and an at-a-glance history graph for each app. Coverage
+details distinguish blank activity dates from actual source problems without
+calling either proof of inactivity. Raw pair totals and champion counts are not
+dashboard headlines. Organization cards
+and trends stay organization-wide; company selection narrows the department panel.
+The seven app graphs show available weekly points in the last 30 calendar days up to
+the selected report, without selecting apps individually. One shared measure control
+switches every graph between active users and share of enabled users.
+Rate changes use percentage points calculated from the exact captured user/cohort
+counts and rounded to the nearest tenth (ties away from zero). Nonzero changes
+smaller than 0.1 percentage points retain their direction and display `<0.1`;
+changed denominators are disclosed. The default comparison uses a measured point about four weeks
+earlier when available, with its actual date shown. Shorter available history is
+identified explicitly, never fabricated or interpolated into daily usage.
+Until two weekly snapshots are available in that window, a compact history-building
+notice replaces the graphs and measure control; the app breakdown still shows current
+adoption. No observation displays unknown metrics and automatic
+source preparation status instead of zeros.
+
+Users retains its **Users / Adoption** toggle at the start of the header controls
+row. Inside Adoption, the matching **Agents / Office apps** toggle sits at the
+opposite end of that row and defaults to **Agents**. Office mode
+keeps search, company/department filters, removable chips, five-group numbered
+pages and separately paginated people. The app filter selects recent users and
+their Office Champs, while each group's saved licensed denominator and
+all seven app totals remain complete. Suggestions are ranked over the entire
+matching population, not the visible people page.
+Qualifying people carry a compact **Office Champ** badge, using the same styling
+as the **Agent Champ** badge in agent adoption, with Office breadth/recency
+explained in its tooltip. Office Champ names appear only
+in the paged People column, not in a repeated list beside the app breakdown.
+Reported app dates or unknown-evidence status sit beneath each name; recent-app
+counts stay aligned separately. Facet options are paginated;
+their search explicitly searches the loaded option page, without changing the
+observation's organization-search query.
+
+The Office report refresh date and **Office observation** selector occupy the
+fifth summary card, after the four group/participation metrics, in the same
+position as Report context in Users. The compact card shows **Refreshed**
+with the report date, an **Observation** dropdown and, when available, **Compare
+with**; the full reporting window,
+capture date and coverage context remain on the Office dashboard.
+**Office observation** selects Latest
+current details or an exact weekly summary. Source errors and aggregate-only
+history navigation remain outside the summary cards. Group app columns contain
+the app breakdown without repeated overlap or inactivity notices; individual
+evidence labels and source details remain available.
+**Office baseline** selects an earlier Office capture; it never uses the agent
+baseline. One available earlier observation is enough to offer comparison.
+Both selectors preserve bookmarked values while saved context or history loads
+or a retryable read fails; an unloaded pin is labelled as selected, not Latest
+or the automatic comparison. Dashboard department/app links carry the exact observed snapshot and
+applicable organization/app filters into Users. Reader-personal Office pins are
+shared between Dashboard and Users, with separate `officeSnapshot` /
+`officeBaseline` parameters; agent `snapshot` / `baseline` remain independent.
+When carried through Office navigation, a valid agent `snapshot` remains inert
+Dashboard navigation metadata, including after switching back to Agent adoption;
+it never filters Dashboard report history or Office reads.
+Back/Forward, refresh and numbered `page` bookmarks preserve valid Office context.
+Office group page bookmarks accept positive safe integers, including pages beyond
+2,001; the selected dataset determines which pages exist. Other Users views remain
+cursor-owned, and the Agents offset-bookmark limit is unchanged.
+Restoring Office history also restores its independent agent `snapshot`, or Latest
+when that pin is absent; subsequent Users, Agents and Dashboard navigation keeps
+that restored choice without reviving an earlier pin.
+Domain changes intentionally clear incompatible filters and paging. Removed,
+corrected or malformed Office pins show an explicit notice and recover to Latest.
+Revisiting the same unavailable Office pin after leaving it triggers recovery again.
+Sign-out/account changes remove private observation and person context.
+
+Historical groups expose aggregate totals only. Select **Explore current people**
+to return to Latest for individual records. Historical person endpoints return
+an explicit `office_history_aggregate_only` error, not an empty successful page.
+Opening a current Office person shows captured group, paid-feature state, seven dates,
+qualifying apps, latest recent date, original source dates and evidence gaps.
+The selected observation's provider refresh and the app row's original provider
+refresh are shown separately; a retained row can have an older refresh, and a
+missing app refresh remains unknown.
+Direct person bookmarks include the exact `officeGroup` and observation.
+**Open separate current profile, licenses and agent evidence** is optional:
+its newer information cannot replace the frozen Office facts, and a missing
+current profile or agent report does not prevent the Office detail from opening.
+An open current profile closes when the person or signed-in account changes;
+the replacement person's profile requires its own explicit open action.
+Already validated people/suggestion facts open directly after the current
+selection verifies the same account, observation and filters; they do not rescan
+the group's earlier pages. A direct bookmark without accepted frozen facts uses
+bounded people pages, not a tenant-wide browser materialization.
+Latest follows existing `users` publications, including recovery-only changes.
+Valid older-week pins remain fixed; current pins and replaced weekly points
+recover through the existing changed-selection notice. Ordinary lease renewal retains readable
+content without moving focus or requiring a manual start.
+Previously loaded Office evidence remains readable after a retryable revalidation
+failure, but paging, facet choices and accepting frozen person facts require an
+unexpired successful context and panel read. In-flight revalidation suspends those
+actions immediately, before the browser renders the loading state; a successful
+retry restores them without a new approval or manual-start prerequisite.
+
 Viewer, UsageReportUploader and Admin can read shared saved data and initiate
 read-only sync. New CSV imports require Uploader or Admin; published-report
 corrections and deletion require Admin. Local import uses no
@@ -64,7 +232,7 @@ Session-driven automatic refresh uses application Graph reads with the initiatin
 
 Users refresh retains one account-session generation through authorization, collection and publication. Cancellation or a superseding sign-in stops subsequent token/provider operations and publication after pending authorization returns. Both independent source attempts settle before the refresh finishes, including when one fails unexpectedly, so cancellation and retry do not lose track of the other attempt.
 Saved-status reads and the source-publication transaction also recheck that generation after pending work returns, including a final synchronous check immediately before COMMIT; a cancelled or superseded refresh cannot return a current-status result or finish source publication. Each source captures its capability authority generation before the initial saved-data reads and retains it through collection and publication rather than renewing under superseding authority. Report-identity batches, provider pages, signed downloads, report streaming and retries recheck that authority after pending work returns and before further collection. Active sync job attachment, progress and final success-marker/run updates also recheck session, cancellation and admission authority immediately before COMMIT. Graph error-body deadlines preserve an already received HTTP status and `Retry-After`, so authorization denials remain authorization failures and throttling waits retain the provider's delay.
-Each source's persisted absolute deadline also cancels pending provider work and is checked synchronously around collection, validation, publication authorization and completion, including immediately before COMMIT even when the timeout callback has not yet run. Counts are captured before publication; post-COMMIT cleanup or observation failures emit `user_source_publication_cleanup_failed` without downgrading a durably published source to a failed or partial outcome.
+Each source's persisted absolute deadline also cancels pending provider work and is checked synchronously around collection, validation, publication authorization and completion, including immediately before COMMIT even when the timeout callback has not yet run. Graph collection completion rechecks cancellation and source authority after reader cleanup, before staging the final buffered SKU or directory batch. Counts are captured before publication; post-COMMIT cleanup or observation failures emit `user_source_publication_cleanup_failed` without downgrading a durably published source to a failed or partial outcome.
 
 Microsoft Graph activity and Microsoft 365 Copilot Agents usage reports are
 different sources.
@@ -99,8 +267,8 @@ Activity alone does not prove a paid license.
 - Candidate discovery uses a separate `assignedLicenses/any(...)` predicate for each product containing a paid Copilot service, joined with `or` outside the lambdas in batches of at most 20 IDs. **Graph applies this filter across the tenant**, rather than the app issuing one license request per account. Each returned page includes `assignedLicenses` and `assignedPlans` for bulk paid-feature verification. This compound filter requires `$count=true` and `ConsistencyLevel: eventual`, including the header on continuation requests. Every continuation is followed, and each batch's unique candidate count must match Graph's first-page `@odata.count`; that count is for the filtered cohort, not all tenant accounts. Any count repeated on a continuation must also match, for both product discovery and exact-identity verification. Disagreement makes the source unavailable and requires refresh, rather than displaying an incomplete total. Discovery alone never sets the paid-feature state. Users assigned multiple products are deduplicated across batches. Recent license changes may take time to appear in Graph's advanced-query index.
 - Users sync also reads the selected saved reports and verifies active report identities absent from the discovery cohort through bounded exact UPN/object-ID user queries, using the same catalog and license fields. It does not scan all tenant accounts or infer absence of a license from an unmatched report. A verified directory user with no assigned recognized paid Copilot service is saved with no active paid access; missing, concealed, ambiguous or unverified identities remain unknown. A positive Users-report response total or a positive Users & agents response establishes activity; dates, agent counts and missing metrics alone do not. No snapshot reset is required. Run Users sync after deployment or a new import to verify newly reported identities.
 - Catalog and directory pagination completes only when `@odata.nextLink` is absent or `null`. An empty or otherwise invalid continuation is rejected, not interpreted as a complete source. Continuations retain the requested field projection and, for directory queries, the exact filter, `$count=true` and `$top=100`. Only one nonempty opaque `$skiptoken` may be added; changed, duplicate or undocumented query options are rejected before another authenticated request. Graph URLs remain limited to 8,192 characters and the exact endpoint origin/path, without credentials or fragments.
-- The report reader accepts a direct CSV response or one HTTP 302 redirect to the exact HTTPS origins `reports.office.com` or `reportsweu.office.com`. Supported paths are query-free `/data/download/<id>` and `/data/v1.0/download?token=<signed-token>`; the latter requires exactly one nonempty token and no other query parameters. The signed download is fetched without the Graph bearer token, under the same deadline and byte limit. Cancellation and the shared deadline are checked again after body completion, before CSV parsing. Other hosts, paths, credentials, fragments, and further redirects are rejected; there is no wildcard Office-domain allowlist.
-- The CSV reader requires the shared v1/v2 activity fields by exact, unique header name, regardless of order. Additional v2 activity and prompt-count columns are ignored, not interpreted as new dashboard metrics. Missing or duplicate headers, malformed row widths, invalid required dates, and any period other than the requested 28 days remain errors. The report body is bounded at 64 MiB, and parsing stops at the first row beyond the 100,000-user limit with an explicit result-limit error rather than materializing the remaining records or returning a truncated report.
+- The report reader accepts a direct CSV response or one HTTP 302 redirect to the exact HTTPS origins `reports.office.com` or `reportsweu.office.com`. Supported paths are query-free `/data/download/<id>` and `/data/v1.0/download?token=<signed-token>`; the latter requires exactly one nonempty token and no other query parameters. The signed download is fetched without the Graph bearer token, under the same source deadline and bounded header/body idle waits. Cancellation and the shared deadline are rechecked throughout incremental parsing and after body completion. Other hosts, paths, credentials, fragments, and further redirects are rejected; there is no wildcard Office-domain allowlist.
+- The CSV reader requires the shared v1/v2 activity fields by exact, unique header name, regardless of order. Additional v2 activity and prompt-count columns are ignored, not interpreted as new dashboard metrics. Missing or duplicate headers, malformed row widths, invalid required dates, and any period other than the requested 28 days remain errors. Reports stream without a total-byte or user-count ceiling; individual CSV records remain bounded at 64 KiB. Bounded database writes, storage quotas and source deadlines prevent unbounded work, and incomplete/failed attempts never replace a complete source.
   Borrowed transport chunks are copied before decoding yields to a backpressured consumer. Transport errors are isolated from Node stream error inspection, so arbitrary error accessors or proxies cannot run while handling a report failure.
   Report dates use positive four-digit years (`0001`–`9999`); year zero is rejected as `provider_schema` before staging rather than reaching PostgreSQL date conversion.
 
@@ -122,7 +290,7 @@ without being included in paid-license counts.
 ## Data boundaries
 
 - **HTTP 400 from the directory:** investigate the Graph query, not additional consent. The license count stays unknown rather than showing zero.
-- **Access denied:** the visible source notice identifies the relevant delegated permission and, for Office activity, the report-reader role.
+- **Access denied:** the visible source notice identifies the actual capability. Directory/license and Office report collection use application permissions (`User.Read.All`, `LicenseAssignment.Read.All`, `Reports.Read.All`) and configured consent, not a signed-in report-reader role. Power Platform reads remain delegated.
 - **Failed report download:** refresh to obtain a new signed download. Allow outbound HTTPS from the app to `graph.microsoft.com`, `reports.office.com`, and `reportsweu.office.com`; do not attach the Graph token to the download request.
 - **"You cannot access this right now" during Microsoft sign-in:** this is a tenant sign-in policy/Conditional Access restriction, not a license permission error. Use an organization-approved account, browser, device, and network, or have the tenant administrator review the Entra sign-in logs. The app does not bypass that policy.
 - **Office activity unavailable but licensed users visible:** license inventory is working. Resolve report access separately; do not remove or reassign user licenses to repair report access.
@@ -175,7 +343,7 @@ Partial app-report coverage does not invalidate uniquely matched, fresh rows: th
 
 ## Users: paid users and active users without paid Copilot
 
-The **Adoption** tab groups saved users and all agents used by company
+In the default **Agents** domain, the **Adoption** tab groups saved users and all agents used by company
 and department, with five groups per page. Paging keeps the current groups and
 summary visible while the requested page loads. A single set of numbered controls
 below the groups shows the current range, total, and page, with first/last pages and
@@ -230,7 +398,7 @@ unknown agent counts, not measured zeroes; a published empty report produces zer
 Neither **With agent usage** nor **Without agent usage** classifies missing usage
 as a measured result.
 
-Up to three **Copilot Champs** per group are ranked by reported responses
+Up to three **Agent Champs** per group are ranked by reported responses
 descending, distinct agents used descending, lowercase name and exact user
 identity. Positive reported responses or positive agent usage qualify; inventory
 creation does not qualify or boost a person. The MCP champion view uses the same
@@ -264,13 +432,15 @@ scrollable tab panel beneath the heading and tabs. Loading and error messages,
 including retry actions, stay inside that panel rather than touching the dialog
 edges or pushing navigation out of view on narrow screens.
 
-The dialog retains the presentation from `7e2be0b6`: **Overview** shows license
+The dialog has four tabs: **Overview** shows license
 and Users-report metrics, report dates, organization, and last reported agent
 activity. **Usage & agents** keeps the searchable agent breakdown and separate
-Office-app activity cards; **Licenses**, **Responsibility**, and **Purview audit**
-remain dedicated tabs. These views use the current selection-scoped, paginated
-APIs. Database storage details and provenance controls do not replace the user
-summary, and missing evidence is never presented as zero.
+Office-app activity cards; **Licenses** and **Responsibility** remain dedicated
+tabs. Purview audit and Logs are not exposed in this dialog; a `tab=purview`
+detail link opens **Overview** without starting a log reader. These views use
+the current selection-scoped, paginated APIs. Database storage details and
+provenance controls do not replace the user summary, and missing evidence is
+never presented as zero.
 
 Missing relationship evidence is not a mismatch with the Users report: discrepancy labels require both a Users row and a reported relationship breakdown. A missing companion is labeled unavailable, separately from a present report containing no rows for that person. Report-wide Users response totals are `null` when the Users report is absent; a present report can total zero, including a known-empty export. User rows contain relationship totals, not complete relationship arrays: the selected user's `/agents` endpoint pages those rows independently. Server filtering and totals examine the full selected relations before paging.
 

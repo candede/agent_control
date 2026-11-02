@@ -189,9 +189,15 @@ describe("history selection status", () => {
 describe.each(["history", "directory_report_inputs"] as const)("%s selection expiry maintenance", endpoint => {
   const captureSelection = () => endpoint === "history" ? reports.capture(identity, endpoint) : reports.captureReportIdentities(identity);
 
+  beforeEach(() => {
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    vi.spyOn(reports.history.connections, "run").mockImplementation(work => work(client));
+    vi.spyOn(reports.history, "reconcileHead").mockResolvedValue({ active_set_id: null, revision: "1" });
+  });
+
   it.each([0, 1, 4, 5, 9])("drains %i expired sets before capturing a selection", async expired => {
     vi.spyOn(reports.sources, "ensureScope").mockResolvedValue("source-scope");
-    vi.spyOn(reports.history, "ensure").mockResolvedValue("history-scope");
+    const ensure = vi.spyOn(reports.history, "ensure").mockResolvedValue("history-scope");
     let remaining = expired;
     const expire = vi.spyOn(reports.history, "expire").mockImplementation(async () => {
       const batch = Math.min(4, remaining);
@@ -208,6 +214,24 @@ describe.each(["history", "directory_report_inputs"] as const)("%s selection exp
     expect(remaining).toBe(0);
     expect(expire).toHaveBeenCalledTimes(Math.ceil(expired / 4) + 1);
     expect(capture).toHaveBeenCalledOnce();
+    const reconcile = vi.mocked(reports.history.reconcileHead);
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(expect.any(pg.Client), identity.tenantId);
+    expect(reconcile.mock.invocationCallOrder[0]).toBeGreaterThan(ensure.mock.invocationCallOrder[0]);
+    expect(reconcile.mock.invocationCallOrder[0]).toBeLessThan(expire.mock.invocationCallOrder[0]);
+    expect(expire.mock.invocationCallOrder.at(-1)).toBeLessThan(capture.mock.invocationCallOrder[0]);
+    expect(database.connect).not.toHaveBeenCalled();
+  });
+
+  it("propagates head reconciliation failures before expiry or selection capture", async () => {
+    vi.spyOn(reports.history, "ensure").mockResolvedValue("history-scope");
+    const failure = new Error("head reconciliation failed");
+    vi.mocked(reports.history.reconcileHead).mockRejectedValue(failure);
+    const expire = vi.spyOn(reports.history, "expire").mockRejectedValue(new Error("Unexpected expiry maintenance"));
+    const capture = vi.spyOn(reports.selections, "captureWith").mockRejectedValue(new Error("Unexpected selection capture"));
+    await expect(captureSelection()).rejects.toBe(failure);
+    expect(expire).not.toHaveBeenCalled();
+    expect(capture).not.toHaveBeenCalled();
+    expect(database.connect).not.toHaveBeenCalled();
   });
 
   it("propagates maintenance failures without capturing a partial selection", async () => {

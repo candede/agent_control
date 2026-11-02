@@ -33,44 +33,72 @@ export class PackageScanDiagnostics {
   private comparedCount = 0;
   private matchingObservationCount = 0;
   private readonly reads = { catalog: readCounters(), identity: readCounters() };
+  private readonly catalogCoverage = detailFields.map(([field, kind]) => ({
+    field, kind, missingCount: 0, nullCount: 0, emptyCount: 0, nonemptyCount: 0, invalidCount: 0,
+  }));
+  private readonly catalogTypes = new Map<string, number>();
+  private catalogRecordCount = 0;
   private readonly comparisons = detailFields.map(([field]) => ({
     field, matchingCount: 0, differingCount: 0, listOnlyCount: 0, detailOnlyCount: 0, bothMissingCount: 0,
   }));
 
   constructor(private readonly mode: "broad" | "exact") {}
 
-  catalogPage(values: readonly unknown[], page: number, hasContinuation: boolean, durationMs: number, totalRecords?: number) {
+  catalogPage(count: number, page: number, hasContinuation: boolean, durationMs: number, totalRecords?: number) {
     if (this.finishedAt !== undefined) return;
     this.pages = page;
-    this.listedCount += values.length;
+    this.listedCount += count;
     this.log("package_catalog_page", {
-      stage: "catalog", page, pageSize: values.length, observedCount: this.listedCount,
+      stage: "catalog", page, pageSize: count, observedCount: this.listedCount,
       hasContinuation, durationMs: Math.round(durationMs), totalRecords,
     });
-    const rows: Record<string, unknown>[] = values.map(value => isRecord(value) ? value : {});
-    for (const [field, kind] of detailFields) {
-      const counts = { missingCount: 0, nullCount: 0, emptyCount: 0, nonemptyCount: 0, invalidCount: 0 };
-      for (const row of rows) {
-        const value = row[field];
-        if (value === undefined) counts.missingCount += 1;
-        else if (value === null) counts.nullCount += 1;
-        else if (kind === "array" && Array.isArray(value) || kind === "string" && typeof value === "string") {
-          if (value.length === 0) counts.emptyCount += 1;
-          else counts.nonemptyCount += 1;
-        } else counts.invalidCount += 1;
-      }
-      this.log("package_catalog_field_coverage", { stage: "catalog", page, field, count: values.length, ...counts });
+    this.logCatalogCoverage(page, count, true);
+  }
+
+  catalogFailure(page: number) {
+    if (this.finishedAt === undefined && this.catalogRecordCount) this.logCatalogCoverage(page, this.catalogRecordCount, false);
+  }
+
+  private logCatalogCoverage(page: number, count: number, complete: boolean) {
+    for (const coverage of this.catalogCoverage) {
+      const { field, kind: _kind, ...counts } = coverage;
+      this.log("package_catalog_field_coverage", { stage: "catalog", page, field, count, complete, ...counts });
     }
-    const types = new Map<string, number>();
-    for (const row of rows) {
+    for (const [actualType, count] of this.catalogTypes) {
+      this.log("package_catalog_response_type", { stage: "catalog", page, actualType, count, complete });
+    }
+    this.beginCatalogPage();
+  }
+
+  beginCatalogPage() {
+    if (this.finishedAt !== undefined) return;
+    this.catalogRecordCount = 0;
+    for (const coverage of this.catalogCoverage) {
+      for (const key of ["missingCount", "nullCount", "emptyCount", "nonemptyCount", "invalidCount"] as const) coverage[key] = 0;
+    }
+    this.catalogTypes.clear();
+  }
+
+  catalogRecords(values: readonly unknown[]) {
+    if (this.finishedAt !== undefined) return;
+    this.catalogRecordCount += values.length;
+    for (const input of values) {
+      const row = isRecord(input) ? input : {};
+      for (const coverage of this.catalogCoverage) {
+        const { field, kind } = coverage;
+        const value = row[field];
+        if (value === undefined) coverage.missingCount += 1;
+        else if (value === null) coverage.nullCount += 1;
+        else if (kind === "array" && Array.isArray(value) || kind === "string" && typeof value === "string") {
+          if (value.length === 0) coverage.emptyCount += 1;
+          else coverage.nonemptyCount += 1;
+        } else coverage.invalidCount += 1;
+      }
       const value = row["@odata.type"];
       const type = value === undefined ? "missing" : value === null ? "null"
         : value === "#microsoft.graph.copilotPackageDetail" ? "detail"
         : value === "#microsoft.graph.copilotPackage" ? "summary" : "other";
-      types.set(type, (types.get(type) ?? 0) + 1);
-    }
-    for (const [actualType, count] of types) {
-      this.log("package_catalog_response_type", { stage: "catalog", page, actualType, count });
+      this.catalogTypes.set(type, (this.catalogTypes.get(type) ?? 0) + 1);
     }
   }
 

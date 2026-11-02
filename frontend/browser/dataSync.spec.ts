@@ -385,7 +385,7 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   const firstSync = firstSyncNotice(page);
   await expect(firstSync.getByRole("heading", { name: "Your first sync is in progress" })).toBeVisible();
   await expect(firstSync.getByRole("list", { name: "First sync sources" }).getByRole("listitem")).toHaveCount(3);
-  await expect(firstSync.getByText(/You can use saved tenant data while sources sync or need attention/)).toBeVisible();
+  await expect(firstSync.getByText("Read-only collection runs automatically. You can use saved tenant data while sources sync or need attention.", { exact: true })).toHaveCount(0);
   await expectFirstSyncModal(page);
   expect((await new AxeBuilder({ page }).include(".first-sync-dialog").analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

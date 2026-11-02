@@ -190,6 +190,121 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it.each((["token", "beforeRequest", "retry"] as const).flatMap(stage =>
+    [undefined, 5_000, 120_000].map(callerBudget => ({ stage, callerBudget, budget: Math.min(callerBudget ?? Infinity, 60_000) })),
+  ))("bounds diagnostic $stage waits to $budget ms with a caller signal and budget $callerBudget", async ({ stage, callerBudget, budget }) => {
+    fakeDeadlineTimers();
+    const controller = new AbortController();
+    const waiting = Promise.withResolvers<void>();
+    const fetcher = vi.fn(async () => new Response(null, { status: 503 }));
+    const delay = vi.fn(() => waiting.promise);
+    const getAccessToken = vi.fn(async () => { if (stage === "token") await waiting.promise; return "token"; });
+    const beforeRequest = vi.fn(async () => { if (stage === "beforeRequest") await waiting.promise; });
+    const pending = new PowerPlatformResourceQueryClient(fetcher, { delay }).getDiagnosticAgentDetail("token",
+      "3deaf785-6ba7-44e6-b67d-e255791c432c", {
+        environmentId: `default-${resource.tenantId}`, expectedTenantId: resource.tenantId,
+        signal: controller.signal, getAccessToken, beforeRequest,
+        ...(callerBudget === undefined ? {} : { executionDeadlineAt: Date.now() + callerBudget }),
+      }).then(result => ({ result }), error => ({ error }));
+    const settled = vi.fn();
+    void pending.then(settled);
+    try {
+      await vi.advanceTimersByTimeAsync(budget - 1);
+      expect(settled).not.toHaveBeenCalled();
+      expect(getAccessToken).toHaveBeenCalledOnce();
+      expect(fetcher).toHaveBeenCalledTimes(stage === "retry" ? 1 : 0);
+      expect(delay).toHaveBeenCalledTimes(stage === "retry" ? 1 : 0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toHaveBeenCalledOnce();
+      expect(await pending).toMatchObject({ error: { name: "TimeoutError" } });
+    } finally {
+      controller.abort(new Error("synthetic diagnostic cleanup"));
+      waiting.resolve();
+      await pending;
+    }
+    expect(fetcher).toHaveBeenCalledTimes(stage === "retry" ? 1 : 0);
+  });
+
+  it.each([NaN, Infinity, 1.5])("rejects invalid diagnostic execution deadlines before dispatch (%s)", async executionDeadlineAt => {
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, resultTruncated: false, data: [] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token",
+      "3deaf785-6ba7-44e6-b67d-e255791c432c", {
+        environmentId: `default-${resource.tenantId}`, expectedTenantId: resource.tenantId, executionDeadlineAt,
+      })).rejects.toMatchObject({ code: "invalid_read_policy" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects an expired diagnostic deadline before dispatch", async () => {
+    const fetcher = vi.fn(async () => Response.json({ totalRecords: 0, count: 0, resultTruncated: false, data: [] }));
+    await expect(new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token",
+      "3deaf785-6ba7-44e6-b67d-e255791c432c", {
+        environmentId: `default-${resource.tenantId}`, expectedTenantId: resource.tenantId,
+        signal: new AbortController().signal, executionDeadlineAt: Date.now() - 1,
+      })).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it.each((["transport", "body"] as const).flatMap(stage =>
+    (["deadline", "cancellation"] as const).map(stop => ({ stage, stop })),
+  ))("interrupts diagnostic $stage on $stop and disposes the unread response", async ({ stage, stop }) => {
+    fakeDeadlineTimers();
+    const controller = new AbortController();
+    const reason = new AppError(409, "read_job_cancelled", "Synthetic diagnostic cancellation.");
+    const waiting = Promise.withResolvers<Response>();
+    const cancel = vi.fn();
+    const response = new Response(new ReadableStream<Uint8Array>({ cancel }));
+    const fetcher = vi.fn(() => stage === "transport" ? waiting.promise : Promise.resolve(response));
+    const pending = new PowerPlatformResourceQueryClient(fetcher).getDiagnosticAgentDetail("token",
+      "3deaf785-6ba7-44e6-b67d-e255791c432c", {
+        environmentId: `default-${resource.tenantId}`, expectedTenantId: resource.tenantId,
+        signal: controller.signal, executionDeadlineAt: Date.now() + 5_000,
+      }).then(result => ({ result }), error => ({ error }));
+    const settled = vi.fn();
+    void pending.then(settled);
+    try {
+      await vi.advanceTimersByTimeAsync(stop === "deadline" ? 5_000 : 1_000);
+      if (stop === "cancellation") controller.abort(reason);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).toHaveBeenCalledOnce();
+      if (stop === "deadline") expect(await pending).toMatchObject({ error: { name: "TimeoutError" } });
+      else expect(await pending).toEqual({ error: reason });
+    } finally {
+      controller.abort(reason);
+      waiting.resolve(response);
+      await pending;
+    }
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it.each(["inventory", "access", "diagnostic"] as const)("does not release %s observations when synchronous projection exhausts the read deadline", async mode => {
+    fakeDeadlineTimers();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const publishedAt = "2024-02-29T12:34:56.000Z";
+    const toISOString = Date.prototype.toISOString;
+    vi.spyOn(Date.prototype, "toISOString").mockImplementation(function (this: Date) {
+      if (this.getTime() === Date.parse(publishedAt)) now = mode === "inventory" ? inventoryLimits.powerPlatformDeadlineMs : mode === "access" ? 10_000 : 60_000;
+      return toISOString.call(this);
+    });
+    const nativeId = "3deaf785-6ba7-44e6-b67d-e255791c432c", environmentId = `default-${resource.tenantId}`;
+    const fetcher = vi.fn(async () => Response.json({
+      totalRecords: 1, count: 1, resultTruncated: false, data: [{
+        ...resource, name: nativeId,
+        type: mode === "access" ? "microsoft.powerplatform/environments" : resource.type,
+        properties: { environmentId, ...(mode === "access" ? { createdAt: publishedAt } : { lastPublishedAt: publishedAt }) },
+      }],
+    }));
+    const client = new PowerPlatformResourceQueryClient(fetcher);
+    const pending = mode === "inventory" ? client.pages("token", ["microsoft.copilotstudio/agents"], { visit: async () => {} }).next()
+      : mode === "access" ? client.checkAccess("token") : client.getDiagnosticAgentDetail("token", nativeId, {
+        expectedTenantId: resource.tenantId, environmentId,
+      });
+    await expect(pending).rejects.toMatchObject(mode === "inventory" ? { code: "provider_timeout" } : { name: "TimeoutError" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it.each([
     '{"totalRecords":100001,"total\\u0052ecords":0,"count":0,"resultTruncated":false,"data":[]}',
     '{"totalRecords":0,"count":1,"count":0,"resultTruncated":false,"data":[]}',
@@ -312,10 +427,8 @@ describe("PowerPlatformResourceQueryClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
     expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).Options).toEqual({ Top: 1, Skip: 0 });
     const page = client.pages("opaque-token", ["microsoft.powerplatform/environments"], { visit: async () => {} });
-    if (totalRecords <= inventoryLimits.sourceRows) {
-      expect((await page.next()).value).toMatchObject({ rawCount: 1, expectedCount: totalRecords });
-      await page.return(undefined);
-    } else await expect(page.next()).rejects.toMatchObject({ code: "provider_result_limit" });
+    expect((await page.next()).value).toMatchObject({ rawCount: 1, expectedCount: totalRecords });
+    await page.return(undefined);
   });
 
   it("keeps the ten-second access-check deadline when a caller supplies a cancellation signal", async () => {

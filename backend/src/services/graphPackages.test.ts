@@ -64,6 +64,14 @@ describe("GraphPackagesClient", () => {
     expect(fetcher.mock.calls[0][1]?.body).toBeUndefined();
   });
 
+  it.each(["v1.0", "beta"] as const)("rejects a case-distinct opaque package identity in %s diagnostics", async version => {
+    const id = "P_Opaque";
+    const fetcher = vi.fn<FetchLike>(async () => Response.json({ id: id.toLowerCase(), privateField: "unprojected" }));
+    await expect(new GraphPackagesClient(fetcher).getDiagnosticPackageDetails("token", id, version))
+      .rejects.toMatchObject({ code: "diagnostic_scope_mismatch" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it.each([null, {}, { value: null }, { value: {} }, { value: [{ id: 12 }] }])("still rejects invalid catalog first-page schemas: %j", async body => {
     const fetcher = vi.fn<FetchLike>(async () => Response.json(body));
     await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_schema" });
@@ -130,10 +138,56 @@ describe("GraphPackagesClient", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
-  it("retains the response byte limit for catalog checks without requesting an undocumented row limit", async () => {
-    const fetcher = vi.fn<FetchLike>(async () => new Response("x".repeat(2_000_001)));
-    await expect(new GraphPackagesClient(fetcher).checkCatalogAccess("token")).rejects.toMatchObject({ code: "provider_result_limit" });
+  it.each(["probe", "inventory"])("accepts a complete multi-package catalog larger than sixteen MB during %s", async operation => {
+    const body = JSON.stringify({ value: Array.from({ length: 2500 }, (_, index) => ({
+      id: `P_${index}`, displayName: "Package", isBlocked: false, longDescription: "x".repeat(7000),
+    })) });
+    expect(Buffer.byteLength(body)).toBeGreaterThan(16_000_000);
+    const fetcher = vi.fn<FetchLike>(async () => new Response(body));
+    const client = new GraphPackagesClient(fetcher);
+    if (operation === "probe") await expect(client.checkCatalogAccess("token")).resolves.toBeUndefined();
+    else {
+      let observed = 0;
+      await client.collectCatalog("token", {
+        visit: async () => {},
+        onRecords: async records => {
+          expect(records.length).toBeLessThanOrEqual(100);
+          observed += records.length;
+          if (observed === 2500) expect(records.at(-1)).toMatchObject({ id: "P_2499", longDescription: "x".repeat(7000) });
+        },
+        onPage: async page => {
+          expect(observed).toBe(2500);
+          expect(page).toMatchObject({ rawCount: 2500, expectedCount: 2500, nextToken: null });
+        },
+      });
+    }
     expect(fetcher).toHaveBeenCalledOnce();
+    expect([...new URL(String(fetcher.mock.calls[0][0])).searchParams.keys()]).toEqual(["$filter"]);
+  });
+
+  it.each(["probe", "inventory"])("accepts response bytes beyond the former catalog ceiling during %s", async operation => {
+    const body = JSON.stringify({ value: [] }).padEnd(16_000_001, " ");
+    const fetcher = vi.fn<FetchLike>(async () => new Response(body));
+    const client = new GraphPackagesClient(fetcher);
+    if (operation === "probe") await expect(client.checkCatalogAccess("token")).resolves.toBeUndefined();
+    else await expect(tinyGraphCatalog(client, "token")).resolves.toEqual([]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["probe", "inventory"])("rejects malformed responses during %s without requesting an undocumented row limit", async operation => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response("not JSON"));
+    const client = new GraphPackagesClient(fetcher);
+    await expect(operation === "probe" ? client.checkCatalogAccess("token") : tinyGraphCatalog(client, "token"))
+      .rejects.toMatchObject({
+        code: "provider_schema",
+      });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("retains the smaller response byte limit for exact package details", async () => {
+    const client = new GraphPackagesClient(async () => new Response("x".repeat(2_000_001)));
+    await expect(client.getPackageDetails("token", "P_1"))
+      .rejects.toMatchObject({ code: "provider_result_limit", maximumBytes: 2_000_000 });
   });
 
   it.each(["probe", "inventory", "detail"])("allows a slow package %s read within a finite 30-second deadline", async operation => {
@@ -156,7 +210,8 @@ describe("GraphPackagesClient", () => {
         : operation === "inventory" ? [] : expect.objectContaining({ id: "P_1", isBlocked: false }));
       await vi.advanceTimersByTimeAsync(12_000);
       await assertion;
-      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(timeout).toHaveBeenCalledWith(operation === "detail" ? 30_000
+        : operation === "probe" ? 330_000 : 14_400_000);
       expect(fetcher).toHaveBeenCalledOnce();
     } finally {
       timeout.mockRestore();

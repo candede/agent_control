@@ -3,23 +3,45 @@ import { ArrowDownRight, ArrowUpRight, Bot, ChartNoAxesCombined, Minus, Sparkles
 import type { AdoptionSnapshot } from "../../../backend/src/types/adoptionDashboard";
 import { adoptionChange, adoptionDirection, adoptionSnapshotLabel, orderedAdoptionSnapshots, type AdoptionMetric } from "../adoptionTrends";
 import { useAdoptionHistory } from "../useAdoptionHistory";
-import { isValidUsageCount, usageCount, usageDate, usageDateRange } from "../usageInsights";
+import { usageCount, usageDate, usageDateRange } from "../usageInsights";
 import { ReportReadStatus } from "./ReportPageControls";
 import { DashboardInsights, DashboardPanelHeading } from "./DashboardInsights";
+import { DashboardObservationChart } from "./DashboardObservationChart";
+import { OfficeAdoptionDashboard } from "./OfficeAdoptionDashboard";
+import type { DashboardRouteState } from "../workbenchRouting";
 import "./adoptionDashboard.css";
 
-export function AdoptionDashboard({ revision, baselineId, onBaselineChange, company, onCompanyChange }: {
+export function AdoptionDashboard({ revision, baselineId, onBaselineChange, company, onCompanyChange, route, officeRevision = revision, onRouteChange }: {
+  revision: number; baselineId?: string; onBaselineChange: (id: string) => void;
+  company?: string | null; onCompanyChange: (company: string | null | undefined) => void;
+  route?: DashboardRouteState; officeRevision?: number; onRouteChange?: (route: DashboardRouteState) => void;
+}) {
+  return <div className="adoption-dashboard">
+    <header className="dashboard-header">
+      <p className="eyebrow"><Sparkles size={15} aria-hidden="true" /> Adoption insights</p>
+      <div className="dashboard-title-row">
+        <h2 id="adoption-dashboard-title">Understand adoption. Empower your people.</h2>
+        <div className="agent-inventory-scopes dashboard-domain-controls" role="group" aria-label="Dashboard adoption domain">
+          {([["agents", "Agent adoption"], ["office", "Copilot in Office apps"]] as const).map(([domain, label]) =>
+            <button key={domain} type="button" className="agent-inventory-scope" aria-pressed={(route?.adoption === "office") === (domain === "office")}
+              onClick={() => onRouteChange?.({ ...route, adoption: domain === "office" ? "office" : undefined, company: undefined, app: undefined })}>{label}</button>)}
+        </div>
+      </div>
+      <p>{route?.adoption === "office" ? "Copilot participation in the seven Office apps, from saved provider observations."
+        : "See who is getting involved, where to focus, and who is leading the way."}</p>
+    </header>
+    {route?.adoption === "office" ? <OfficeAdoptionDashboard route={route} revision={officeRevision} change={next => onRouteChange?.(next)} />
+      : <AgentAdoptionDashboard revision={revision} baselineId={baselineId} onBaselineChange={onBaselineChange} company={company} onCompanyChange={onCompanyChange} />}
+  </div>;
+}
+
+function AgentAdoptionDashboard({ revision, baselineId, onBaselineChange, company, onCompanyChange }: {
   revision: number; baselineId?: string; onBaselineChange: (id: string) => void;
   company?: string | null; onCompanyChange: (company: string | null | undefined) => void;
 }) {
   const history = useAdoptionHistory(revision);
   const snapshots = history.snapshots;
   return <section className="adoption-dashboard" aria-labelledby="adoption-dashboard-title">
-    <header className="dashboard-header">
-      <div><p className="eyebrow"><Sparkles size={15} aria-hidden="true" /> Adoption insights</p>
-        <h2 id="adoption-dashboard-title">Understand adoption. Empower your people.</h2>
-        <p>See who is getting involved, where to focus, and who is leading the way.</p></div>
-    </header>
     <ReportReadStatus read={history.read} />
     {!snapshots && !history.read.error && !history.read.leaseEnded ? <p role="status">
       Loading report history{history.total ? `: ${usageCount(history.loaded)} of ${usageCount(history.total)} snapshots` : "..."}
@@ -104,7 +126,7 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange, revision, c
           Historical license and inventory denominators are not inferred from today's inventory.</li>
         <li><strong>Departments:</strong> active, unambiguously matched people divided by saved directory members in each
           company / department. This is not a workforce census or historical membership. Unmatched report identities are excluded.</li>
-        <li><strong>Copilot champions:</strong> up to three people per company / department, ranked by reported responses,
+        <li><strong>Agent Champs:</strong> up to three people per company / department, ranked by reported responses,
           then agents used. These are usage-based suggestions, not assigned roles or measures of productivity.</li>
       </ul>
     </details>
@@ -129,36 +151,11 @@ function AdoptionMetricCard({ label, metric, latest, baseline, previous }: {
 }
 
 function AdoptionChart({ snapshots, metric, label }: { snapshots: AdoptionSnapshot[]; metric: AdoptionMetric; label: string }) {
-  const title = useId(), caption = useId();
-  const maximum = Math.max(1, ...snapshots.map(snapshot => isValidUsageCount(snapshot[metric]) ? snapshot[metric] : 0));
-  const first = Date.parse(snapshots[0].reportingEnd!), last = Date.parse(snapshots.at(-1)!.reportingEnd!);
-  const x = (snapshot: AdoptionSnapshot) => first === last ? 190 : 44 + (Date.parse(snapshot.reportingEnd!) - first) / (last - first) * 292;
-  const y = (snapshot: AdoptionSnapshot) => 154 - (isValidUsageCount(snapshot[metric]) ? snapshot[metric] : 0) / maximum * 118;
-  return <section className="dashboard-chart" aria-labelledby={title}>
-    <h3 id={title}>{label} over saved reports</h3>
-    <svg viewBox="0 0 360 210" role="img" aria-labelledby={title} aria-describedby={caption}>
-      {[0, 0.5, 1].map(fraction => <g key={fraction}>
-        <line x1="44" x2="336" y1={154 - fraction * 118} y2={154 - fraction * 118} className="dashboard-grid" />
-        <text x="36" y={158 - fraction * 118} textAnchor="end">{(maximum * fraction).toLocaleString(undefined, { maximumFractionDigits: 1, notation: "compact" })}</text>
-      </g>)}
-      {snapshots.map((snapshot, index) => {
-        const previous = snapshots[index - 1];
-        const connected = previous && adoptionChange(previous, snapshot, metric).direction !== "unknown";
-        return <g key={snapshot.id}>
-          {connected ? <line className="dashboard-trend-line" x1={x(previous)} y1={y(previous)} x2={x(snapshot)} y2={y(snapshot)} /> : null}
-          {isValidUsageCount(snapshot[metric]) ? <circle className="dashboard-trend-point" cx={x(snapshot)} cy={y(snapshot)}
-            r={index === 0 || index === snapshots.length - 1 ? 5 : 3.5}>
-            <title>{adoptionSnapshotLabel(snapshot)}: {usageCount(snapshot[metric])} {label.toLowerCase()}</title>
-          </circle> : null}
-        </g>;
-      })}
-      <text x="44" y="178">{usageDate(snapshots[0].reportingEnd)}</text>
-      {first !== last ? <text x="336" y="178" textAnchor="end">{usageDate(snapshots.at(-1)!.reportingEnd)}</text> : null}
-      <text x="190" y="203" textAnchor="middle">Report observations (UTC)</text>
-    </svg>
-    <p id={caption}>One point per saved report, from the selected baseline. {snapshots.length === 1 ? "One observation is not a trend. " : ""}
-      No daily values or missing periods are estimated. Exact counts appear below.</p>
-  </section>;
+  return <DashboardObservationChart label={label} source="saved reports" points={snapshots.map((snapshot, index) => ({
+    id: snapshot.id, date: snapshot.reportingEnd!, label: adoptionSnapshotLabel(snapshot), value: snapshot[metric],
+    connected: index > 0 && adoptionChange(snapshots[index - 1], snapshot, metric).direction !== "unknown",
+  }))} caption={`One point per saved report, from the selected baseline. ${snapshots.length === 1 ? "One observation is not a trend. " : ""}
+No daily values or missing periods are estimated. Exact counts appear below.`} />;
 }
 
 function SnapshotTable({ snapshots, heading }: { snapshots: AdoptionSnapshot[]; heading: string }) {

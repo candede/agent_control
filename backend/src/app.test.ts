@@ -23,6 +23,7 @@ import { refreshInventoryFixture } from "../scripts/inventoryFixtures.js";
 import { packageInventoryRecord, powerPlatformInventoryRecord } from "./services/inventoryRecordProjection.js";
 import { PurviewAuditRepository } from "./db/purviewAudit.js";
 import { schemaFingerprint } from "./db/schema.js";
+import * as schema from "./db/schema.js";
 import { AppError } from "./errors.js";
 import { AuditLog } from "./services/auditLog.js";
 import { CopilotStudioQuarantineClient } from "./services/copilotStudioQuarantine.js";
@@ -155,10 +156,10 @@ beforeAll(async () => {
   application = createApp(fixture.runtime,directory);
   await new Promise<void>(resolve => { server=application.app.listen(0,"127.0.0.1",resolve); });
   base=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
-  vi.spyOn(GraphPackagesClient.prototype,"catalogPages").mockImplementation(async function* (_token, options = {}) {
+  vi.spyOn(GraphPackagesClient.prototype,"collectCatalog").mockImplementation(async (_token, options) => {
     await options.visit?.("initial");
-    yield { token: "initial", nextToken: null, records: [{ id: "package-1", displayName: "Fixture", isBlocked: false }],
-      rawCount: 1, expectedCount: 1, page: 1 };
+    await options.onRecords([{ id: "package-1", displayName: "Fixture", isBlocked: false }]);
+    await options.onPage({ token: "initial", nextToken: null, rawCount: 1, expectedCount: 1, page: 1 });
   });
   vi.spyOn(GraphPackagesClient.prototype,"getPackageDetails").mockResolvedValue({id:"package-1",displayName:"Fixture",isBlocked:false,allowedUsersAndGroups:[{resourceType:"user",resourceId:"sensitive-user"}],acquireUsersAndGroups:[]});
   vi.spyOn(GraphPackagesClient.prototype,"blockPackage").mockResolvedValue();
@@ -337,6 +338,32 @@ describe.sequential("packaged API/session contracts", () => {
       config.frontendOrigin = previousOrigin;
     }
   });
+  it.each([false, true])("shares overlapping readiness schema checks without caching success or failure: %s", async fail => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const original = schema.verifySchema;
+    const verification = vi.spyOn(schema, "verifySchema").mockImplementation(async database => {
+      await pending;
+      if (fail) throw new Error("Synthetic schema verification failure");
+      await original(database);
+    });
+    const requests = Array.from({ length: 4 }, () => request("/api/ready"));
+    try {
+      await vi.waitFor(() => expect(verification).toHaveBeenCalledOnce());
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(verification).toHaveBeenCalledOnce();
+      release();
+      expect((await Promise.all(requests)).map(response => response.status)).toEqual(Array(4).fill(fail ? 503 : 200));
+      verification.mockImplementation(original);
+      expect((await request("/api/ready")).status).toBe(200);
+      expect(verification).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await Promise.all(requests);
+      verification.mockRestore();
+    }
+  });
+
   it("keeps liveness, readiness, API/auth and static routes separate", async () => {
     const health=await request("/api/health");
     expect(await health.json()).toEqual({ok:true});
@@ -1169,8 +1196,9 @@ describe.sequential("packaged API/session contracts", () => {
       .toEqual([expect.objectContaining({id:"package-1",publisher:"'=formula",sourceSystem:"graph_packages",snapshotId})]);
     expect(JSON.stringify(rows)).not.toContain("sensitive-user");
     const audit=await request("/api/audit/events?action=export-package-inventory",{headers:{Cookie:readerCookie}});
-    expect(audit.status).toBe(200);
-    const auditBody=await audit.json() as {value:Array<{action:string;metadata?:Record<string,unknown>}>};
+    expect(audit.status).toBe(403);
+    const auditBody={value:await new AuditLog({tenantId:config.tenants[0].tenantId!,principalId},fixture.runtime)
+      .listEvents({action:"export-package-inventory"})};
     expect(auditBody.value.length).toBeGreaterThanOrEqual(1);
     expect(auditBody.value.every(event => event.action === "export-package-inventory")).toBe(true);
     expect(JSON.stringify(auditBody)).not.toContain("=formula");
@@ -1273,11 +1301,12 @@ describe.sequential("packaged API/session contracts", () => {
     const foreignCookie = await roleCookie("unified-export-foreign", ["AgentControl.Viewer"]);
     expect((await exportRequest({}, foreignCookie)).status).toBe(409);
     const audit = await request("/api/audit/events?action=export-agent-inventory", { headers: { Cookie: readerCookie } });
-    expect(audit.status).toBe(200);
-    const events = await audit.json() as { value: Array<{ status: string; metadata: Record<string, unknown> }> };
+    expect(audit.status).toBe(403);
+    const events = { value: await new AuditLog({tenantId:config.tenants[0].tenantId!,principalId},fixture.runtime)
+      .listEvents({action:"export-agent-inventory"}) };
     expect(events.value.filter(event => event.status === "succeeded")).toHaveLength(6);
     expect(JSON.stringify(events)).not.toContain("sensitive-user");
-    expect(events.value.every(event => Number(event.metadata.rowCount) >= 1)).toBe(true);
+    expect(events.value.every(event => Number(event.metadata?.rowCount) >= 1)).toBe(true);
     expect(vi.mocked(GraphPackagesClient.prototype.getPackageDetails).mock.calls.length).toBe(graphReads);
     expect(inventoryProviderFixture.queries).toBe(platformReads);
     expect((await request("/api/data-exports", {
@@ -1365,7 +1394,7 @@ describe.sequential("packaged API/session contracts", () => {
     const exportRequest = (selectedCookie: string) => request("/api/audit/events/export.csv", {
       method: "POST", headers: { Cookie: selectedCookie, "Content-Type": "application/json" }, body: JSON.stringify({ ids: [event.id] }),
     });
-    const securityCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
+    const securityCookie = await roleCookie(principalId, ["AgentControl.Admin"]);
     const exported = await exportRequest(securityCookie);
     expect(exported.status).toBe(200);
     const rows = parseCsv(await exported.text(), { bom: true, columns: true });
@@ -1373,10 +1402,10 @@ describe.sequential("packaged API/session contracts", () => {
     const auditRecords = await audit.listEvents({ action: "export-administrative-audit" });
     expect(auditRecords).toEqual([expect.objectContaining({ metadata: expect.objectContaining({ resultingCount: 1 }), status: "succeeded" })]);
     expect(JSON.stringify(auditRecords)).not.toContain("private selected audit message");
-    const otherCookie = await roleCookie("administrative-export-other", ["AgentControl.Viewer"]);
+    const otherCookie = await roleCookie("administrative-export-other", ["AgentControl.Admin"]);
     expect((await exportRequest(otherCookie)).status).toBe(404);
-    const readerCookie = await roleCookie(principalId, ["AgentControl.Viewer"]);
-    expect((await exportRequest(readerCookie)).status).toBe(200);
+    const readerCookie = await roleCookie("administrative-export-viewer", ["AgentControl.Viewer"]);
+    expect((await exportRequest(readerCookie)).status).toBe(403);
     const complete = AuditLog.prototype.completeEvent;
     const completion = vi.spyOn(AuditLog.prototype, "completeEvent").mockImplementation(async function (id, update) {
       const result = await complete.call(this, id, update);
@@ -1428,7 +1457,7 @@ describe.sequential("packaged API/session contracts", () => {
     expect(JSON.stringify(await shared.json())).not.toContain(job.id);
   });
   it("reads authorized saved audit data during provider outage", async () => {
-    const securityReaderCookie=await roleCookie("security-reader",["AgentControl.Viewer"]);
+    const securityReaderCookie=await roleCookie("security-reader",["AgentControl.Admin"]);
     vi.mocked(capabilities.requireAvailable).mockRejectedValue(new AppError(502,"provider_error","provider unavailable"));
     try {
       const response=await request("/api/audit/events",{headers:{Cookie:securityReaderCookie}});

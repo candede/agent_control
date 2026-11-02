@@ -57,6 +57,7 @@ type Props = {
   packageResults?: BulkActionResult["results"];
   dataRevision?: number;
   usageContext?: import("../../../backend/src/types/unifiedAgents").InventoryReportContext;
+  personalReportSetId?: string;
   inventoryRevision?: string;
   inventoryError?: string;
   onInventoryInvalidated?: (selectionId: string) => void;
@@ -69,6 +70,7 @@ type Props = {
 };
 
 export function UnifiedAgentDetailModal({
+  personalReportSetId,
   selectionId,
   record,
   activeTab,
@@ -323,6 +325,7 @@ export function UnifiedAgentDetailModal({
           record={record} selectionId={selectionId} selectedPackage={selectedPackage} packageDetail={selectedDetail} peopleState={peopleState}
           onInvalidated={() => { if (selectionId) onInventoryInvalidated?.(selectionId); }} /> : null}
         {selectedTab === "reports" || selectedTab === "users" ? <AgentUsagePanel key={record.id}
+          personalReportSetId={personalReportSetId}
           view={selectedTab === "reports" ? "usage" : "users"}
           onOpenAdoption={onOpenAdoption}
           record={record} context={usageContext} inventoryRevision={JSON.stringify([selectionId?.toLowerCase(), inventoryRevision])} dataRevision={dataRevision}

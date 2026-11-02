@@ -49,6 +49,24 @@ async function fixture() {
 }
 
 describe("layout fixture request boundaries", () => {
+  it("keeps the current report identity and revisions coherent across inventory, Users and the selector", async () => {
+    const { request, capture, unexpected } = await fixture();
+    const inventory = (await request(`/api/agent-inventory?selectionId=${await capture()}`)).json;
+    const users = (await request("/api/copilot-usage/users?limit=100")).json;
+    const options = (await request("/api/official-usage/history/options?limit=100")).json;
+    for (const reports of [inventory.usageContext.reports, users.reports, options.reports]) {
+      expect(reports).toMatchObject({ setId: "10000000-0000-4000-8000-000000000001",
+        activeSetId: "10000000-0000-4000-8000-000000000001", activeRevision: "4", historyRevision: "35", historyEpoch: "2" });
+    }
+    expect(options.value[0].id).toBe(users.reports.setId);
+    const usage = (await request(`/api/agent-inventory/${encodeURIComponent(inventory.value[0].id)}/usage?inventorySelectionId=${inventory.selection.id}`)).json;
+    expect(usage.context).toMatchObject({ selectionId: inventory.selection.id,
+      inventoryRevision: inventory.selection.revision, usageRevision: inventory.usageContext.revision,
+      reportSetId: users.reports.setId });
+    expect(usage).toMatchObject({ status: "unlinked", responses: null, activeUsers: null, associationCount: 0 });
+    expect(unexpected).toEqual([]);
+  });
+
   it("pins paid-user source revisions, filters, exact membership and service plans until a replacement capture", async () => {
     const { page, request } = await fixture(), source = selectedUsersPage();
     const user = source.value[0], other = source.value[1], plans = selectedPlansPage().value;

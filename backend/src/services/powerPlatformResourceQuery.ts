@@ -128,7 +128,7 @@ export class PowerPlatformResourceQueryClient {
     let metadata: ReturnType<typeof pageTelemetry> = {};
     operationalLog("info", "inventory_query_started", {
       ...logContext, requestedTypeCount: requestedTypes.length, environmentScoped: Boolean(environmentId),
-      pageSize: defaultPageSize, pageLimit: inventoryLimits.pages, rowLimit: inventoryLimits.sourceRows, deadlineMs: durationMs,
+      pageSize: defaultPageSize, deadlineMs: durationMs,
     });
 
     try {
@@ -137,7 +137,6 @@ export class PowerPlatformResourceQueryClient {
         metadata = {};
         stage = "request";
         assertCurrent();
-        if (pages >= inventoryLimits.pages) throw new AppError(502, "provider_page_limit", "Inventory exceeds 10000 pages.");
         // The initial page must not collide with an opaque provider continuation.
         const pageToken = JSON.stringify(skipToken ?? null);
         await this.withSignal(() => options.visit(pageToken), signal);
@@ -148,7 +147,6 @@ export class PowerPlatformResourceQueryClient {
         metadata = pageTelemetry(page);
         stage = "validation";
         const parsed = parsePage(page, requestedTypes, environmentId, expectedTenantId, observedCount);
-        if (parsed.totalRecords > inventoryLimits.sourceRows) throw new AppError(502, "provider_result_limit", "Inventory exceeds 100000 resources.");
         pages += 1;
         totalRecords ??= parsed.totalRecords;
         if (parsed.totalRecords !== totalRecords) throw new InventorySchemaError("Power Platform inventory changed totalRecords during paging.", { reason: "changed_total", field: "totalRecords" });
@@ -162,6 +160,7 @@ export class PowerPlatformResourceQueryClient {
         operationalLog("info", "inventory_page_validated", {
           ...logContext, ...metadata, omittedFieldCount,
         });
+        assertCurrent();
         stage = "save_page";
         yield { token: pageToken, nextToken: parsed.skipToken === undefined ? null : JSON.stringify(parsed.skipToken), records: parsed.resources,
           rawCount: parsed.resources.length, expectedCount: totalRecords, page: pages, omittedFieldCount };
@@ -206,14 +205,21 @@ export class PowerPlatformResourceQueryClient {
   async checkAccess(accessToken: string, signal?: AbortSignal) {
     const requestedTypes = ["microsoft.powerplatform/environments"] as const;
     const logContext: QueryLogContext = { provider: "power_platform", source: "capability_check", page: 1 };
+    const deadlineAt = performance.now() + 10_000;
     const deadlineSignal = AbortSignal.timeout(10_000);
     const checkSignal = signal ? AbortSignal.any([signal, deadlineSignal]) : deadlineSignal;
+    const assertCurrent = () => {
+      checkSignal.throwIfAborted();
+      if (performance.now() >= deadlineAt) throw new DOMException("Power Platform access check deadline expired.", "TimeoutError");
+    };
     let metadata: ReturnType<typeof pageTelemetry> = {};
     try {
-      const page = await this.requestPage(accessToken, requestedTypes, undefined, checkSignal, undefined, 1, logContext);
-      checkSignal.throwIfAborted();
+      const page = await this.requestPage(accessToken, requestedTypes, undefined, checkSignal, undefined, 1, logContext,
+        this.retryPolicy.maximumDelayMs, assertCurrent);
+      assertCurrent();
       metadata = pageTelemetry(page);
       const parsed = parsePage(page, requestedTypes);
+      assertCurrent();
       if (parsed.resources.length > 1) throw new InventorySchemaError("Power Platform access check returned an oversized page.", { reason: "oversized_access_check", field: "count" });
       operationalLog("info", "inventory_access_check_completed", { ...logContext, ...metadata });
     } catch (error) {
@@ -236,16 +242,29 @@ export class PowerPlatformResourceQueryClient {
     const tenantId = validateExpectedTenantId(options.expectedTenantId);
     const environmentId = validateEnvironmentId(options.environmentId);
     if (!tenantId || !environmentId) throw new AppError(400, "invalid_diagnostic_scope", "Agent diagnostics require a tenant and environment.");
-    const signal = options.signal ?? AbortSignal.timeout(60_000);
-    signal.throwIfAborted();
-    options.assertCurrent?.();
+    if (options.executionDeadlineAt !== undefined && !Number.isSafeInteger(options.executionDeadlineAt)) {
+      throw new AppError(500, "invalid_read_policy", "Agent diagnostics require a finite absolute deadline.");
+    }
+    const durationMs = Math.max(0, Math.min(60_000,
+      options.executionDeadlineAt === undefined ? Infinity : options.executionDeadlineAt - Date.now()));
+    const deadlineAt = performance.now() + durationMs;
+    const deadlineSignal = AbortSignal.timeout(durationMs);
+    const signal = options.signal ? AbortSignal.any([options.signal, deadlineSignal]) : deadlineSignal;
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      options.assertCurrent?.();
+      if (performance.now() >= deadlineAt || options.executionDeadlineAt !== undefined && Date.now() >= options.executionDeadlineAt) {
+        throw new DOMException("Agent diagnostic deadline expired.", "TimeoutError");
+      }
+    };
+    assertCurrent();
     const types = ["microsoft.copilotstudio/agents"] as const;
     const page = await this.requestPage(accessToken, types, undefined, signal, environmentId, 1,
       { provider: "power_platform", source: "agent_sharing_diagnostic", page: 1 },
-      this.retryPolicy.maximumDelayMs, options.assertCurrent, options.getAccessToken, options.beforeRequest, { nativeId, tenantId });
-    signal.throwIfAborted();
-    options.assertCurrent?.();
+      this.retryPolicy.maximumDelayMs, assertCurrent, options.getAccessToken, options.beforeRequest, { nativeId, tenantId });
+    assertCurrent();
     const parsed = parsePage(page, types, environmentId, tenantId, 0);
+    assertCurrent();
     if (parsed.totalRecords === 0) throw new AppError(404, "diagnostic_target_missing", "The targeted agent was not returned.");
     if (parsed.totalRecords !== 1 || parsed.resources.length !== 1 || parsed.skipToken
       || normalizeNativeIdentity(parsed.resources[0].nativeId) !== normalizeNativeIdentity(nativeId)) {

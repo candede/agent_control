@@ -8,6 +8,7 @@ import { retainRecordData } from "../src/db/dataRetention.js";
 import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
 import { emptyReportStaging, orphanReportVersion } from "../src/db/officialReportRetention.js";
 import { dataWorkMetricScope, flushDataWorkMetrics } from "../src/services/dataMetrics.js";
+import { clientErrorState } from "../src/db/clientErrors.js";
 
 class DatabaseSchemaError extends Error {
   readonly code = "database_schema_reset_required";
@@ -24,6 +25,7 @@ async function inspectSchema(database: Pick<pg.PoolClient, "query">) {
       SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace
       UNION ALL SELECT 1 FROM pg_proc WHERE pronamespace='public'::regnamespace
       UNION ALL SELECT 1 FROM pg_type WHERE typnamespace='public'::regnamespace
+      UNION ALL SELECT 1 FROM pg_collation WHERE collnamespace='public'::regnamespace
     ) AS populated`);
     if (objects.rows[0]?.populated !== false) throw new DatabaseSchemaError();
     return { state: "fresh" as const, currentFingerprint: null, targetFingerprint: schemaFingerprint };
@@ -45,13 +47,18 @@ export async function preflightSchema(database: pg.Pool) {
         AND NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=pg_roles.oid)
         AND NOT EXISTS(SELECT 1 FROM pg_class WHERE relnamespace='public'::regnamespace AND relowner=pg_roles.oid)
         AND NOT has_table_privilege('agentcontrol_app','app_schema','INSERT,UPDATE,DELETE,TRUNCATE')
-        AND has_table_privilege('agentcontrol_app','data_principal_epochs','SELECT,INSERT,UPDATE')
+        AND has_table_privilege('agentcontrol_app','data_principal_epochs','SELECT')
+        AND has_table_privilege('agentcontrol_app','data_principal_epochs','INSERT')
+        AND has_table_privilege('agentcontrol_app','data_principal_epochs','UPDATE')
         AND NOT has_table_privilege('agentcontrol_app','data_principal_epochs','DELETE,TRUNCATE')
-        AND has_table_privilege('agentcontrol_app','audit_events','SELECT,INSERT')
+        AND has_table_privilege('agentcontrol_app','audit_events','SELECT')
+        AND has_table_privilege('agentcontrol_app','audit_events','INSERT')
         AND NOT has_table_privilege('agentcontrol_app','audit_events','UPDATE,DELETE,TRUNCATE')
-        AND has_table_privilege('agentcontrol_app','copilot_quarantine_audit','SELECT,INSERT')
+        AND has_table_privilege('agentcontrol_app','copilot_quarantine_audit','SELECT')
+        AND has_table_privilege('agentcontrol_app','copilot_quarantine_audit','INSERT')
         AND NOT has_table_privilege('agentcontrol_app','copilot_quarantine_audit','UPDATE,DELETE,TRUNCATE')
-        AND has_table_privilege('agentcontrol_app','official_usage_audit','SELECT,INSERT')
+        AND has_table_privilege('agentcontrol_app','official_usage_audit','SELECT')
+        AND has_table_privilege('agentcontrol_app','official_usage_audit','INSERT')
         AND NOT has_table_privilege('agentcontrol_app','official_usage_audit','UPDATE,DELETE,TRUNCATE')
         AS valid FROM pg_roles WHERE rolname='agentcontrol_app'`)).rows[0];
       if (!role?.valid) throw new Error("Runtime role drift; operator recovery required.");
@@ -167,6 +174,8 @@ export async function grantRuntime(database: pg.Pool) {
     GRANT SELECT,UPDATE ON data_lifecycle_progress TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE ON inventory_collection_progress TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE ON data_sync_runs,data_sync_run_sources,data_sync_success_markers TO agentcontrol_app;
+    GRANT SELECT,INSERT,DELETE ON office_observations,office_person_facts,office_group_facts TO agentcontrol_app;
+    GRANT UPDATE(coverage,metrics) ON office_observations TO agentcontrol_app;
     GRANT SELECT,INSERT ON data_sync_source_jobs TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE ON agent_people_cache TO agentcontrol_app;
     GRANT SELECT,INSERT,UPDATE,DELETE ON agent_identity_cache TO agentcontrol_app;
@@ -215,10 +224,12 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 5_000) throw new Error("Retention batch size must be 1-5000.");
   if (!verifiedClient) await verifySchema(database);
   const client = verifiedClient ?? await database.connect();
+  const state = clientErrorState(client);
   const affected: Record<string, number> = {};
   const slice = new LifecycleSlice(client, Math.min(batchSize, 250), "operator");
   const metrics = dataWorkMetricScope();
   let committed = false;
+  let discard: Error | undefined, failure: unknown;
   const remove = async (name: string, table: string, where: string) => {
     affected[name] = await slice.change(name, table, where.replaceAll(`${table}.`, "target."));
   };
@@ -238,7 +249,6 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
     const expiredJob = "EXISTS(SELECT 1 FROM jobs j WHERE j.id=target.job_id AND j.expires_at<clock_timestamp() AND (j.lease_until IS NULL OR j.lease_until<clock_timestamp()))";
     await remove("jobAttempts", "job_attempts", expiredJob);
     await remove("jobItems", "job_items", `${expiredJob} AND NOT EXISTS(SELECT 1 FROM job_attempts a WHERE a.item_id=target.id)`);
-    await update("jobStageReceipts", "inventory_mutation_stages", expiredJob, "job_id=NULL");
     await remove("jobs", "jobs", `expires_at<clock_timestamp() AND (lease_until IS NULL OR lease_until<clock_timestamp())
       AND NOT EXISTS(SELECT 1 FROM job_items i WHERE i.job_id=target.id)
       AND NOT EXISTS(SELECT 1 FROM job_attempts a WHERE a.job_id=target.id)
@@ -408,6 +418,7 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
     await metrics.run(() => slice.finish());
     const cursor = (await client.query("SELECT cursor FROM data_lifecycle_progress WHERE worker='operator'")).rows[0].cursor;
     const pending = Number(cursor.step ?? 0) !== 0 || Boolean(cursor.tenant);
+    if (state.error) throw state.error;
     if (options.dryRun) await client.query("ROLLBACK");
     else {
       const commit = await client.query("COMMIT");
@@ -417,13 +428,23 @@ async function retainSlice(database: pg.Pool, options: { batchSize?: number; dry
     }
     return { dryRun: Boolean(options.dryRun), batchSize, affected, pending };
   } catch (error) {
+    failure = error;
     if (!committed) {
-      try { await client.query("ROLLBACK"); } catch { /* preserve original failure */ }
+      try { await client.query("ROLLBACK"); }
+      catch (rollback) {
+        discard = rollback instanceof Error ? rollback : new Error("data_connection_unusable", { cause: rollback });
+        failure = new AggregateError([error, rollback], "data_transaction_failed");
+      }
     }
-    throw error;
+    throw failure;
   } finally {
     metrics.discard();
-    if (!verifiedClient) client.release();
+    if (!verifiedClient) {
+      try { client.release(discard ?? state.error); }
+      catch (error) {
+        throw failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+      }
+    }
   }
 }
 
@@ -438,7 +459,9 @@ export async function retainUntilConverged(
   const batchSize = options.batchSize ?? 1_000;
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 5_000) throw new Error("Retention batch size must be 1-5000.");
   const client = await database.connect();
+  const state = clientErrorState(client);
   let locked = false,discard = false;
+  let failure: unknown;
   try {
     locked = (await client.query("SELECT pg_try_advisory_lock_shared(3650101) AS acquired")).rows[0].acquired;
     if (!locked) throw new Error("Schema initialization owns the database lock; retry retention after it completes.");
@@ -457,13 +480,25 @@ export async function retainUntilConverged(
       }
     }
     throw new Error("Retention cleanup did not converge within its bounded pass limit; keep the database in maintenance.");
+  } catch (error) {
+    failure = error;
+    discard = true;
+    throw error;
   } finally {
     try {
       if (locked && (await client.query("SELECT pg_advisory_unlock_shared(3650101) AS unlocked")).rows[0].unlocked!==true) {
         throw new Error("Retention schema lock ownership was lost.");
       }
-    } catch (error) { discard = true; throw error; }
-    finally { client.release(discard); }
+    } catch (error) {
+      discard = true;
+      failure = failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+      throw failure;
+    } finally {
+      try { client.release(discard || state.error); }
+      catch (error) {
+        throw failure === undefined ? error : new AggregateError([failure, error], "data_transaction_cleanup_failed");
+      }
+    }
   }
 }
 

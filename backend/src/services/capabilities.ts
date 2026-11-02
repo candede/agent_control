@@ -220,6 +220,7 @@ export class CapabilityService {
     if (!current.authorized && !reuseCapabilityCheck(current, Boolean(options.retryFailed))) {
       current = await this.refreshAtGeneration(definition, user, generation);
     }
+    this.requireGeneration(definition.id, user, generation);
     if (!current.authorized) throw unavailableCapabilityError(current);
     return current;
   }
@@ -299,6 +300,7 @@ export class CapabilityService {
     if (current.fresh && current.evidence?.category === "provider_throttled") return current;
     const refreshed = await this.refreshAtGeneration(definition, user, generation, signal);
     signal?.throwIfAborted();
+    this.requireGeneration(definition.id, user, generation);
     return refreshed;
   }
 
@@ -630,6 +632,9 @@ function unavailableCapabilityError(current: CapabilityDecision) {
     }
     if (category === "provider_throttled") {
       return new AppError(429, "provider_throttled", "Microsoft throttled the readiness check. Wait for the provider cooldown before retrying; no permission change is indicated.", current);
+    }
+    if (category === "provider_result_limit") {
+      return new AppError(502, "provider_result_limit", "The Microsoft readiness response exceeded the application's byte budget for an individual record or non-streaming response. This does not establish missing permissions.", current);
     }
     return new AppError(503, "provider_error", "The Microsoft readiness check failed. This does not establish missing permissions. Retry the readiness check.", current);
   }

@@ -6,12 +6,21 @@ import { retain, retainUntilConverged } from "../../scripts/database.js";
 import { selectionIdentity } from "../../scripts/largeTenantFixtures.js";
 import { schemaRegistry } from "../services/officialReportFields.js";
 import { OfficialReportImports } from "./officialReportImports.js";
+import { officialReportLimits } from "../services/officialReportStream.js";
 import { createJobConfirmation, JobRepository, type JobIntentInput } from "./jobs.js";
 import { DataGenerations } from "./dataGenerations.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 let evidence: Awaited<ReturnType<typeof lifecycleEvidence>>;
-beforeAll(async () => { fixture = await testDatabase(); evidence = await lifecycleEvidence(fixture.operator); });
+let acceptedFixture: { owner: ReturnType<typeof identity>; peer: ReturnType<typeof identity> };
+beforeAll(async () => {
+  fixture = await testDatabase();
+  evidence = await lifecycleEvidence(fixture.operator);
+  const owner = identity(), peer = identity();
+  await accept(owner, await stage(owner, 5025));
+  expect((await complete(peer)).complete).toBe(true);
+  acceptedFixture = { owner, peer };
+});
 afterAll(async () => { await fixture?.close(); });
 const identity = () => ({ ...selectionIdentity, tenantId: `repair-${randomUUID()}` });
 async function stage(owner: ReturnType<typeof identity>, rows: number) {
@@ -58,11 +67,7 @@ async function complete(owner: ReturnType<typeof identity>) {
 }
 
 it("acceptance repair: accepted staging drains child-first within every physical transaction and releases its reservation", async () => {
-  const owner = identity(), peer = identity();
-  const preview = await stage(owner, 5025);
-  await accept(owner, preview);
-  const published = await complete(peer);
-  expect(published.complete).toBe(true);
+  const { owner, peer } = acceptedFixture;
   const history = () => fixture.runtime.query(`SELECT row_to_json(s) AS state,
     (SELECT jsonb_agg(h ORDER BY h.set_id,h.valid_from_revision) FROM official_usage_history_memberships h WHERE h.tenant_id=s.tenant_id) AS history
     FROM official_usage_state s WHERE tenant_id=$1`, [peer.tenantId]);
@@ -97,13 +102,13 @@ it("acceptance repair: accepted staging drains child-first within every physical
 it("acceptance repair: interrupted committed copies remain leased, then lose provenance without leaking payload or quota", async () => {
   const owner = identity(), imports = new OfficialReportImports(fixture.runtime);
   await accept(owner, await stage(owner, 1));
-  const published = await physical(owner), preview = await stage(owner, 150);
+  const published = await physical(owner), preview = await stage(owner, officialReportLimits.batchRows + 100);
   let copied = false, entered!: () => void, stop!: () => void;
   const paused = new Promise<void>(resolve => { entered = resolve; });
   const interrupted = new Promise<void>(resolve => { stop = resolve; });
   const accepting = withQueries(fixture.runtime, async (text, values) => {
     if (text.includes("INSERT INTO official_usage_version_rows")) {
-      if (Number(values[3]) >= 50) {
+      if (Number(values[3]) >= officialReportLimits.batchRows) {
         entered();
         await interrupted;
         throw new Error("fixture_process_interruption_after_committed_copy");
@@ -123,7 +128,7 @@ it("acceptance repair: interrupted committed copies remain leased, then lose pro
   } finally { stop(); await failure; }
   expect(copied).toBe(true);
   const ingestion = (await fixture.operator.query("SELECT id,version_id FROM official_usage_ingestions WHERE staging_id=$1", [preview.id])).rows[0];
-  expect((await physical(owner)).rows).toBe(published.rows + 50);
+  expect((await physical(owner)).rows).toBe(published.rows + officialReportLimits.batchRows);
   // The failed attempt returns to ready with a valid immutable expiry, so cleanup must not retire it.
   await retainUntilConverged(fixture.operator);
   expect((await fixture.runtime.query("SELECT deleted_at FROM official_usage_versions WHERE id=$1", [ingestion.version_id])).rows[0].deleted_at).toBeNull();

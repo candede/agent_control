@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DataSyncRepository } from "../db/dataSync.js";
+import { OfficeAppAdoptionRepository } from "../db/officeAppAdoption.js";
 import { pool } from "../db/pool.js";
 import { AppError } from "../errors.js";
 import type { DataSyncRun } from "../types/dataSync.js";
@@ -98,6 +99,71 @@ describe("data sync admission ownership", () => {
       await expect(f.service.recover(admissionsOpen)).rejects.toThrow("State unavailable");
       expect(recovered).toHaveBeenCalledOnce();
     } finally { await f.service.drain(); }
+  });
+
+  it("cancels and joins Office recovery before shutdown settles", async () => {
+    const completed = Promise.withResolvers<void>();
+    const officeRecovery = vi.fn(async (_signal: AbortSignal) => completed.promise);
+    const f = fixture(undefined, officeRecovery);
+    const recovering = f.service.recoverOffice();
+    await vi.waitFor(() => expect(officeRecovery).toHaveBeenCalledOnce());
+    let stopped = false;
+    const draining = f.service.drain().then(() => { stopped = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(stopped).toBe(false);
+      expect(officeRecovery.mock.calls[0][0].aborted).toBe(true);
+    } finally {
+      completed.resolve();
+      await Promise.all([recovering, draining]);
+    }
+    await f.service.recoverOffice();
+    expect(officeRecovery).toHaveBeenCalledOnce();
+    expect(f.packages.submit).not.toHaveBeenCalled();
+    expect(f.powerPlatform.submit).not.toHaveBeenCalled();
+  });
+
+  it("joins an Office recovery admission read without starting preparation after shutdown", async () => {
+    const admitted = Promise.withResolvers<boolean>();
+    const admissionsOpen = vi.fn(async () => admitted.promise);
+    const officeRecovery = vi.fn(async (_signal: AbortSignal) => undefined);
+    const f = fixture(undefined, officeRecovery);
+    const recovering = f.service.recoverOffice(admissionsOpen);
+    await vi.waitFor(() => expect(admissionsOpen).toHaveBeenCalledOnce());
+    let stopped = false;
+    const draining = f.service.drain().then(() => { stopped = true; });
+    try {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(stopped).toBe(false);
+    } finally {
+      admitted.resolve(true);
+      await Promise.all([recovering, draining]);
+    }
+    expect(officeRecovery).not.toHaveBeenCalled();
+  });
+
+  it("passes the owned cancellation signal to the default Office repository", async () => {
+    const recover = vi.spyOn(OfficeAppAdoptionRepository.prototype, "recover").mockResolvedValue(undefined);
+    const service = new DataSyncService(pool);
+    try {
+      await service.recoverOffice();
+      expect(recover).toHaveBeenCalledExactlyOnceWith(undefined, expect.any(AbortSignal));
+    } finally { await service.drain(); }
+  });
+
+  it("respects closed Office recovery admissions and preserves unexpected shutdown failures", async () => {
+    const completed = Promise.withResolvers<void>();
+    const officeRecovery = vi.fn(async (_signal: AbortSignal) => completed.promise);
+    const f = fixture(undefined, officeRecovery);
+    await f.service.recoverOffice(async () => false);
+    expect(officeRecovery).not.toHaveBeenCalled();
+    const recovering = f.service.recoverOffice().catch(error => error);
+    await vi.waitFor(() => expect(officeRecovery).toHaveBeenCalledOnce());
+    const draining = f.service.drain().catch(error => error);
+    const failure = new Error("Office recovery cleanup unavailable.");
+    completed.reject(failure);
+    expect(await recovering).toBe(failure);
+    expect(await draining).toBe(failure);
   });
 
   it.each((["graph_packages", "power_platform"] as const).flatMap(source =>
@@ -218,7 +284,8 @@ it("releases an orphaned manual authorization wait before automatic admission af
   expect(f.packages.refreshDueDetails).toHaveBeenCalledOnce();
 });
 
-function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>) {
+function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSharingDiagnosticContext) => Promise<unknown>,
+  officeRecovery?: (signal: AbortSignal) => Promise<void>) {
   const user: AuthenticatedUser = {
     tenantId: `synthetic-sync-${randomUUID()}`, homeAccountId: randomUUID(),
     username: "viewer@example.invalid", displayName: "Viewer", roles: ["AgentControl.Viewer"],
@@ -260,6 +327,7 @@ function fixture(sharingDiagnostic?: (user: AuthenticatedUser, context: AgentSha
     officialUsage: { read: vi.fn(async () => ({ complete: false, count: 0, acceptedAt: null })) },
     wait: vi.fn(async () => undefined),
     sharingDiagnostic,
+    officeRecovery,
   });
   return { service, repository, user, run, packages, powerPlatform, copilotUsage };
 }

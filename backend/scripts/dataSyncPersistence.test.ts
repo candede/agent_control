@@ -93,7 +93,7 @@ describe("data sync persistence integration", () => {
     }
   });
 
-  it("fences restored sync work and requires fresh principal evidence after an actual backup/restore", async () => {
+  it("fences restored sync work without resurrecting explicitly cleared shared sources", async () => {
     const current = await testDatabase();
     const target = `agentcontrol_restore_${randomUUID().replaceAll("-", "")}`;
     const directory = resolve("artifacts");
@@ -103,11 +103,17 @@ describe("data sync persistence integration", () => {
     try {
       const repository = new DataSyncRepository(current.runtime);
       const revoked = { ...scope, principalId: "revoked-reader" };
-      await publishFixtureDirectory(current.runtime, identity(), [fixtureDirectoryUser(randomUUID(), "Current user", "current@example.invalid")]);
+      const preceding = await publishFixtureDirectory(current.runtime, identity(), [fixtureDirectoryUser(randomUUID(), "Current user", "current@example.invalid")]);
       const removed = await publishFixtureDirectory(current.runtime, identity(revoked),
         [fixtureDirectoryUser(randomUUID(), "Removed user", "removed@example.invalid")]);
       const { run } = await repository.submit(scope, { mode: "initial" });
       await repository.updateSource(scope, run.id, "users", { status: "running", message: "Reading users.", canRetry: false });
+      const tenantRows = "SELECT count(*)::int AS count FROM directory_user_rows WHERE generation_id IN(SELECT id FROM data_generations WHERE tenant_id=$1)";
+      expect((await current.runtime.query(`SELECT count(*)::int AS count FROM directory_user_rows
+        WHERE generation_id=ANY($1::uuid[]) GROUP BY generation_id ORDER BY count`,
+      [[preceding.generationId, removed.generationId]])).rows.map(row => row.count)).toEqual([1, 2]);
+      expect((await sourcePage(current.runtime)).sources.directory.rowCount).toBe(2);
+      expect((await current.runtime.query(tenantRows, [scope.tenantId])).rows[0].count).toBe(3);
       await backup(current.operator, filename);
       const removedScope = (await current.runtime.query("SELECT scope_id FROM data_generations WHERE id=$1", [removed.generationId])).rows[0].scope_id;
       await new DataGenerations(current.runtime).invalidate(removedScope, revoked.tenantId);
@@ -118,7 +124,7 @@ describe("data sync persistence integration", () => {
       for (const owner of [scope, revoked]) {
         const epoch = await new DataGenerations(restored).sessionEpoch(owner.tenantId, owner.principalId);
         expect((await sourcePage(restored, owner, epoch)).sources.directory).toMatchObject({
-          generationId: removed.generationId, state: "partial", rowCount: 2,
+          generationId: null, state: "unavailable", rowCount: null,
         });
       }
       expect((await restoredRepository.getRun(scope, run.id))?.sources.find(source => source.source === "users")).toMatchObject({
@@ -127,8 +133,8 @@ describe("data sync persistence integration", () => {
       expect((await restored.query("SELECT mode FROM operational_state")).rows[0]).toEqual({
         mode: "maintenance",
       });
-      expect((await current.runtime.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(0);
-      expect((await restored.query("SELECT count(*)::int AS count FROM directory_user_rows")).rows[0].count).toBe(2);
+      expect((await current.runtime.query(tenantRows, [scope.tenantId])).rows[0].count).toBe(0);
+      expect((await restored.query(tenantRows, [scope.tenantId])).rows[0].count).toBe(0);
     } finally {
       await restored?.end();
       await current.operator.query(`DROP DATABASE IF EXISTS "${target}"`);

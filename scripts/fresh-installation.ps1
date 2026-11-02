@@ -155,9 +155,32 @@ function Invoke-FreshFirstSync {
     param($Context,[string]$Directory,[string]$Stage)
     Assert-FreshInstallationContext $Context $Directory
     $script = [IO.File]::ReadAllText((Join-Path $Context.Root 'backend/scripts/restart-runtime.mjs'))
-    $output = @($script | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$($Context.Project)" "$($Context.Project)-app-1" node --input-type=module - first-sync 2>&1)
+    $order = if ($Stage -ceq 'recollected') { 'app-first' } else { 'directory-first' }
+    if ($order -ceq 'app-first') {
+        Invoke-LocalOperator $Context @('--input-type=module','--eval',@'
+import pg from "pg";import {databaseSettings} from "./backend/src/db/pool.ts";
+const db=new pg.Pool(databaseSettings());
+try {
+  await db.query(`CREATE SEQUENCE fixture_office_failure;
+    GRANT USAGE ON SEQUENCE fixture_office_failure TO agentcontrol_app;
+    CREATE FUNCTION fixture_office_failure() RETURNS trigger LANGUAGE plpgsql AS $body$
+    BEGIN IF nextval('fixture_office_failure')=1 THEN RAISE EXCEPTION 'synthetic interrupted Office capture'; END IF; RETURN NEW; END $body$;
+    CREATE TRIGGER fixture_office_failure BEFORE INSERT ON office_person_facts FOR EACH ROW EXECUTE FUNCTION fixture_office_failure();`);
+} finally {await db.end();}
+'@)
+    }
+    try {
+        $output = @($script | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$($Context.Project)" "$($Context.Project)-app-1" node --input-type=module - first-sync $order 2>&1)
+        $code = $LASTEXITCODE
+    } finally {
+        if ($order -ceq 'app-first') {
+            Invoke-LocalOperator $Context @('--input-type=module','--eval',
+                'import pg from "pg";import {databaseSettings} from "./backend/src/db/pool.ts";const db=new pg.Pool(databaseSettings());try{await db.query("DROP TRIGGER fixture_office_failure ON office_person_facts;DROP FUNCTION fixture_office_failure();DROP SEQUENCE fixture_office_failure");}finally{await db.end();}')
+        }
+    }
     Write-LocalText (Join-Path $Directory "$Stage-first-sync.log") ($output -join "`n")
-    if ($LASTEXITCODE -ne 0 -or -not ($output -match '"event":"fresh_runtime_first_sync".*"outcome":"passed"')) {
+    if ($code -ne 0 -or -not ($output -match '"event":"fresh_runtime_first_sync".*"outcome":"passed"') -or
+        -not ($output -match '"event":"fresh_office_automatic_first_sync".*"outcome":"passed"')) {
         throw "Compiled first collection failed; inspect $Stage-first-sync.log."
     }
     $snapshot = Write-FreshInstallationEvidence $Context $Directory $Stage
@@ -308,6 +331,14 @@ networks:
         Write-LocalText (Join-Path $Directory 'restart-progress.json') (@{before=$progressBefore;after=$progressAfter;interpretation='Only scheduled lifecycle metadata may advance within existing 1000-row/1-MiB slice bounds; all other table fingerprints and all row counts must match.'} | ConvertTo-Json -Depth 5)
         Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter
         Invoke-FreshFirstSync $context $Directory 'collected'
+        Invoke-DockerCommand ($context.Compose + @('restart','--timeout','130','app'))
+        Wait-FreshInstallationHealth $context $Directory
+        $idleScript = [IO.File]::ReadAllText((Join-Path $Root 'backend/scripts/restart-runtime.mjs'))
+        $idleOutput = @($idleScript | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$project" "$project-app-1" node --input-type=module - office-idle 2>&1)
+        Write-LocalText (Join-Path $Directory 'office-restart-idle.log') ($idleOutput -join "`n")
+        if ($LASTEXITCODE -ne 0 -or -not ($idleOutput -match '"event":"fresh_office_restart_idle".*"outcome":"passed"')) {
+            throw 'Compiled Office restart/idle proof failed.'
+        }
         if ($CurrentSchemaOnly) {
             $receiptHash = (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
             $prior = @(Get-OwnedLocalContainers $context | Where-Object Service -eq 'app')[0]

@@ -67,6 +67,7 @@ export class DataConnections {
       signal?.throwIfAborted();
       client = renewal && this.database instanceof BoundedPool ? await this.database.connectRenewal() : await this.database.connect();
       clientState = clientErrorState(client);
+      signal?.throwIfAborted();
       if (serializationKey !== undefined) {
         // Lease renewal and export chunk writes must finish before a selected
         // snapshot is taken, rather than conflict with that snapshot's row fence.
@@ -83,7 +84,9 @@ export class DataConnections {
       }
       await client.query(begin);
       if (begin === "BEGIN ISOLATION LEVEL REPEATABLE READ") selectedReaders.add(client);
+      signal?.throwIfAborted();
       await transactionCheckpoint(client);
+      signal?.throwIfAborted();
       const transactionClient = client;
       const value = await metrics.run(() => work(transactionClient));
       peakCheckpoint("sql.result");
@@ -92,10 +95,18 @@ export class DataConnections {
       signal?.throwIfAborted();
       if (clientState.error) throw clientState.error;
       beforeCommit?.();
+      signal?.throwIfAborted();
       const commit = await client.query("COMMIT");
       if (commit.command !== "COMMIT") throw new Error("data_transaction_not_committed");
       committed = true;
-      onCommitted?.();
+      try { onCommitted?.(); }
+      catch (error) {
+        try { metrics.commit(); }
+        catch (metricError) {
+          throw new AggregateError([error, metricError], "data_transaction_post_commit_failed");
+        }
+        throw error;
+      }
       metrics.commit();
       measured?.();
       return value;

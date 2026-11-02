@@ -1,8 +1,49 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import pgUtils from "pg/lib/utils.js";
 import { assertAgentDefinitionBytes, assertResidualBytes, dataLimits, encodeBatch, encodeInventoryFactBatch } from "./dataBounds.js";
 import { withTelemetryContext } from "../services/telemetry.js";
 
+vi.mock("../config.js", () => ({ config: { nodeEnv: "test" } }));
+
 afterEach(() => vi.restoreAllMocks());
+
+describe("PostgreSQL parameter byte accounting", () => {
+  it.each([
+    ["dates", [new Date("2026-11-01T12:34:56.789Z")]],
+    ["SQL arrays", [[1, true, null, ["界", { text: 'quoted " text\\' }]]]],
+    ["binary views", [Buffer.from([0, 1, 255]), new Uint8Array([2, 3, 4])]],
+    ["custom encoders", [{ toPostgres: () => "encoded parameter" }]],
+  ])("uses the driver's encoding for %s", (_name, parameters) => {
+    const rows = [{ id: "界" }];
+    const batch = encodeBatch(rows, parameters);
+    const expectedBytes = [...parameters, JSON.stringify(rows)].reduce((total, parameter) => {
+      const encoded = pgUtils.prepareValue(parameter);
+      return total + 4 + (encoded == null ? 0 : Buffer.byteLength(encoded));
+    }, 0);
+    expect(batch.bytes).toBe(expectedBytes);
+    expect(batch.json).toBe(JSON.stringify(rows));
+  });
+
+  it("keeps the inclusive 1 MiB boundary with a timestamp parameter", () => {
+    const timestamp = new Date("2026-11-01T12:34:56.789Z");
+    const overhead = 12 + Buffer.byteLength(pgUtils.prepareValue(timestamp)!);
+    const text = "x".repeat(dataLimits.batchBytes - overhead);
+    expect(encodeBatch([text], [timestamp]).bytes).toBe(dataLimits.batchBytes);
+    expect(() => encodeBatch([`${text}x`], [timestamp])).toThrow(expect.objectContaining({
+      code: "data_batch_bytes",
+      details: { limit: dataLimits.batchBytes, observed: dataLimits.batchBytes + 1 },
+    }));
+  });
+
+  it("does not reject a binary parameter that fits the actual byte budget", () => {
+    const binary = Buffer.alloc(dataLimits.batchBytes - 10);
+    expect(encodeBatch([], [binary]).bytes).toBe(dataLimits.batchBytes);
+  });
+
+  it("counts null length prefixes without charging nonexistent content", () => {
+    expect(encodeBatch([], [null, undefined]).bytes).toBe(14);
+  });
+});
 
 describe("residual size diagnostics", () => {
   it("keeps the 256 KiB boundary inclusive and does not log successful checks", () => {
@@ -42,7 +83,8 @@ describe("residual size diagnostics", () => {
       expect(() => encodeBatch([large])).toThrow(expect.objectContaining({ code: "data_batch_bytes" }));
       expect(() => encodeInventoryFactBatch([large, { kind: "element" }])).toThrow(expect.objectContaining({ code: "data_batch_bytes" }));
       expect(() => encodeInventoryFactBatch([{ ...large, kind: "identifier" }])).toThrow(expect.objectContaining({ code: "data_batch_bytes" }));
-      expect(() => encodeInventoryFactBatch([{ kind: "element", payload: { definition: "x".repeat(5 * 1024 ** 2) } }]))
+      const oversized = { ...large, payload: { definition: "x".repeat(5 * 1024 ** 2) } };
+      expect(() => encodeInventoryFactBatch([oversized]))
         .toThrow(expect.objectContaining({ code: "data_batch_bytes", details: expect.objectContaining({ limit: 5_242_880 }) }));
     });
   });

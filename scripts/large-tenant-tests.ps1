@@ -23,6 +23,7 @@ $implemented += @('production-publication','production-gate-repairs','fresh-inst
 $implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
 $implemented += @('production-frontend','auth-recovery','audit-origin','mcp-read-contracts','shared-agent-controls','webapp-regressions','webapp-qualification')
 $implemented += @('deployment-current','fresh-installation-current','mcp-container','mcp-end-to-end')
+$implemented += @('office-app-adoption')
 if ($Suite -notin ($implemented + @('inventory-acceptance-repair','inventory-acceptance-recovery','inventory-controller-contract','report-source-scale','backend-shard-1','backend-shard-2','inventory-app-exports','inventory-http-contract','inventory-route-contract','inventory-integration','inventory-expiry','inventory-parity','inventory-verification','inventory-identity-proof','inventory-cleanup','inventory-identity','inventory-facets','inventory','inventory-cutover','inventory-usage-authority','inventory-native-evidence','inventory-staging','inventory-jobs','inventory-route','inventory-protocol','inventory-core','inventory-reconciliation','inventory-native-ui','inventory-groups','inventory-foundation')) -and -not $profile -and $Suite -ne 'cutover-compiled-restart') { throw "Suite '$Suite' is not yet implemented; no qualification claimed." }
 if ($Suite -in @('cutover-browser-contract','browser')) {
     if ($Suite -eq 'browser' -and -not $PSBoundParameters.ContainsKey('BrowserFiles')) { $BrowserFiles = 'largeTenantData.spec.ts' }
@@ -70,6 +71,16 @@ if ($Suite -in @('browser','restart')) {
     exit 0
 }
 # Reuse installed, approved dependencies; no installer or registry access.
+if ($Suite -eq 'cutover-browser-contract') {
+    $browser = 'agent-control:permission-browser-test-phase06'
+    $browserId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$browser) -Capture
+    if ($browserId -cne 'sha256:b4eda044a9e58194703b1aa3e3209d3a7ea9cc219f9df14d36d418db873bb60b') { throw 'Protected browser identity changed.' }
+    $architectures = @($baseline,$browser | ForEach-Object { Invoke-DockerCommand @('image','inspect','--format','{{.Architecture}}',$_) -Capture })
+    if (@($architectures | Select-Object -Unique).Count -ne 1) { throw 'Installed dependency and browser architectures differ.' }
+    Invoke-DockerCommand @('build','--network','none','--build-arg',"DEPENDENCY_BASE=$baseline",
+        '--build-arg',"BROWSER_BASE=$browser",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1',
+        '--target','permission-browser-test','-t',$image,$root)
+} else {
 $dockerfile = Join-Path $directory 'Dockerfile'
 $base = "FROM $baseline`n"
 if ($Suite -eq 'mcp-end-to-end') {
@@ -98,6 +109,7 @@ if ($Suite -eq 'gate-failure') {
     [IO.File]::AppendAllText($dockerfile, "RUN printf '%s\n' 'console.error(`"intentional owned gate failure`"); setTimeout(() => process.exit(17), 1200);' > /app/backend/scripts/test-all.ts`n")
 }
 Invoke-DockerCommand @('build','--network','none','-f',$dockerfile,'-t',$image,$root)
+}
 if ($Suite -in @('gate-failure','software-gate')) {
     $failure = $null
     try { Invoke-LocalSoftwareChecks @{Root=$root;Operator=$image} -ForceChecks } catch { $failure=$_.Exception }
@@ -136,6 +148,7 @@ try {
     $dataMount = @($mounts | ConvertFrom-Json | Where-Object { $_.Destination -eq '/var/lib/postgresql/data' })
     if ($dataMount.Count -ne 1 -or $dataMount[0].Type -ne 'volume' -or $dataMount[0].Name -cne "${project}_large-tenant-data") { throw 'Fixture requires exact owned disk-backed PGDATA, not tmpfs.' }
     $command = if ($Suite -eq 'export-readonly') { @('node','--import','tsx','backend/scripts/exportReadonlyFixture.ts') }
+        elseif ($Suite -eq 'cutover-browser-contract') { @('node','/app/node_modules/tsx/dist/cli.mjs','/app/backend/scripts/largeTenantFixture.ts',$Suite) }
         else { @('node','node_modules/tsx/dist/cli.mjs','backend/scripts/largeTenantFixture.ts',$Suite) }
     if ($Suite -eq 'cutover-browser-contract') { $command += $BrowserFiles }
     Invoke-OwnedFixtureWorkload $compose $project $directory $command
