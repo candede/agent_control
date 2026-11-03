@@ -83,7 +83,8 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange, revision, c
     </div>
     {missingBaseline ? <p className="dashboard-notice" role="status">The bookmarked baseline is not available as a dated retained report.
       Showing the earliest dated report instead.</p> : null}
-    <div className="dashboard-overview-grid">
+    <DashboardInsights key={latest?.id ?? undated.at(-1)!.id} snapshot={latest ?? undated.at(-1)!}
+      baseline={baseline} revision={revision} company={company} onCompanyChange={onCompanyChange}>
       <section className="dashboard-panel dashboard-panel-blue" aria-labelledby="dashboard-trends-title">
         <DashboardPanelHeading id="dashboard-trends-title" icon={ChartNoAxesCombined} title="Adoption over time"
           description="How agent usage is changing across saved reports." />
@@ -106,9 +107,7 @@ function DashboardResults({ snapshots, baselineId, onBaselineChange, revision, c
         </> : <p className="dashboard-notice">Saved counts are available below, but dates are missing.
           Import order is not usage chronology, so no direction or latest-activity claim is shown.</p>}
       </section>
-      <DashboardInsights key={latest?.id ?? undated.at(-1)!.id} snapshot={latest ?? undated.at(-1)!}
-        baseline={baseline} revision={revision} company={company} onCompanyChange={onCompanyChange} />
-    </div>
+    </DashboardInsights>
     <SnapshotTable snapshots={[...visible].reverse()} heading="Report snapshots and comparisons" />
     {undated.length ? <SnapshotTable snapshots={undated} heading="Reports without activity dates" /> : null}
     <details className="dashboard-definitions">

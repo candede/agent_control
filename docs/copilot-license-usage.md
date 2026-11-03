@@ -126,6 +126,15 @@ current assignments, disabled plans and effective paid-feature evidence.
 A feature disabled in one product can be enabled by another. Account sign-in
 status is separate. Checked directory candidates are not headcount or paid-user totals.
 
+### Agent adoption dashboard
+
+Open **Dashboard > Agent adoption**. Like the Office dashboard, it starts with
+organization-wide participation. **People and engagement** and **Agents and Agent
+Champs** appear side by side on wide screens. The next row shows **Adoption over
+time** on the left and **Adoption by department** on the right. The panels stack
+in that order on smaller screens. Company selection narrows the department
+panel, not the organization-wide cards or trends.
+
 ### Agent adoption by group
 
 Open **Users > Adoption > Agents** for company/department groups. Report-only

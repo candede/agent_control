@@ -33,6 +33,25 @@ async function expectDashboardHeaderLayout(page: Page) {
   }
 }
 
+async function expectAgentDashboardPanelOrder(page: Page) {
+  const titles = ["People and engagement", "Agents and Agent Champs", "Adoption over time", "Adoption by department"];
+  await expect(page.locator(".dashboard-panel-heading h3")).toHaveText(titles);
+  const [people, champions, trends, departments] = await Promise.all(titles.map(async name =>
+    (await page.getByRole("region", { name, exact: true }).boundingBox())!));
+  expect(Math.max(people.y + people.height, champions.y + champions.height))
+    .toBeLessThan(Math.min(departments.y, trends.y));
+  expect(people.width).toBeCloseTo(champions.width, 0);
+  if (page.viewportSize()!.width > 1150) {
+    expect(people.y).toBeCloseTo(champions.y, 0);
+    expect(people.x + people.width).toBeLessThan(champions.x);
+    expect(departments.y).toBeCloseTo(trends.y, 0);
+    expect(trends.x + trends.width).toBeLessThan(departments.x);
+  } else {
+    expect(people.y + people.height).toBeLessThan(champions.y);
+    expect(trends.y + trends.height).toBeLessThan(departments.y);
+  }
+}
+
 async function expectOfficeDashboardVisuals(page: Page, info: TestInfo) {
   for (const width of [1440, 760, 360]) {
     await page.setViewportSize({ width, height: width === 360 ? 780 : 1000 });
@@ -466,6 +485,13 @@ test("Dashboard shows historical adoption, preserves baseline and company naviga
   await expect(departmentPanel.getByText("75%", { exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "People and engagement" }).getByText("40,000", { exact: true })).toBeVisible();
   await expect(page.getByRole("region", { name: "Agents and Agent Champs" }).getByText("6", { exact: true })).toBeVisible();
+  const viewport = page.viewportSize()!;
+  for (const width of [1440, 760, 360]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await expectAgentDashboardPanelOrder(page);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  }
+  await page.setViewportSize(viewport);
   await expect(page.getByRole("heading", { name: "Agent Champs", exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "Explore groups and Agent Champs", exact: true })).toBeVisible();
   await expect(page.getByText(/Snapshot comparison: observed activity dates/)).toHaveCount(0);

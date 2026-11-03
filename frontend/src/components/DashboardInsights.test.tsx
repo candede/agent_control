@@ -34,6 +34,28 @@ function fixture(data = adoptionDepartmentPage(), summary = adoptionSummaryPage(
 }
 
 describe("dashboard insights", () => {
+  it("groups participation and champions above trends and departments", async () => {
+    fixture();
+    render(<DashboardInsights snapshot={adoptionSnapshot()} revision={0} onCompanyChange={vi.fn()}>
+      <section aria-label="Adoption over time"><h3>Adoption over time</h3></section>
+    </DashboardInsights>);
+    await screen.findByRole("list", { name: "Department adoption" });
+
+    expect(screen.getAllByRole("heading", { level: 3 }).map(heading => heading.textContent)).toEqual([
+      "People and engagement", "Agents and Agent Champs", "Adoption over time", "Adoption by department",
+    ]);
+    const people = screen.getByRole("region", { name: "People and engagement" });
+    const departments = screen.getByRole("region", { name: "Adoption by department" });
+    const trends = screen.getByRole("region", { name: "Adoption over time" });
+    const champions = screen.getByRole("region", { name: "Agents and Agent Champs" });
+    expect(people.parentElement).toHaveClass("dashboard-overview-grid");
+    expect(champions.parentElement).toBe(people.parentElement);
+    expect(departments.parentElement).toHaveClass("dashboard-overview-grid");
+    expect(trends.parentElement).toBe(departments.parentElement);
+    expect(people.parentElement).not.toBe(departments.parentElement);
+    expect(people.parentElement?.parentElement).toBe(departments.parentElement?.parentElement);
+  });
+
   it("does not reuse a cleaned-up selection for facets while a remounted summary refreshes", async () => {
     const summary = adoptionSummaryPage(), fresh = { ...summary, selection: reportSelection(3) };
     const { fetcher } = fixture(adoptionDepartmentPage(), summary), base = fetcher.getMockImplementation()!;

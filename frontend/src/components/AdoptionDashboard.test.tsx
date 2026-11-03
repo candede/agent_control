@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdoptionHistoryPage } from "../../../backend/src/types/adoptionDashboard";
 import { adoptionSnapshotLabel } from "../adoptionTrends";
@@ -8,7 +9,7 @@ import { deferred } from "../test/deferred";
 import { AdoptionDashboard } from "./AdoptionDashboard";
 
 vi.mock("./DashboardInsights", async original => ({
-  ...await original<typeof import("./DashboardInsights")>(), DashboardInsights: () => null,
+  ...await original<typeof import("./DashboardInsights")>(), DashboardInsights: ({ children }: { children?: ReactNode }) => children,
 }));
 
 const first = adoptionSnapshot(1, { reportingStart: "2026-08-14", reportingEnd: "2026-09-12" });
