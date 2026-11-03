@@ -58,7 +58,8 @@ export class UserSourceStages {
         fence(providerSignal);
         await work(lease, providerSignal);
         fence(providerSignal);
-        const retained = await this.preserveUnseen(lease, input.scope.source as UserSourceKind, () => fence(providerSignal));
+        const retained = input.scope.source === "directory"
+          ? await this.preserveUnseen(lease, () => fence(providerSignal)) : 0;
         fence(providerSignal);
         await this.validate(lease);
         fence(providerSignal);
@@ -80,7 +81,7 @@ export class UserSourceStages {
                 AND NOT residual ? 'retainedObservedAt')
               WHERE generation_id=$1`, [lease.id, input.scope.source === "directory"
               ? `Checked ${result.rows-retained} directory users; this is not tenant headcount or basic Copilot Chat usage.${retained ? ` Retained ${retained} previously saved unseen users with their original evidence.` : ""}`
-              : `Saved ${result.rows-retained} Microsoft 365 Copilot ${activityPeriod} app activity rows.${retained ? ` Retained ${retained} unseen rows with their original report dates.` : ""}`, retained]);
+              : `Saved ${result.rows} Microsoft 365 Copilot ${activityPeriod} app activity rows.`, retained]);
             fence(providerSignal);
             await options.completeJob?.(client, { ...result, source: input.scope.source as UserSourceKind, generationId: lease.id });
             fence(providerSignal);
@@ -123,38 +124,38 @@ export class UserSourceStages {
     }
   }
 
-  async preserveUnseen(lease: GenerationLease, source: UserSourceKind, fence: () => void): Promise<number> {
+  async preserveUnseen(lease: GenerationLease, fence: () => void): Promise<number> {
     const previous = await this.guarded(lease, async client => (await client.query<{ id: string; observed_at: Date; actor_principal_id: string | null }>(`
       SELECT g.id,g.observed_at,g.actor_principal_id FROM data_generation_heads h
       JOIN data_generations g ON g.id=h.generation_id JOIN data_scope_epochs s ON s.id=h.scope_id
       WHERE h.scope_id=$1 AND h.tenant_id=$2 AND g.state='published'
         AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch`, [lease.scopeId, lease.tenantId])).rows[0]);
     if (!previous) return 0;
-    const table = source === "directory" ? "directory_user_rows" : "app_activity_rows";
     let after = "", retained = 0;
     for (;;) {
       fence();
       const rows = await this.guarded(lease, async client => (await client.query<{ value: RecordKinds["directory"] | RecordKinds["activity"]; identity: string }>(`
         WITH candidates AS MATERIALIZED (
         SELECT old.identity,to_jsonb(old)-ARRAY['generation_id','scope_id','tenant_id','schema_version','content_hash'] AS value
-        FROM ${table} old WHERE old.generation_id=$1 AND old.identity COLLATE "C">$3
-          AND NOT EXISTS(SELECT 1 FROM ${table} incoming WHERE incoming.generation_id=$2
+        FROM directory_user_rows old WHERE old.generation_id=$1 AND old.identity COLLATE "C">$3
+          AND NOT EXISTS(SELECT 1 FROM user_source_identity_inputs checked
+            WHERE checked.generation_id=$2 AND checked.identity=old.identity AND checked.checked)
+          AND NOT EXISTS(SELECT 1 FROM directory_user_rows incoming WHERE incoming.generation_id=$2
             AND NOT incoming.residual ? 'retainedObservedAt'
-            AND incoming.${source === "directory" ? "identity" : "upn_key"}=old.${source === "directory" ? "identity" : "upn_key"})
+            AND incoming.identity=old.identity)
         ORDER BY old.identity COLLATE "C" LIMIT 100), sized AS (
           SELECT *,sum(octet_length(value::text)) OVER(ORDER BY identity COLLATE "C") AS bytes FROM candidates)
         SELECT identity,value FROM sized WHERE bytes<=524288 ORDER BY identity COLLATE "C"`, [previous.id, lease.id, after])).rows);
       if (!rows.length) break;
       const records = rows.map(({ value, identity }) => ({ ...value,
-        identity: source === "directory" ? identity : `retained:${digest(`${previous.id}:${identity}`)}`,
+        identity,
         residual: { ...value.residual, retainedObservedAt: value.residual.retainedObservedAt ?? previous.observed_at.toISOString(),
           retainedCollectorPrincipalId: value.residual.retainedCollectorPrincipalId ?? previous.actor_principal_id } }));
-      if (source === "directory") {
-        await this.append(lease, "directory", records as RecordKinds["directory"][]);
-        let planAfter = "";
-        for (;;) {
-          fence();
-          const plans = await this.guarded(lease, async client => (await client.query<{ value: RecordKinds["plans"]; identity: string }>(`
+      await this.append(lease, "directory", records as RecordKinds["directory"][]);
+      let planAfter = "";
+      for (;;) {
+        fence();
+        const plans = await this.guarded(lease, async client => (await client.query<{ value: RecordKinds["plans"]; identity: string }>(`
             WITH candidates AS MATERIALIZED (
             SELECT identity,to_jsonb(plan)-ARRAY['generation_id','scope_id','tenant_id','schema_version','content_hash'] AS value
             FROM directory_service_plan_rows plan WHERE generation_id=$1 AND user_id=ANY($2::text[])
@@ -162,12 +163,9 @@ export class UserSourceStages {
                 SELECT *,sum(octet_length(value::text)) OVER(ORDER BY identity COLLATE "C") AS bytes FROM candidates)
             SELECT identity,value FROM sized WHERE bytes<=524288 ORDER BY identity COLLATE "C"`,
           [previous.id, rows.map(row => row.identity), planAfter])).rows);
-          if (!plans.length) break;
-          await this.append(lease, "plans", plans.map(row => row.value));
-          planAfter = plans.at(-1)!.identity;
-        }
-      } else {
-        await this.append(lease, "activity", records as RecordKinds["activity"][]);
+        if (!plans.length) break;
+        await this.append(lease, "plans", plans.map(row => row.value));
+        planAfter = plans.at(-1)!.identity;
       }
       retained += records.length;
       after = rows.at(-1)!.identity;
@@ -189,7 +187,8 @@ export class UserSourceStages {
         return work(client);
       });
     } catch (error) {
-      await this.generations.abort(lease);
+      try { await this.generations.abort(lease); }
+      catch (failure) { throw new AggregateError([error, failure], "data_poison_fence_failed"); }
       throw error;
     }
   }
@@ -289,6 +288,27 @@ export class UserSourceStages {
       [lease.id, lease.scopeId, lease.tenantId, batch.json]);
       await this.charge(client, lease, batch.bytes);
     });
+  }
+
+  async includeSavedIdentities(lease: GenerationLease, fence: () => void) {
+    let after = "";
+    for (;;) {
+      fence();
+      const rows = await this.guarded(lease, async client => (await client.query<{ identity: string }>(`
+        SELECT old.identity FROM data_generation_heads h
+        JOIN data_generations g ON g.id=h.generation_id
+        JOIN data_scope_epochs s ON s.id=h.scope_id
+        JOIN directory_user_rows old ON old.generation_id=g.id
+        WHERE h.scope_id=$1 AND h.tenant_id=$2 AND g.state='published' AND s.source='directory'
+          AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch
+          AND old.identity COLLATE "C">$3
+        ORDER BY old.identity COLLATE "C" LIMIT 250`, [lease.scopeId, lease.tenantId, after])).rows);
+      fence();
+      if (!rows.length) return;
+      await this.identities(lease, rows.map(row => row.identity));
+      fence();
+      after = rows.at(-1)!.identity;
+    }
   }
 
   async verificationBatch(lease: GenerationLease): Promise<string[]> {

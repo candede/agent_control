@@ -21,7 +21,10 @@ import { reportIdentity } from "./reportIdentity.js";
 import type { FetchLike } from "./graphPackages.js";
 import { observePeakMemory, observeTransactionResult } from "./peakMemory.js";
 
-beforeEach(() => { vi.spyOn(UserSourceStages.prototype, "preserveUnseen").mockResolvedValue(0); });
+beforeEach(() => {
+  vi.spyOn(UserSourceStages.prototype, "preserveUnseen").mockResolvedValue(0);
+  vi.spyOn(UserSourceStages.prototype, "includeSavedIdentities").mockResolvedValue(undefined);
+});
 
 vi.mock("../db/pool.js", () => ({
   pool: { options: { max: 4 },
@@ -195,6 +198,28 @@ describe("Users refresh session boundaries", () => {
       .rejects.toMatchObject({ status: 401 });
     expect(completed).not.toHaveBeenCalled();
     expect(write).toHaveBeenCalledTimes(boundary === "publication-lock" ? 0 : 1);
+  });
+
+  it("uses the persisted checked directory count instead of the merged generation total at source completion", async () => {
+    const f = fixture("app_activity", "waiting_authorization", 1);
+    const client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const write = vi.spyOn(client, "query").mockResolvedValue({ rows: [], rowCount: 1, command: "UPDATE", oid: 0, fields: [] });
+    const generationId = randomUUID();
+    f.refresh.mockImplementationOnce(async (_stages, input, options) => {
+      await options.completeJob?.(client, {
+        jobId: input.jobId, runId: input.runId ?? null, source: "directory",
+        generationId, rows: 3, bytes: 1,
+      });
+      return { generationId, scopeId: randomUUID(), revision: "1",
+        rows: 3, children: 0, batches: 1, pages: 1, wireRows: 1, bytes: 1 };
+    });
+
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+
+    expect(write).toHaveBeenCalledWith(
+      expect.stringMatching(/count=CASE WHEN \$5='directory' THEN \(SELECT observed_count FROM user_source_attempts WHERE generation_id=\$6\) ELSE count END/),
+      [f.publication.runId, user.tenantId, user.homeAccountId, f.publication.jobId, "directory", generationId],
+    );
   });
 
   it("does not renew publication authorization under a superseding capability generation", async () => {
@@ -771,6 +796,40 @@ describe("Users provider HTTP failure boundaries", () => {
     expect(f.wait).not.toHaveBeenCalled();
   });
 
+  it.each((["invalid-redirect", "repeated-redirect", "download-failure", "download-retry"] as const).flatMap(response =>
+    (["cancelled", "authority"] as const).map(boundary => ({ response, boundary })),
+  ))("preserves $boundary during $response cleanup without retrying", async ({ response, boundary }) => {
+    const controller = new AbortController();
+    const reason = new AppError(boundary === "cancelled" ? 409 : 401,
+      boundary === "cancelled" ? "read_job_cancelled" : "authorization_expired", "Source collection stopped.");
+    let current = true;
+    const cancel = vi.fn(() => {
+      if (boundary === "cancelled") controller.abort(reason);
+      else current = false;
+    });
+    const discarded = new Response(new ReadableStream<Uint8Array>({ cancel }), {
+      status: response === "download-failure" ? 400 : response === "download-retry" ? 503 : 302,
+      headers: { location: "https://example.invalid/unsupported-report" },
+    });
+    const fetcher = vi.fn<FetchLike>();
+    if (response !== "invalid-redirect") fetcher.mockResolvedValueOnce(new Response(null, {
+      status: 302, headers: { location: "https://reports.office.com/data/download/synthetic" },
+    }));
+    fetcher.mockResolvedValueOnce(discarded);
+    const f = providerFixture(fetcher);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const page = vi.spyOn(f.stages, "page").mockResolvedValue(undefined);
+    const activity = vi.spyOn(f.stages, "activity").mockResolvedValue(undefined);
+    await expect(f.provider.activity(f.stages, f.lease, "synthetic-token", controller.signal,
+      () => { if (!current) throw reason; })).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(response === "invalid-redirect" ? 1 : 2);
+    expect(f.wait).not.toHaveBeenCalled();
+    expect(warning).not.toHaveBeenCalled();
+    expect(page).not.toHaveBeenCalled();
+    expect(activity).not.toHaveBeenCalled();
+  });
+
   it.each([0, 3])("rejects a year-zero CSV date at column %i before staging activity", async column => {
     const row = ["2026-10-10", "person@example.invalid", "Person", "", "", "", "", "", "", "", "", "", "28"];
     row[column] = "0000-01-01";
@@ -1027,6 +1086,44 @@ describe("Users provider HTTP failure boundaries", () => {
 });
 
 describe("automatic Users source cadence", () => {
+  it.each((["directory", "app_activity"] as const).flatMap(source =>
+    [true, false].map(automatic => ({ source, automatic }))))(
+    "rechecks stale retained $source evidence without treating collection as complete, automatic: $automatic", async ({ source, automatic }) => {
+    const f = fixture(source, "failed", 1);
+    for (const metadata of Object.values(f.sources)) {
+      Object.assign(metadata, { attemptStatus: "available", state: "available", observedAt: now.toISOString(), attemptedAt: now.toISOString() });
+    }
+    Object.assign(f.sources[source], { state: "stale", rowCount: 2, attemptObservedCount: 1 });
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic, incompleteOnly: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual([source]);
+  });
+
+  it.each((["directory", "app_activity"] as const).flatMap(source =>
+    [true, false].map(automatic => ({ source, automatic }))))(
+    "rechecks retained $source evidence without waiting six hours, automatic: $automatic", async ({ source, automatic }) => {
+    const f = fixture(source, "failed", 1);
+    for (const metadata of Object.values(f.sources)) {
+      Object.assign(metadata, { attemptStatus: "available", observedAt: now.toISOString(), attemptedAt: now.toISOString() });
+    }
+    Object.assign(f.sources[source], { rowCount: 2, attemptObservedCount: 1 });
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic, incompleteOnly: true });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual([source]);
+    f.sources[source].state = "available";
+    f.refresh.mockClear();
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic, incompleteOnly: true });
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+
+  it("does not repeatedly recollect a fresh complete report whose identities cannot all be matched", async () => {
+    const f = fixture("app_activity", "failed", 1);
+    for (const metadata of Object.values(f.sources)) {
+      Object.assign(metadata, { attemptStatus: "available", observedAt: now.toISOString(), attemptedAt: now.toISOString() });
+    }
+    Object.assign(f.sources.app_activity, { state: "partial", rowCount: 1, attemptObservedCount: 1 });
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true });
+    expect(f.refresh).not.toHaveBeenCalled();
+  });
+
   it.each(["not_collected", "invalidated"] as const)("automatically collects both sources when saved data is %s", async state => {
     const f = fixture("app_activity", "failed", 16);
     for (const metadata of Object.values(f.sources)) {

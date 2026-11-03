@@ -14,6 +14,7 @@ import type {
   UserSourceFacts, UserSourceFilter, UserSourceMetadata, UserSourcePage,
   UserSourcePeople, UserSourceScope, UserSourceSummary, UserSourcePlan,
 } from "../types/userSources.js";
+import { hasIncompleteUserSourceCollection } from "../types/userSources.js";
 
 const queryFields = ["search", "company", "department", "entitlement", "serviceState", "activity", "sort", "order"] as const;
 const endpoint = "/user-source-facts";
@@ -226,7 +227,8 @@ export class UserSourcesRepository {
       const evaluatedAt = (await client.query("SELECT clock_timestamp() AS now")).rows[0].now as Date;
       const metadata = await this.metadataInRead(client, identity, evaluatedAt);
       const sources = Object.values(metadata);
-      const complete = sources.every(source => source.generationId !== null && source.attemptStatus === "available");
+      const complete = sources.every(source => source.generationId !== null && source.attemptStatus === "available"
+        && !hasIncompleteUserSourceCollection(source));
       const status = complete ? "succeeded" : sources.some(source => source.generationId !== null) ? "partial"
         : sources.some(source => source.attemptStatus === "waiting_authorization") ? "waiting_authorization"
           : sources.some(source => source.attemptStatus === "permission_required") ? "permission_required" : "failed";

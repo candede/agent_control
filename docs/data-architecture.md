@@ -108,6 +108,30 @@ Owners: [generations](../backend/src/db/dataGenerations.ts),
 Canonical inventory reconciles exact identities, not names. Package-record and
 logical-agent counts differ. All captured agent-capable native scopes participate
 in membership checks; environment-only records are enrichment, not agents.
+Canonical compaction preserves the compacted revision's captured source inputs,
+not the inputs of a pending or failed reconciliation.
+
+A completed, count-reconciled Power Platform catalog replaces that collector's
+older observations within its requested resource types and environment filter.
+Omitted in-scope records leave the current snapshot; this is not proof of
+provider-side deletion. Other collectors' visibility, equally new or newer
+observations, out-of-scope records and pinned history remain intact. Compaction
+preserves the original catalog provenance. Failed or incomplete collection never
+replaces the preceding snapshot. Automatic sync requires a complete unfiltered
+agents-and-environments collection without unreconciled older observations from
+that collector, so narrowed or incorrectly merged evidence is automatically
+recollected without manual sync. A genuinely different collector's visibility
+does not cause an endless automatic retry.
+
+Automatic package-detail collection treats identity-revalidation flags as pending
+even when descriptive details are fresh. Such batches use the existing
+authoritative exact-read path to re-establish identity, rather than repeatedly
+enriching descriptions while leaving identity invalidated. Failed reads retain
+the preceding evidence and the normal retry cooldown.
+Detail coverage and automatic target selection use the same complete, unexpired
+catalog and validated published-generation checks. Exact-only or expired catalogs
+do not start automatic enrichment; a successful scheduled catalog sync makes
+eligible details available without an additional approval or enable step.
 
 Absence, unavailable, null, zero and false stay distinct. Older complete evidence
 can remain readable without current management authority. Configuration/provenance
@@ -115,6 +139,8 @@ comes from the captured member; detail cannot override invalid catalog authority
 Package hosts/types/categories reconstruct from saved child facts; full About
 text uses bounded continuation. Search folding is not identity matching;
 source-qualified/native/environment IDs retain exact bounds and normalization.
+Source-reference lookups normalize Power Platform GUID casing and preserve exact,
+case-sensitive opaque native IDs and Graph package IDs.
 
 ### Maker sharing and configuration
 
@@ -346,6 +372,9 @@ Package/Studio controls require current exact identity, provider permission,
 prestate, confirmation and readback. Unknown mutation outcomes reconcile
 read-only before a separately confirmed retry. Receipts bind intent/evidence,
 not extra business approval; pending receipts fence canonical publication.
+Native control staging accepts GUID casing aliases so superseded receipts can
+settle without rewriting the captured resource. Applying a quarantine receipt
+still requires the case-exact native resource and matching current bot evidence.
 
 Audit/local mutation commit together; audit failure rolls back, never rewrites
 durable success. Append-only audit separates verified actor, `webapp|mcp|unknown`

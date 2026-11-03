@@ -178,6 +178,56 @@ describe("session-driven automatic sync admission", () => {
   }
 
   it.each(["failed", "permission_required", "waiting_authorization"] as const)(
+    "automatically admits fresh retained license evidence but preserves the %s retry cooldown", async status => {
+      const scope = owner(), principal = identity(scope);
+      const first = await repository.submitDue(scope);
+      await complete(scope, first.run!);
+      await publishFixtureDirectory(fixture.runtime, principal, [directoryUser(randomUUID())]);
+      await publishFixtureDirectory(fixture.runtime, principal, []);
+      expect((await savedUsers(scope)()).sources.directory).toMatchObject({ state: "partial", attemptStatus: "available" });
+      const recovery = await repository.submitDue(scope);
+      expect(recovery).toMatchObject({ created: true, run: { automatic: true, sources: [{ source: "users" }] } });
+      await repository.updateSource(scope, recovery.run!.id, "users", {
+        status, count: null, message: "Fixture verification did not complete.", canRetry: true,
+      });
+      await repository.finishRun(scope, recovery.run!.id);
+      expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: recovery.run!.id } });
+    },
+  );
+
+  it.each(["failed", "permission_required", "waiting_authorization"] as const)(
+    "automatically replaces narrowed native evidence and preserves the %s retry cooldown", async status => {
+      const scope = owner(), first = await repository.submitDue(scope);
+      await complete(scope, first.run!);
+      await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: ["microsoft.copilotstudio/agents"] });
+      const recovery = await repository.submitDue(scope);
+      expect(recovery).toMatchObject({ created: true, run: { automatic: true, sources: [{ source: "power_platform" }] } });
+      await repository.updateSource(scope, recovery.run!.id, "power_platform", {
+        status, count: null, message: "Synthetic native collection failure.", canRetry: true,
+      });
+      await repository.finishRun(scope, recovery.run!.id);
+      expect(await repository.submitDue(scope)).toMatchObject({ created: false, run: { id: recovery.run!.id } });
+      await publishSource(scope, "power_platform");
+      expect((await repository.listSavedSources(scope)).find(source => source.source === "power_platform")?.status).toBe("succeeded");
+      expect(await repository.submitDue(scope)).toMatchObject({ created: false });
+    },
+  );
+
+  it("preserves another collector's native observations without repeatedly retrying a complete authorized query", async () => {
+    const scope = owner(), first = await repository.submitDue(scope);
+    await complete(scope, first.run!);
+    await nativeInventoryFixture(fixture.runtime, scope, [{
+      nativeId: "visible-to-first-collector", identifiers: [], type: "microsoft.powerplatform/environments",
+    }], { resourceTypes: [...powerPlatformResourceTypes] });
+    const other = { ...scope, principalId: randomUUID() };
+    const root = await nativeInventoryFixture(fixture.runtime, other, [], { resourceTypes: [...powerPlatformResourceTypes] });
+    expect((await fixture.runtime.query("SELECT row_count FROM inventory_roots WHERE baseline_id=$1", [root.baselineId])).rows[0].row_count).toBe(1);
+    expect(await savedSourcesAvailable(other)).toBe(true);
+    expect(await repository.submitDue(other)).toMatchObject({ created: false });
+    expect(await repository.submitDue(other)).toMatchObject({ created: false });
+  });
+
+  it.each(["failed", "permission_required", "waiting_authorization"] as const)(
     "refreshes licenses after the automatic report head advances but retains the %s retry cooldown", async status => {
       const scope = owner(), principal = identity(scope);
       const saved = await seedReportSet(fixture.runtime, scope.tenantId, 1);
@@ -504,7 +554,7 @@ describe("session-driven automatic sync admission", () => {
     });
   });
 
-  it("uses the same saved source and freshness after a successful narrower Power Platform collection", async () => {
+  it("automatically restores broad coverage after a successful environment-scoped Power Platform collection", async () => {
     const scope = owner();
     const first = await repository.submitDue(scope);
     await complete(scope, first.run!);
@@ -515,6 +565,10 @@ describe("session-driven automatic sync admission", () => {
     await nativeInventoryFixture(fixture.runtime, scope, [], {
       resourceTypes: [powerPlatformResourceTypes[0]], environmentId: "environment-only",
     });
+    expect(await savedSourcesAvailable(scope)).toBe(false);
+    const recovery = await repository.submitDue(scope);
+    expect(recovery).toMatchObject({ created: true, run: { sources: [{ source: "power_platform" }] } });
+    await complete(scope, recovery.run!);
     expect(await savedSourcesAvailable(scope)).toBe(true);
     expect(await repository.submitDue(scope)).toMatchObject({ created: false });
   });

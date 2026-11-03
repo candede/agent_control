@@ -16,6 +16,7 @@ import {
 import { pool, transaction } from "./pool.js";
 import { readAutomaticInventoryRevisions } from "./inventoryAutomaticRevisions.js";
 import { directoryNeedsReportRefresh } from "./officialReportStatus.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 
 export type DataSyncScope = { tenantId: string; principalId: string };
 export type UserSourcePublication = { runId: string; jobId: string };
@@ -75,7 +76,8 @@ const savedAutomaticSourcesSql = `
         AND generation.state='published' AND generation.validated
         AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
         AND EXISTS(SELECT 1 FROM user_source_attempts proof
-          WHERE proof.generation_id=generation.id AND proof.status='available')
+          WHERE proof.generation_id=generation.id AND proof.status='available'
+            AND proof.retained_count=0)
     )
   ) ELSE EXISTS (
     SELECT 1 FROM data_scope_epochs scope
@@ -89,6 +91,22 @@ const savedAutomaticSourcesSql = `
       AND scope.selector='complete'
       AND generation.scope_epoch=scope.epoch AND generation.session_epoch=scope.session_epoch
       AND generation.validated AND generation.state IN ('published','retired')
+      AND (requested.source_id<>'power_platform' OR EXISTS(
+        SELECT 1 FROM inventory_attempts proof JOIN data_generations collected ON collected.id=proof.generation_id
+        WHERE proof.scope_id=scope.id AND proof.channel='catalog' AND proof.read_started_at=root.catalog_observed_at
+          AND proof.environment_id IS NULL
+          AND proof.resource_types @> ARRAY[${powerPlatformResourceTypes.map(type => `'${type}'`).join(",")}]::text[]
+          AND collected.validated AND collected.state IN ('published','retired')
+          AND collected.scope_epoch=scope.epoch AND collected.session_epoch=scope.session_epoch
+          AND collected.actor_principal_id IS NOT NULL AND NOT EXISTS(
+            SELECT 1 FROM inventory_memberships member JOIN power_platform_record_rows record
+              ON record.generation_id=member.generation_id AND record.identity=member.identity
+            JOIN data_generations observed ON observed.id=coalesce(record.catalog_generation,record.generation_id)
+            WHERE member.baseline_id=root.baseline_id AND member.valid_from_revision<=root.revision
+              AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
+              AND observed.actor_principal_id=collected.actor_principal_id AND record.read_started_at<collected.observed_at
+          )
+      ))
   ) END AS available FROM unnest($3::text[]) requested(source_id)`;
 
 export class DataSyncRepository {
@@ -498,10 +516,11 @@ async function readRun(database: Pick<pg.Pool, "query">, scope: DataSyncScope, i
 }
 
 async function readLatestRun(database: Pick<pg.Pool, "query">, scope: DataSyncScope) {
-  // Retrying a retained run updates its activity, not its original start time.
+  // Retained upload completion must not hide active work; retries otherwise sort by activity.
   const result = await database.query<{ id: string }>(`SELECT id FROM data_sync_runs
     WHERE tenant_id=$1 AND principal_id=$2 AND expires_at>clock_timestamp()
-    ORDER BY updated_at DESC,started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
+    ORDER BY (status IN ('running','waiting')) DESC,
+      updated_at DESC,started_at DESC,id DESC LIMIT 1`, [scope.tenantId, scope.principalId]);
   return result.rows[0] ? readRun(database, scope, result.rows[0].id) : undefined;
 }
 

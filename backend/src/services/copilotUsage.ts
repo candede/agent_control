@@ -8,7 +8,7 @@ import { UserSourcesRepository } from "../db/userSources.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import type { AuthenticatedUser } from "../types/session.js";
-import type { UserSourceKind, UserSourceMetadata } from "../types/userSources.js";
+import { hasIncompleteUserSourceCollection, type UserSourceKind, type UserSourceMetadata } from "../types/userSources.js";
 import { automaticDataSyncIntervalMs, automaticDataSyncRetryIntervalMs } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
 import { capabilities } from "./capabilities.js";
@@ -65,13 +65,14 @@ export class CopilotUsageService {
     const reportChanged = (options.automatic || options.incompleteOnly) && await directoryNeedsReportRefresh(this.database, scope);
     fence();
     const due = (source: UserSourceMetadata) => {
-      if (!options.automatic) return source.source === "directory" && reportChanged
+      const sourceIncomplete = hasIncompleteUserSourceCollection(source);
+      if (!options.automatic) return sourceIncomplete || source.source === "directory" && reportChanged
         || !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
       if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
       if (source.attemptedAt && source.attemptStatus !== "available")
         return Date.now() - Date.parse(source.attemptedAt) >= automaticDataSyncRetryIntervalMs;
-      return source.source === "directory" && reportChanged || !source.generationId || !source.observedAt
+      return sourceIncomplete || source.source === "directory" && reportChanged || !source.generationId || !source.observedAt
         || Date.now() - Date.parse(source.observedAt) >= automaticDataSyncIntervalMs;
     };
     const requested = (["directory", "app_activity"] as const).filter(source => due(before.sources[source]));
@@ -123,9 +124,9 @@ export class CopilotUsageService {
           // Each source's published attempt is terminal in this transaction. The
           // shared Users job remains running until both sources and people settle.
           await client.query(`UPDATE data_sync_run_sources SET updated_at=clock_timestamp(),
-            count=CASE WHEN $5='directory' THEN $6 ELSE count END
+            count=CASE WHEN $5='directory' THEN (SELECT observed_count FROM user_source_attempts WHERE generation_id=$6) ELSE count END
             WHERE run_id=$1 AND tenant_id=$2 AND principal_id=$3 AND job_id=$4 AND source_id='users' AND status='running'`,
-          [options.publication.runId, scope.tenantId, scope.principalId, options.publication.jobId, result.source, result.rows]);
+          [options.publication.runId, scope.tenantId, scope.principalId, options.publication.jobId, result.source, result.generationId]);
           sourceFence();
         },
       }), { signal });

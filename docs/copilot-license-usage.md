@@ -51,6 +51,18 @@ Office collection does not require agent CSVs or inventory.
 Saved data is tenant-shared. Viewing, filtering and exporting do not call Microsoft
 Graph. A changed usable default agent report automatically makes directory
 verification due; newly reported identities remain license-unknown until it succeeds.
+Each directory refresh also rechecks previously saved users by their immutable
+object IDs, even when they no longer have a Copilot license or appear in the latest
+agent reports. Changed licenses replace the saved evidence; users confirmed absent
+by a complete exact-ID query leave the current snapshot. A failed or incomplete
+query preserves the preceding snapshot rather than treating missing users as removed.
+Saved license evidence containing users not yet rechecked is automatically
+reverified on the next eligible check, without waiting for the normal six-hour
+refresh or requiring **Sync users**. Failed attempts retain the normal retry backoff.
+Until that recheck completes, Users sync remains partial and its checked count
+excludes retained users that were not rechecked. Stale source metadata does not
+hide incomplete collection. A fully collected Office report does not require
+recollection solely because some identities cannot be matched.
 
 ## 1. Review users
 
@@ -157,7 +169,10 @@ agent activity do not count. These views measure no prompts, productivity or ROI
 
 Check **Activity report coverage**: incomplete coverage makes participation a
 confirmed lower bound. Blank dates can reflect reporting delay or a new license.
-Retained unseen rows keep original dates and remain unknown, not never-used.
+A completed D28/v2 report replaces the preceding current report, including
+omissions; omitted people remain unknown, not never-used. Failed or incomplete
+downloads preserve the preceding good report. Previously merged report rows are
+automatically recollected without manual sync, independently of license data.
 
 ### History and comparisons
 

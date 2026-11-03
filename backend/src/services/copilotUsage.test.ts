@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { testDatabase } from "../../scripts/testDatabase.js";
 import { generationInput } from "../../scripts/largeTenantFixtures.js";
+import { publishFixtureDirectory } from "../../scripts/userSourceFixture.js";
 import { seedReportSet } from "../../scripts/officialReportFixtures.js";
 import { nativeInventoryFixture, reconcileInventoryFixture, streamedPackageFixture } from "../../scripts/inventoryFixtures.js";
 import { DataSyncRepository, requireUserPublication } from "../db/dataSync.js";
@@ -183,6 +184,38 @@ describe("live Users orchestration and publication boundary", () => {
     await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true });
     expect(h.fetcher).toHaveBeenCalledOnce();
     expect(String(h.fetcher.mock.calls[0][0])).toContain("getMicrosoft365CopilotUsageUserDetail");
+  });
+  it("automatically repairs fresh retained license evidence without a manual Users sync", async () => {
+    const h = await harness();
+    await h.seed("directory");
+    await publishFixtureDirectory(fixture.runtime, h.identity, []);
+    await h.seed("app_activity");
+    const before = await h.status();
+    expect(before.sources.directory).toMatchObject({ state: "partial", attemptStatus: "available", rowCount: 1 });
+    h.fetcher.mockImplementation(async target => {
+      const url = new URL(String(target));
+      if (url.pathname.endsWith("/subscribedSkus")) {
+        return Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] });
+      }
+      if (url.searchParams.get("$filter")!.includes("assignedLicenses/any")) {
+        return Response.json({ value: [], "@odata.count": 0 });
+      }
+      expect(url.searchParams.get("$filter")).toBe(`id eq '${objectId}'`);
+      return Response.json({ value: [{ ...graphUser(), assignedLicenses: [], assignedPlans: [] }], "@odata.count": 1 });
+    });
+    h.fetcher.mockClear();
+    expect(await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true }))
+      .toMatchObject({ status: "succeeded", count: 1 });
+    const after = await h.status();
+    expect(after.sources.directory).toMatchObject({ state: "available", attemptStatus: "available", rowCount: 1 });
+    expect(after.sources.directory.generationId).not.toBe(before.sources.directory.generationId);
+    expect(after.sources.app_activity.generationId).toBe(before.sources.app_activity.generationId);
+    expect(h.fetcher).toHaveBeenCalledTimes(3);
+    const selected = await h.sources.capture(h.identity);
+    expect((await h.sources.page(selected.id, h.identity, {})).summary).toMatchObject({ licensedUsers: 0, noPaidUsers: 1 });
+    h.fetcher.mockClear();
+    await h.service.refreshUsers(h.user, undefined, { publication: h.publication, automatic: true });
+    expect(h.fetcher).not.toHaveBeenCalled();
   });
   it("backs off failed automatic attempts but never reports false success", async () => {
     const h = await harness();

@@ -94,11 +94,11 @@ describe("typed immutable inventory verification", () => {
     await reconcileInventoryFixture(fixture.runtime, scope);
     const selected = await inventorySelectionFixture(fixture.runtime, scope);
     const page = inventoryPresentation(selected.raw);
-    expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["current-global-agent", "obsolete-global-agent", "scoped-only-agent"]);
+    expect(page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["obsolete-global-agent", "scoped-only-agent"]);
     expect(page.value.every(row => row.environment?.displayName === "Finance production")).toBe(true);
     expect(page.value.find(row => row.powerPlatformResource?.nativeId === "obsolete-global-agent")?.observations.powerPlatform?.snapshotId).toBe(broad.baselineId);
     expect(inventorySourceStatuses(selected.raw.freshness.sources, selected.raw.selection.evaluatedAt as Date).powerPlatform)
-      .toMatchObject({ state: "partial", observation: { snapshotId: scoped.baselineId, environmentScope: environmentId, observedCount: 1, totalRecords: 4 } });
+      .toMatchObject({ state: "partial", observation: { snapshotId: scoped.baselineId, environmentScope: environmentId, observedCount: 1, totalRecords: 3 } });
     await expect(new LiveInventory(fixture.runtime).record(scope,
       unifiedAgentRecordId({ source: "power_platform", nativeId: "obsolete-global-agent", environmentId })))
       .resolves.toMatchObject({ native: { resource: { nativeId: "obsolete-global-agent" } } });
@@ -121,7 +121,7 @@ describe("typed immutable inventory verification", () => {
     await reconcileInventoryFixture(fixture.runtime, scope);
     const second = await inventorySelectionFixture(fixture.runtime, scope);
     const current = inventoryPresentation(second.raw);
-    expect(current.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "deleted", "retained"]);
+    expect(current.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "retained"]);
     expect(current.value.find(row => row.powerPlatformResource?.nativeId === "retained")?.id).toBe(retainedId);
     expect(current.value.every(row => row.environment?.displayName === "Original environment")).toBe(true);
     const historical = await first.queries.page(first.selection.id, first.identity);
@@ -144,8 +144,8 @@ describe("typed immutable inventory verification", () => {
     await nativeInventoryFixture(fixture.runtime, scope, [], { resourceTypes: [agentType] });
     await reconcileInventoryFixture(fixture.runtime, scope);
     const empty = inventoryPresentation((await inventorySelectionFixture(fixture.runtime, scope)).raw);
-    expect(empty.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["added", "deleted", "retained"]);
-    expect(empty.counts.total).toBe(3);
+    expect(empty.value).toEqual([]);
+    expect(empty.counts.total).toBe(0);
     expect(empty.sources.powerPlatform).toMatchObject({ state: "partial",
       observation: { observedCount: 0, coverage: "unknown", verification: null } });
   });

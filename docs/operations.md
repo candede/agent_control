@@ -83,6 +83,9 @@ Saved reloads read PostgreSQL, not Microsoft; complete data stays readable durin
 Running counts are not totals/ETAs; concurrent durations overlap.
 Filters, history and `/sync?syncRun=<id>` never submit new work.
 
+Office report collection preserves cancellation and authorization diagnostics,
+including during download cleanup, without starting another download retry.
+
 ### Package and Studio job recovery
 
 Inspect the saved job before starting another:

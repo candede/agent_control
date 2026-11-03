@@ -252,6 +252,24 @@ describe("native quarantine receipt settlement", () => {
       expect(saved.native_id).toBe(previous.native_id);
       expect(saved.residual.details).toMatchObject({ isQuarantined: scenario === "same-resource" || scenario === "repeated-evidence" });
       expect(saved.factSource).toMatchObject({ generationId: previousId, identity: previous.identity });
+
+      vi.mocked(stream.stages.fence).mockResolvedValue({
+        state: "staging", batch_count: 0, byte_count: "0", reserved_bytes: String(input.reserveBytes * 1024),
+      });
+      vi.mocked(client.query).mockImplementation(async statement => {
+        const sql = String(statement);
+        if (sql.startsWith("SELECT * FROM inventory_attempts")) return rows([{
+          domain: "power_platform", mode: "delta", channel: "control", exact_targets: [nativeId],
+          resource_types: ["microsoft.copilotstudio/agents"], baseline_id: previousId, base_revision: "1",
+        }]);
+        if (sql.startsWith("SELECT max(octet_length")) return rows([{ observed: "1024" }]);
+        if (sql.startsWith("SELECT 1 FROM inventory_memberships")) return rows([{}]);
+        if (sql.startsWith("WITH candidates")) return rows([{ count: 0, bytes: "0", last: null }]);
+        return rows([]);
+      });
+      const abort = vi.spyOn(stream.stages.generations, "abort").mockResolvedValue(undefined);
+      await expect(stream.stages.append(lease, [saved])).resolves.toMatchObject({ rows: 1, replay: false });
+      expect(abort).not.toHaveBeenCalled();
     },
   );
 });

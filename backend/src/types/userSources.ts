@@ -32,6 +32,10 @@ export type UserSourceMetadata = {
   period: "D28" | "D30" | null;
   reportVersion: "v1" | "v2" | null;
 };
+export function hasIncompleteUserSourceCollection(source: UserSourceMetadata): boolean {
+  return source.attemptStatus === "available" && source.state !== "available" && (source.source === "directory" && source.state === "partial"
+    || source.rowCount !== null && source.attemptObservedCount !== null && source.rowCount > source.attemptObservedCount);
+}
 export type UserSourceFacts = {
   directory: CopilotDirectoryIdentity;
   copilotServiceState: CopilotServiceSummaryState;

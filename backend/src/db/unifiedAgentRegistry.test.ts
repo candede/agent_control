@@ -70,6 +70,13 @@ describe("typed canonical identity registry", () => {
     expect(new Set(stored.map(row => row.identity))).toEqual(new Set([record.id.slice(6)]));
     expect(stored.filter(row => row.domain === "packages").map(row => row.native_id).sort()).toEqual([...ids].sort());
     expect(JSON.stringify(stored.map(row => row.residual))).not.toContain("Private provider payload");
+    for (const nativeId of ids) {
+      const references = await result.queries.sourceReferences(result.selection.id, result.identity, [
+        { domain: "packages", nativeId, environmentId: null },
+      ]);
+      expect(references).toHaveLength(1);
+      expect(references[0]).toMatchObject({ canonical_id: record.id.slice(6), native_id: nativeId });
+    }
     const first = await result.queries.members(result.selection.id, result.identity, record.id.slice(6), { limit: 2 });
     expect(first.value).toHaveLength(2);
     expect(first.total).toBe(5);
@@ -215,11 +222,24 @@ describe("typed canonical identity registry", () => {
         === (nativeId.toLowerCase() === nativeGuid ? nativeGuid.toUpperCase() : nativeId))!;
       expect(selected.value[0].id).toBe(expected.id);
       expect((await new LiveInventory(fixture.runtime).record(scope, recordId)).id).toBe(expected.id);
+      const references = await result.queries.sourceReferences(result.selection.id, result.identity, [
+        { domain: "power_platform", nativeId, environmentId },
+      ]);
+      expect(references).toHaveLength(1);
+      expect(references[0]).toMatchObject({
+        canonical_id: expected.id.slice(6), native_id: expected.powerPlatformResource!.nativeId,
+      });
     }
     const wrongEnvironment = inventoryPresentation(await result.queries.page(result.selection.id, result.identity, {
       recordId: `power_platform::${nativeGuid}`, limit: 2,
     }));
     expect(wrongEnvironment.value).toEqual([]);
+    for (const reference of [
+      { domain: "power_platform" as const, nativeId: nativeGuid, environmentId: null },
+      { domain: "power_platform" as const, nativeId: "OPAQUE/Native", environmentId },
+    ]) {
+      await expect(result.queries.sourceReferences(result.selection.id, result.identity, [reference])).resolves.toEqual([]);
+    }
   });
 
   it("admits unified export audit events only with null blocked state", async () => {

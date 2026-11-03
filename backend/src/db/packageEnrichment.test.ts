@@ -12,6 +12,9 @@ import type { CopilotPackageDetail } from "../types/copilotPackage.js";
 import { automaticDataSyncIntervalMs } from "../types/dataSync.js";
 import { PackageRefreshJobs, type PackageDataScope } from "./packageRefreshJobs.js";
 import { verifySchema } from "./schema.js";
+import { publishPackageReadback } from "./packageControls.js";
+import { capturePackageMutationState } from "../services/packageMutationState.js";
+import { transaction } from "./pool.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>, jobs: PackageRefreshJobs;
 const selections: Awaited<ReturnType<typeof inventorySelectionFixture>>[] = [];
@@ -76,6 +79,42 @@ async function targetIds(owner: PackageDataScope, job: Job) {
 }
 
 describe("streamed catalog and bounded automatic detail enrichment", () => {
+  it.each([false, true])("automatically revalidates fresh-but-conflicted identity without manual sync (failure=%s)", async failure => {
+    const owner = scope();
+    await publish(owner, [summary()]);
+    await publish(owner, [detail()], ["one"]);
+    const changed = { ...detail("one", "2"), isBlocked: true };
+    await transaction(fixture.runtime, client => publishPackageReadback(owner, changed, client, null,
+      capturePackageMutationState(changed, "block")));
+    await reconcileInventoryFixture(fixture.runtime, owner);
+    expect((await read(owner)).detail).toMatchObject({
+      identityRevalidationRequired: true, detailFreshness: { state: "fresh" }, isBlocked: true,
+    });
+    const before = await inventorySelectionFixture(fixture.runtime, owner);
+    selections.push(before);
+    expect(before.raw.verificationCounts).toMatchObject({ checked_packages: 0, invalidated_packages: 1, stale_packages: 0 });
+    expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 1, fresh: 0, eligible: 1 });
+    const automatic = await claim(owner);
+    if (failure) {
+      await expect(collect(owner, automatic, [changed], { failureId: "one" })).rejects.toThrow();
+      await jobs.markFailed(owner, automatic.id, "provider_error", "Synthetic provider failure.");
+      expect((await read(owner)).detail).toMatchObject({
+        version: "1", identityRevalidationRequired: true, detailFreshness: { state: "fresh" },
+      });
+      expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 1, fresh: 0, eligible: 0 });
+    } else {
+      await collect(owner, automatic, [changed]);
+      const current = (await read(owner)).detail;
+      expect(current).toMatchObject({ version: "2", identityDetailsCollected: true, detailFreshness: { state: "fresh" }, isBlocked: true });
+      expect(current).not.toHaveProperty("identityRevalidationRequired");
+      expect(await jobs.detailCoverage(owner)).toEqual({ catalog_available: true, total: 1, fresh: 1, eligible: 0 });
+      await reconcileInventoryFixture(fixture.runtime, owner);
+      const after = await inventorySelectionFixture(fixture.runtime, owner);
+      selections.push(after);
+      expect(after.raw.verificationCounts).toMatchObject({ checked_packages: 1, invalidated_packages: 0, stale_packages: 0 });
+    }
+    expect(await jobs.claimDueDetails(owner, owner.principalId)).toBeNull();
+  });
   it("collects and pages sharing evidence through automatic detail sync, compatible catalog refresh and canonical sections", async () => {
     const owner = scope();
     const recipients = [

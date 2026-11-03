@@ -53,6 +53,7 @@ export type DataSyncRun = {
 export type DataSyncState = {
   onboardingRequired: boolean;
   usageImportRequired: boolean;
+  /** Active run first; otherwise the retained run with the most recent activity. */
   run: DataSyncRun | null;
   /** Last successful saved-data markers, independent of the latest run's attempts. */
   sources: DataSyncSourceStatus[];

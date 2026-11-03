@@ -6,6 +6,7 @@ import { DataGenerations, type BeginGeneration, type GenerationLease } from "./d
 import { inventoryLimits, type InventoryDomain, type InventoryPageReceipt, type InventoryRoot } from "../types/inventoryRecords.js";
 import type { InventoryRecord } from "../services/inventoryRecordProjection.js";
 import { normalizeEnvironmentIdentity, normalizeNativeIdentity } from "../services/inventoryIdentity.js";
+import { normalizeEnvironmentIdentitySql } from "./inventoryIdentityNormalization.js";
 
 const inventoryTables = { packages: "package_record_rows", power_platform: "power_platform_record_rows", canonical: "unified_agent_rows" } as const;
 export type InventoryIntent = {
@@ -189,9 +190,15 @@ export class InventoryGenerations {
       if (generation.state !== "staging") throw new Error("data_not_staging");
       const attempt = (await client.query("SELECT * FROM inventory_attempts WHERE generation_id=$1", [lease.id])).rows[0];
       for (const row of rows) {
-        if (attempt.domain !== "canonical" && attempt.mode === "delta"
-          && !(attempt.target_job_id ? (await client.query("SELECT 1 FROM inventory_refresh_targets WHERE job_id=$1 AND target_id=$2",
-            [attempt.target_job_id, row.native_id])).rowCount : attempt.exact_targets.includes(row.native_id))) throw new Error("inventory_exact_target_mismatch");
+        if (attempt.domain !== "canonical" && attempt.mode === "delta") {
+          const matchesTarget = attempt.target_job_id
+            ? (await client.query("SELECT 1 FROM inventory_refresh_targets WHERE job_id=$1 AND target_id=$2",
+              [attempt.target_job_id, row.native_id])).rowCount
+            : attempt.exact_targets.some((target: string) => target === row.native_id
+              || attempt.domain === "power_platform" && attempt.channel === "control"
+                && normalizeNativeIdentity(target) === normalizeNativeIdentity(row.native_id));
+          if (!matchesTarget) throw new Error("inventory_exact_target_mismatch");
+        }
         if (attempt.domain === "power_platform" && (normalizeNativeIdentity(String(row.residual.tenantId ?? "")) !== normalizeNativeIdentity(lease.tenantId)
           || attempt.environment_id && normalizeEnvironmentIdentity(row.environment_id ?? "") !== normalizeEnvironmentIdentity(attempt.environment_id)
           || !attempt.resource_types.includes(row.resource_type))) throw new Error("inventory_resource_scope");
@@ -413,7 +420,18 @@ export class InventoryGenerations {
               ? (await client.query(`SELECT identity,generation_id FROM inventory_memberships m
                 WHERE ${inventoryAsOf()} AND identity>$3
                 ${phase==="unseen" ? `AND NOT EXISTS(SELECT 1 FROM inventory_keys k WHERE k.generation_id=$4 AND k.identity=m.identity)` : ""}
-                ORDER BY identity LIMIT 250`,phase==="unseen" ? [a.baseline_id,a.base_revision,after,lease.id] : [a.baseline_id,a.base_revision,after])).rows
+                ${phase==="unseen" && a.domain==="power_platform" ? `AND EXISTS(
+                  SELECT 1 FROM power_platform_record_rows prior
+                  JOIN data_generations observed ON observed.id=coalesce(prior.catalog_generation,prior.generation_id)
+                  JOIN data_generations incoming ON incoming.id=$4
+                  WHERE prior.generation_id=m.generation_id AND prior.identity=m.identity
+                    AND (incoming.actor_principal_id IS NULL OR observed.actor_principal_id IS DISTINCT FROM incoming.actor_principal_id
+                      OR prior.read_started_at>=incoming.observed_at OR NOT (prior.resource_type=ANY($5::text[]) AND ($6::text IS NULL
+                        OR ${normalizeEnvironmentIdentitySql("prior.environment_id")} IS NOT DISTINCT FROM $6))))` : ""}
+                ORDER BY identity LIMIT 250`,phase==="unseen"
+                  ? [a.baseline_id,a.base_revision,after,lease.id,...(a.domain==="power_platform"
+                    ? [a.resource_types,a.environment_id ? normalizeEnvironmentIdentity(a.environment_id) : null] : [])]
+                  : [a.baseline_id,a.base_revision,after])).rows
               : (await client.query(`SELECT identity,source_generation_id AS generation_id FROM inventory_compaction_refs
                 WHERE generation_id=$1 AND identity>$2 ORDER BY identity LIMIT 250`,[lease.id,after])).rows;
             last = rows.at(-1)?.identity;
@@ -466,7 +484,8 @@ export class InventoryGenerations {
       [baseline,lease.scopeId,revision])).rows[0];
       if (!root) throw new Error("inventory_prepared_root_fenced");
       await this.publishExactHeads(client,lease,a,baseline,root.observation_epoch);
-      return this.finishPublication(client,lease,baseline,revision,root.row_count,0,a.prepared_changed_count,root.row_count);
+      return this.finishPublication(client,lease,baseline,revision,root.row_count,0,a.prepared_changed_count,root.row_count,
+        a.mode==="compact" ? a.base_revision : null);
     }
     if ((await client.query("SELECT baseline_id FROM inventory_roots WHERE baseline_id=$1 AND current AND revision=$2 FOR UPDATE",
       [baseline, a.base_revision])).rowCount !== 1) throw new Error("inventory_head_conflict");
@@ -501,7 +520,7 @@ export class InventoryGenerations {
       [lease.id, lease.scopeId, lease.tenantId, revision, baseline])).rowCount ?? 0;
     const priorCount = exactCount((await client.query("SELECT row_count FROM inventory_roots WHERE baseline_id=$1", [baseline])).rows[0].row_count);
     const effectiveCount = priorCount + inserted - closed;
-    return this.finishPublication(client,lease,baseline,revision,inserted,closed,changes,effectiveCount);
+    return this.finishPublication(client,lease,baseline,revision,inserted,closed,changes,effectiveCount,null);
   }
 
   private async publishExactHeads(client: pg.PoolClient,lease: GenerationLease,a: pg.QueryResultRow,baseline: string,epoch: string) {
@@ -512,12 +531,14 @@ export class InventoryGenerations {
   }
 
   private async finishPublication(client: pg.PoolClient,lease: GenerationLease,baseline: string,revision: string,
-    inserted: number,closed: number,changes: number,effectiveCount: number) {
+    inserted: number,closed: number,changes: number,effectiveCount: number,compactedRevision: string | null) {
     await client.query(`UPDATE inventory_roots SET revision=$2,row_count=$3 WHERE baseline_id=$1`, [baseline, revision, effectiveCount]);
     await client.query(`INSERT INTO inventory_revisions(scope_id,tenant_id,revision,baseline_id,generation_id,inputs,row_count)
-      VALUES($1,$2,$3,$4,$5,coalesce((SELECT active_inputs FROM inventory_reconciliation WHERE scope_id=$1),'[]'::jsonb),
+      VALUES($1,$2,$3,$4,$5,CASE WHEN $6::bigint IS NOT NULL
+        THEN (SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$6)
+        ELSE coalesce((SELECT active_inputs FROM inventory_reconciliation WHERE scope_id=$1),'[]'::jsonb) END,
         (SELECT row_count FROM inventory_roots WHERE baseline_id=$4))`,
-    [lease.scopeId, lease.tenantId, revision, baseline, lease.id]);
+    [lease.scopeId, lease.tenantId, revision, baseline, lease.id,compactedRevision]);
     return { scopeId: lease.scopeId, tenantId: lease.tenantId, baselineId: baseline as string, revision, epoch: lease.epoch,
       inserted, closed, changed: changes };
   }

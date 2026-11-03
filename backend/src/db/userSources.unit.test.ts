@@ -45,6 +45,30 @@ function fixture() {
   return { repository, query, client, context };
 }
 
+describe("source refresh completion", () => {
+  it.each([
+    { source: "directory", state: "partial", observed: 2, status: "partial", count: 2 },
+    { source: "directory", state: "partial", observed: null, status: "partial", count: null },
+    { source: "directory", state: "stale", observed: 2, status: "partial", count: 2 },
+    { source: "app_activity", state: "partial", observed: 2, status: "partial", count: 3 },
+    { source: "app_activity", state: "stale", observed: 2, status: "partial", count: 3 },
+    { source: "app_activity", state: "partial", observed: 3, status: "succeeded", count: 3 },
+    { source: "app_activity", state: "partial", observed: null, status: "succeeded", count: 3 },
+    { source: "directory", state: "available", observed: 3, status: "succeeded", count: 3 },
+    { source: "directory", state: "stale", observed: 3, status: "succeeded", count: 3 },
+  ] as const)("reports $source $state evidence with $observed checked rows as $status", async ({ source, state, observed, status, count }) => {
+    const { repository, query, client, context } = fixture();
+    context.metadata.app_activity = { ...context.metadata.directory, source: "app_activity" };
+    Object.assign(context.metadata[source], { state, attemptObservedCount: observed });
+    vi.spyOn(repository.connections, "selectedRead").mockImplementation(async work => work(client));
+    vi.spyOn(repository, "metadataInRead").mockResolvedValue(context.metadata);
+    query.mockImplementation(async statement => result(typeof statement === "string" && statement.includes("clock_timestamp()")
+      ? [{ now: at }] : [{ epoch: identity.sessionEpoch }]));
+
+    await expect(repository.refreshStatus(identity)).resolves.toMatchObject({ status, count, sources: context.metadata });
+  });
+});
+
 describe("wide normalized source cursor boundaries", () => {
   it.each(["users", "facets"] as const)("keeps legal Unicode %s pages navigable within 4 KiB", async endpoint => {
     const { repository, query } = fixture();

@@ -183,10 +183,28 @@ export class StreamedInventory {
     }, options);
   }
 
-  exactJob(input: BeginGeneration, token: string, detailOnly: boolean,
+  async exactJob(input: BeginGeneration, token: string, detailOnly: boolean,
     options: Parameters<InventoryGenerations["execute"]>[3] & PackageReadOptions & { onProgress?: (value: { pages: number; observedCount: number }) => Promise<void> }) {
     if (!input.jobId) throw new Error("inventory_exact_targets");
-    return this.stages.execute(input, { domain: "packages", mode: "delta", channel: detailOnly ? "detail" : "exact", targetJobId: input.jobId }, async (lease, signal) => {
+    let channel: "detail" | "exact" = detailOnly ? "detail" : "exact";
+    if (detailOnly) {
+      options.signal?.throwIfAborted();
+      options.assertCurrent?.();
+      const { rows } = await this.stages.generations.connections.run(client => client.query<{ required: boolean }>(`
+        SELECT EXISTS(
+          SELECT 1 FROM inventory_refresh_targets target
+          JOIN data_scope_epochs scope ON scope.tenant_id=$2 AND scope.scope_kind='tenant'
+            AND scope.token_mode='tenant' AND scope.source='inventory_packages' AND scope.selector='complete'
+          JOIN inventory_roots root ON root.scope_id=scope.id AND root.current
+          JOIN inventory_memberships member ON member.baseline_id=root.baseline_id AND member.identity=target.target_id
+            AND member.valid_from_revision<=root.revision AND (member.valid_to_revision IS NULL OR member.valid_to_revision>root.revision)
+          JOIN package_record_rows record ON record.generation_id=member.generation_id AND record.identity=member.identity
+          WHERE target.job_id=$1 AND record.residual->>'identityRevalidationRequired'='true'
+        ) AS required`, [input.jobId, input.scope.tenantId]), false, options.signal, undefined, options.assertCurrent);
+      if (!rows[0]) throw new Error("inventory_detail_revalidation_missing");
+      if (rows[0].required) channel = "exact";
+    }
+    return this.stages.execute(input, { domain: "packages", mode: "delta", channel, targetJobId: input.jobId }, async (lease, signal) => {
       if (detailOnly) {
         const count = (await this.stages.database.query("SELECT count(*)::int AS count FROM inventory_refresh_targets WHERE job_id=$1", [input.jobId])).rows[0].count;
         if (!count || count > 20) throw new Error("inventory_detail_targets");
@@ -204,7 +222,7 @@ export class StreamedInventory {
         encodeBatch(targets);
         for (const target of targets) {
           signal.throwIfAborted();
-          const found = await this.exactPackageObservation(lease, token, target.target_id, detailOnly ? "detail" : "exact",
+          const found = await this.exactPackageObservation(lease, token, target.target_id, channel,
             this.packageReadOptions(lease, options, signal, input.deadlineAt));
           options.diagnostics?.completeDetail(found);
           observedCount++;

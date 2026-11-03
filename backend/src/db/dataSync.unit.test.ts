@@ -47,6 +47,37 @@ describe("provider source job authority", () => {
   });
 });
 
+describe("current data sync run selection", () => {
+  it.each(["running", "waiting"] as const)(
+    "prioritizes a %s run over recently reconciled terminal history", async status => {
+      const database = new pg.Pool({ max: 4 });
+      const scope = { tenantId: "synthetic-current-run", principalId: "synthetic-viewer" };
+      const runId = randomUUID(), now = new Date();
+      const result = (rows: object[]): pg.QueryResult => ({
+        command: "SELECT", rowCount: rows.length, oid: 0, fields: [], rows,
+      });
+      const query = vi.spyOn(database, "query")
+        .mockResolvedValueOnce(result([{ id: runId }]))
+        .mockResolvedValueOnce(result([{
+          id: runId, mode: "incremental", status, started_at: now, updated_at: now,
+          completed_at: null, automatic: true,
+        }]))
+        .mockResolvedValueOnce(result([]));
+      try {
+        await expect(new DataSyncRepository(database).getLatestRun(scope)).resolves.toMatchObject({
+          id: runId, status, automatic: true,
+        });
+        expect(query).toHaveBeenNthCalledWith(1, expect.stringMatching(
+          /ORDER BY \(status IN \('running','waiting'\)\) DESC,\s*updated_at DESC,started_at DESC,id DESC LIMIT 1/,
+        ), [scope.tenantId, scope.principalId]);
+        expect(query).toHaveBeenNthCalledWith(2, expect.stringContaining(
+          "WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND expires_at>clock_timestamp()",
+        ), [runId, scope.tenantId, scope.principalId]);
+      } finally { await database.end(); }
+    },
+  );
+});
+
 describe("data sync run completion", () => {
   it.each([
     { status: "succeeded", aggregate: "completed", terminal: true },

@@ -249,17 +249,17 @@ describe("retained Office SQL/publication/lifecycle",()=>{
     await expect(reads.context(selectionIdentity,{},first.selection.id)).rejects.toMatchObject({ code:"selection_invalidated" });
     expect((await reads.summary(selectionIdentity,{})).organization).toMatchObject({ reportedActiveUsers:2,activeUserAppPairs:3 });
   });
-  it("retains unseen rows and identities as unknown, never current participation even when their dates remain in-window",async()=>{
+  it("replaces omitted report rows with unknown evidence while preserving unverified directory identities",async()=>{
     await seed();
     await publishOfficeSource(fixture.runtime,"app_activity",[officeFixtureActivity(2,{ word_date:date })]);
     const summary=await reads.summary(selectionIdentity,{});
     expect(summary.organization).toMatchObject({ reportedActiveUsers:1,unknownEvidencePeople:1,noRecentEvidencePeople:1 });
-    expect(summary.context.observation?.coverage.retainedRows).toBe(1);
+    expect(summary.context.observation?.coverage.retainedRows).toBe(0);
     const group=(await reads.groups(selectionIdentity,{})).value[0];
     const people=(await reads.people(selectionIdentity,{},group.id)).value;
-    expect(people[0].dates.word).toBe(date);
+    expect(people[0].dates.word).toBeNull();
     expect(people[0].recentApps).toEqual([]);
-    expect(people[0].unknownReasons).toContain("retained_row");
+    expect(people[0].unknownReasons).toContain("missing_row");
     await publishOfficeSource(fixture.runtime,"directory",[officeFixturePerson(2)]);
     expect((await reads.context(selectionIdentity,{})).observation?.coverage.unknownReasons.retained_directory).toBe(1);
   });

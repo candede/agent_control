@@ -503,7 +503,7 @@ describe("package stream request and publication fencing without a database", ()
       command: "SELECT", oid: 0, fields: [], rowCount: 1, rows: [{ count: 2 }],
     });
     f.query.mockImplementation(async statement => {
-      const rows = String(statement).includes("SELECT ordinal,target_id")
+      const rows = String(statement).includes("AS required") ? [{ required: false }] : String(statement).includes("SELECT ordinal,target_id")
         ? [{ ordinal: 0, target_id: "first" }, { ordinal: 1, target_id: "second" }] : [];
       return { command: "", oid: 0, fields: [], rowCount: rows.length, rows };
     });
@@ -531,12 +531,13 @@ describe("package stream request and publication fencing without a database", ()
     expect(getEventListeners(f.signal, "abort")).toHaveLength(0);
   });
 
-  it.each(["exact", "exactJob", "details", "detailJob"] as const)(
-    "only manual exact reads tombstone provider-confirmed absence (%s)", async mode => {
+  it.each(["exact", "exactJob", "details", "detailJob", "revalidationJob"] as const)(
+    "only authoritative exact reads tombstone provider-confirmed absence (%s)", async mode => {
       const f = collectionFixture();
       f.fetcher.mockResolvedValue(Response.json({ error: { code: "ResourceNotFound" } }, { status: 404 }));
       f.query.mockImplementation(async (statement, parameters) => {
-        const rows = String(statement).includes("SELECT ordinal,target_id") && parameters?.[1] === -1
+        const rows = String(statement).includes("AS required") ? [{ required: mode === "revalidationJob" }]
+          : String(statement).includes("SELECT ordinal,target_id") && parameters?.[1] === -1
           ? [{ ordinal: 0, target_id: "package" }] : [];
         return { command: "", oid: 0, fields: [], rowCount: rows.length, rows };
       });
@@ -547,8 +548,8 @@ describe("package stream request and publication fencing without a database", ()
       const options = { authorize: async () => {} };
       const run = mode === "exact" ? f.stream.exact(f.input, "token", ["package"], options)
         : mode === "details" ? f.stream.details(f.input, "token", ["package"], options)
-          : f.stream.exactJob(f.input, "token", mode === "detailJob", options);
-      if (mode === "exact" || mode === "exactJob") {
+          : f.stream.exactJob(f.input, "token", mode === "detailJob" || mode === "revalidationJob", options);
+      if (mode === "exact" || mode === "exactJob" || mode === "revalidationJob") {
         await expect(run).resolves.toMatchObject({ baselineId: f.lease.id });
         expect(missing).toHaveBeenCalledExactlyOnceWith(f.lease, "package");
       } else {

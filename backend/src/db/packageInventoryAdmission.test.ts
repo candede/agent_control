@@ -175,6 +175,60 @@ describe("package refresh admission", () => {
     expect(candidate![1]).toEqual([scope.tenantId, scope.principalId, []]);
   });
 
+  it("uses the same complete, current catalog contract for automatic claims and detail coverage", async () => {
+    query.mockResolvedValue(emptyResult);
+    const repository = new PackageRefreshJobs();
+    await expect(repository.claimDueDetails(scope, scope.principalId)).resolves.toBeNull();
+    const candidate = query.mock.calls.find(([sql]) => String(sql).includes("AS catalog_revision_hash"));
+    expect(candidate).toBeDefined();
+    query.mockResolvedValueOnce({ ...emptyResult, rows: [{ catalog_available: false, total: 0, fresh: 0, eligible: 0 }] });
+    await expect(repository.detailCoverage(scope)).resolves.toEqual({ catalog_available: false, total: 0, fresh: 0, eligible: 0 });
+    const coverage = query.mock.calls.at(-1);
+    expect(coverage).toBeDefined();
+
+    for (const statement of [String(candidate![0]), String(coverage![0])]) {
+      expect(statement).toContain("s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'");
+      expect(statement).toContain("g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.validated");
+      expect(statement).toContain("g.state IN ('published','retired') AND g.expires_at>clock_timestamp()");
+      expect(statement).toContain("root.catalog_complete AND root.catalog_expires_at>clock_timestamp()");
+      expect(statement).toContain("r.residual->>'identityRevalidationRequired' IS NOT DISTINCT FROM 'true'");
+    }
+  });
+
+  it("automatically creates the first bounded detail job when the catalog has eligible targets", async () => {
+    const targets = [
+      { native_id: "Exact-Package", catalog_revision_hash: "a".repeat(64) },
+      { native_id: "Needs-Revalidation", catalog_revision_hash: "b".repeat(64) },
+    ];
+    let claimedId: string | undefined;
+    query.mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult).mockResolvedValueOnce(emptyResult)
+      .mockResolvedValueOnce(emptyResult).mockResolvedValueOnce({ ...emptyResult, rows: targets })
+      .mockImplementationOnce(async (statement, parameters) => {
+        expect(statement).toContain("INSERT INTO package_refresh_jobs");
+        expect(statement).toContain("'exact',true,clock_timestamp()+interval '10 minutes'");
+        claimedId = String(parameters?.[0]);
+        expect(parameters?.[6]).toBe("signed-in-viewer");
+        return emptyResult;
+      }).mockImplementationOnce(async (statement, parameters) => {
+        expect(statement).toContain("INSERT INTO inventory_refresh_targets");
+        expect(parameters?.[0]).toBe(claimedId);
+        expect(JSON.parse(String(parameters?.[1]))).toEqual(targets.map((target, ordinal) => ({
+          target_id: target.native_id, ordinal, catalog_revision_hash: target.catalog_revision_hash,
+        })));
+        return emptyResult;
+      }).mockImplementationOnce(async () => ({ ...emptyResult, rows: [{
+        ...job, id: claimedId, authorization_principal_id: "signed-in-viewer",
+        auto_details: true, scope_kind: "exact", target_count: targets.length,
+      }] }));
+
+    await expect(new PackageRefreshJobs().claimDueDetails(scope, "signed-in-viewer")).resolves.toMatchObject({
+      id: expect.any(String), authorizationPrincipalId: "signed-in-viewer",
+      status: "waiting_authorization", autoDetails: true, scopeKind: "exact", targetCount: 2,
+    });
+    expect(query).toHaveBeenCalledTimes(9);
+  });
+
   it("rejects an expired idempotent replay instead of returning an undefined job", async () => {
     query.mockResolvedValueOnce(emptyResult)
       .mockResolvedValueOnce(emptyResult)

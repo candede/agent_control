@@ -803,6 +803,7 @@ export class InventoryQueries {
     const summaries = Object.fromEntries(Object.entries(row).map(([key, value]) => [key,
       Object.fromEntries(Object.entries(value as Record<string, string>).map(([name, count]) => [name, exactCount(count)]))]));
     const collectedIdentity = `r.residual->>'identityDetailsCollected'='true'
+      AND r.residual->>'identityRevalidationRequired' IS DISTINCT FROM 'true'
       AND (r.residual->'detailFreshness'->>'state' IS NULL OR r.residual->'detailFreshness'->>'state' IN ('fresh','stale')
         AND coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz
           >(r.residual->'detailFreshness'->>'observedAt')::timestamptz
@@ -826,8 +827,10 @@ export class InventoryQueries {
         CASE WHEN r.domain='packages' THEN '' ELSE coalesce(${normalizeEnvironmentIdentitySql("r.environment_id")},'') END))::int AS unique_sources,
       count(*) FILTER(WHERE r.domain='packages' AND (${collectedIdentity}))::int AS checked_packages,
       count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state' IN ('fresh','stale')
+        AND r.residual->>'identityRevalidationRequired' IS DISTINCT FROM 'true'
         AND NOT coalesce(${collectedIdentity},false))::int AS stale_packages,
-      count(*) FILTER(WHERE r.domain='packages' AND r.residual->'detailFreshness'->>'state'='invalidated')::int AS invalidated_packages,
+      count(*) FILTER(WHERE r.domain='packages' AND (r.residual->'detailFreshness'->>'state'='invalidated'
+        OR r.residual->>'identityRevalidationRequired'='true'))::int AS invalidated_packages,
       count(*) FILTER(WHERE r.domain='packages' AND c.residual->'identity'->>'invalidMetadata'='true')::int AS invalid_packages
       FROM inventory_memberships m JOIN unified_agent_rows c ON c.generation_id=m.generation_id AND c.identity=m.identity
       JOIN unified_agent_memberships s ON s.generation_id=m.generation_id AND s.identity=m.identity
@@ -1011,7 +1014,9 @@ export class InventoryQueries {
       const rows = (await client.query(`SELECT DISTINCT m.identity AS canonical_id,
       source.domain,source.native_id,source.environment_id,source.generation_id FROM jsonb_to_recordset($3::jsonb)
         requested(domain text,"nativeId" text,"environmentId" text)
-      JOIN inventory_records source ON source.domain=requested.domain AND source.native_id=requested."nativeId"
+      JOIN inventory_records source ON source.domain=requested.domain AND CASE WHEN requested.domain='packages'
+        THEN source.native_id=requested."nativeId"
+        ELSE ${normalizeNativeIdentitySql("source.native_id")}=${normalizeNativeIdentitySql('requested."nativeId"')} END
         AND (requested.domain='packages' OR coalesce(${normalizeEnvironmentIdentitySql("source.environment_id")},'')
           =coalesce(${normalizeEnvironmentIdentitySql('requested."environmentId"')},''))
       JOIN unified_agent_memberships member ON member.source_generation_id=source.generation_id AND member.source_identity=source.identity

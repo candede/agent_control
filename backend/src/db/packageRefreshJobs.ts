@@ -20,7 +20,8 @@ export type PackageDataScope = { tenantId: string; principalId: string; tokenMod
 const catalogRevisionHashSql = `encode(sha256(convert_to(jsonb_build_array(
   r.residual->'lastModifiedDateTime',r.residual->'appId',${normalizeNativeIdentitySql("(r.residual->>'manifestId')")},
   r.residual->'assetId',r.residual->'version',r.residual->'manifestVersion')::text,'UTF8')),'hex')`;
-const detailPendingSql = `(r.detail_generation IS NULL OR coalesce(r.residual->'detailFreshness'->>'state','missing')<>'fresh'
+const detailPendingSql = `(r.detail_generation IS NULL OR r.residual->>'identityRevalidationRequired' IS NOT DISTINCT FROM 'true'
+  OR coalesce(r.residual->'detailFreshness'->>'state','missing')<>'fresh'
   OR coalesce((r.residual->'detailFreshness'->>'expiresAt')::timestamptz,'-infinity'::timestamptz)<=clock_timestamp())`;
 const detailUnattemptedSql = `NOT EXISTS(SELECT 1 FROM package_refresh_jobs attempted
   WHERE attempted.tenant_id=$1 AND $2::text IS NOT NULL AND attempted.auto_details
@@ -28,6 +29,10 @@ const detailUnattemptedSql = `NOT EXISTS(SELECT 1 FROM package_refresh_jobs atte
     AND EXISTS(SELECT 1 FROM inventory_refresh_targets t WHERE t.job_id=attempted.id AND t.target_id=r.native_id
       AND t.catalog_revision_hash=${catalogRevisionHashSql})
     AND attempted.updated_at>clock_timestamp()-interval '1 hour')`;
+const detailCatalogSql = `s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'
+  AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.validated
+  AND g.state IN ('published','retired') AND g.expires_at>clock_timestamp()
+  AND root.catalog_complete AND root.catalog_expires_at>clock_timestamp()`;
 export type PackageRefreshInput = {
   authorizationPrincipalId: string;
   tokenMode: "application";
@@ -218,8 +223,7 @@ export class PackageRefreshJobs {
         JOIN package_record_rows r ON r.generation_id=m.generation_id AND r.identity=m.identity
         LEFT JOIN recent_detail_attempts attempted ON attempted.target_id=r.native_id
           AND attempted.catalog_revision_hash=${catalogRevisionHashSql}
-        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'
-          AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.expires_at>clock_timestamp()
+        WHERE ${detailCatalogSql}
           AND r.expires_at>clock_timestamp()
           AND ${detailPendingSql}
           AND (r.native_id=ANY($3::text[]) OR attempted.target_id IS NULL)
@@ -266,10 +270,7 @@ export class PackageRefreshJobs {
         SELECT root.* FROM data_scope_epochs s JOIN inventory_roots root ON root.scope_id=s.id AND root.current
         JOIN inventory_revisions revision ON revision.scope_id=root.scope_id AND revision.revision=root.revision
         JOIN data_generations g ON g.id=revision.generation_id
-        WHERE s.tenant_id=$1 AND s.scope_kind='tenant' AND s.token_mode='tenant' AND s.source='inventory_packages'
-          AND g.scope_epoch=s.epoch AND g.session_epoch=s.session_epoch AND g.validated
-          AND g.state IN ('published','retired') AND g.expires_at>clock_timestamp()
-          AND root.catalog_complete AND root.catalog_expires_at>clock_timestamp()
+        WHERE ${detailCatalogSql}
       ), records AS (
         SELECT r.* FROM source root JOIN inventory_memberships m ON m.baseline_id=root.baseline_id
           AND m.valid_from_revision<=root.revision AND (m.valid_to_revision IS NULL OR m.valid_to_revision>root.revision)

@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { testDatabase } from "../../scripts/testDatabase.js";
-import { inventoryBaseline, inventoryDelta, inventoryInput, packageRecord,streamedPackageFixture,reconcileInventoryFixture } from "../../scripts/inventoryFixtures.js";
+import { inventoryBaseline, inventoryDelta, inventoryInput, packageRecord,streamedPackageFixture,reconcileInventoryFixture,
+  nativeInventoryFixture } from "../../scripts/inventoryFixtures.js";
 import { InventoryGenerations, inventoryAsOf } from "./inventoryGenerations.js";
 import type { GenerationLease } from "./dataGenerations.js";
 import { InventoryQueries } from "./inventoryQueries.js";
@@ -25,6 +26,7 @@ import { verifyInventoryCollectionRewindSchema } from "./inventoryCollectionRewi
 import { AuditLog } from "../services/auditLog.js";
 import { withTelemetryContext } from "../services/telemetry.js";
 import { dataLimits } from "./dataBounds.js";
+import { powerPlatformResourceTypes } from "../types/powerPlatformInventory.js";
 
 describe("immutable inventory record storage", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>;
@@ -32,6 +34,42 @@ describe("immutable inventory record storage", () => {
   beforeAll(async () => { fixture = await testDatabase(); store = new InventoryGenerations(fixture.runtime); }, 30_000);
   afterAll(async () => { await fixture?.close(); });
   beforeEach(() => { selectionIdentity.tenantId = randomUUID(); });
+  it("replaces only the completed native query scope while preserving pinned history and failed collection", async () => {
+    const principalId = randomUUID(), scope = { tenantId: selectionIdentity.tenantId, principalId };
+    const environment = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const agent = (nativeId: string, environmentId: string) => ({ nativeId, environmentId, identifiers: [] });
+    const environmentRow = (nativeId: string) => ({ nativeId, identifiers: [], type: "microsoft.powerplatform/environments" as const });
+    const first = await nativeInventoryFixture(fixture.runtime, scope, [
+      agent("agent-a", environment), agent("omitted-agent-a", environment), agent("agent-b", "environment-b"),
+      environmentRow("current-environment"), environmentRow("omitted-environment"),
+    ], { resourceTypes: [...powerPlatformResourceTypes] });
+    const members = async (root: typeof first) => (await fixture.runtime.query<{ native_id: string }>(`
+      SELECT record.native_id FROM inventory_memberships m JOIN power_platform_record_rows record
+        ON record.generation_id=m.generation_id AND record.identity=m.identity WHERE ${inventoryAsOf()}
+      ORDER BY record.native_id`, [root.baselineId, root.revision])).rows.map(row => row.native_id);
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-native-snapshot-cursor-secret");
+    const identity = { ...selectionIdentity, principalId }, pinned = await queries.capture(identity, first.scopeId);
+    const narrow = await nativeInventoryFixture(fixture.runtime, scope, [agent("agent-a", environment)], {
+      resourceTypes: ["microsoft.copilotstudio/agents"], environmentId: environment.toUpperCase(),
+    });
+    expect(await members(narrow)).toEqual(["agent-a", "agent-b", "current-environment", "omitted-environment"]);
+    expect((await queries.page(pinned.id, identity, { limit: 50 })).counts.total).toBe(5);
+    const current = await nativeInventoryFixture(fixture.runtime, scope, [
+      agent("agent-a", environment), agent("agent-b", "environment-b"), environmentRow("current-environment"),
+    ], { resourceTypes: [...powerPlatformResourceTypes] });
+    expect(await members(current)).toEqual(["agent-a", "agent-b", "current-environment"]);
+    expect((await fixture.runtime.query("SELECT row_count FROM inventory_roots WHERE baseline_id=$1", [current.baselineId])).rows[0].row_count).toBe(3);
+    const input = inventoryInput(principalId, "power_platform");
+    await expect(store.execute(input, { domain: "power_platform", mode: "baseline", channel: "catalog",
+      resourceTypes: [...powerPlatformResourceTypes] }, async lease => {
+      await store.visit(lease, "incomplete");
+      await store.acceptPage(lease, { token: "incomplete", nextToken: null, records: [], rawCount: 0,
+        expectedCount: 1, page: 1, omittedFieldCount: 0 }, 0);
+    }, { authorize: async () => {} })).rejects.toThrow();
+    expect((await fixture.runtime.query("SELECT baseline_id FROM inventory_roots WHERE scope_id=$1 AND current", [current.scopeId])).rows[0].baseline_id).toBe(current.baselineId);
+    expect(await members(first)).toHaveLength(5);
+    await queries.selections.invalidate(pinned.id, identity);
+  });
   it("enters account serialization before opening publication locks and retains it through completion", async () => {
     const isolated = await testDatabase();
     const store = new InventoryGenerations(isolated.runtime);
@@ -415,6 +453,37 @@ describe("immutable inventory record storage", () => {
     expect((await fixture.runtime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1", [root.scopeId])).rows[0].count).toBe(before);
     await store.gc(changed);
     expect((await queries.exact(old.id, identity, ["package-000001"]))[0].residual.displayName).toBe("Changed 1");
+  });
+  it("preserves published canonical inputs when compacting after a failed reconciliation", async () => {
+    const scope = { tenantId: selectionIdentity.tenantId, principalId: randomUUID() };
+    await inventoryBaseline(store, scope.principalId, 1);
+    const root = await reconcileInventoryFixture(fixture.runtime, scope);
+    if (!root) throw new Error("expected_canonical_fixture");
+    const inputs = async (revision: string) => (await fixture.runtime.query(
+      "SELECT inputs FROM inventory_revisions WHERE scope_id=$1 AND revision=$2", [root.scopeId, revision])).rows[0].inputs;
+    const publishedInputs = await inputs(root.revision);
+    await inventoryDelta(store, scope.principalId, 1);
+    const execution = vi.spyOn(InventoryGenerations.prototype, "execute").mockRejectedValueOnce(new Error("reconciliation_failed"));
+    try {
+      await expect(reconcileInventoryFixture(fixture.runtime, scope)).rejects.toThrow("reconciliation_failed");
+    } finally { execution.mockRestore(); }
+    const state = (await fixture.runtime.query(
+      "SELECT active_id,active_inputs,published_inputs FROM inventory_reconciliation WHERE scope_id=$1", [root.scopeId])).rows[0];
+    expect(state.active_id).toBeNull();
+    expect(state.published_inputs).toEqual(publishedInputs);
+    expect(state.active_inputs).not.toEqual(publishedInputs);
+
+    const compacted = await store.compact(inventoryInput(scope.principalId, "canonical"), root, { authorize: async () => {} });
+
+    expect(await inputs(compacted.revision)).toEqual(publishedInputs);
+    const queries = new InventoryQueries(fixture.runtime, "synthetic-compaction-dependencies-secret");
+    const identity = { ...selectionIdentity, principalId: scope.principalId };
+    const selection = await queries.capture(identity, root.scopeId);
+    expect((await queries.page(selection.id, identity)).value.map(row => row.displayName)).toEqual(["Agent 0"]);
+    expect((await fixture.runtime.query(`SELECT generation_id,revision FROM data_generation_pins
+      WHERE selection_id=$1 AND scope_id=$2`, [selection.id, publishedInputs[0].scopeId])).rows)
+      .toEqual([{ generation_id: publishedInputs[0].baselineId, revision: publishedInputs[0].revision }]);
+    await queries.selections.invalidate(selection.id, identity);
   });
   it.each(["catalog", "detail"] as const)("retains referenced %s metadata after content GC and releases it after clear", async evidence => {
     const principal = randomUUID(), stream = new StreamedInventory(fixture.runtime), now = Date.now();

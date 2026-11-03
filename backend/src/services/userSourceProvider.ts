@@ -108,6 +108,8 @@ export class UserSourceProvider {
       fence();
       lastSku = batch.at(-1)!.skuId;
     }
+    await stages.includeSavedIdentities(lease, fence);
+    fence();
     for (;;) {
       const identities = await stages.verificationBatch(lease);
       fence();
@@ -317,10 +319,12 @@ export class UserSourceProvider {
       const first = await this.request(url, token, signal, true, false, assertCurrent);
       if (first.response.status !== 302) return first;
       void first.response.body?.cancel().catch(() => {});
+      assertCurrent();
       const download = validateReportDownloadUrl(first.response.headers.get("location"));
       const next = await this.request(download, null, signal, true, false, assertCurrent);
       if (next.response.status === 302) {
         void next.response.body?.cancel().catch(() => {});
+        assertCurrent();
         throw new AppError(502, "invalid_provider_link", "Repeated report redirect.");
       }
       if (next.response.ok) return next;
@@ -328,6 +332,7 @@ export class UserSourceProvider {
       const retryDelay = retryAfterMs(next.response.headers.get("Retry-After"));
       const wait = retryDelay ?? Math.min(30_000, 2000 * 2 ** attempt);
       void next.response.body?.cancel().catch(() => {});
+      assertCurrent();
       if (attempt >= 2 || ![401, 403, 404, 410, 429, 500, 502, 503, 504].includes(status) || wait > 600_000) {
         operationalLog("warn", "report_download_failed", { provider: "graph", source: "app_activity", status, attempt: attempt + 1 });
         throw new AppError(502, "report_download_failed",

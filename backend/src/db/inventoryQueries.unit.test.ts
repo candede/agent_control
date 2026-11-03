@@ -5,6 +5,7 @@ import { digest } from "./dataBounds.js";
 import { packageInventoryRecord } from "../services/inventoryRecordProjection.js";
 import { allowlistedPackage } from "../services/packageObservation.js";
 import { userSourceSearchSql } from "./userSources.js";
+import { normalizeEnvironmentIdentitySql, normalizeNativeIdentitySql } from "./inventoryIdentityNormalization.js";
 
 const databases: pg.Pool[] = [];
 const identity = { tenantId: "tenant", principalId: "reader", authorizationHash: "viewer", sessionEpoch: "1" };
@@ -206,6 +207,27 @@ describe("selected inventory request snapshots", () => {
       : await inventory.resolveControlReferencesInRead(client, context, references);
     expect(resolved).toEqual(submitted);
     expect(readQuery).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("selected inventory source references", () => {
+  it("normalizes native GUID aliases without folding opaque native or package IDs", async () => {
+    const { inventory, readQuery } = fixture();
+    const references = [
+      { domain: "power_platform" as const, nativeId: "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF",
+        environmentId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" },
+      { domain: "power_platform" as const, nativeId: "Opaque/Native", environmentId: "Opaque/Environment" },
+      { domain: "packages" as const, nativeId: "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF", environmentId: null },
+    ];
+    readQuery.mockReturnValue(result());
+
+    await expect(inventory.sourceReferences("selection", identity, references)).resolves.toEqual([]);
+
+    const [sql, values] = readQuery.mock.calls[0];
+    expect(sql.replace(/\s+/g, " ")).toContain(`source.domain=requested.domain AND CASE WHEN requested.domain='packages' THEN source.native_id=requested."nativeId" ELSE ${normalizeNativeIdentitySql("source.native_id")}=${normalizeNativeIdentitySql('requested."nativeId"')} END`);
+    expect(sql).toContain(`coalesce(${normalizeEnvironmentIdentitySql("source.environment_id")},'')`);
+    expect(sql).toContain(`coalesce(${normalizeEnvironmentIdentitySql('requested."environmentId"')},'')`);
+    expect(JSON.parse(String(values?.[2]))).toEqual(references);
   });
 });
 

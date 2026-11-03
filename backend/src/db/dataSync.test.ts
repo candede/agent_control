@@ -106,6 +106,7 @@ describe.sequential("Data sync repository", () => {
       .toBeGreaterThanOrEqual(Date.parse(completed.sources.find(source => source.source === "usage_reports")!.lastSuccessAt!));
     expect((await retained.listMarkers(owner)).every(marker => marker.status === "succeeded" && marker.count === 0)).toBe(true);
     expect((await retained.getRun(owner, automatic.run!.id))?.status).toBe("running");
+    expect(await retained.getLatestRun(owner)).toMatchObject({ id: automatic.run!.id, status: "running" });
   });
 
   it.each(["failed", "waiting_authorization", "permission_required"] as const)(

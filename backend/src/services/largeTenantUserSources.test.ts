@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import type { UnifiedAgentRecord } from "../types/unifiedAgents.js";
 import { SavedAgentPeopleService } from "./savedAgentPeople.js";
 import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
+import { publishFixtureDirectory } from "../../scripts/userSourceFixture.js";
 
 vi.hoisted(() => { process.env.SESSION_SECRET = "synthetic-user-source-selected-read-secret"; });
 
@@ -80,6 +81,33 @@ describe("dormant user-source foundation", () => {
   beforeEach(async () => { fixture = await testDatabase(); }, 30_000);
   afterEach(async () => { await fixture?.close(); });
 
+  it("replaces a completed activity report without carrying omitted people and preserves the prior report on failure", async () => {
+    const identity = { ...selectionIdentity, principalId: randomUUID() };
+    await publishFixtureDirectory(fixture.runtime, identity, [sourceUser(firstId), sourceUser(secondId)]);
+    let body = csv() + csv(`${secondId}@example.invalid`).split("\n")[1] + "\n";
+    const provider = new UserSourceProvider(async () => new Response(body, { headers: { "content-type": "text/csv" } }));
+    const stages = new UserSourceStages(fixture.runtime);
+    const input = generationInput({ scope: { tenantId: identity.tenantId, principalId: null, kind: "tenant",
+      tokenMode: "tenant", source: "app_activity", selector: "complete" }, actorPrincipalId: identity.principalId });
+    const repository = new UserSourcesRepository(fixture.runtime, "synthetic-activity-snapshot-cursor-secret");
+    const first = await provider.refresh(stages, input, { authorize: async () => "synthetic" });
+    const pinned = await repository.capture(identity);
+    body = csv();
+    const current = await provider.refresh(stages, input, { authorize: async () => "synthetic" });
+    expect(current.rows).toBe(1);
+    const selected = await repository.capture(identity), page = await repository.page(selected.id, identity);
+    expect(page.sources.app_activity).toMatchObject({ state: "available", rowCount: 1, generationId: current.generationId });
+    expect(page.value.find(row => row.directory.objectId === secondId)?.activityState).toBe("unknown");
+    expect((await repository.page(pinned.id, identity)).sources.app_activity).toMatchObject({ rowCount: 2, generationId: first.generationId });
+    expect((await fixture.runtime.query("SELECT retained_count FROM user_source_attempts WHERE generation_id=$1",
+      [current.generationId])).rows[0].retained_count).toBe(0);
+    body = reportHeaders.join(",") + "\n\"unterminated";
+    await expect(provider.refresh(stages, input, { authorize: async () => "synthetic" })).rejects.toMatchObject({ code: "provider_schema" });
+    expect((await repository.refreshStatus(identity)).sources.app_activity).toMatchObject({ generationId: current.generationId, rowCount: 1 });
+    await repository.selections.invalidate(pinned.id, identity);
+    await repository.selections.invalidate(selected.id, identity);
+  });
+
   it("reads only requested object IDs and preserves licensing-state goldens", async () => {
     const generations = new DataGenerations(fixture.runtime);
     const input = generationInput();
@@ -111,6 +139,88 @@ describe("dormant user-source foundation", () => {
     expect(userSourceObjectIds([firstId.toUpperCase(), firstId])).toEqual([firstId]);
     expect(() => userSourceObjectIds(Array(101).fill(firstId))).toThrow("at most 100");
     expect(() => userSourceObjectIds(["someone@example.invalid"])).toThrow("exact");
+  });
+
+  it.each([false, true])("rechecks saved users outside current license discovery, including previously retained=%s", async retained => {
+    const stages = new UserSourceStages(fixture.runtime);
+    const removedId = "00000000-0000-0000-0000-000000000003";
+    const input = generationInput({ actorPrincipalId: "saved-user-verification" });
+    let users = [graphUser(firstId), graphUser(secondId), graphUser(removedId)];
+    const fetcher = vi.fn(async (target: string | URL | Request) => {
+      const url = new URL(String(target));
+      if (url.pathname.endsWith("/subscribedSkus")) {
+        return Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] });
+      }
+      const filter = url.searchParams.get("$filter")!;
+      const value = filter.includes("assignedLicenses/any")
+        ? users.filter(user => user.assignedLicenses.length)
+        : users.filter(user => filter.includes(user.id));
+      return Response.json({ value, "@odata.count": value.length });
+    });
+    const provider = new UserSourceProvider(fetcher);
+    const refresh = () => provider.refresh(stages, { ...input, jobId: randomUUID(), observedAt: new Date() },
+      { authorize: async () => "synthetic-token" });
+    await refresh();
+    users = [graphUser(firstId), { ...graphUser(secondId), userPrincipalName: "renamed@example.invalid",
+      assignedLicenses: [], assignedPlans: [] }];
+    if (retained) {
+      const skipVerification = vi.spyOn(stages, "includeSavedIdentities").mockResolvedValue(undefined);
+      try { await refresh(); } finally { skipVerification.mockRestore(); }
+      const saved = new UserSourcesRepository(fixture.runtime, "synthetic-verification-cursor-secret");
+      expect((await saved.refreshStatus(selectionIdentity)).sources.directory.state).toBe("partial");
+    }
+    fetcher.mockClear();
+    const published = await refresh();
+    const repository = new UserSourcesRepository(fixture.runtime, "synthetic-verification-cursor-secret");
+    const identity = selectionIdentity;
+    expect((await repository.refreshStatus(identity)).sources.directory).toMatchObject({
+      generationId: published.generationId, state: "available", attemptStatus: "available",
+      rowCount: 2, attemptObservedCount: 2,
+    });
+    const selected = await repository.capture(identity);
+    const page = await repository.page(selected.id, identity, {});
+    expect(page.summary).toMatchObject({ checkedUsers: 2, licensedUsers: 1, noPaidUsers: 1 });
+    expect(page.value.find(user => user.directory.objectId === secondId)).toMatchObject({
+      directory: { userPrincipalName: "renamed@example.invalid" }, entitlement: "no_paid", servicePlanCount: 0,
+    });
+    expect(page.value.some(user => user.directory.objectId === removedId)).toBe(false);
+    const filters = fetcher.mock.calls.map(([url]) => new URL(String(url)).searchParams.get("$filter") ?? "");
+    expect(filters).toContain(`id eq '${secondId}' or id eq '${removedId}'`);
+    expect((await fixture.runtime.query(`SELECT retained_count FROM user_source_attempts WHERE generation_id=$1`,
+      [published.generationId])).rows[0].retained_count).toBe(0);
+    expect((await fixture.runtime.query(`SELECT count(*)::int AS n FROM directory_service_plan_rows
+      WHERE generation_id=$1 AND user_id=ANY($2::text[])`, [published.generationId, [secondId, removedId]])).rows[0].n).toBe(0);
+  });
+
+  it.each(["denied", "incomplete"] as const)("preserves saved license evidence when the exact-ID recheck is %s", async failure => {
+    const stages = new UserSourceStages(fixture.runtime);
+    const input = generationInput();
+    let rechecking = false;
+    const provider = new UserSourceProvider(async target => {
+      const url = new URL(String(target));
+      if (url.pathname.endsWith("/subscribedSkus")) {
+        return Response.json({ value: [{ skuId, appliesTo: "User", servicePlans: [{ servicePlanId: planId }] }] });
+      }
+      if (!rechecking) return Response.json({ value: [graphUser()], "@odata.count": 1 });
+      if (url.searchParams.get("$filter")!.includes("assignedLicenses/any")) {
+        return Response.json({ value: [], "@odata.count": 0 });
+      }
+      return failure === "denied" ? new Response(null, { status: 403 })
+        : Response.json({ value: [], "@odata.count": 1 });
+    });
+    const saved = await provider.refresh(stages, input, { authorize: async () => "synthetic-token" });
+    rechecking = true;
+    await expect(provider.refresh(stages, { ...input, jobId: randomUUID(), observedAt: new Date() },
+      { authorize: async () => "synthetic-token" })).rejects.toMatchObject({
+      code: failure === "denied" ? "graph_error" : "provider_count_mismatch",
+    });
+    const repository = new UserSourcesRepository(fixture.runtime, "synthetic-failed-recheck-cursor-secret");
+    expect((await repository.refreshStatus(selectionIdentity)).sources.directory).toMatchObject({
+      generationId: saved.generationId, state: "partial", rowCount: 1,
+      attemptStatus: failure === "denied" ? "permission_required" : "failed",
+    });
+    const selected = await repository.capture(selectionIdentity);
+    expect((await repository.page(selected.id, selectionIdentity, {})).summary.licensedUsers).toBe(1);
   });
 
   it("publishes independent directory/activity sources and never replaces a good head on denied or inconsistent attempts", async () => {

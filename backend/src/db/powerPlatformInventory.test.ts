@@ -145,7 +145,7 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
       .rejects.toMatchObject({ code: "selection_invalidated" });
   });
 
-  it("retains historical pins and unseen tenant agents and environments through a narrower current query", async () => {
+  it("replaces in-scope agents while retaining historical pins and out-of-scope environments", async () => {
     const scope = owner();
     const broad = await collect(scope, await running(scope, "broad"), provider([
       resource(scope, "old-agent"), resource(scope, environmentId, { displayName: "Saved environment" }, environmentType),
@@ -153,10 +153,10 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     const pin = await selected(scope, broad);
     const next = await collect(scope, await running(scope, "agents", [agentType]), provider([resource(scope, "new-agent")]));
     expect(next.scopeId).toBe(broad.scopeId);
-    expect((await selected(scope, next)).raw.value.map(row => row.nativeId)).toEqual(["new-agent", "old-agent", environmentId]);
+    expect((await selected(scope, next)).raw.value.map(row => row.nativeId)).toEqual(["new-agent", environmentId]);
     expect((await pin.queries.page(pin.selection.id, pin.identity)).counts.total).toBe(2);
     const current = await canonical(scope);
-    expect(current.page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["new-agent", "old-agent"]);
+    expect(current.page.value.map(row => row.powerPlatformResource?.nativeId)).toEqual(["new-agent"]);
     expect(current.page.value[0].environment?.displayName).toBe("Saved environment");
   });
 
@@ -200,11 +200,11 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
     } finally { release(); }
     const nextRoot = await pending;
     expect((await pin.queries.page(pin.selection.id, pin.identity)).value.map(row => row.nativeId)).toEqual(["old-visible"]);
-    expect((await selected(scope, nextRoot)).raw.value.map(row => row.nativeId)).toEqual(["new-visible", "old-visible"]);
+    expect((await selected(scope, nextRoot)).raw.value.map(row => row.nativeId)).toEqual(["new-visible"]);
     const failed = await running(scope, "rollback", [agentType]);
     await expect(collect(scope, failed, provider([resource(scope, "rollback-new")]),
       { beforeComplete: async () => { throw new Error("synthetic completion rollback"); } })).rejects.toThrow("synthetic completion rollback");
-    expect((await selected(scope, nextRoot)).raw.value.map(row => row.nativeId)).toEqual(["new-visible", "old-visible"]);
+    expect((await selected(scope, nextRoot)).raw.value.map(row => row.nativeId)).toEqual(["new-visible"]);
     expect((await fixture.runtime.query("SELECT baseline_id FROM inventory_roots WHERE scope_id=$1 AND current",
       [nextRoot.scopeId])).rows).toEqual([{ baseline_id: nextRoot.baselineId }]);
     expect((await jobs.getJob(scope, failed.id))?.snapshotId).toBeNull();
@@ -237,7 +237,7 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
   });
 
   it.each([["retained"], ["replacement-a", "replacement-b"], []])(
-    "retains unseen tenant records after a successful narrower or empty authorized enumeration (%j)", async (...names) => {
+    "replaces older in-scope observations after a complete or empty authorized enumeration (%j)", async (...names) => {
       const values = names as string[], scope = owner();
       const initial = await collect(scope, await running(scope, "initial", powerPlatformResourceTypes, "unknown"),
         provider([resource(scope, "retained"), resource(scope, "removed")]));
@@ -245,11 +245,11 @@ describe.sequential("streamed native inventory and durable refresh jobs", () => 
       const job = await running(scope, "next", powerPlatformResourceTypes, "unknown");
       const next = await collect(scope, job, provider(values.map(name => resource(scope, name))));
       const page = (await selected(scope, next)).raw;
-      const saved = [...new Set(["removed", "retained", ...values])].sort();
+      const saved = [...values].sort();
       expect(page.value.map(row => row.nativeId)).toEqual(saved);
       expect(page.counts.total).toBe(saved.length);
       expect(inventorySourceStatuses(page.freshness.sources, page.selection.evaluatedAt as Date).powerPlatform.observation).toMatchObject({
-        roleScope: "unknown", coverage: "unknown", verification: null, observedCount: values.length, totalRecords: saved.length,
+        roleScope: "unknown", coverage: "covered", verification: { status: "verified" }, observedCount: values.length, totalRecords: saved.length,
       });
       expect((await pin.queries.page(pin.selection.id, pin.identity)).counts.total).toBe(2);
       expect(await jobs.getJob(scope, job.id)).toMatchObject({ status: "succeeded", observedCount: values.length });
@@ -429,14 +429,14 @@ describe.each(["full", "unknown"] as const)("42-page streamed native provider wi
             queries: [...costs].sort((a,b) => b[1].milliseconds-a[1].milliseconds).slice(0,5) })+"\n");
         }
         process.stdout.write(`NATIVE_SOURCE_SELECTED ${JSON.stringify({ roleScope, total, elapsedMs: performance.now() - started })}\n`);
-        expect(last.raw.counts.total).toBe(total + (start ? 1 : 0));
+        expect(last.raw.counts.total).toBe(total);
         expect(last.raw.value).toHaveLength(100);
         expect(last.raw.value[0].nativeId).toBe(`agent-${total + start - 1}`);
         expect(last.raw.value.at(-1)?.nativeId).toBe(`agent-${total + start - 100}`);
         expect(last.raw.page.nextCursor).toEqual(expect.any(String));
       });
-      if (start) it("retains unseen tenant membership without overwriting the earlier baseline", async () => {
-          expect((await selected(scope, changed, { search: "agent-0000" })).raw.counts.filtered).toBe(1);
+      if (start) it("retires omitted current membership without overwriting the earlier baseline", async () => {
+          expect((await selected(scope, changed, { search: "agent-0000" })).raw.counts.filtered).toBe(0);
           expect((await fixture.runtime.query(`SELECT count(*)::int AS count FROM inventory_memberships
             WHERE baseline_id=$1 AND valid_from_revision<=$2 AND (valid_to_revision IS NULL OR valid_to_revision>$2)`,
           [prior.baselineId, prior.revision])).rows[0].count).toBe(4_140);
@@ -445,7 +445,7 @@ describe.each(["full", "unknown"] as const)("42-page streamed native provider wi
   it("preserves the complete 4173-row source after a later incomplete authorized provider page", async () => {
     const job = await running(scope, "incomplete", powerPlatformResourceTypes, roleScope);
     await expect(collect(scope, job, provider([resource(scope, "partial")], 4_173))).rejects.toMatchObject({ code: "provider_schema" });
-    expect((await selected(scope, changed)).raw.counts.total).toBe(4_174);
+    expect((await selected(scope, changed)).raw.counts.total).toBe(4_173);
     expect((await fixture.runtime.query("SELECT baseline_id FROM inventory_roots WHERE scope_id=$1 AND current", [changed.scopeId])).rows)
       .toEqual([{ baseline_id: changed.baselineId }]);
     expect((await jobs.listJobs({ ...scope, principalId: "other-reader" })).value).toEqual([]);
