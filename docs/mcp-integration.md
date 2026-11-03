@@ -9,8 +9,9 @@ registration.
 - Have Agent Control running and permission to create Entra app registrations
   and grant administrator consent.
 - Choose a public HTTPS address for MCP, such as `https://mcp.example.com/mcp`.
-  Configure your HTTPS proxy/tunnel to forward to the MCP port, including OAuth
-  and discovery paths on that hostname, not just `/mcp`.
+  With Dev Tunnels, expose MCP's own port, not the web/API port. Sharing the
+  web/API hostname requires a path-routing reverse proxy. Forward OAuth and
+  discovery paths to MCP too, not just `/mcp`.
 - Keep the existing installation's tenant ID and Agent Control application
   (client) ID available.
 
@@ -59,11 +60,18 @@ registration's client secret.
 
 ## 3. Add MCP permissions and grant consent
 
+Ensure your setup account is listed under **Owners** on both app registrations
+so they appear in **My APIs**.
+
+MCP acts as both an Entra OAuth client and a protected resource: it requests a
+token for itself, then exchanges it for an API token (On-Behalf-Of).
+
 On **Agent Control MCP > API permissions**:
 
 1. **Add a permission > My APIs > Agent Control > Delegated permissions**:
-   select `AgentControl.Access`.
-2. Add the MCP registration's own delegated `Mcp.Access` permission.
+   select `AgentControl.Access` for calls to the Agent Control API.
+2. Add the MCP registration's own delegated `Mcp.Access` permission for MCP
+   sign-in; this does not grant API access or application roles.
 3. Under **Microsoft Graph > Delegated permissions**, add the sign-in scopes
    `openid`, `profile` and `offline_access`.
 4. Select **Grant admin consent** for the tenant.
@@ -120,6 +128,7 @@ https://insiders.vscode.dev/redirect,https://vscode.dev/redirect,http://127.0.0.
 
 For other clients, use their [callback instructions](mcp-clients.md#choose-a-client).
 Point your HTTPS proxy/tunnel at the selected loopback port.
+MCP calls the API internally at `http://app:3001`, not through the web/API tunnel.
 
 The wizard saves the API binding, generates protected signing/encryption keys
 on first setup, and starts the MCP container. It does not create Entra apps or
