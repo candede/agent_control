@@ -63,30 +63,45 @@ function Assert-LocalMcpSecretValues {
 }
 
 function Read-LocalMcpSettings {
-    param($Settings,[object[]]$Profiles,$Current)
+    param($Context,$Settings,[object[]]$Profiles,$Current)
     if (-not $Profiles.Count -or @($Profiles | Where-Object { -not $_.tenantId -or -not $_.clientId -or -not $_.clientSecret -or -not $_.domains.Count }).Count) {
         throw 'Complete the API tenant setup before configuring MCP.'
     }
-    Write-Host 'Configure MCP. Downstream clients register dynamically; the Entra application ID below identifies this server, not Claude/Copilot/OpenCode.'
+    Write-Host "Configure MCP for local project '$($Context.Project)'."
+    Write-Host 'Select the existing Agent Control configuration MCP will connect to.'
+    Write-Host 'Only tenant configurations saved in this project are listed. A project can contain multiple tenants.'
     for ($index=0; $index -lt $Profiles.Count; $index++) {
-        Write-Host "$($index+1): $($Profiles[$index].displayName) tenant=$($Profiles[$index].tenantId) API=$($Profiles[$index].clientId)"
+        $profile = $Profiles[$index]
+        $label = if ([string]::IsNullOrWhiteSpace($profile.displayName)) { $profile.domains -join ', ' } else { $profile.displayName }
+        Write-Host "$($index+1): $label"
+        Write-Host "   Entra tenant ID: $($profile.tenantId)"
+        Write-Host "   Existing Agent Control application (client) ID: $($profile.clientId)"
     }
     $selected = 1
     for ($index=0; $index -lt $Profiles.Count; $index++) {
         if ($Profiles[$index].tenantId -ieq $Current.tenantId -and $Profiles[$index].clientId -ieq $Current.apiClientId) { $selected=$index+1 }
     }
     while ($true) {
-        $answer = [string](Read-Host "API tenant profile [$selected; Enter to keep]")
+        $answer = [string](Read-Host "Choose a configuration number [default: $selected; press Enter to select]")
         $choice = $selected
         if ([string]::IsNullOrWhiteSpace($answer) -or
             ([int]::TryParse($answer.Trim(),[ref]$choice) -and $choice -ge 1 -and $choice -le $Profiles.Count)) { break }
-        Write-Warning 'Choose one of the listed API tenant profiles.'
+        Write-Warning "Enter a number from 1 to $($Profiles.Count), or press Enter to select $selected."
     }
     $profile = $Profiles[$choice-1]
+    Write-Host 'Next, provide the separate MCP server Entra registration, not the existing Agent Control registration above.'
+    Write-Host 'MCP clients such as Claude/Copilot/OpenCode register dynamically; do not enter their application IDs.'
     $currentClient = if ($Current.clientId) { $Current.clientId } else { $profile.integration.clientId }
     $client = (Read-LocalIdentifier 'MCP Entra application ID (a separate confidential registration)' $currentClient).ToLowerInvariant()
-    $url = [string](Read-Host "MCP public HTTPS resource URL [$($Current.publicUrl); Enter to keep]")
-    if ([string]::IsNullOrWhiteSpace($url)) { $url = [string]$Current.publicUrl }
+    Write-Host 'Enter the full public HTTPS MCP endpoint, including its resource path (for example https://mcp.example.com/mcp), not just the base URL. Do not add a trailing slash.'
+    $urlPrompt = if ($Current.publicUrl) { "MCP public HTTPS resource URL [$($Current.publicUrl); Enter to keep]" }
+        else { 'MCP public HTTPS resource URL (required; for example https://mcp.example.com/mcp)' }
+    while ($true) {
+        $url = [string](Read-Host $urlPrompt)
+        if ([string]::IsNullOrWhiteSpace($url)) { $url = [string]$Current.publicUrl }
+        if (-not [string]::IsNullOrWhiteSpace($url)) { break }
+        Write-Warning 'MCP public HTTPS resource URL is required. Enter the full endpoint, for example https://mcp.example.com/mcp.'
+    }
     $redirects = [string](Read-Host "Allowed client callback URLs, comma-separated [$(@($Current.redirectUris) -join ','); Enter to keep]")
     $redirectUris = if ([string]::IsNullOrWhiteSpace($redirects)) { @($Current.redirectUris) } else { @($redirects -split ',' | ForEach-Object { $_.Trim() }) }
     $port = if ($Current.port) { [int]$Current.port } elseif ($Settings.port -eq 8001) { 8002 } else { 8001 }
@@ -115,7 +130,7 @@ function Get-LocalMcpPlan {
             }
         }
     }
-    if ($Context.ConfigureMcp) { $mcp = Read-LocalMcpSettings $Settings $Profiles $mcp }
+    if ($Context.ConfigureMcp) { $mcp = Read-LocalMcpSettings $Context $Settings $Profiles $mcp }
     if ($null -eq $mcp) { return $null }
     Assert-LocalMcpSettings $mcp $Settings.port
     $binding = @($Profiles | Where-Object { $_.tenantId -ieq $mcp.tenantId -and $_.clientId -ieq $mcp.apiClientId })
@@ -171,6 +186,14 @@ function Get-LocalMcpPlan {
     return @{ Settings=$mcp; Inputs=$inputs; SecretValues=$values; SecretsChanged=$changed }
 }
 
+function Get-LocalComposeWithoutMcp {
+    param([string[]]$Compose)
+    for ($index=0; $index -lt $Compose.Count; $index++) {
+        if ($Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Compose[$index+1]) -ceq 'compose.mcp.yaml') { $index++; continue }
+        $Compose[$index]
+    }
+}
+
 function Sync-LocalMcpContext {
     param($Context,$Settings)
     $Context.Mcp = $Settings.mcp
@@ -179,10 +202,7 @@ function Sync-LocalMcpContext {
     $baseIndex = [Array]::IndexOf($Context.Compose,'-f')
     $overlay = Join-Path (Split-Path $Context.Compose[$baseIndex+1] -Parent) 'compose.mcp.yaml'
     $compose = [Collections.Generic.List[string]]::new()
-    for ($index=0; $index -lt $Context.Compose.Count; $index++) {
-        if ($Context.Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Context.Compose[$index+1]) -ceq 'compose.mcp.yaml') { $index++; continue }
-        $compose.Add($Context.Compose[$index])
-    }
+    $compose.AddRange([string[]]@(Get-LocalComposeWithoutMcp $Context.Compose))
     if ($Context.Mcp) {
         $index = $compose.IndexOf('-f')
         $compose.InsertRange($index+2,[string[]]@('-f',$overlay))

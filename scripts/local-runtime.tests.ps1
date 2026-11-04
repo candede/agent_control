@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
 $root = Join-Path $repository "artifacts/test-scratch/runtime-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory((Join-Path $root 'backend')) | Out-Null
-foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.large-tenant-test.yaml')) {
+foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.large-tenant-test.yaml')) {
     Copy-Item -LiteralPath (Join-Path $repository $file) -Destination (Join-Path $root $file)
 }
 [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'snapshot-v1')
@@ -32,6 +32,9 @@ $script:candidateHash = ''
 $script:replacePostgresOnAppStart = $false
 $script:buildStdout = 'Docker Desktop build summary (Windows)'
 $script:answers = [Collections.Generic.Queue[string]]::new()
+$script:validateDatabaseCompose = $false
+$script:composeValidations = 0
+$script:dockerExecutable = (Microsoft.PowerShell.Core\Get-Command docker -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message }; $script:checks++ }
 function Fails([scriptblock]$Action,[string]$Pattern) {
     try { & $Action; throw 'Expected failure did not occur.' }
@@ -54,7 +57,7 @@ function git {
         [IO.File]::WriteAllText((Join-Path $root 'backend/added.ts'),'added-during-capture')
         return ((@('Dockerfile','compose.yaml','backend/input.ts','backend/added.ts')) -join "`0") + "`0"
     }
-    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
+    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
 }
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
@@ -141,6 +144,22 @@ function docker {
         if ($Arguments -contains 'stop') { $script:containers[('a' * 64)].running=$false; return }
         if ($Arguments -contains 'up') {
             $service = $Arguments[-1]
+            if ($script:validateDatabaseCompose -and $service -eq 'postgres') {
+                if ($script:dockerExecutable) {
+                    $upIndex = [Array]::IndexOf($Arguments,'up')
+                    $validationArguments = @($Arguments[0..($upIndex-1)]) + @('config','--format','json')
+                    $configuration = @(& $script:dockerExecutable @validationArguments)
+                    if ($LASTEXITCODE -ne 0) { throw 'Read-only database Compose configuration validation failed.' }
+                    $configuration = ($configuration -join "`n") | ConvertFrom-Json
+                    Assert ($configuration.services.app.container_name -ceq "$($context.Project)-agent-control-app-1" -and
+                        $configuration.services.postgres.container_name -ceq "$($context.Project)-agent-control-postgres-1") 'Compose did not derive clear container names from the selected project.'
+                    Assert ($configuration.name -ceq $context.Project -and $configuration.volumes.data.name -ceq $context.Volume -and
+                        $configuration.networks.default.name -ceq $context.Network) 'Container naming changed project, data volume or network ownership.'
+                    Assert ($configuration.services.app.environment.PGHOST -ceq 'postgres') 'Container naming changed the internal database service hostname.'
+                    $script:composeValidations++
+                } else { Write-Host 'Real Compose interpolation check skipped: Docker CLI is unavailable; mocked ordering assertions still run.' }
+                Assert (@($Arguments | Where-Object { [IO.Path]::GetFileName($_) -ceq 'compose.mcp.yaml' }).Count -eq 0) 'Database preflight included the unsaved MCP overlay.'
+            }
             $id = if ($service -eq 'app') {'a' * 64} else {'b' * 64}
             $script:containers[$id]=@{service=$service;running=$true;image=$(if ($service -eq 'app') {$script:runtime} else {'sha256:' + ('d' * 64)})}
             if ($service -eq 'app' -and $script:replacePostgresOnAppStart) {
@@ -287,6 +306,39 @@ exit $ExitCode
     $messages=Run-Deploy
     Assert ($script:operationalMode -eq 'normal' -and ($messages -join "`n").Contains('ALREADY RUNNING') -and
         -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Normal start left a healthy deployment stuck in saved-only admission.'
+    & {
+        $beforeSettings = (Get-FileHash -LiteralPath (Join-Path $context.State 'settings.json')).Hash
+        $beforeEnvironment = (Get-FileHash -LiteralPath (Join-Path $context.State 'compose.env')).Hash
+        $beforeRegistry = (Get-FileHash -LiteralPath (Join-Path $context.State 'secrets/tenants.json')).Hash
+        Assert (-not (Read-LocalSettings $context.State).Contains('mcp') -and
+            -not [IO.File]::ReadAllText((Join-Path $context.State 'compose.env')).Contains('MCP_')) 'First MCP setup regression requires an existing project without MCP settings.'
+        $context.ConfigureMcp = $true
+        foreach ($answer in @('','33333333-3333-4333-8333-333333333333','https://mcp.runtime.example.invalid/mcp','https://client.example.invalid/callback','14400','synthetic-mcp-runtime-test-secret')) {
+            $script:answers.Enqueue($answer)
+        }
+        $script:validateDatabaseCompose = $true
+        $script:failure = '[\\/]mcp[\\/]Dockerfile\|'
+        try {
+            Fails { Run-Deploy } 'Simulated Docker failure'
+            Assert (($script:calls -join "`n") -match '(?m)database\.ts\|preflight$') 'First MCP setup never reached the database preflight.'
+            Assert (($script:calls -join "`n") -match '[\\/]mcp[\\/]Dockerfile\|') 'First MCP setup did not reach the deliberately interrupted MCP build.'
+            if ($script:dockerExecutable) { Assert ($script:composeValidations -eq 1) 'First MCP setup did not validate the actual database Compose configuration.' }
+            Assert ((Get-FileHash -LiteralPath (Join-Path $context.State 'settings.json')).Hash -ceq $beforeSettings -and
+                (Get-FileHash -LiteralPath (Join-Path $context.State 'compose.env')).Hash -ceq $beforeEnvironment -and
+                (Get-FileHash -LiteralPath (Join-Path $context.State 'secrets/tenants.json')).Hash -ceq $beforeRegistry) 'Interrupted MCP setup saved planned configuration before builds succeeded.'
+            Assert ($script:containers[('a'*64)].running -and
+                -not (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance')) -and
+                -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|(reset|initialize)\|?')) 'Interrupted MCP setup stopped the existing app or changed the database.'
+            foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
+                Assert (-not (Test-Path -LiteralPath (Join-Path $context.State "secrets/$name"))) 'Interrupted MCP setup persisted new credentials.'
+            }
+        } finally {
+            $script:failure = ''
+            $script:validateDatabaseCompose = $false
+            $context.ConfigureMcp = $false
+            Sync-LocalMcpContext $context (Read-LocalSettings $context.State)
+        }
+    }
     $script:runtime='sha256:' + ('e' * 64)
     $messages=Run-Deploy
     Assert (($script:calls -join "`n") -match '\|stop\|--timeout\|130\|app') 'Changed image was not drained.'

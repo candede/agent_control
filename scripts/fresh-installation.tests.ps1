@@ -24,7 +24,7 @@ function Invoke-DockerCommand([string[]]$Arguments,[switch]$Capture) {
     if ($script:collision -eq 'volume' -and $line -like 'volume|ls|*') { return $context.Volume }
     if ($script:collision -eq 'network' -and $line -like 'network|ls|*') { return $context.Network }
     if ($script:collision -eq 'container' -and $line -like 'ps|-aq|*') { return 'a' * 64 }
-    if ($script:collision -eq 'name' -and $line -like 'ps|-a|*') { return "$($context.Project)-app-1" }
+    if ($script:collision -eq 'name' -and $line -like 'ps|-a|*') { return "$($context.Project)-agent-control-app-1" }
     if ($script:collision -eq 'image' -and $line -like 'image|ls|*') { return $context.Image }
     return ''
 }
@@ -65,7 +65,7 @@ function New-Container([string]$Service) {
     }
     $ports = @{}
     return (@{
-        Id=('a'*64);Image=('sha256:'+'b'*64);Name="/$($context.Project)-$Service-1"
+        Id=('a'*64);Image=('sha256:'+'b'*64);Name="/$($context.Project)-agent-control-$Service-1"
         Config=@{Labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.service'=$Service
             'com.docker.compose.project.working_dir'=$root;'com.docker.compose.project.config_files'="$root/compose.yaml,$($context.FixtureCompose)"
             'io.agent-control.fixture'=$context.Project;'io.agent-control.source-sha256'=$context.SourceHash}}
@@ -78,7 +78,7 @@ foreach ($service in @('app','postgres')) {
     Assert-FreshInstallationContainer $context (New-Container $service)
     $script:checks++
     foreach ($mutation in @(
-        {param($c) $c.Name='/seha-app-1'},
+        {param($c) $c.Name='/seha-agent-control-app-1'},
         {param($c) $c.Config.Labels.'com.docker.compose.project'='seha'},
         {param($c) $c.Config.Labels.'com.docker.compose.project.working_dir'='/other'},
         {param($c) $c.Config.Labels.'com.docker.compose.project.config_files'='other.yaml'},
@@ -181,8 +181,8 @@ Assert-True ($source.Contains('$peak -gt $container.HostConfig.Memory') -and
 Assert-True ($source.Contains('$limit -ne $container.HostConfig.Memory') -and
     $source.Contains('$cpu -cne $expectedCpu') -and $source.Contains('memory.events cpu.max cpu.stat')) 'Actual cgroup memory and CPU caps must match supported configuration and be recorded.'
 Assert-True (-not $source.Contains("@('up'") -and $source.Contains('Wait-FreshInstallationHealth $context $Directory')) 'Fresh runner must poll health after restart, not directly create/start runtime services.'
-Assert-Refused { Get-IsolatedLocalHttp 'seha-app-1' '/api/ready' }
-Assert-Refused { Get-IsolatedLocalHttp "$($context.Project)-app-1" '/api/auth/callback' }
+Assert-Refused { Get-IsolatedLocalHttp 'seha-agent-control-app-1' '/api/ready' }
+Assert-Refused { Get-IsolatedLocalHttp "$($context.Project)-agent-control-app-1" '/api/auth/callback' }
 $before = [pscustomobject]@{schemaFingerprint=('a'*64);tables=[pscustomobject]@{sessions=@{count=0;hash='same'};data_lifecycle_progress=@{count=6;hash='before'}}}
 $after = [pscustomobject]@{schemaFingerprint=('a'*64);tables=[pscustomobject]@{sessions=@{count=0;hash='same'};data_lifecycle_progress=@{count=6;hash='after'}}}
 $progressBefore = @('inventory','inventory_metadata','operator','records','report_payloads','report_staging' | ForEach-Object { @{worker=$_;slices=1;rows_collected=0;bytes_collected=0} })

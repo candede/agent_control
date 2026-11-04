@@ -111,6 +111,16 @@ Under `.local/agent-control/`, the wizard saves `settings.json`, protected
 `secrets/`. `compose.env` is generated; no `.env` is needed.
 Application data lives in Docker volume `agent-control_data`.
 
+Container names use `<project>-agent-control-<service>-1`. For `-Project seha`,
+the names are `seha-agent-control-app-1`, `seha-agent-control-postgres-1` and,
+when enabled, `seha-agent-control-mcp-1`. Compose service names remain `app`,
+`postgres` and `mcp`; project labels, `<project>_data`, `<project>_mcp-oauth`
+and `<project>_default` are unchanged.
+
+Existing containers keep their names until renamed or recreated. Normal startup
+deliberately does not recreate PostgreSQL. Do not change `-Project` or reset the
+database just to adopt the display names.
+
 ### Check permissions and collect data
 
 1. Open the printed URL (`http://localhost:3001` by default). Sign in with an

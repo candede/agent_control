@@ -55,6 +55,7 @@ services:
       timeout: 3s
       retries: 30
   postgres:
+    container_name: "${COMPOSE_PROJECT_NAME:?Compose project name is required}-agent-control-postgres-1"
     image: postgres:17-bookworm
     cpus: 0.5
     mem_limit: 1g
@@ -78,6 +79,7 @@ services:
         max-size: "10m"
         max-file: "3"
   app:
+    container_name: "${COMPOSE_PROJECT_NAME:?Compose project name is required}-agent-control-app-1"
     image: ${APP_IMAGE:-agent-control-app:local}
     cpus: 1.5
     mem_limit: 1536m

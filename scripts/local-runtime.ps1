@@ -192,7 +192,7 @@ function Get-LocalReleaseTarget {
         } elseif ($container.Service -eq 'mcp') {
             Assert-LocalMcpContainer $Context $container.Id
         } elseif ($Context.IsolatedHealthContainer) {
-            if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or $Context.IsolatedHealthContainer -cne "$($Context.Project)-app-1" -or
+            if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or $Context.IsolatedHealthContainer -cne "$($Context.Project)-agent-control-app-1" -or
                 $Context.Port -in @(3001,3002) -or ($details.ports -and $details.ports.Count)) { throw 'Isolated release cannot publish ports or target a retained installation.' }
         } elseif ($details.ports.Count -ne 1 -or $details.ports['3001/tcp'].Count -ne 1 -or
             $details.ports['3001/tcp'][0].HostIp -cne '127.0.0.1' -or $details.ports['3001/tcp'][0].HostPort -cne [string]$Context.Port) { throw 'Release loopback origin/port mismatch.' }
@@ -352,7 +352,7 @@ function Assert-LocalRuntimeReady {
     param($Context)
     if ($Context.IsolatedHealthContainer) {
         if ($Context.Project -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}$' -or
-            $Context.IsolatedHealthContainer -cne "$($Context.Project)-app-1" -or $Context.Port -in @(3001,3002)) {
+            $Context.IsolatedHealthContainer -cne "$($Context.Project)-agent-control-app-1" -or $Context.Port -in @(3001,3002)) {
             throw 'Isolated readiness cannot target a retained installation.'
         }
         $health = Get-LocalHealth $Context.Url -IsolatedContainer $Context.IsolatedHealthContainer
@@ -481,7 +481,11 @@ function Invoke-LocalApplication {
         if ($DbReset) { Write-Warning "Explicit database reset requested for project '$($Context.Project)'. All saved application data will be deleted; settings, secrets and backup files are retained." }
         Write-Host '[DATABASE PREFLIGHT] Checking the current schema before runtime compilation, maintenance or app shutdown.'
         try {
-            if (-not $candidate) { Invoke-DockerCommand ($Context.Compose + @('up','-d','--no-recreate','--wait','--wait-timeout','90','postgres')) }
+            if (-not $candidate) {
+                # MCP settings may still be an unsaved plan during database preflight.
+                $databaseCompose = @(Get-LocalComposeWithoutMcp $Context.Compose)
+                Invoke-DockerCommand ($databaseCompose + @('up','-d','--no-recreate','--wait','--wait-timeout','90','postgres'))
+            }
             $preflight = if ($DbReset -and $progress.resetStatus -ne 'completed') { @('preflight-reset','agentcontrol') } else { @('preflight') }
             $schema = Invoke-LocalOperator $Context (@('backend/scripts/database.ts') + $preflight) -Capture | ConvertFrom-Json
             if ($DbReset -and $progress.resetStatus -ne 'completed' -and ($schema.outcome -cne 'succeeded' -or

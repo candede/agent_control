@@ -682,7 +682,7 @@ function Get-LocalHealth {
 
 function Get-IsolatedLocalHttp {
     param([string]$Container,[string]$Route)
-    if ($Container -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}-app-1$' -or $Route -notin @('/api/ready','/api/auth/status','/api/agents')) {
+    if ($Container -cnotmatch '^ac-ltdp-install-[a-f0-9]{12}-agent-control-app-1$' -or $Route -notin @('/api/ready','/api/auth/status','/api/agents')) {
         throw 'Container-local HTTP is restricted to the owned isolated fresh-installation runtime and bounded proof routes.'
     }
     return Invoke-DockerCommand @('exec',$Container,'node','-e',

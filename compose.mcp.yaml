@@ -1,5 +1,6 @@
 services:
   mcp:
+    container_name: "${COMPOSE_PROJECT_NAME:?Compose project name is required}-agent-control-mcp-1"
     image: ${MCP_IMAGE:?MCP image must be explicitly configured}
     user: "${APP_UID:?MCP requires an owned non-root UID}:${APP_GID:?MCP requires an owned GID}"
     environment:

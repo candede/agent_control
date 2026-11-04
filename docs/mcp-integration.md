@@ -15,13 +15,16 @@ registration.
 - Keep the existing installation's tenant ID and Agent Control application
   (client) ID available.
 
-| Address | Configure in |
-| --- | --- |
-| `https://mcp.example.com/mcp` | MCP setup wizard and client |
-| `https://mcp.example.com/auth/callback` | New MCP Entra registration, **Web** redirect URI |
-| Client's OAuth callback | MCP setup wizard's allowed client callbacks; not Entra |
+| Address | Purpose | Configure in |
+| --- | --- | --- |
+| `https://mcp.example.com/mcp` | Endpoint clients call to use MCP tools | MCP setup wizard and client |
+| `https://mcp.example.com/auth/callback` | Returns the user from Entra sign-in to the MCP server | New MCP Entra registration, **Web** redirect URI |
+| Client's OAuth callback | Returns an OAuth authorization code from the MCP server to the client to finish connecting | MCP setup wizard's allowed client callbacks; not Entra |
 
 Replace the example hostname with yours.
+Client callbacks are not MCP tool endpoints. Their exact allowlist prevents
+authorization codes being redirected to unintended destinations; it lists
+callback addresses, not individual users or client installations.
 
 ## 1. Update the existing Agent Control registration
 
@@ -108,17 +111,31 @@ From the repository root:
 pwsh ./deploy-local.ps1 start -ConfigureMcp
 ```
 
-For a named installation, append `-Project <your-existing-project-name>`.
+For a named installation, append `-Project <your-existing-project-name>` and
+use that same project name on subsequent commands.
+
+The wizard identifies the selected project, then lists only the existing
+Agent Control tenant configurations saved in that project. A project can contain
+multiple tenants; this question selects a tenant within the project, not another
+project. Enter a listed configuration number, or press Enter to select the shown
+default (including when there is only one configuration). Each entry shows its
+display name or domains, Entra tenant ID and existing Agent Control application
+(client) ID. The following MCP application ID prompt needs the **separate MCP
+registration** from step 2, not the existing application ID just displayed.
+
 Enter:
 
 | Wizard prompt | Value |
 | --- | --- |
-| API tenant profile | Existing Agent Control tenant |
+| Choose a configuration number | Number of an existing Agent Control tenant configuration in this project; Enter selects the shown default |
 | MCP Entra application ID | `<MCP_CLIENT_ID>` from step 2 |
-| Public HTTPS resource URL | `https://mcp.example.com/mcp` |
+| Public HTTPS resource URL | Full public endpoint, for example `https://mcp.example.com/mcp`, not just `https://mcp.example.com`; no trailing slash |
 | Allowed client callback URLs | Exact URLs for your client, comma-separated; see below |
 | MCP loopback port | Normally `8001`; use the port selected by the wizard |
 | MCP Entra client secret | Secret **Value** from step 2; hidden input |
+
+The public MCP URL is required on first setup; the example is not a default.
+On later edits, the wizard shows the saved URL and Enter keeps it.
 
 For VS Code, paste these callbacks as one line:
 
@@ -126,13 +143,25 @@ For VS Code, paste these callbacks as one line:
 https://insiders.vscode.dev/redirect,https://vscode.dev/redirect,http://127.0.0.1/,http://127.0.0.1:33418/
 ```
 
-For other clients, use their [callback instructions](mcp-clients.md#choose-a-client).
+For Copilot Studio, M365 declarative agents, Microsoft Copilot Cowork and
+Copilot CLI, see the [client callback reference](mcp-clients.md#oauth-callback-reference).
+It includes Microsoft's documented Teams plugin callback and identifies which
+callbacks must be obtained from the client rather than guessed. When adding a
+client later, rerun `start -ConfigureMcp` for the same project and provide the
+combined existing and new callbacks, comma-separated. `*` is not accepted.
+Changing client callbacks does not change the MCP server's Entra `/auth/callback`.
+
 Point your HTTPS proxy/tunnel at the selected loopback port.
 MCP calls the API internally at `http://app:3001`, not through the web/API tunnel.
 
 The wizard saves the API binding, generates protected signing/encryption keys
 on first setup, and starts the MCP container. It does not create Entra apps or
 HTTPS ingress. Keep its saved keys and OAuth volume; do not regenerate them on restart.
+
+For an existing project, database preflight uses the base Compose configuration
+without MCP; new MCP settings and credentials are saved after preflight and builds
+succeed. Adding the first API integration binding can restart the web app and
+require users to sign in again, so schedule that setup outside a live demo.
 
 After setup, normal startup includes MCP:
 

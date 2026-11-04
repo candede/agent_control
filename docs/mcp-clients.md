@@ -9,7 +9,7 @@ synchronization still starts automatically after sign-in.
 1. Have the operator complete [server setup](mcp-integration.md).
 2. Replace `https://mcp.example.test/mcp` in the examples with your public HTTPS
    MCP resource URL, including `/mcp`.
-3. Give the operator your client's exact callbacks below for
+3. Give the operator your client's exact [callbacks](#oauth-callback-reference) for
    `MCP_ALLOWED_CLIENT_REDIRECT_URIS`. No wildcard hosts, ports or paths are accepted.
    The server's Entra callback, `/auth/callback`, is separate.
 4. Sign in as yourself with the required [roles and Microsoft permissions](user-roles-and-permissions.md).
@@ -18,6 +18,48 @@ synchronization still starts automatically after sign-in.
 Never copy the server's Entra secret, signing/encryption keys, or API/Graph
 tokens into client settings. Normal supported use needs no additional
 application approval or feature-enable action.
+
+## OAuth callback reference
+
+OAuth uses two different return addresses:
+
+- **Entra to MCP:** `https://<your-mcp-host>/auth/callback` receives Entra's
+  sign-in response. Register it as a **Web** redirect URI on the MCP Entra app.
+- **MCP to client:** the URLs below receive an OAuth authorization code so the
+  client can finish connecting. Enter these in **Allowed client callback URLs**
+  in the setup wizard, not in the MCP Entra app registration.
+
+The allowlist prevents codes being sent to unintended destinations. Allow
+addresses for the clients you use, not each individual user or installation.
+Loopback addresses refer to the machine running the client, not the MCP
+container; their ports are separate from the MCP server's listening port.
+
+| Client | Client callback URLs | Notes |
+| --- | --- | --- |
+| VS Code / GitHub Copilot, web redirects | `https://insiders.vscode.dev/redirect`, `https://vscode.dev/redirect` | Include both with the desktop callbacks below. |
+| VS Code / GitHub Copilot, desktop callbacks | `http://127.0.0.1/`, `http://127.0.0.1:33418/` | Exact addresses registered by the reviewed VS Code build; an ephemeral fallback port is not automatically allowed. |
+| Standalone GitHub Copilot CLI | Prospective: `http://127.0.0.1:53110/` | The sample fixes `auth.redirectPort` to `53110`; the emitted host/path/port is not source-verified. Use the actual emitted callback, not this example without checking. |
+| Copilot Studio agents, including those published to M365 Copilot | The connection wizard's exact environment-specific callback | Copy the callback supplied for that connection; do not substitute a generic Microsoft or guessed Power Platform URL. |
+| M365 Copilot declarative agents | `https://teams.microsoft.com/api/platform/v1.0/oAuthRedirect` for the documented plugin OAuth flow | This is a downstream client callback, not a replacement for the MCP server's Entra callback. DCR handles registration separately. |
+| Microsoft Copilot Cowork | `https://teams.microsoft.com/api/platform/v1.0/oAuthRedirect` for the documented remote-MCP `OAuthPluginVault` flow | Use the callback required by the plugin's selected authentication flow and target host. Microsoft Copilot Cowork is not Claude Cowork. |
+
+These are callback configuration references, not proof of native client
+interoperability. In particular, Microsoft's M365 DCR documentation currently
+requires the authorization server to issue a client secret; this repository's
+[documented downstream contract](mcp-reference.md#oauth-and-token-flow) is public
+DCR. Adding a callback alone does not establish compatibility with that M365
+flow, and the MCP server's Entra secret must not be used as a downstream client
+secret.
+
+Microsoft callback/authentication references checked **2026-11-04**:
+[Copilot Studio onboarding](https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-add-existing-server-to-agent),
+[M365 plugin OAuth](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/plugin-authentication-oauth),
+[remote MCP plugins / Copilot Cowork](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/configure-plugin-mcp-servers)
+and [M365 DCR requirements](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/plugin-authentication-dynamic-client-registration).
+
+To add clients later, rerun `start -ConfigureMcp` for the same project and supply
+the combined existing and new callbacks, comma-separated. No `*`, wildcard host,
+port or path is accepted. Keep the Entra `/auth/callback` unchanged.
 
 ## Choose a client
 
@@ -31,7 +73,8 @@ Merge the relevant entry into existing configuration; do not overwrite other ser
 | [Claude Code](#claude-code) | [Sample](../mcp/examples/clients/claude-code/.mcp.json) → project `.mcp.json` |
 | [Claude web, Desktop and Cowork](#claude-web-desktop-and-cowork) | Account remote connector; no JSON import |
 | [Claude Messages API](#claude-messages-api) | Host application supplies an MCP-resource token |
-| [Copilot Studio / Microsoft 365 Copilot](#copilot-studio-and-microsoft-365-publication) | OAuth wizard; optional [OpenAPI transport import](../mcp/examples/clients/copilot-studio/agent-control.openapi.yaml) |
+| [Copilot Studio / published Microsoft 365 agents](#copilot-studio-and-microsoft-365-publication) | OAuth wizard; optional [OpenAPI transport import](../mcp/examples/clients/copilot-studio/agent-control.openapi.yaml) |
+| [M365 declarative agents / Microsoft Copilot Cowork](#oauth-callback-reference) | MCP plugin authentication; see callback and DCR compatibility notes above |
 | [GitHub cloud coding agent / code review](#github-cloud-coding-agent-and-code-review) | [Transport-only sample](../mcp/examples/clients/github-cloud/mcp-config.json); no remote OAuth support |
 
 Version notes follow the repository's **2026-10-17** vendor review, not live
@@ -195,7 +238,8 @@ licensing, region and data policies; a trial can test chat but cannot publish.
    description and the exact MCP URL.
 2. Choose **OAuth 2.0 > Dynamic discovery** and DCR.
 3. Copy the wizard's exact **environment-specific callback** into the service's
-   allowlist. There is no universal Microsoft callback to guess.
+   allowlist. Use the callback for this Studio connection, not the Teams plugin
+   callback simply because both clients are Microsoft products.
 4. Create the connection, sign in and add it to the agent.
 5. In test chat, request `list_capabilities`, then follow the
    [first-read checks](#verify-and-use-the-connection). If the build omits required

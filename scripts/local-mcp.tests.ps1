@@ -50,11 +50,11 @@ function Get-OwnedLocalContainers {
     if ($script:running) { @{Id=$script:container;Service='mcp';Image=$script:image;State=@{Running=$true;Health=@{Status=$(if ($script:ready) {'healthy'} else {'unhealthy'})}}} }
 }
 function New-McpSetupFixture {
-    param([string]$Name,[object[]]$Profiles,[int]$Port=8001)
+    param([string]$Name,[object[]]$Profiles,[int]$Port=8001,[string]$Project='mcp-test')
     $directory = Join-Path $root $Name
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     foreach ($file in @('compose.yaml','compose.mcp.yaml')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $directory }
-    $fixture = New-LocalContext $directory 'mcp-test'
+    $fixture = New-LocalContext $directory $Project
     $secrets = Join-Path $fixture.State 'secrets'
     [IO.Directory]::CreateDirectory($secrets) | Out-Null
     Protect-LocalPath $secrets -Directory
@@ -222,21 +222,43 @@ try {
     $script:volume=$false
     $unbound=$profile.Clone();$unbound.Remove('integration')
     $other=@{tenantId='44444444-4444-4444-4444-444444444444';clientId='55555555-5555-5555-5555-555555555555';clientSecret='synthetic-other-api-secret';domains=@('other.invalid')}
-    $wizard=New-McpSetupFixture 'wizard' @($profile,$other)
+    $namedProfile=$profile.Clone();$namedProfile.displayName='Primary tenant'
+    $wizard=New-McpSetupFixture 'wizard' @($namedProfile,$other) -Project 'seha'
+    $foreignProfile=$other.Clone();$foreignProfile.displayName='Other project only';$foreignProfile.domains=@('foreign.invalid')
+    $foreign=New-McpSetupFixture 'wizard' @($foreignProfile) -Project 'other-project'
+    $foreignSettings=[IO.File]::ReadAllText((Join-Path $foreign.State 'settings.json'))
+    $foreignRegistry=[IO.File]::ReadAllText((Join-Path $foreign.State 'secrets/tenants.json'))
     Set-SetupAnswers
     Save-LocalConfiguration $wizard (Read-LocalConfiguration $wizard $false -Onboard)
     $wizard.ConfigureMcp=$true
     $wizardClient='66666666-6666-6666-6666-666666666666'
     $wizardSecret='synthetic-new-mcp-credential'
-    Set-SetupAnswers @('2',$wizardClient,$mcp.publicUrl,'https://client.example.test/callback,http://127.0.0.1:8585/oauth/callback','') @($wizardSecret)
-    $setup=Read-LocalConfiguration $wizard $true -Edit
+    Set-SetupAnswers @('2',$wizardClient,'','   ',$mcp.publicUrl,'https://client.example.test/callback,http://127.0.0.1:8585/oauth/callback','') @($wizardSecret)
+    $wizardOutput=Join-Path $root 'wizard-output.txt'
+    $wizardWarnings=Join-Path $root 'wizard-warnings.txt'
+    $setup=Read-LocalConfiguration $wizard $true -Edit 6>$wizardOutput 3>$wizardWarnings
+    $wizardMessages=[IO.File]::ReadAllText($wizardOutput)
+    Assert ($wizardMessages.Contains("Configure MCP for local project 'seha'.") -and
+        $wizardMessages.Contains('Only tenant configurations saved in this project are listed.')) 'Wizard did not explain the selected project boundary.'
+    Assert ($wizardMessages.Contains('1: Primary tenant') -and $wizardMessages.Contains('2: other.invalid')) 'Wizard omitted the tenant name or its domain fallback.'
+    Assert ($wizardMessages.Contains("Entra tenant ID: $($other.tenantId)") -and
+        $wizardMessages.Contains("Existing Agent Control application (client) ID: $($other.clientId)")) 'Wizard did not label the existing tenant/API identities.'
+    Assert (-not $wizardMessages.Contains('Other project only') -and -not $wizardMessages.Contains('foreign.invalid')) 'Wizard listed a tenant from another project.'
+    Assert ($wizardMessages.Contains('separate MCP server Entra registration, not the existing Agent Control registration above.')) 'Wizard did not distinguish the new MCP registration from the existing API.'
+    Assert ($script:prompts[0].text -ceq 'Choose a configuration number [default: 1; press Enter to select]') 'First-time configuration selection did not explain the default.'
+    Assert ($wizardMessages.Contains('including its resource path (for example https://mcp.example.com/mcp), not just the base URL.')) 'Wizard did not explain the full MCP endpoint URL.'
+    $urlPrompts=@($script:prompts | Where-Object { $_.text.StartsWith('MCP public HTTPS resource URL') })
+    Assert ($urlPrompts.Count -eq 3 -and
+        @($urlPrompts | Where-Object { $_.text -cne 'MCP public HTTPS resource URL (required; for example https://mcp.example.com/mcp)' }).Count -eq 0) 'First-time URL setup offered an empty default or accepted blank input.'
+    Assert ([regex]::Matches([IO.File]::ReadAllText($wizardWarnings),'MCP public HTTPS resource URL is required').Count -eq 2) 'Blank URL inputs did not produce explicit validation warnings.'
+    Assert ($setup.McpPlan.Settings.publicUrl -ceq $mcp.publicUrl) 'Wizard did not retain the entered full MCP endpoint.'
     Assert ($setup.McpPlan.Settings.tenantId -ceq $other.tenantId -and $setup.McpPlan.Settings.apiClientId -ceq $other.clientId) 'Wizard selected the wrong API tenant profile.'
     Assert ($setup.McpPlan.Settings.port -eq 8002) 'Wizard default conflicts with the API port.'
     Assert ($setup.McpPlan.Settings.redirectUris.Count -eq 2) 'Wizard lost an exact client callback.'
     Assert ($setup.RegistryChanged -and $setup.IdentityChanged -and $setup.SettingsChanged -and -not $setup.ApplicationSettingsChanged) 'Integration binding was added after metadata/change detection.'
     Assert ($setup.Profiles[0].integration.clientId -ceq $profile.integration.clientId -and $setup.Profiles[1].integration.clientId -ceq $wizardClient) 'Wizard overwrote another tenant integration.'
     Assert ($setup.Profiles[1].integration.audience -ceq $other.clientId -and $setup.Profiles[1].integration.scope -ceq 'AgentControl.Access') 'Wizard broadened API audience or scope.'
-    Assert ($script:prompts.Count -eq 6 -and @($script:prompts | Where-Object secure).Count -eq 1 -and $script:prompts[-1].text.StartsWith('MCP Entra client secret')) 'Wizard exposed a credential or re-prompted for API secrets.'
+    Assert ($script:prompts.Count -eq 8 -and @($script:prompts | Where-Object secure).Count -eq 1 -and $script:prompts[-1].text.StartsWith('MCP Entra client secret')) 'Wizard exposed a credential or re-prompted for API secrets.'
     foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
         Assert (-not (Test-Path -LiteralPath (Join-Path $wizard.State "secrets/$name"))) 'Planning persisted MCP secrets before successful validation.'
     }
@@ -246,6 +268,9 @@ try {
     Assert-LocalMcpKey $generatedEncryption[0]
     Assert ($generatedEncryption.Count -eq 1 -and $generatedSigning -cne $generatedEncryption[0] -and $generatedSigning -cne $wizardSecret) 'First setup reused secret/key material.'
     Save-LocalConfiguration $wizard $setup
+    Assert ([IO.File]::ReadAllText((Join-Path $foreign.State 'settings.json')) -ceq $foreignSettings -and
+        [IO.File]::ReadAllText((Join-Path $foreign.State 'secrets/tenants.json')) -ceq $foreignRegistry -and
+        -not (Test-Path -LiteralPath (Join-Path $foreign.State 'secrets/mcp-client'))) 'MCP setup changed another project configuration or credentials.'
     Assert ((Test-Path -LiteralPath (Join-Path $wizard.State 'control/reauthenticate')) -and
         @($script:calls | Where-Object { $_ -match '\|stop\|--timeout\|130\|app$' }).Count -eq 1) 'First integration binding did not drain the retained API and invalidate old sessions.'
     $saved=Read-LocalSettings $wizard.State
@@ -263,6 +288,10 @@ try {
     if (-not $IsWindows) { Assert ([int][IO.File]::GetUnixFileMode((Join-Path $wizard.State 'secrets')) -eq 448) 'Generated secret directory is not 0700.' }
     Set-SetupAnswers @('','','','','') @('')
     $unchanged=Read-LocalConfiguration $wizard $true -Edit
+    Assert ($script:prompts[0].text -ceq 'Choose a configuration number [default: 2; press Enter to select]' -and
+        $unchanged.McpPlan.Settings.apiClientId -ceq $other.clientId) 'Enter did not select the saved tenant configuration.'
+    Assert ($script:prompts[2].text -ceq "MCP public HTTPS resource URL [$($mcp.publicUrl); Enter to keep]" -and
+        $unchanged.McpPlan.Settings.publicUrl -ceq $mcp.publicUrl) 'Saved URL was not shown or retained when Enter was pressed.'
     Assert (-not $unchanged.RegistryChanged -and -not $unchanged.IdentityChanged -and -not $unchanged.SettingsChanged -and -not $unchanged.McpPlan.SecretsChanged) 'Enter-to-keep changed existing MCP authority.'
     Save-LocalConfiguration $wizard $unchanged
     foreach ($name in $times.Keys) {
@@ -363,6 +392,9 @@ try {
     $firstRun.ConfigureMcp=$true
     Set-SetupAnswers @($mcp.tenantId,$mcp.apiClientId,'example.invalid','8001','',$mcp.clientId,$mcp.publicUrl,'https://client.example.test/callback','') @('synthetic-first-api-credential','synthetic-first-mcp-credential')
     $firstPlan=Read-LocalConfiguration $firstRun $false -Onboard
+    Assert ($firstPlan.McpPlan.Settings.tenantId -ceq $mcp.tenantId -and
+        $firstPlan.McpPlan.Settings.apiClientId -ceq $mcp.apiClientId -and
+        @($script:prompts | Where-Object { $_.text -ceq 'Choose a configuration number [default: 1; press Enter to select]' }).Count -eq 1) 'Single-tenant setup did not accept Enter to select the project configuration.'
     Assert ($firstPlan.Port -eq 8001 -and $firstPlan.McpPlan.Settings.port -eq 8002 -and 8001 -in $script:portChecks) 'Combined first-run wizard lost API port validation or MCP port separation.'
     Assert ($firstPlan.Profiles[0].clientSecret -ceq 'synthetic-first-api-credential' -and
         $firstPlan.McpPlan.SecretValues['mcp-client'] -ceq 'synthetic-first-mcp-credential') 'Combined wizard copied the API credential into MCP.'

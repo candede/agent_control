@@ -46,7 +46,7 @@ function Assert-FreshInstallationContainer {
         $labels.'com.docker.compose.project.config_files' -ceq $verified.Config.Labels.'com.docker.compose.project.config_files'
     if ($labels.'com.docker.compose.project' -cne $Context.Project -or $service -notin @('app','postgres') -or
         $labels.'com.docker.compose.project.working_dir' -cne $Context.Root -or
-        $Container.Name -cne "/$($Context.Project)-$service-1" -or
+        $Container.Name -cne "/$($Context.Project)-agent-control-$service-1" -or
         $Container.Id -cnotmatch '^[a-f0-9]{64}$' -or
         ($labels.'com.docker.compose.project.config_files' -cne ($composeFiles -join ',') -and -not $retainedContainer)) {
         throw 'Fresh installation container metadata differs; cleanup refused.'
@@ -170,7 +170,7 @@ try {
 '@)
     }
     try {
-        $output = @($script | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$($Context.Project)" "$($Context.Project)-app-1" node --input-type=module - first-sync $order 2>&1)
+        $output = @($script | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$($Context.Project)" "$($Context.Project)-agent-control-app-1" node --input-type=module - first-sync $order 2>&1)
         $code = $LASTEXITCODE
     } finally {
         if ($order -ceq 'app-first') {
@@ -288,7 +288,7 @@ networks:
         $context.DependencyHashes = Get-LocalDependencyManifests $context.DependencyImageId
         $context.BuildArguments = @('--network','none','--build-arg',"DEPENDENCY_BASE=$Baseline",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1','--label',"io.agent-control.fixture=$project")
         $context.OperatorArguments = @('--memory','1536m','--cpus','1.5','-e','NODE_OPTIONS=--max-old-space-size=768')
-        $context.IsolatedHealthContainer = "$project-app-1"
+        $context.IsolatedHealthContainer = "$project-agent-control-app-1"
         Write-Host "Fresh installation: $project; evidence: $Directory; unpublished synthetic origin port: $($context.Port)"
         if ($CurrentSchemaOnly) { Invoke-LocalDeployment -Context $context -Action Deploy }
         else { Invoke-LocalDeployment -Context $context -Action Deploy -ForceChecks }
@@ -300,7 +300,7 @@ networks:
         if ($schema.state -cne 'current' -or $schema.targetFingerprint -cnotmatch '^[a-f0-9]{64}$' -or
             $schema.currentFingerprint -cne $schema.targetFingerprint) { throw 'Fresh installation does not match the compiled schema fingerprint.' }
         Write-LocalText (Join-Path $Directory 'schema.json') ($schema | ConvertTo-Json)
-        $runtimeFiles = Invoke-DockerCommand @('exec',"$project-app-1",'node','-e',
+        $runtimeFiles = Invoke-DockerCommand @('exec',"$project-agent-control-app-1",'node','-e',
             'const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto"),out={};function visit(p){for(const e of fs.readdirSync(p,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const f=path.join(p,e.name);if(e.isDirectory())visit(f);else if(e.isFile())out[f]=crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex");}}visit("backend/dist");visit("frontend/dist");console.log(JSON.stringify(out));') -Capture
         Write-LocalText (Join-Path $Directory 'runtime-files.json') $runtimeFiles
         $observations = @()
@@ -334,7 +334,7 @@ networks:
         Invoke-DockerCommand ($context.Compose + @('restart','--timeout','130','app'))
         Wait-FreshInstallationHealth $context $Directory
         $idleScript = [IO.File]::ReadAllText((Join-Path $Root 'backend/scripts/restart-runtime.mjs'))
-        $idleOutput = @($idleScript | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$project" "$project-app-1" node --input-type=module - office-idle 2>&1)
+        $idleOutput = @($idleScript | & docker exec -i -e "AGENT_CONTROL_FRESH_FIXTURE=$project" "$project-agent-control-app-1" node --input-type=module - office-idle 2>&1)
         Write-LocalText (Join-Path $Directory 'office-restart-idle.log') ($idleOutput -join "`n")
         if ($LASTEXITCODE -ne 0 -or -not ($idleOutput -match '"event":"fresh_office_restart_idle".*"outcome":"passed"')) {
             throw 'Compiled Office restart/idle proof failed.'
