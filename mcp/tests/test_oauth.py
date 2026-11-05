@@ -1,17 +1,21 @@
 import asyncio
+import json
 import time
 from dataclasses import replace
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlencode
 
 import httpx2
 import pytest
 from conftest import OTHER, connect, tokens
 from cryptography.fernet import Fernet
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-from agent_control_mcp.auth import TenantAzureProvider
+from agent_control_mcp.auth import TenantAzureProvider, valid_claims
 from agent_control_mcp.config import ConfigurationError
 from agent_control_mcp.domains import PUBLIC_TOOLS
-from agent_control_mcp.service import build_service
+from agent_control_mcp.service import ProtocolBoundary, build_service
 from agent_control_mcp.storage import OAuthStore
 from agent_control_mcp.tools import OPERATIONS
 
@@ -147,14 +151,197 @@ async def test_pkce_wrong_verifier_wrong_client_and_replay(browser):
     _, grant = await connect(browser)
     wrong = await browser.post("/token", data={**grant, "code_verifier": "b" * 64})
     assert wrong.status_code in {400, 401}
-    missing_resource = await browser.post(
-        "/token", data={key: value for key, value in grant.items() if key != "resource"}
+    wrong_resource = await browser.post(
+        "/token", data={**grant, "resource": "https://wrong.example.test/mcp"}
     )
-    assert missing_resource.status_code == 400
+    assert wrong_resource.status_code == 400
     response = await browser.post("/token", data=grant)
     assert response.status_code == 200, response.text
     replay = await browser.post("/token", data=grant)
     assert replay.status_code in {400, 401}
+
+
+@pytest.mark.parametrize("resource_path", ["/mcp", "/tenant/agents"])
+async def test_missing_resource_is_pinned_through_authorize_token_and_refresh(
+    settings, entra, monkeypatch, resource_path
+):
+    configured = replace(settings, public_url=settings.public_origin + resource_path)
+    runtime = build_service(configured, transport=httpx2.MockTransport(entra.route))
+    observed_resources = []
+    authorize = runtime.provider.authorize
+
+    async def observe_resource(client, params):
+        observed_resources.append(params.resource)
+        return await authorize(client, params)
+
+    monkeypatch.setattr(runtime.provider, "authorize", observe_resource)
+    sdk_app = runtime.app.app
+    try:
+        async with sdk_app.router.lifespan_context(sdk_app):
+            async with httpx2.AsyncClient(
+                transport=httpx2.ASGITransport(app=runtime.app),
+                base_url=configured.public_origin,
+                follow_redirects=False,
+            ) as browser:
+                client_id, grant = await connect(browser, include_resource=False)
+                assert "resource" not in grant
+                assert observed_resources == [configured.public_url]
+                wrong_verifier = await browser.post(
+                    "/token", data={**grant, "code_verifier": "b" * 64}
+                )
+                assert wrong_verifier.status_code in {400, 401}
+                issued = await browser.post("/token", data=grant)
+                assert issued.status_code == 200, issued.text
+                token = issued.json()
+                loaded = await runtime.provider.load_access_token(token["access_token"])
+                assert loaded is not None and loaded.client_id == client_id
+                assert valid_claims(loaded.claims, configured)
+                assert loaded.claims["aud"] == configured.client_id
+                assert loaded.claims["tid"] == configured.tenant_id
+                authenticated = await browser.get(
+                    "/diagnostics",
+                    headers={"Authorization": f"Bearer {token['access_token']}"},
+                )
+                assert authenticated.status_code == 200
+                replay = await browser.post("/token", data=grant)
+                assert replay.status_code in {400, 401}
+                refresh = {
+                    "grant_type": "refresh_token",
+                    "client_id": client_id,
+                    "refresh_token": token["refresh_token"],
+                }
+                for resource in ("", "https://wrong.example.test/mcp"):
+                    rejected = await browser.post("/token", data={**refresh, "resource": resource})
+                    assert rejected.status_code == 400
+                    assert rejected.json()["error"] == "invalid_request"
+                refreshed = await browser.post("/token", data=refresh)
+                assert refreshed.status_code == 200, refreshed.text
+                current = await runtime.provider.load_access_token(refreshed.json()["access_token"])
+                assert current is not None and current.client_id == client_id
+                assert valid_claims(current.claims, configured)
+                assert refreshed.json()["refresh_token"] != token["refresh_token"]
+    finally:
+        await runtime.http.aclose()
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("GET", "/authorize"), ("POST", "/authorize"), ("POST", "/token")],
+)
+async def test_missing_resource_preserves_form_values_and_content_length(settings, method, path):
+    async def echo(scope, receive, send):
+        request = Request(scope, receive)
+        raw = scope["query_string"] if method == "GET" else await request.body()
+        await JSONResponse(
+            {
+                "params": parse_qs(raw.decode()),
+                "lengthHeaders": [
+                    value.decode()
+                    for key, value in scope["headers"]
+                    if key.lower() == b"content-length"
+                ],
+                "bodyLength": len(raw),
+                "preservedHeader": request.headers["x-preserved"],
+            }
+        )(scope, receive, send)
+
+    params = {
+        "client_id": "synthetic-client",
+        "code_challenge": "a" * 43,
+        "code_challenge_method": "S256",
+        "grant_type": "authorization_code",
+        "state": "synthetic state + caf\u00e9",
+    }
+    transport = httpx2.ASGITransport(app=ProtocolBoundary(echo, settings))
+    async with httpx2.AsyncClient(transport=transport, base_url=settings.public_origin) as browser:
+        response = await browser.request(
+            method,
+            path,
+            params=params if method == "GET" else None,
+            content=urlencode(params).encode() if method == "POST" else None,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Preserved": "unchanged",
+            },
+        )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["params"] == {
+        **{key: [value] for key, value in params.items()},
+        "resource": [settings.public_url],
+    }
+    assert result["preservedHeader"] == "unchanged"
+    assert result["lengthHeaders"] == ([str(result["bodyLength"])] if method == "POST" else [])
+
+
+@pytest.mark.parametrize("canonical_length", [65536, 65537])
+async def test_resource_default_preserves_canonical_request_size_bound(settings, canonical_length):
+    calls = []
+
+    async def capture(scope, receive, send):
+        body = await Request(scope, receive).body()
+        calls.append(len(body))
+        await JSONResponse({"length": len(body)})(scope, receive, send)
+
+    params = {"grant_type": "authorization_code", "padding": ""}
+    base_length = len(urlencode({**params, "resource": settings.public_url}).encode())
+    params["padding"] = "x" * (canonical_length - base_length)
+    transport = httpx2.ASGITransport(app=ProtocolBoundary(capture, settings))
+    async with httpx2.AsyncClient(transport=transport, base_url=settings.public_origin) as browser:
+        response = await browser.post(
+            "/token",
+            content=urlencode(params).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    if canonical_length == 65536:
+        assert response.status_code == 200, response.text
+        assert response.json() == {"length": canonical_length}
+        assert calls == [canonical_length]
+    else:
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "invalid_request"
+        assert not calls
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "",
+        "https://wrong.example.test/mcp",
+        "https://mcp.example.test",
+        "https://mcp.example.test/another",
+        ["https://mcp.example.test/mcp", "https://mcp.example.test/mcp"],
+    ],
+)
+@pytest.mark.parametrize("path", ["/authorize", "/token"])
+async def test_resource_default_does_not_accept_explicit_invalid_resources(
+    settings, resource, path
+):
+    calls = []
+
+    async def unexpected(scope, receive, send):
+        calls.append(scope)
+        await JSONResponse({"unexpected": True})(scope, receive, send)
+
+    params = {
+        "resource": resource,
+        "code_challenge": "a" * 43,
+        "code_challenge_method": "S256",
+        "grant_type": "authorization_code",
+    }
+    transport = httpx2.ASGITransport(app=ProtocolBoundary(unexpected, settings))
+    async with httpx2.AsyncClient(transport=transport, base_url=settings.public_origin) as browser:
+        if path == "/authorize":
+            response = await browser.get(path, params=params)
+        else:
+            response = await browser.post(
+                path,
+                content=urlencode(params, doseq=True).encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_request"
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -175,7 +362,7 @@ async def test_exact_resource_and_no_pkce_downgrade(browser, resource):
     assert response.status_code == 400
 
 
-async def test_dynamic_consumers_do_not_require_a_vendor_client_id(browser, settings):
+async def test_dynamic_consumers_do_not_require_a_vendor_client_id(browser, settings, caplog):
     identifiers = set()
     for name in ("Synthetic desktop", "Synthetic coding agent", "Any other consumer"):
         response = await browser.post(
@@ -195,6 +382,7 @@ async def test_dynamic_consumers_do_not_require_a_vendor_client_id(browser, sett
         assert client["redirect_uris"] == ["https://client.example.test/callback"]
         identifiers.add(client["client_id"])
     assert len(identifiers) == 3
+    assert not any(record.name == "agent_control_mcp.auth" for record in caplog.records)
     assert (await browser.get("/diagnostics")).status_code == 401
 
 
@@ -233,6 +421,86 @@ async def test_exact_native_callback_oauth_flow(settings, entra, callback):
                 assert alternate_host.status_code == 400
     finally:
         await runtime.http.aclose()
+
+
+@pytest.mark.parametrize(
+    ("redirects", "diagnostics"),
+    [
+        (
+            ["https://studio.example.test/Redirect/my-connection"],
+            ["https://studio.example.test/Redirect/my-connection"],
+        ),
+        (
+            [
+                "https://client.example.test/callback",
+                "https://studio.example.test/redirect/my-connection",
+            ],
+            ["https://studio.example.test/redirect/my-connection"],
+        ),
+        (
+            ["http://127.0.0.1:53110/callback"],
+            ["http://127.0.0.1:53110/callback"],
+        ),
+        (
+            ["http://[::1]:53110/callback"],
+            ["http://[::1]:53110/callback"],
+        ),
+        (
+            [
+                "https://synthetic-callback-user:synthetic-callback-password"
+                "@studio.example.test/redirect/my-connection"
+                "?access_token=synthetic-callback-token#synthetic-callback-fragment"
+            ],
+            ["https://[redacted]@studio.example.test/redirect/my-connection?[redacted]#[redacted]"],
+        ),
+        (
+            ["data:synthetic-callback-token"],
+            ["[unsupported callback scheme]"],
+        ),
+    ],
+)
+async def test_registration_rejection_diagnostics_are_safe(browser, caplog, redirects, diagnostics):
+    response = await browser.post(
+        "/register",
+        json={
+            "client_name": "synthetic-sensitive-client-name",
+            "redirect_uris": redirects,
+            "token_endpoint_auth_method": "none",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_redirect_uri"
+    records = [record for record in caplog.records if record.name == "agent_control_mcp.auth"]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelname == "WARNING"
+    assert record.exc_info is None
+    message = record.getMessage()
+    assert message.startswith("OAuth client registration rejected: invalid_redirect_uri; ")
+    assert json.loads(message.split("rejected_redirect_uris=", 1)[1]) == diagnostics
+    for sensitive in (
+        "synthetic-sensitive-client-name",
+        "synthetic-callback-user",
+        "synthetic-callback-password",
+        "synthetic-callback-token",
+        "synthetic-callback-fragment",
+    ):
+        assert sensitive not in caplog.text + response.text
+
+
+async def test_empty_registration_redirects_preserve_sdk_validation(browser, caplog):
+    response = await browser.post(
+        "/register",
+        json={
+            "client_name": "synthetic-sensitive-client-name",
+            "redirect_uris": [],
+            "token_endpoint_auth_method": "none",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_client_metadata"
+    assert not any(record.name == "agent_control_mcp.auth" for record in caplog.records)
+    assert "synthetic-sensitive-client-name" not in caplog.text + response.text
 
 
 async def test_rejects_unapproved_redirect_and_mixed_credentials(browser):
@@ -315,12 +583,8 @@ async def test_reference_expiring_during_token_swap_returns_unauthenticated(
         checks.append(True)
         return expiry - 1 if len(checks) == 1 else expiry + 1
 
-    monkeypatch.setattr(
-        "fastmcp.server.auth.jwt_issuer.time", SimpleNamespace(time=issuer_time)
-    )
-    response = await browser.get(
-        "/diagnostics", headers={"Authorization": f"Bearer {reference}"}
-    )
+    monkeypatch.setattr("fastmcp.server.auth.jwt_issuer.time", SimpleNamespace(time=issuer_time))
+    response = await browser.get("/diagnostics", headers={"Authorization": f"Bearer {reference}"})
     assert response.status_code == 401
     assert len(checks) == 2
     assert reference not in response.text
@@ -354,9 +618,7 @@ async def test_callback_errors_and_deadlines_do_not_expose_provider_diagnostics(
     assert deadline.json()["error"] == "temporarily_unavailable"
 
 
-async def test_signing_key_rotation_returns_invalid_grant_for_old_refresh(
-    browser, settings, entra
-):
+async def test_signing_key_rotation_returns_invalid_grant_for_old_refresh(browser, settings, entra):
     client_id, issued = await tokens(browser)
     runtime = build_service(
         replace(settings, signing_key=Fernet.generate_key()),
@@ -640,6 +902,28 @@ async def test_authorization_code_is_single_use_under_concurrent_redemption(brow
     statuses = sorted(result.status_code for result in results)
     assert statuses[0] == 200 and statuses[1] in {400, 401}
     assert grant["code"] not in caplog.text
+
+
+async def test_refresh_token_is_single_use_under_concurrent_redemption(browser, service, settings):
+    client_id, issued = await tokens(browser)
+    grant = {
+        "grant_type": "refresh_token",
+        "refresh_token": issued["refresh_token"],
+        "client_id": client_id,
+        "resource": settings.public_url,
+    }
+    results = await asyncio.gather(
+        browser.post("/token", data=grant),
+        browser.post("/token", data=grant),
+    )
+    statuses = sorted(result.status_code for result in results)
+    assert statuses[0] == 200 and statuses[1] in {400, 401}
+    winner = next(result.json() for result in results if result.status_code == 200)
+    assert await service.provider.load_access_token(winner["access_token"])
+    replay = await browser.post("/token", data=grant)
+    assert replay.status_code in {400, 401}
+    rotated = await browser.post("/token", data={**grant, "refresh_token": winner["refresh_token"]})
+    assert rotated.status_code == 200
 
 
 async def test_revocation_during_refresh_cannot_reissue_credentials(

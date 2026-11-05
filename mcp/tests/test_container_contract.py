@@ -1,3 +1,4 @@
+import re
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,9 +7,109 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from agent_control_mcp import __main__, healthcheck, initialize_storage
+from agent_control_mcp import __main__, healthcheck, initialize_storage, recording
+from agent_control_mcp.config import ConfigurationError, guid
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_local_build_guard_checks_parent_links_and_repository_boundary(tmp_path):
+    root = tmp_path / "repository"
+    target = tmp_path / "outside"
+    root.mkdir()
+    target.mkdir()
+    (target / "input.ts").write_text("synthetic-source")
+    (root / "backend").symlink_to(target, target_is_directory=True)
+    leaf = root / "backend/input.ts"
+    assert leaf.is_file() and not leaf.is_symlink() and leaf.parent.is_symlink()
+
+    source = (ROOT / "scripts/local-runtime.ps1").read_text()
+    guard = source.split("function Assert-LocalBuildPath {", 1)[1].split(
+        "\nfunction Get-LocalSourceFiles {", 1
+    )[0]
+    assert "[IO.Path]::GetFullPath($Root)" in guard
+    assert "[IO.Path]::GetFullPath($Path)" in guard
+    assert "[StringComparison]::OrdinalIgnoreCase" in guard
+    assert "$current.StartsWith($prefix,$comparison)" in guard
+    assert "while ($true)" in guard
+    assert "Get-Item -LiteralPath $current -Force -ErrorAction Stop).LinkType" in guard
+    assert "[string]::Equals($current,$boundary,$comparison)" in guard
+    assert "$current = [IO.Path]::GetDirectoryName($current)" in guard
+
+
+@pytest.mark.parametrize(
+    ("function", "guard", "consumption"),
+    [
+        (
+            "Get-LocalSourceFiles",
+            "Assert-LocalBuildPath $Root $file",
+            "Test-Path -LiteralPath $file -PathType Leaf",
+        ),
+        (
+            "New-LocalBuildSnapshot",
+            "Assert-LocalBuildPath $Context.Root $directory",
+            "[IO.Directory]::CreateDirectory($source)",
+        ),
+        (
+            "New-LocalBuildSnapshot",
+            "Assert-LocalBuildPath $Context.Root (Join-Path $Context.Root $path)",
+            "[IO.File]::Copy((Join-Path $Context.Root $path),$destination)",
+        ),
+        (
+            "Read-LocalCandidate",
+            "Assert-LocalBuildPath $Context.Root $file",
+            "Get-FileHash -LiteralPath $file",
+        ),
+        (
+            "Read-LocalCandidate",
+            "Assert-LocalBuildPath $Context.Root $path",
+            "Get-FileHash -LiteralPath $candidate.sourceManifest",
+        ),
+        (
+            "Read-LocalCandidate",
+            "Assert-LocalBuildPath $candidate.sourceRoot $source",
+            "Get-FileHash -LiteralPath $source",
+        ),
+    ],
+)
+def test_local_build_inputs_are_guarded_before_consumption(function, guard, consumption):
+    source = (ROOT / "scripts/local-runtime.ps1").read_text()
+    body = source.split(f"function {function} {{", 1)[1].split("\nfunction ", 1)[0]
+    assert body.index(guard) < body.index(consumption)
+
+
+def test_local_snapshot_setup_is_inside_cleanup_scope():
+    source = (ROOT / "scripts/local-runtime.ps1").read_text()
+    snapshot = source.split("function New-LocalBuildSnapshot {", 1)[1].split(
+        "\nfunction Build-LocalArtifact {", 1
+    )[0]
+    assert (
+        snapshot.index("try {")
+        < snapshot.index("[IO.Directory]::CreateDirectory($source)")
+        < snapshot.index("Protect-LocalPath $directory -Directory")
+        < snapshot.index("} catch {")
+    )
+    cleanup = snapshot.split("} catch {", 1)[1]
+    assert (
+        "if (Test-Path -LiteralPath $directory) { "
+        "Remove-Item -LiteralPath $directory -Recurse -Force }"
+    ) in cleanup
+    assert "throw" in cleanup
+
+
+@pytest.mark.parametrize("suffix", ["", "\n", "\r\n", " ", "\0"])
+def test_local_setup_guid_guard_matches_exact_runtime_boundary(suffix):
+    source = (ROOT / "scripts/local-mcp.ps1").read_text()
+    guard = re.search(r"\$Mcp\[\$name\] -cnotmatch '([^']+)'", source)
+    assert guard is not None
+    value = "33333333-3333-3333-3333-333333333333" + suffix
+    # Python 3.14 and .NET share the $ and \z boundary semantics used here.
+    assert (re.search(guard.group(1), value) is not None) == (suffix == "")
+    if suffix:
+        with pytest.raises(ConfigurationError):
+            guid(value)
+    else:
+        assert guid(value) == value
 
 
 def test_server_has_bounded_drain_without_proxy_trust(monkeypatch):
@@ -51,7 +152,10 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
     assert set(base["services"]["app"]["depends_on"]) == {"postgres"}
     overlay = yaml.safe_load((ROOT / "compose.mcp.yaml").read_text())
     assert set(overlay) == {"services", "volumes"}
-    assert set(overlay["volumes"]) == {"mcp-oauth"}
+    assert set(overlay["volumes"]) == {"mcp-oauth", "mcp-recordings"}
+    assert overlay["volumes"]["mcp-recordings"] == {
+        "labels": {"io.agent-control.purpose": "mcp-session-recordings"}
+    }
     assert set(overlay["services"]) == {"app", "mcp"}
     assert overlay["services"]["app"] == {
         "environment": {
@@ -82,6 +186,13 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
     mcp = overlay["services"]["mcp"]
     assert "depends_on" not in mcp
     assert mcp["environment"]["MCP_API_ORIGIN"] == "http://app:3001"
+    assert mcp["environment"]["MCP_RECORDING_STORAGE_PATH"] == (
+        "/var/lib/agent-control-mcp/recordings"
+    )
+    assert not any(
+        key.startswith("MCP_RECORDING_") and key != "MCP_RECORDING_STORAGE_PATH"
+        for key in mcp["environment"]
+    )
     assert mcp["environment"]["MCP_PUBLIC_URL"].startswith("${MCP_PUBLIC_URL:?")
     assert mcp["ports"] == ["127.0.0.1:${MCP_PORT:?MCP loopback port is required}:8000"]
     assert mcp["read_only"] is True
@@ -90,19 +201,27 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
     assert mcp["cpus"] == 0.5 and mcp["mem_limit"] == "512m" and mcp["pids_limit"] == 128
     assert mcp["stop_grace_period"] == "75s"
     assert mcp["logging"]["options"] == {"max-size": "5m", "max-file": "2"}
-    assert len(mcp["volumes"]) == 4
+    assert len(mcp["volumes"]) == 5
     for mount in mcp["volumes"][:3]:
         assert mount["type"] == "bind"
         assert mount["bind"] == {"create_host_path": False}
         assert mount.get("read_only", False) == mount["target"].startswith("/run/secrets/")
         assert "postgres" not in mount["source"]
         assert "tenants" not in mount["source"]
-    assert mcp["volumes"][-1] == {
-        "type": "volume",
-        "source": "mcp-oauth",
-        "target": "/var/lib/agent-control-mcp/oauth",
-        "volume": {"nocopy": True},
-    }
+    assert mcp["volumes"][3:] == [
+        {
+            "type": "volume",
+            "source": "mcp-oauth",
+            "target": "/var/lib/agent-control-mcp/oauth",
+            "volume": {"nocopy": True},
+        },
+        {
+            "type": "volume",
+            "source": "mcp-recordings",
+            "target": "/var/lib/agent-control-mcp/recordings",
+            "volume": {"nocopy": True},
+        },
+    ]
 
 
 def test_image_is_pinned_nonroot_locked_and_uses_only_approved_python_feed():
@@ -134,28 +253,52 @@ def test_image_is_pinned_nonroot_locked_and_uses_only_approved_python_feed():
         (501, 21, 0o700, True, False),
     ],
 )
+@pytest.mark.parametrize("storage_kind", ["oauth", "recording"])
 def test_volume_initialization_never_repairs_nonempty_or_foreign_state(
-    monkeypatch, uid, gid, mode, nonempty, allowed
+    monkeypatch, uid, gid, mode, nonempty, allowed, storage_kind
 ):
     root = Mock()
     root.lstat.return_value = SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=stat.S_IFDIR | mode)
     root.iterdir.return_value = iter(["existing"] if nonempty else [])
     chown = Mock()
-    monkeypatch.setattr(initialize_storage, "ROOT", root)
     monkeypatch.setattr(initialize_storage.os, "getuid", lambda: 0)
     monkeypatch.setattr(initialize_storage.os, "chown", chown)
-    monkeypatch.setattr(initialize_storage.sys, "argv", ["initialize-storage", "501", "20"])
+    if storage_kind == "oauth":
+        monkeypatch.setattr(initialize_storage, "ROOT", root)
+        monkeypatch.setattr(initialize_storage.sys, "argv", ["initialize-storage", "501", "20"])
+
+    def initialize():
+        if storage_kind == "oauth":
+            initialize_storage.main()
+        else:
+            recording.initialize(root, 501, 20)
+
     if allowed:
-        initialize_storage.main()
+        initialize()
     else:
         with pytest.raises(ValueError):
-            initialize_storage.main()
+            initialize()
     if uid == 0 and not nonempty:
         root.chmod.assert_called_once_with(0o700)
         chown.assert_called_once_with(root, 501, 20)
     else:
         root.chmod.assert_not_called()
         chown.assert_not_called()
+
+
+def test_recording_initializer_uses_volume_env_without_starting_tracing(monkeypatch):
+    path = Path("/var/lib/agent-control-mcp/recordings")
+    initialize = Mock()
+    store = Mock(root=path)
+    factory = Mock(return_value=store)
+    monkeypatch.setenv("MCP_RECORDING_STORAGE_PATH", str(path))
+    monkeypatch.setattr(recording.sys, "argv", ["recording", "initialize", "501", "20"])
+    monkeypatch.setattr(recording, "RecordingStore", factory)
+    monkeypatch.setattr(recording, "initialize", initialize)
+    recording.main()
+    factory.assert_called_once_with(path)
+    initialize.assert_called_once_with(path, 501, 20)
+    store.start.assert_not_called()
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o666])

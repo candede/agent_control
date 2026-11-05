@@ -82,6 +82,34 @@ def test_secret_symlink_rejected(settings_env, tmp_path):
         Settings.from_env(settings_env)
 
 
+@pytest.mark.parametrize("relationship", ["same", "child", "parent"])
+def test_recording_storage_rejects_resolved_oauth_overlap(settings_env, tmp_path, relationship):
+    root = tmp_path / "real"
+    root.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    settings_env["MCP_OAUTH_STORAGE_PATH"] = str(alias / "oauth")
+    recording = {
+        "same": root / "oauth",
+        "child": root / "oauth" / "recordings",
+        "parent": root,
+    }[relationship]
+    settings_env["MCP_RECORDING_STORAGE_PATH"] = str(recording)
+    with pytest.raises(ConfigurationError, match="separate"):
+        Settings.from_env(settings_env)
+
+
+def test_recording_storage_accepts_independent_resolved_paths(settings_env, tmp_path):
+    root = tmp_path / "real"
+    root.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(root, target_is_directory=True)
+    settings_env["MCP_OAUTH_STORAGE_PATH"] = str(alias / "oauth")
+    recording = root / "recordings"
+    settings_env["MCP_RECORDING_STORAGE_PATH"] = str(recording)
+    assert Settings.from_env(settings_env).recording_path == recording
+
+
 async def test_encryption_restart_rotation_and_plaintext_rejection(settings):
     store = OAuthStore(settings)
     value = {"access_token": "synthetic-sensitive-access", "refresh_token": "synthetic-refresh"}
@@ -262,6 +290,12 @@ def test_azure_native_references_use_same_separation_and_no_secret_files(azure_e
     assert configured.client_secret == azure_env["MCP_AZURE_CLIENT_SECRET"]
     assert configured.client_secret not in repr(configured)
     assert configured.encryption_keys[0].decode() not in repr(configured)
+
+
+@pytest.mark.parametrize("path", ["/unused/azure-blob", "/unused/azure-blob/recordings"])
+def test_azure_recording_has_no_local_oauth_storage_to_overlap(azure_env, path):
+    azure_env["MCP_RECORDING_STORAGE_PATH"] = path
+    assert Settings.from_env(azure_env).recording_path == Path(path)
 
 
 @pytest.mark.parametrize(

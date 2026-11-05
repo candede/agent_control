@@ -5,6 +5,11 @@ For Entra registration and startup, use [Enable the MCP server](mcp-integration.
 for client settings, use [Connect an MCP client](mcp-clients.md).
 The [role guide](user-roles-and-permissions.md) owns permission explanations.
 
+For restricted, on-demand protocol capture using Docker-exec start/status/stop/
+export controls, see [MCP session flight recorder](mcp-session-recording.md).
+Recording is separate from OAuth state and administrative audit; it does not
+affect application authorization or normal tool execution.
+
 MCP authenticates external clients and calls the same canonical API handlers as
 the browser. The API owns SQL, joins, metrics, provider effects, jobs and audit;
 the browser never calls MCP. MCP adds no scheduler, classifier, generic
@@ -132,7 +137,7 @@ and known incompatibilities.
 | --- | --- |
 | Client → MCP | Streamable HTTP, authorization on every request; protocol session IDs are not credentials |
 | Discovery | 401 challenge points to protected-resource metadata for the exact resource path; issuer and `/authorize`, `/token`, `/register`, `/revoke` are on the MCP origin root |
-| Downstream OAuth | Public DCR, exact allowlisted redirects, authorization code with S256/state; exact `resource=MCP_PUBLIC_URL` on authorize and code/refresh token requests |
+| Downstream OAuth | Public DCR, exact allowlisted redirects, authorization code with S256/state; authorize and code/refresh token requests are pinned to `MCP_PUBLIC_URL`. An omitted `resource` defaults only to that URL; explicit empty, duplicate or different resources are rejected |
 | MCP → Entra | Exact tenant authority, MCP confidential credentials, `api://<MCP GUID>/Mcp.Access openid profile offline_access`; `forward_resource=false` for Entra's scope-based request |
 | MCP → API token | OBO with MCP confidential credentials, upstream Entra MCP-audience assertion and only `api://<API GUID>/AgentControl.Access` |
 | API admission | Verified signature/issuer/tenant, scalar v2 API GUID audience, delegated scope, configured integration `azp`, user identity and recognized API roles |
@@ -143,10 +148,19 @@ reference JWT has the MCP HTTPS resource audience. It is **not** an OBO assertio
 public `get_access_token()` returns the verified upstream Entra token after SDK
 token swap. No private SDK token store is read.
 
+The HTTP boundary applies the single configured resource before the SDK receives
+an authorization or token request. This supports OAuth clients that omit RFC 8707
+resource indicators without accepting a shared authorization server's generic
+default audience. MCP clients should still send their required exact `resource`
+parameter. Omission does not relax S256, redirect, client, tenant, scope, token
+audience or API-role validation.
+
 The service narrows upstream/API claims beyond SDK defaults: exact v2 scalar
 GUID audience/issuer/tenant, delegated scope, integration `azp`, same user,
 finite issuance/not-before/expiry, no ID/app token mode. Resource/S256 guards
 cover both HTTP endpoints; refresh must preserve the original user.
+Authorization codes and rotating refresh credentials are single-use, including
+concurrent redemption within the supported single service worker.
 Only maintained cryptography/storage verification is used.
 Reference credentials that expire during the awaited upstream token swap are
 rejected as unauthenticated (401), not reported as a server failure.
@@ -347,7 +361,7 @@ Secrets/provider diagnostic bodies are not forwarded or logged.
 | Retry | Safe GET only, once for 429/503 with bounded honored Retry-After; no deadline extension |
 | Lists | One page/call; inventory/report ≤100, adoption groups ≤10 |
 | Client example polling | ≤12 polls, ≥2 seconds apart, ≤120 seconds, then return pending |
-| OAuth endpoints | 30 seconds/request |
+| OAuth endpoints | One shared 30-second deadline for POST upload and handler/response work |
 
 POST/PATCH/DELETE submissions are never automatically replayed, including after
 503, timeout or lost response. Transport dispatch rejects cookies, redirects,
@@ -688,7 +702,9 @@ to a private location and replace its synthetic metadata:
 ```
 
 `tenantId`/`apiClientId` select an existing API profile; `clientId` is the MCP
-Entra GUID, not a downstream DCR client ID or `*`. Optional import fields
+Entra GUID, not a downstream DCR client ID or `*`. All three import identities
+must be exact lowercase GUIDs without surrounding whitespace or line breaks.
+Optional import fields
 `clientSecretFile`, `signingKeyFile`, `encryptionKeyFile` are absolute paths to
 distinct protected regular files, never inline values.
 

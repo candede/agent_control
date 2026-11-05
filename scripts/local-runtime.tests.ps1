@@ -237,6 +237,30 @@ try {
     $script:addDuringCapture=$false
     Remove-Item -LiteralPath (Join-Path $root 'backend/added.ts')
     & {
+        function Protect-LocalPath { param([string]$Path,[switch]$Directory) throw 'Simulated snapshot protection failure.' }
+        Fails { New-LocalBuildSnapshot $context } 'snapshot protection failure'
+        Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Failed snapshot protection leaked its source directory.'
+    }
+    & {
+        $inputRoot = Join-Path $root 'linked-input'
+        $targetRoot = Join-Path $root 'linked-target'
+        foreach ($directory in @($inputRoot,$targetRoot)) { [IO.Directory]::CreateDirectory($directory) | Out-Null }
+        [IO.File]::WriteAllText((Join-Path $targetRoot 'input.ts'),'synthetic-linked-input')
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        $backendLink = Join-Path $inputRoot 'backend'
+        New-Item -ItemType $linkType -Path $backendLink -Target $targetRoot | Out-Null
+        function git { $global:LASTEXITCODE=0; return "backend/input.ts`0" }
+        Assert (-not (Get-Item -LiteralPath (Join-Path $backendLink 'input.ts')).LinkType) 'Ancestor-link regression must use a regular leaf file.'
+        Fails { Get-LocalSourceFiles $inputRoot } 'Symbolic build input paths'
+        Fails { Assert-LocalBuildPath $inputRoot (Join-Path $targetRoot 'input.ts') } 'remain inside the repository'
+        Remove-Item -LiteralPath $backendLink -Force
+        $artifactLink = Join-Path $inputRoot 'artifacts'
+        New-Item -ItemType $linkType -Path $artifactLink -Target $targetRoot | Out-Null
+        Fails { New-LocalBuildSnapshot @{Root=$inputRoot} } 'Symbolic build input paths'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $targetRoot 'local-builds'))) 'Snapshot creation wrote through a linked artifact ancestor.'
+        Remove-Item -LiteralPath $artifactLink -Force
+    }
+    & {
         $nativeExecutable=(Microsoft.PowerShell.Core\Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
         $nativeFixture=Join-Path $root 'native build fixture.ps1'
         [IO.File]::WriteAllText($nativeFixture,@'
@@ -299,16 +323,20 @@ exit $ExitCode
         $releaseContext.DatabaseAction = 'deploy'
         $releaseContext.CandidateSha256 = 'f' * 64
         $inspectedAppName = $null
+        $releaseMcpDetails = $null
+        $releaseRecordingProject = $releaseContext.Project
         function Get-OwnedLocalContainers {
             param($Context)
             foreach ($id in $script:containers.Keys) {
                 $container = $script:containers[$id]
                 @{Id=$id;Service=$container.service;Image=$container.image}
             }
+            if ($releaseMcpDetails) { @{Id=('c'*64);Service='mcp';Image=$script:runtime} }
         }
         function Invoke-DockerCommand {
             param([string[]]$Arguments,[switch]$Capture)
             if ($Arguments[0] -ceq 'inspect') {
+                if ($releaseMcpDetails -and $Arguments[-1] -ceq ('c'*64)) { return $releaseMcpDetails | ConvertTo-Json -Depth 10 }
                 $service = $script:containers[$Arguments[-1]].service
                 $mounts = if ($service -ceq 'postgres') {
                     @(@{Destination='/var/lib/postgresql/data';Type='volume';Name=$releaseContext.Volume;RW=$true},
@@ -327,6 +355,14 @@ exit $ExitCode
                 return (@{name=$name;mounts=$mounts;ports=$ports;networks=@{$releaseContext.Network=@{}};memory=0;cpus=0} | ConvertTo-Json -Depth 10)
             }
             if ($Arguments[0] -cin @('volume','network')) {
+                if ($Arguments[0] -ceq 'volume' -and $Arguments[-1] -cin @($releaseContext.McpVolume,$releaseContext.McpRecordingVolume)) {
+                    $recordings = $Arguments[-1] -ceq $releaseContext.McpRecordingVolume
+                    return (@{name=$Arguments[-1];driver='local';createdAt='2026-01-01T00:00:00Z';labels=@{
+                        'com.docker.compose.project'=$(if ($recordings) {$releaseRecordingProject} else {$releaseContext.Project})
+                        'com.docker.compose.volume'=$(if ($recordings) {'mcp-recordings'} else {'mcp-oauth'})
+                        'io.agent-control.purpose'=$(if ($recordings) {'mcp-session-recordings'} else {'encrypted-oauth-state'})
+                    }} | ConvertTo-Json -Depth 5)
+                }
                 if ($Arguments[3] -ceq '{{json .Labels}}') {
                     return (@{'com.docker.compose.project'=$releaseContext.Project
                         "com.docker.compose.$($Arguments[0])"=$(if ($Arguments[0] -ceq 'volume') {'data'} else {'default'})} | ConvertTo-Json)
@@ -343,6 +379,41 @@ exit $ExitCode
         foreach ($invalidName in @("/$($context.Project)-app-1",'/different-project-agent-control-app-1')) {
             $inspectedAppName = $invalidName
             Fails { Get-LocalReleaseTarget $releaseContext } 'network/name mismatch'
+        }
+        $inspectedAppName = $null
+        $releaseContext.Mcp = @{port=14392}
+        $releaseMcpDetails = @{name="/$($releaseContext.Project)-agent-control-mcp-1";user='1000:1000'
+            networks=@{$releaseContext.Network=@{}};ports=@{'8000/tcp'=@(@{HostIp='127.0.0.1';HostPort='14392'})}
+            mounts=@(
+                @{Destination='/run/secrets/mcp-client';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/mcp-client');RW=$false},
+                @{Destination='/run/secrets/mcp-signing';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/mcp-signing');RW=$false},
+                @{Destination='/run/secrets/mcp-encryption';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/mcp-encryption');RW=$false},
+                @{Destination='/var/lib/agent-control-mcp/oauth';Type='volume';Name=$releaseContext.McpVolume;RW=$true},
+                @{Destination='/var/lib/agent-control-mcp/recordings';Type='volume';Name=$releaseContext.McpRecordingVolume;RW=$true})}
+        try {
+            foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
+                Write-LocalText (Join-Path $releaseContext.State "secrets/$name") "synthetic-release-$name"
+            }
+            $withMcp = Get-LocalReleaseTarget $releaseContext
+            Assert ($withMcp.containers.Count -eq 3 -and
+                $withMcp.resources.Count -eq $releaseTarget.resources.Count) 'Release target rejected separate diagnostics or added disposable volume receipts.'
+            foreach ($field in @('Name','Type','RW')) {
+                $saved=$releaseMcpDetails.mounts[-1][$field]
+                $releaseMcpDetails.mounts[-1][$field]=if ($field -ceq 'RW') {$false} elseif ($field -ceq 'Type') {'bind'} else {$releaseContext.McpVolume}
+                Fails { Get-LocalReleaseTarget $releaseContext } 'volume identity/access mismatch'
+                $releaseMcpDetails.mounts[-1][$field]=$saved
+            }
+            $releaseRecordingProject='other-project'
+            Fails { Get-LocalReleaseTarget $releaseContext } 'recording volume ownership/purpose'
+            $releaseRecordingProject=$releaseContext.Project
+            $saved=$releaseMcpDetails.mounts
+            $releaseMcpDetails.mounts=$saved[0..3]
+            Fails { Get-LocalReleaseTarget $releaseContext } 'mount inventory differs'
+            $releaseMcpDetails.mounts=$saved
+        } finally {
+            foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
+                Remove-Item -LiteralPath (Join-Path $releaseContext.State "secrets/$name") -ErrorAction SilentlyContinue
+            }
         }
     }
     $receipt=(Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
@@ -592,6 +663,29 @@ exit $ExitCode
     $context.CandidateSha256=(Get-FileHash -LiteralPath $context.Candidate).Hash.ToLowerInvariant()
     $portableCandidate = Read-LocalCandidate $context
     Assert ($portableCandidate.sourceManifestHash -ceq $context.SourceHash) 'Candidate inventory must match its slash-separated Git manifest on every supported OS.'
+    & {
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        $artifactLink = Join-Path $root 'artifacts/linked-candidate'
+        $sourceLink = Join-Path $root 'artifacts/linked-candidate-source'
+        New-Item -ItemType $linkType -Path $artifactLink -Target $candidateDirectory | Out-Null
+        New-Item -ItemType $linkType -Path $sourceLink -Target $frozen.Directory | Out-Null
+        $linkedContext = $context.Clone()
+        $linkedContext.Candidate = Join-Path $artifactLink 'build.json'
+        $script:calls.Clear()
+        Fails { Read-LocalCandidate $linkedContext } 'Symbolic build input paths'
+        Assert ($script:calls.Count -eq 0) 'Linked candidate reached Docker verification.'
+        $linkedContext.Candidate = Join-Path $candidateDirectory 'linked-inputs.json'
+        foreach ($field in @('sourceRoot','sourceManifest')) {
+            $linkedCandidate = $portableCandidate.Clone()
+            $linkedCandidate[$field] = if ($field -eq 'sourceRoot') { Join-Path $sourceLink 'source' } else { Join-Path $artifactLink 'source.json' }
+            Write-LocalText $linkedContext.Candidate ($linkedCandidate | ConvertTo-Json -Depth 6)
+            $linkedContext.CandidateSha256 = (Get-FileHash -LiteralPath $linkedContext.Candidate).Hash.ToLowerInvariant()
+            Fails { Read-LocalCandidate $linkedContext } 'Symbolic build input paths'
+            Assert ($script:calls.Count -eq 0) 'Linked candidate source/manifest reached Docker verification.'
+        }
+        Remove-Item -LiteralPath $artifactLink -Force
+        Remove-Item -LiteralPath $sourceLink -Force
+    }
     $secretPath=Join-Path $context.State 'secrets/tenants.json'
     $savedRegistry=[IO.File]::ReadAllText($secretPath)
     $beforeIdentity=Get-LocalDeploymentIdentity $context @()

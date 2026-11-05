@@ -77,11 +77,13 @@ Merge the relevant entry into existing configuration; do not overwrite other ser
 | [M365 declarative agents / Microsoft Copilot Cowork](#oauth-callback-reference) | MCP plugin authentication; see callback and DCR compatibility notes above |
 | [GitHub cloud coding agent / code review](#github-cloud-coding-agent-and-code-review) | [Transport-only sample](../mcp/examples/clients/github-cloud/mcp-config.json); no remote OAuth support |
 
-Version notes follow the repository's **2026-10-17** vendor review, not live
-client certification. No native client's login/refresh journey has end-to-end
-evidence here. In particular, Copilot CLI's emitted callback and OAuth request
-fields, and Studio's strict resource/S256 and published end-user flow, remain
-unverified. Do not relax server validation to make a client connect.
+Version notes follow the repository's **2026-10-17** vendor review, not blanket
+client certification. On **2026-11-05**, the user verified native Copilot Studio
+consent, authentication, connection creation and an authenticated saved-report
+period read in author test chat, without synchronization. Studio's native refresh
+and published end-user flow remain unverified, as do Copilot CLI's emitted
+callback and OAuth request fields. Do not relax token, identity, S256 or redirect
+validation to make a client connect.
 
 ## VS Code / GitHub Copilot
 
@@ -156,8 +158,10 @@ permission to execute it.
 Use `opencode mcp debug agentControl` for diagnostics and
 `opencode mcp logout agentControl` to clear authentication. Keep OAuth material
 out of project settings/version control; do not set `oauth:false` or add API-key
-headers. The reviewed SDK **1.29.0** can omit the required resource when discovery
-fails, so check protected-resource metadata if authentication is rejected.
+headers. The reviewed SDK **1.29.0** can omit the MCP-required resource when
+discovery fails. The server pins an omitted resource to its sole configured MCP
+URL; an explicit different or empty resource remains rejected. Check
+protected-resource metadata if authentication is rejected.
 
 ## Claude web, Desktop and Cowork
 
@@ -231,19 +235,32 @@ confirmation outside the model call; tool enablement is not consent.
 
 ## Copilot Studio and Microsoft 365 publication
 
+See the [Studio connection technical reference](copilot-studio-mcp-connection.md)
+for verified behavior, callback diagnostics and the single-resource policy.
+
 Use Streamable HTTP and generative orchestration. Confirm your environment's
 licensing, region and data policies; a trial can test chat but cannot publish.
 
 1. In **Tools > Add a tool > New tool > Model Context Protocol**, enter a name,
    description and the exact MCP URL.
 2. Choose **OAuth 2.0 > Dynamic discovery** and DCR.
-3. Copy the wizard's exact **environment-specific callback** into the service's
-   allowlist. Use the callback for this Studio connection, not the Teams plugin
-   callback simply because both clients are Microsoft products.
+3. Add this connection's exact **environment-specific callback** to the MCP
+   service's allowlist, not its Entra app registration. Use the wizard's callback
+   or the generated Power Platform custom connector's **Security** tab.
+   Dynamic discovery does not always display a callback; if it is hidden, inspect
+   the MCP container's `OAuth client registration rejected: invalid_redirect_uri`
+   warning after a connection attempt. Use that exact valid callback, not a
+   generic Power Platform URL or the Teams plugin callback simply because both
+   clients are Microsoft products. VPS administrators can use the
+   [container extraction command](copilot-studio-mcp-connection.md#vps-extraction-command)
+   to deduplicate and export retained callback rejections safely.
 4. Create the connection, sign in and add it to the agent.
 5. In test chat, request `capabilities`, action `list`, then follow the
-   [first-read checks](#verify-and-use-the-connection). If the build omits required
-   OAuth resource/S256 fields, report incompatibility; do not weaken validation.
+   [first-read checks](#verify-and-use-the-connection). Studio can omit the OAuth
+   `resource` parameter; the server pins omission on authorize and token/refresh
+   requests to its sole configured MCP URL. Explicit wrong/empty resources and
+   missing or downgraded S256 remain rejected. Do not substitute an Entra
+   application ID or a different server URL, or weaken token-audience validation.
 6. To publish, publish the agent, add **Teams and Microsoft Copilot**, select
    **Make agent available in Microsoft Copilot**, and share/install for intended
    users. Verify each published user's own connection and first read separately;
@@ -313,7 +330,7 @@ execution and recovery.
 | Symptom | Action |
 | --- | --- |
 | Discovery/401 loop | Use the MCP resource URL, not `/sse`, the API origin or Entra token URL. Check HTTPS discovery/OAuth forwarding and the client's exact resource on authorize/token/refresh. |
-| Redirect rejected | Compare the full emitted/registered URI with the allowlist, including root slash, host and port. Use all four VS Code callbacks; do not invent `/callback` or wildcard ports. |
+| Redirect rejected | Inspect the MCP container's `OAuth client registration rejected: invalid_redirect_uri` warning for rejected callback URLs. Compare the full emitted/registered URI with the allowlist, including root slash, host and port. Use all four VS Code callbacks; do not invent `/callback` or wildcard ports. |
 | `reauthorization_required` / claims challenge | Reconnect through client OAuth; never enter credentials in tools/chat. |
 | `invalid_authorization_response` | The token endpoint returned malformed success metadata. This is a server/provider response failure, not evidence that the client is disconnected. |
 | 403 | Check the actual role, consent or provider denial. Do not treat denied data as empty or add a feature flag. |
@@ -323,6 +340,11 @@ execution and recovery.
 | Tools listed, but sign-in/refresh fails | Sample import/discovery is not OAuth interoperability. Check the client-specific limitations above and [authentication contract](mcp-reference.md#oauth-and-token-flow). |
 
 Redact tokens, OAuth values and provider diagnostic bodies from support output.
+Registration warnings include only rejected callback URLs, not client names or
+full request bodies. Callback credentials, query values and fragments are
+redacted; non-HTTP callback contents are withheld. HTTP access logging remains
+disabled. Use an exact valid callback supplied by the client, never a redaction
+placeholder, when updating the allowlist.
 
 ## References and local checks
 

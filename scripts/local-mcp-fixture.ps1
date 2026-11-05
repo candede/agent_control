@@ -28,6 +28,8 @@ function Get-LocalMcpFixtureContainers {
             foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) { $expected["/run/secrets/$name"] = Join-Path $Context.State "secrets/$name" }
             if (Test-LocalMcpMetadataCredential $Context) { $expected['/run/secrets/mcp-metadata'] = Join-Path $Context.State 'secrets/mcp-metadata' }
             $expected['/var/lib/agent-control-mcp/oauth'] = $Context.McpVolume
+            $expected['/var/lib/agent-control-mcp/recordings'] = $Context.McpRecordingVolume
+            Get-LocalMcpRecordingVolume $Context | Out-Null
             if ($details.memory -ne 536870912 -or $details.cpus -ne 500000000 -or $details.pids -ne 128 -or
                 -not $details.readOnly -or ($details.capDrop -join ',') -cne 'ALL' -or
                 ($details.securityOpt -join ',') -cne 'no-new-privileges:true' -or
@@ -38,8 +40,8 @@ function Get-LocalMcpFixtureContainers {
         } elseif ($details.ports -and $details.ports.Count) { throw 'Synthetic API must not publish host ports.' }
         if ($details.mounts.Count -ne $expected.Count) { throw 'MCP fixture has extra mounts.' }
         foreach ($mount in $details.mounts) {
-            if ($mount.Destination -ceq '/var/lib/agent-control-mcp/oauth') {
-                if ($mount.Type -cne 'volume' -or $mount.Name -cne $Context.McpVolume -or -not $mount.RW) { throw 'MCP fixture exact volume differs.' }
+            if ($mount.Destination -cin @('/var/lib/agent-control-mcp/oauth','/var/lib/agent-control-mcp/recordings')) {
+                if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination] -or -not $mount.RW) { throw 'MCP fixture exact volume differs.' }
             } elseif (-not $expected.ContainsKey($mount.Destination) -or $mount.Type -cne 'bind' -or
                 -not (Test-LocalBindSource $mount.Source $expected[$mount.Destination]) -or $mount.RW) { throw 'MCP fixture exact mount/access differs.' }
         }
@@ -283,6 +285,10 @@ services:
                     $labels['io.agent-control.purpose'] -cne 'encrypted-oauth-state') { throw 'MCP fixture volume ownership changed; cleanup refused.' }
                 Get-LocalMcpVolume $context | Out-Null
                 Invoke-DockerCommand @('volume','rm',$context.McpVolume)
+            }
+            if ($context.McpRecordingVolume -in ((Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture) -split "`n")) {
+                Get-LocalMcpRecordingVolume $context | Out-Null
+                Invoke-DockerCommand @('volume','rm',$context.McpRecordingVolume)
             }
             foreach ($tag in $images.Keys) {
                 if ((Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$tag) -Capture) -cne $images[$tag]) { throw 'MCP fixture image changed; cleanup refused.' }

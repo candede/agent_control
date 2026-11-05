@@ -146,6 +146,7 @@ class Settings:
     encryption_keys: tuple[bytes, ...] = field(repr=False)
     azure_blob: AzureBlobSettings | None = None
     metadata_key: bytes | None = field(default=None, repr=False)
+    recording_path: Path | None = None
 
     @property
     def authority(self) -> str:
@@ -281,6 +282,27 @@ class Settings:
             not storage.is_absolute() or len(storage.parts) < 3 or ".." in storage.parts
         ):
             raise ConfigurationError("OAuth storage must be an exact absolute dedicated path.")
+        recording = values.get("MCP_RECORDING_STORAGE_PATH")
+        recording_path = Path(recording) if recording else None
+        if recording_path is not None:
+            if (
+                not recording_path.is_absolute()
+                or len(recording_path.parts) < 3
+                or ".." in recording_path.parts
+            ):
+                raise ConfigurationError(
+                    "Recording storage needs an exact absolute dedicated path."
+                )
+            if not azure:
+                oauth_root, recording_root = storage.resolve(), recording_path.resolve()
+                if (
+                    recording_root == oauth_root
+                    or oauth_root in recording_root.parents
+                    or recording_root in oauth_root.parents
+                ):
+                    raise ConfigurationError(
+                        "Recording storage must be separate from OAuth storage."
+                    )
         return cls(
             tenant,
             client,
@@ -294,4 +316,5 @@ class Settings:
             tuple(key.encode() for key in keys),
             AzureBlobSettings.from_env(values) if azure else None,
             metadata_key,
+            recording_path,
         )

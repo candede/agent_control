@@ -325,6 +325,7 @@ async def connect(
     redirect_uri="https://client.example.test/callback",
     register_redirects=None,
     upstream_code="synthetic-entra-code",
+    include_resource=True,
 ):
     registered = await browser.post(
         "/register",
@@ -342,19 +343,18 @@ async def connect(
     challenge = (
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     )
-    authorize = await browser.get(
-        "/authorize",
-        params={
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "response_type": "code",
-            "scope": "Mcp.Access",
-            "state": "client-state",
-            "resource": "https://mcp.example.test/mcp",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-        },
-    )
+    authorize_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "Mcp.Access",
+        "state": "client-state",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if include_resource:
+        authorize_params["resource"] = "https://mcp.example.test/mcp"
+    authorize = await browser.get("/authorize", params=authorize_params)
     assert authorize.status_code in {302, 307}, authorize.text
     consent = await browser.get(authorize.headers["location"])
     assert consent.status_code == 200, consent.text
@@ -398,8 +398,9 @@ async def connect(
         "code": code,
         "redirect_uri": redirect_uri,
         "code_verifier": verifier,
-        "resource": "https://mcp.example.test/mcp",
     }
+    if include_resource:
+        data["resource"] = "https://mcp.example.test/mcp"
     return client_id, data
 
 

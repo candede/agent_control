@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import time
@@ -33,7 +34,10 @@ from pydantic import Field, JsonValue
 
 from .config import ConfigurationError, Settings, guid
 from .errors import AdapterError
+from .redirect_diagnostics import REGISTRATION_REJECTION_PREFIX, redacted_redirect_uri
 from .storage import OAuthStore
+
+logger = logging.getLogger(__name__)
 
 
 def valid_claims(
@@ -104,6 +108,7 @@ class TenantAzureProvider(AzureProvider):
         self.settings = settings
         self.store = store
         self.authorization_code_lock = asyncio.Lock()
+        self.refresh_token_lock = asyncio.Lock()
         super().__init__(
             client_id=settings.client_id,
             client_secret=settings.client_secret,
@@ -138,9 +143,16 @@ class TenantAzureProvider(AzureProvider):
                 error="invalid_client_metadata",
                 error_description="Client metadata exceeds its bound.",
             )
-        if not client_info.redirect_uris or any(
-            str(uri) not in self.settings.redirect_uris for uri in client_info.redirect_uris
-        ):
+        rejected_redirects = [
+            str(uri)
+            for uri in client_info.redirect_uris or []
+            if str(uri) not in self.settings.redirect_uris
+        ]
+        if not client_info.redirect_uris or rejected_redirects:
+            logger.warning(
+                REGISTRATION_REJECTION_PREFIX + "%s",
+                json.dumps([redacted_redirect_uri(uri) for uri in rejected_redirects]),
+            )
             raise RegistrationError(
                 error="invalid_redirect_uri",
                 error_description="Only exact approved client redirects are supported.",
@@ -251,7 +263,7 @@ class TenantAzureProvider(AzureProvider):
         if await self.store.get(self.token_key(refresh_token.token), collection="revoked"):
             raise TokenError("invalid_grant", "Refresh credential was revoked.")
         try:
-            async with asyncio.timeout(10):
+            async with asyncio.timeout(10), self.refresh_token_lock:
                 issued = await super().exchange_refresh_token(client, refresh_token, scopes)
             renewed = self.jwt_issuer.verify_token(issued.access_token)
             if not same_user(

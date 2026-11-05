@@ -208,6 +208,9 @@ Dry-run rolls back database changes and deletes no backup files.
 
 Preserve settings/secrets/backups and unrelated projects. `start` checks schema/grants
 before draining; incompatible schemas need explicit reset/current-schema recovery.
+Repository source files and candidate artifacts must stay inside their trees without
+symbolic links in either files or parent directories. Failed snapshot setup removes
+its disposable build directory; it does not change application configuration or data.
 
 | Failure | Safe action |
 | --- | --- |

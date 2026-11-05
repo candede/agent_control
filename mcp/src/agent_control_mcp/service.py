@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -25,11 +26,24 @@ from .auth import ApiTokenExchange, TenantAzureProvider
 from .config import ConfigurationError, Settings
 from .errors import AdapterError
 from .instructions import INSTRUCTIONS
+from .recording import Recorder, RecordingMiddleware
 from .storage import MAX_DISK_BYTES, MAX_FILES, OAuthStore
 from .tools import OPERATIONS, register_tools
 
 logger = logging.getLogger(__name__)
 METADATA_PATH = "/internal/mcp-metadata"
+
+
+def _with_content_length(scope: Scope, length: int) -> Scope:
+    return {
+        **scope,
+        "headers": [
+            (key, value)
+            for key, value in scope.get("headers", [])
+            if key.lower() != b"content-length"
+        ]
+        + [(b"content-length", str(length).encode())],
+    }
 
 
 class ProtocolBoundary:
@@ -42,6 +56,7 @@ class ProtocolBoundary:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        deadline = asyncio.get_running_loop().time() + 30
         if self.store is not None and scope["path"] not in {"/health", METADATA_PATH}:
             try:
                 await self.store.assert_authority()
@@ -64,7 +79,7 @@ class ProtocolBoundary:
         body = bytearray()
         if scope["method"] == "POST":
             try:
-                async with asyncio.timeout(30):
+                async with asyncio.timeout_at(deadline):
                     while True:
                         message = await receive()
                         if message["type"] == "http.disconnect":
@@ -129,13 +144,7 @@ class ProtocolBoundary:
                 # client_secret field to be present. Empty is not an added credential.
                 form.setdefault("client_secret", [""])
                 body = bytearray(urlencode(form, doseq=True).encode())
-                scope = {
-                    **scope,
-                    "headers": [
-                        (key, value) for key, value in headers if key.lower() != b"content-length"
-                    ]
-                    + [(b"content-length", str(len(body)).encode())],
-                }
+                scope = _with_content_length(scope, len(body))
             except ValueError, UnicodeError:
                 await JSONResponse({"error": "invalid_request"}, status_code=400)(
                     scope,
@@ -155,6 +164,10 @@ class ProtocolBoundary:
                 params = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=32)
                 if any(len(values) != 1 for values in params.values()):
                     raise ValueError
+                defaulted_resource = "resource" not in params
+                if defaulted_resource:
+                    # Pin the resource before the SDK creates or redeems a grant.
+                    params["resource"] = [self.settings.public_url]
                 if params.get("resource") != [self.settings.public_url]:
                     raise ValueError
                 if path == "/authorize" and params.get("code_challenge_method") != ["S256"]:
@@ -164,11 +177,20 @@ class ProtocolBoundary:
                     ["refresh_token"],
                 ):
                     raise ValueError
+                if defaulted_resource:
+                    encoded = urlencode(params, doseq=True).encode()
+                    if len(encoded) > 65536:
+                        raise ValueError
+                    if path == "/authorize" and scope["method"] == "GET":
+                        scope = {**scope, "query_string": encoded}
+                    else:
+                        body = bytearray(encoded)
+                        scope = _with_content_length(scope, len(body))
             except ValueError, UnicodeError:
                 await JSONResponse(
                     {
                         "error": "invalid_request",
-                        "error_description": "Exact resource and PKCE required.",
+                        "error_description": "Invalid OAuth resource, PKCE, or grant type.",
                     },
                     status_code=400,
                     headers={"Cache-Control": "no-store"},
@@ -238,7 +260,7 @@ class ProtocolBoundary:
 
         if path in {"/authorize", "/token", "/register", "/consent", "/revoke", "/auth/callback"}:
             try:
-                async with asyncio.timeout(30):
+                async with asyncio.timeout_at(deadline):
                     await self.app(scope, replay, safe_send)
             except TimeoutError:
                 if discarded:
@@ -272,6 +294,7 @@ class Service:
     provider: TenantAzureProvider
     store: OAuthStore
     http: httpx2.AsyncClient
+    recorder: Recorder
 
 
 def build_service(
@@ -290,12 +313,13 @@ def build_service(
 
     @asynccontextmanager
     async def lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
-        try:
+        async with AsyncExitStack() as resources:
+            resources.push_async_callback(http.aclose)
+            resources.push_async_callback(store.aclose)
+            resources.push_async_callback(recorder.close)
             await store.start()
+            await recorder.start()
             yield {"api": api}
-        finally:
-            await store.aclose()
-            await http.aclose()
 
     mcp = FastMCP(
         "Agent Control",
@@ -309,6 +333,40 @@ def build_service(
         tasks=False,
     )
     register_tools(mcp, api)
+
+    async def catalog() -> dict[str, Any]:
+        options = mcp._mcp_server.create_initialization_options()
+        info = Implementation(
+            name=options.server_name,
+            version=options.server_version,
+            title=options.title,
+            description=options.description,
+            website_url=options.website_url,
+            icons=options.icons,
+        )
+        tools = dedupe_with_versions(list(await mcp.list_tools()), lambda tool: tool.name)
+        return {
+            "serverInfo": info.model_dump(mode="json", by_alias=True, exclude_none=True),
+            "instructions": options.instructions,
+            "tools": [
+                tool.to_mcp_tool(name=tool.name).model_dump(
+                    mode="json", by_alias=True, exclude_none=True
+                )
+                for tool in tools
+            ],
+            "transport": "streamable-http",
+        }
+
+    recorder = Recorder(
+        settings.recording_path,
+        (
+            settings.client_secret,
+            base64.urlsafe_b64encode(settings.signing_key).decode(),
+            *(key.decode() for key in settings.encryption_keys),
+            *((settings.metadata_key.decode(),) if settings.metadata_key else ()),
+        ),
+        catalog,
+    )
 
     @mcp.custom_route(METADATA_PATH, methods=["GET"])
     async def metadata(request: Request) -> JSONResponse:
@@ -327,16 +385,6 @@ def build_service(
             await store.observe_readiness()
         except ConfigurationError, OSError, BaseKeyValueError:
             ready = False
-        options = mcp._mcp_server.create_initialization_options()
-        info = Implementation(
-            name=options.server_name,
-            version=options.server_version,
-            title=options.title,
-            description=options.description,
-            website_url=options.website_url,
-            icons=options.icons,
-        )
-        tools = dedupe_with_versions(list(await mcp.list_tools()), lambda tool: tool.name)
         return JSONResponse(
             {
                 "binding": {
@@ -346,16 +394,8 @@ def build_service(
                     "resourceUrl": settings.public_url,
                 },
                 "redirectUris": list(settings.redirect_uris),
-                "serverInfo": info.model_dump(mode="json", by_alias=True, exclude_none=True),
-                "instructions": options.instructions,
-                "tools": [
-                    tool.to_mcp_tool(name=tool.name).model_dump(
-                        mode="json", by_alias=True, exclude_none=True
-                    )
-                    for tool in tools
-                ],
+                **(await catalog()),
                 "storageReady": ready,
-                "transport": "streamable-http",
             },
             headers=headers,
         )
@@ -430,7 +470,16 @@ def build_service(
         )
 
     sdk_app.add_exception_handler(AdapterError, auth_error)
-    return Service(mcp, ProtocolBoundary(sdk_app, settings, store), api, provider, store, http)
+    sdk_app.add_middleware(RecordingMiddleware, recorder=recorder, path=settings.mcp_path)
+    return Service(
+        mcp,
+        ProtocolBoundary(sdk_app, settings, store),
+        api,
+        provider,
+        store,
+        http,
+        recorder,
+    )
 
 
 def create_app() -> ASGIApp:

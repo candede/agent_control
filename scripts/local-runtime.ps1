@@ -1,3 +1,21 @@
+function Assert-LocalBuildPath {
+    param([string]$Root,[string]$Path)
+    $boundary = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Root))
+    $current = [IO.Path]::GetFullPath($Path)
+    $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $prefix = if ([IO.Path]::EndsInDirectorySeparator($boundary)) { $boundary } else { $boundary + [IO.Path]::DirectorySeparatorChar }
+    if (-not [string]::Equals($current,$boundary,$comparison) -and -not $current.StartsWith($prefix,$comparison)) {
+        throw 'Build input paths must remain inside the repository.'
+    }
+    while ($true) {
+        if ((Test-Path -LiteralPath $current -ErrorAction Stop) -and (Get-Item -LiteralPath $current -Force -ErrorAction Stop).LinkType) {
+            throw 'Symbolic build input paths are not supported.'
+        }
+        if ([string]::Equals($current,$boundary,$comparison)) { break }
+        $current = [IO.Path]::GetDirectoryName($current)
+    }
+}
+
 function Get-LocalSourceFiles {
     param([string]$Root)
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required to snapshot tracked and untracked build inputs without copying local secrets or installed dependencies.' }
@@ -8,7 +26,7 @@ function Get-LocalSourceFiles {
         if ($path -match '(^|/)(node_modules|dist|coverage|artifacts|backups|\.git|\.local|\.azure|\.venv|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|tsx-[0-9]+)(/|$)|(^|/)\.env[^/]*$|(^|/)\.npmrc$|\.(pem|pfx|key|csv|pyc|db|sqlite[^/]*)$') { continue }
         $file = Join-Path $Root $path
         if (-not (Test-Path -LiteralPath $file)) { continue }
-        if ((Get-Item -LiteralPath $file -Force).LinkType) { throw "Symbolic build input is not supported: $path." }
+        Assert-LocalBuildPath $Root $file
         if (Test-Path -LiteralPath $file -PathType Leaf) { $path }
     }
 }
@@ -17,15 +35,17 @@ function New-LocalBuildSnapshot {
     param($Context)
     $directory = Join-Path $Context.Root "artifacts/local-builds/$([Guid]::NewGuid().ToString('N'))"
     $source = Join-Path $directory 'source'
-    [IO.Directory]::CreateDirectory($source) | Out-Null
-    Protect-LocalPath $directory -Directory
+    Assert-LocalBuildPath $Context.Root $directory
     try {
+        [IO.Directory]::CreateDirectory($source) | Out-Null
+        Protect-LocalPath $directory -Directory
         $paths = @(Get-LocalSourceFiles $Context.Root)
         if ($paths -notcontains 'Dockerfile' -or $paths -notcontains 'compose.yaml') { throw 'Deployment source is missing Dockerfile or compose.yaml.' }
         $hashes = [ordered]@{}
         foreach ($path in $paths) {
             $destination = Join-Path $source $path
             [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
+            Assert-LocalBuildPath $Context.Root (Join-Path $Context.Root $path)
             [IO.File]::Copy((Join-Path $Context.Root $path),$destination)
             $hashes[$path] = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
         }
@@ -56,7 +76,7 @@ function New-LocalBuildSnapshot {
         }
         return @{ Directory=$directory; Root=$source; Compose=$compose; ComposeFiles=$composeFiles }
     } catch {
-        Remove-Item -LiteralPath $directory -Recurse -Force
+        if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
         throw
     }
 }
@@ -82,6 +102,11 @@ function Get-LocalSha256 {
 function Read-LocalCandidate {
     param($Context)
     $file = [IO.Path]::GetFullPath($Context.Candidate)
+    $artifactPrefix = (Join-Path $Context.Root 'artifacts') + [IO.Path]::DirectorySeparatorChar
+    if (-not $file.StartsWith($artifactPrefix,[StringComparison]::Ordinal)) {
+        throw 'Candidate inputs must remain in this repository non-linked artifact tree.'
+    }
+    Assert-LocalBuildPath $Context.Root $file
     if ($Context.CandidateSha256 -cnotmatch '^[a-f0-9]{64}$' -or
         (Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant() -cne $Context.CandidateSha256) { throw 'Candidate digest mismatch.' }
     $candidate = [IO.File]::ReadAllText($file) | ConvertFrom-Json -AsHashtable
@@ -91,10 +116,10 @@ function Read-LocalCandidate {
         throw 'Candidate schema or content identity is invalid.'
     }
     foreach ($path in @($file,$candidate.sourceRoot,$candidate.sourceManifest)) {
-        if ((Get-Item -LiteralPath $path -Force).LinkType -or
-            -not ([IO.Path]::GetFullPath($path).StartsWith((Join-Path $Context.Root 'artifacts') + [IO.Path]::DirectorySeparatorChar,[StringComparison]::Ordinal))) {
+        if (-not ([IO.Path]::GetFullPath($path).StartsWith($artifactPrefix,[StringComparison]::Ordinal))) {
             throw 'Candidate inputs must remain in this repository non-linked artifact tree.'
         }
+        Assert-LocalBuildPath $Context.Root $path
     }
     if ((Get-FileHash -LiteralPath $candidate.sourceManifest).Hash.ToLowerInvariant() -cne $candidate.sourceManifestHash) { throw 'Candidate source manifest changed.' }
     $manifest = [IO.File]::ReadAllText($candidate.sourceManifest) | ConvertFrom-Json -AsHashtable
@@ -102,8 +127,8 @@ function Read-LocalCandidate {
     foreach ($path in $manifest.Keys) {
         if ($path -match '(^|/)\.\.(/|$)|[\\\r\n]' -or [IO.Path]::IsPathRooted($path)) { throw 'Invalid candidate source path.' }
         $source = Join-Path $candidate.sourceRoot $path
-        if ((Get-Item -LiteralPath $source -Force).LinkType -or
-            (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() -cne ([string]$manifest[$path]).ToLowerInvariant()) { throw "Candidate source changed: $path." }
+        Assert-LocalBuildPath $candidate.sourceRoot $source
+        if ((Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() -cne ([string]$manifest[$path]).ToLowerInvariant()) { throw "Candidate source changed: $path." }
     }
     $actual = @(Get-ChildItem -LiteralPath $candidate.sourceRoot -Recurse -File -Force | ForEach-Object {
         [IO.Path]::GetRelativePath($candidate.sourceRoot,$_.FullName).Replace('\','/')
@@ -173,7 +198,8 @@ function Get-LocalReleaseTarget {
             @{ '/run/secrets/mcp-client'=(Join-Path $Context.State 'secrets/mcp-client')
                 '/run/secrets/mcp-signing'=(Join-Path $Context.State 'secrets/mcp-signing')
                 '/run/secrets/mcp-encryption'=(Join-Path $Context.State 'secrets/mcp-encryption')
-                '/var/lib/agent-control-mcp/oauth'=$Context.McpVolume }
+                '/var/lib/agent-control-mcp/oauth'=$Context.McpVolume
+                '/var/lib/agent-control-mcp/recordings'=$Context.McpRecordingVolume }
         } else {
             @{ '/run/control'=(Join-Path $Context.State 'control'); '/run/agent-sharing-diagnostics'=(Join-Path $Context.State 'agent-sharing-diagnostics')
                 '/run/secrets/tenants.json'=(Join-Path $Context.State 'secrets/tenants.json'); '/run/secrets/session'=(Join-Path $Context.State 'secrets/session')
@@ -185,10 +211,10 @@ function Get-LocalReleaseTarget {
         if ($details.mounts.Count -ne $expected.Count) { throw 'Release mount inventory differs.' }
         foreach ($mount in $details.mounts) {
             if (-not $expected.ContainsKey($mount.Destination)) { throw 'Unexpected release mount.' }
-            if ($mount.Destination -cin @('/var/lib/postgresql/data','/var/lib/agent-control-mcp/oauth')) {
-                if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination]) { throw 'Retained state volume identity mismatch.' }
+            if ($mount.Destination -cin @('/var/lib/postgresql/data','/var/lib/agent-control-mcp/oauth','/var/lib/agent-control-mcp/recordings')) {
+                if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination] -or -not $mount.RW) { throw 'Release volume identity/access mismatch.' }
             } elseif ($mount.Type -cne 'bind' -or -not (Test-LocalBindSource $mount.Source $expected[$mount.Destination]) -or
-                $mount.RW -ne ($mount.Destination -cin @('/run/agent-sharing-diagnostics','/var/lib/agent-control-mcp/oauth'))) { throw 'Release bind identity/access mismatch.' }
+                $mount.RW -ne ($mount.Destination -ceq '/run/agent-sharing-diagnostics')) { throw 'Release bind identity/access mismatch.' }
         }
         if ($container.Service -eq 'postgres') {
             if ($details.ports -and $details.ports.Count) { throw 'Production database must not publish a port.' }

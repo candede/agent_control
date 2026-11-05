@@ -4,7 +4,7 @@ function Assert-LocalMcpSettings {
     if ($Mcp -isnot [Collections.IDictionary] -or $Mcp.Count -ne $fields.Count -or
         @($Mcp.Keys | Where-Object { $_ -cnotin $fields }).Count) { throw 'MCP configuration must contain only tenantId, clientId, apiClientId, publicUrl, redirectUris and port.' }
     foreach ($name in @('tenantId','clientId','apiClientId')) {
-        if ($Mcp[$name] -isnot [string] -or $Mcp[$name] -cnotmatch '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$') { throw 'MCP identities must be exact lowercase GUIDs.' }
+        if ($Mcp[$name] -isnot [string] -or $Mcp[$name] -cnotmatch '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}\z') { throw 'MCP identities must be exact lowercase GUIDs.' }
     }
     if ($Mcp.clientId -ceq $Mcp.apiClientId) { throw 'MCP and API registrations must be distinct.' }
     if ($Mcp.port -isnot [int] -and $Mcp.port -isnot [long] -or $Mcp.port -lt 1024 -or $Mcp.port -gt 65535 -or $Mcp.port -eq $AppPort) { throw 'MCP requires a distinct loopback port from 1024 to 65535.' }
@@ -202,6 +202,7 @@ function Sync-LocalMcpContext {
     param($Context,$Settings)
     $Context.Mcp = $Settings.mcp
     $Context.McpVolume = "$($Context.Project)_mcp-oauth"
+    $Context.McpRecordingVolume = "$($Context.Project)_mcp-recordings"
     if (-not $Context.McpImage) { $Context.McpImage = "$($Context.Project)-mcp:local" }
     $baseIndex = [Array]::IndexOf($Context.Compose,'-f')
     $overlay = Join-Path (Split-Path $Context.Compose[$baseIndex+1] -Parent) 'compose.mcp.yaml'
@@ -289,12 +290,14 @@ function Get-LocalMcpRunArguments {
             '--env','MCP_METADATA_TOKEN_FILE=/run/secrets/mcp-metadata')
     }
     $arguments += @('--mount',"type=volume,source=$($Context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy")
+    $arguments += @('--mount',"type=volume,source=$($Context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy")
     $values = [ordered]@{
         MCP_TENANT_ID=$Context.Mcp.tenantId; MCP_CLIENT_ID=$Context.Mcp.clientId; MCP_API_CLIENT_ID=$Context.Mcp.apiClientId
         MCP_API_ORIGIN='http://app:3001'; MCP_PUBLIC_URL=$Context.Mcp.publicUrl
         MCP_ALLOWED_CLIENT_REDIRECT_URIS=(ConvertTo-Json -InputObject @($Context.Mcp.redirectUris) -Compress)
         MCP_CLIENT_SECRET_FILE='/run/secrets/mcp-client'; MCP_JWT_SIGNING_KEY_FILE='/run/secrets/mcp-signing'
         MCP_OAUTH_ENCRYPTION_KEY_FILE='/run/secrets/mcp-encryption'; MCP_OAUTH_STORAGE_PATH='/var/lib/agent-control-mcp/oauth'
+        MCP_RECORDING_STORAGE_PATH='/var/lib/agent-control-mcp/recordings'
     }
     foreach ($name in $values.Keys) { $arguments += @('--env',"$name=$($values[$name])") }
     return $arguments
@@ -338,6 +341,36 @@ function Initialize-LocalMcpStorage {
         '--mount',"type=volume,source=$($Context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy",
         '--entrypoint','python',$Context.McpImageId,'-m','agent_control_mcp.initialize_storage',$uid,$gid) -Capture -CaptureError | Out-Null
     Write-LocalText $receiptPath (@{version=1;name=$volume.name;driver=$volume.driver;createdAt=$volume.createdAt} | ConvertTo-Json)
+    Initialize-LocalMcpRecordingStorage $Context
+}
+
+function Initialize-LocalMcpRecordingStorage {
+    param($Context)
+    $names = (Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture) -split "`n"
+    if ($Context.McpRecordingVolume -notin $names) {
+        Invoke-DockerCommand @('volume','create','--label',"com.docker.compose.project=$($Context.Project)",
+            '--label','com.docker.compose.volume=mcp-recordings','--label','io.agent-control.purpose=mcp-session-recordings',
+            $Context.McpRecordingVolume) | Out-Null
+    }
+    Get-LocalMcpRecordingVolume $Context | Out-Null
+    $uid = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
+    $gid = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
+    Invoke-DockerCommand @('run','--rm','--network','none','--user','0:0','--read-only','--cap-drop','ALL','--cap-add','CHOWN',
+        '--cap-add','FOWNER','--security-opt','no-new-privileges','--memory','64m','--cpus','0.25','--pids-limit','16',
+        '--mount',"type=volume,source=$($Context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy",
+        '--env','MCP_RECORDING_STORAGE_PATH=/var/lib/agent-control-mcp/recordings',
+        '--entrypoint','python',$Context.McpImageId,'-m','agent_control_mcp.recording','initialize',$uid,$gid) -Capture -CaptureError | Out-Null
+}
+
+function Get-LocalMcpRecordingVolume {
+    param($Context)
+    $volume = Invoke-DockerCommand @('volume','inspect','--format',
+        '{"name":{{json .Name}},"driver":{{json .Driver}},"labels":{{json .Labels}}}',$Context.McpRecordingVolume) -Capture | ConvertFrom-Json
+    if ($volume.name -cne $Context.McpRecordingVolume -or $volume.driver -cne 'local' -or
+        $volume.labels.'com.docker.compose.project' -cne $Context.Project -or
+        $volume.labels.'com.docker.compose.volume' -cne 'mcp-recordings' -or
+        $volume.labels.'io.agent-control.purpose' -cne 'mcp-session-recordings') { throw 'MCP recording volume ownership/purpose differs.' }
+    return $volume
 }
 
 function Get-LocalMcpVolume {
@@ -362,6 +395,7 @@ function Assert-LocalMcpContainer {
     $expected = @{
         '/run/secrets/mcp-client'='secrets/mcp-client'; '/run/secrets/mcp-signing'='secrets/mcp-signing'
         '/run/secrets/mcp-encryption'='secrets/mcp-encryption'; '/var/lib/agent-control-mcp/oauth'=$Context.McpVolume
+        '/var/lib/agent-control-mcp/recordings'=$Context.McpRecordingVolume
     }
     if (@($details.mounts | Where-Object Destination -CEQ '/run/secrets/mcp-metadata').Count) {
         $expected['/run/secrets/mcp-metadata']='secrets/mcp-metadata'
@@ -371,13 +405,14 @@ function Assert-LocalMcpContainer {
         $details.ports['8000/tcp'][0].HostIp -cne '127.0.0.1' -or
         ($Context.Mcp -and $details.ports['8000/tcp'][0].HostPort -cne [string]$Context.Mcp.port)) { throw 'MCP container user/network/loopback identity differs.' }
     foreach ($mount in $details.mounts) {
-        if ($mount.Destination -ceq '/var/lib/agent-control-mcp/oauth') {
-            if ($mount.Type -cne 'volume' -or $mount.Name -cne $Context.McpVolume -or -not $mount.RW) { throw 'MCP protected volume identity differs.' }
+        if ($mount.Destination -cin @('/var/lib/agent-control-mcp/oauth','/var/lib/agent-control-mcp/recordings')) {
+            if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination] -or -not $mount.RW) { throw 'MCP protected volume identity differs.' }
         } elseif (-not $expected.ContainsKey($mount.Destination) -or $mount.Type -cne 'bind' -or
             -not (Test-LocalBindSource $mount.Source (Join-Path $Context.State $expected[$mount.Destination])) -or
             $mount.RW) { throw 'MCP protected mount identity/access differs.' }
     }
     Get-LocalMcpVolume $Context | Out-Null
+    Get-LocalMcpRecordingVolume $Context | Out-Null
 }
 
 function Start-LocalMcp {

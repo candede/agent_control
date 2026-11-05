@@ -14,6 +14,8 @@ $script:failStart = $false
 $script:mountDetails = $null
 $script:ready = $true
 $script:volume = $false
+$script:recordingVolume = $false
+$script:recordingVolumeOverrides = @{}
 $script:endpoint = "unix://$HOME/.docker/run/docker.sock"
 $script:image = 'sha256:' + ('a'*64)
 $script:container = 'b'*64
@@ -34,9 +36,26 @@ function docker {
         return $script:endpoint
     }
     if ($Arguments[0] -eq 'volume') {
-        if ($Arguments[1] -eq 'ls') { if ($script:volume) { return $context.McpVolume }; return '' }
-        if ($Arguments[1] -eq 'create') { $script:volume=$true;return $context.McpVolume }
-        if ($Arguments[1] -eq 'inspect') { return (@{name=$context.McpVolume;driver='local';createdAt='synthetic-created-at';labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.volume'='mcp-oauth';'io.agent-control.purpose'='encrypted-oauth-state'}} | ConvertTo-Json -Compress) }
+        if ($Arguments[1] -eq 'ls') {
+            if ($script:volume) { $context.McpVolume }
+            if ($script:recordingVolume) { $context.McpRecordingVolume }
+            return
+        }
+        if ($Arguments[1] -eq 'create') {
+            if ($Arguments[-1] -ceq $context.McpRecordingVolume) { $script:recordingVolume=$true;return $context.McpRecordingVolume }
+            $script:volume=$true;return $context.McpVolume
+        }
+        if ($Arguments[1] -eq 'inspect') {
+            if ($Arguments[-1] -ceq $context.McpRecordingVolume) {
+                $details=@{name=$context.McpRecordingVolume;driver='local';labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.volume'='mcp-recordings';'io.agent-control.purpose'='mcp-session-recordings'}}
+                foreach ($key in $script:recordingVolumeOverrides.Keys) {
+                    if ($key -cin @('name','driver')) { $details[$key]=$script:recordingVolumeOverrides[$key] }
+                    else { $details.labels[$key]=$script:recordingVolumeOverrides[$key] }
+                }
+                return $details | ConvertTo-Json -Compress
+            }
+            return (@{name=$context.McpVolume;driver='local';createdAt='synthetic-created-at';labels=@{'com.docker.compose.project'=$context.Project;'com.docker.compose.volume'='mcp-oauth';'io.agent-control.purpose'='encrypted-oauth-state'}} | ConvertTo-Json -Compress)
+        }
     }
     if ($Arguments[0] -eq 'inspect') { return $script:mountDetails | ConvertTo-Json -Depth 8 -Compress }
     if ($Arguments[0] -eq 'compose') {
@@ -112,6 +131,12 @@ try {
     foreach ($name in @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port')) {
         $bad=$mcp.Clone();$bad.Remove($name)
         Fails { Assert-LocalMcpSettings $bad 14391 } 'configuration'
+    }
+    foreach ($name in @('tenantId','clientId','apiClientId')) {
+        foreach ($suffix in @("`n","`r`n",' ',"`0")) {
+            $bad=$mcp.Clone();$bad[$name]=$mcp[$name]+$suffix
+            Fails { Assert-LocalMcpSettings $bad 14391 } 'exact lowercase GUIDs'
+        }
     }
     foreach ($url in @('http://mcp.example.test/mcp','https://mcp.example.test/mcp/','https://mcp.example.test/mcp*','https://mcp.example.test/internal/mcp-metadata','https://mcp.example.test/mcp?tenant=x','https://mcp.example.test/mcp#x','https://mcp.example.test','https://MCP.example.test/mcp')) {
         $bad=$mcp.Clone();$bad.publicUrl=$url
@@ -199,6 +224,8 @@ try {
     }
     Sync-LocalMcpContext $context $settings
     Sync-LocalMcpContext $context $settings
+    Assert ($context.McpRecordingVolume -ceq 'mcp-test_mcp-recordings' -and
+        $context.McpRecordingVolume -cne $context.McpVolume) 'Recording diagnostics reused OAuth state or another project volume.'
     Assert (@($context.Compose | Where-Object { $_ -ceq (Join-Path $root 'compose.mcp.yaml') }).Count -eq 1) 'Compose MCP overlay duplicated.'
     $context.Port=14391;$context.Url='http://localhost:14391';$context.PublicUrl=$context.Url;$context.McpImageId=$script:image
     Write-LocalComposeEnvironment $context
@@ -207,7 +234,40 @@ try {
     Assert (-not $environment.Contains('synthetic-independent')) 'Secret content entered Compose environment.'
     $run=Get-LocalMcpRunArguments $context
     Assert ($run -contains '--read-only' -and $run -contains '--pids-limit' -and @($run | Where-Object { $_ -like 'type=bind,*readonly' }).Count -eq 4) 'MCP preflight mounts/security differ.'
+    Assert ($run -contains "type=volume,source=$($context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy" -and
+        $run -contains "type=volume,source=$($context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy" -and
+        @($run | Where-Object { $_ -like 'type=volume,*' }).Count -eq 2 -and
+        $run -contains 'MCP_RECORDING_STORAGE_PATH=/var/lib/agent-control-mcp/recordings') 'MCP preflight did not isolate the two writable nocopy volumes.'
+    Assert (@($run | Where-Object { $_ -cmatch '^MCP_RECORDING_' }).Count -eq 1) 'Deployment enabled tracing instead of leaving Docker admin controls off by default.'
     Assert (-not (($run -join '|') -match 'tenants.json|postgres|PGPASSWORD|SESSION_SECRET')) 'MCP inherited API/database authority.'
+    $stateFiles=@(Get-ChildItem -LiteralPath $context.State -File | ForEach-Object Name) -join '|'
+    $script:calls.Clear()
+    Initialize-LocalMcpRecordingStorage $context
+    $initialization=@($script:calls | Where-Object { $_ -match '^run\|' })
+    $uid=if ($IsWindows) {'1000'} else {(& id -u).Trim()}
+    $gid=if ($IsWindows) {'1000'} else {(& id -g).Trim()}
+    Assert ($initialization.Count -eq 1 -and
+        $initialization[0].Contains('--network|none|--user|0:0|--read-only|--cap-drop|ALL|--cap-add|CHOWN|--cap-add|FOWNER') -and
+        $initialization[0].Contains("--mount|type=volume,source=$($context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy") -and
+        $initialization[0].Contains('--env|MCP_RECORDING_STORAGE_PATH=/var/lib/agent-control-mcp/recordings') -and
+        $initialization[0].EndsWith("|$($script:image)|-m|agent_control_mcp.recording|initialize|$uid|$gid") -and
+        -not $initialization[0].Contains($context.McpVolume)) 'Recording initialization did not use the exact image, operator ownership and isolated diagnostics volume.'
+    Assert (($script:calls -join "`n").Contains("com.docker.compose.project=$($context.Project)|--label|com.docker.compose.volume=mcp-recordings|--label|io.agent-control.purpose=mcp-session-recordings")) 'Recording volume was created without project/logical/purpose ownership.'
+    Assert ((@(Get-ChildItem -LiteralPath $context.State -File | ForEach-Object Name) -join '|') -ceq $stateFiles) 'Fresh recorder initialization persisted a diagnostics receipt.'
+    $script:calls.Clear()
+    Initialize-LocalMcpRecordingStorage $context
+    Assert (-not (($script:calls -join "`n") -match '^volume\|create\|' ) -and
+        (@(Get-ChildItem -LiteralPath $context.State -File | ForEach-Object Name) -join '|') -ceq $stateFiles) 'Disposable recorder initialization created durable receipts or replaced existing volume ownership.'
+    foreach ($override in @(
+        @{name='foreign-recordings'},@{driver='foreign-driver'},@{'com.docker.compose.project'='other-project'},
+        @{'com.docker.compose.volume'='mcp-oauth'},@{'io.agent-control.purpose'='encrypted-oauth-state'}
+    )) {
+        $script:recordingVolumeOverrides=$override
+        $script:calls.Clear()
+        Fails { Initialize-LocalMcpRecordingStorage $context } 'recording volume ownership/purpose'
+        Assert (-not (($script:calls -join "`n") -match '^run\|')) 'Foreign diagnostics state was mutated before ownership validation.'
+    }
+    $script:recordingVolumeOverrides=@{}
     $env:MCP_PUBLIC_URL='https://wrong.example.test/mcp';$env:MCP_CLIENT_SECRET_FILE='/wrong'
     Start-LocalMcp $context
     Assert ($env:MCP_PUBLIC_URL -ceq 'https://wrong.example.test/mcp') 'MCP shell configuration was not restored after Compose.'
@@ -233,6 +293,14 @@ try {
     $script:volume=$false
     Fails { Initialize-LocalMcpStorage $context } 'Recorded MCP state volume is missing'
     $script:volume=$true
+    $oauthReceiptHash=(Get-FileHash -LiteralPath (Join-Path $context.State 'mcp-storage.json')).Hash
+    $script:recordingVolume=$false
+    $script:calls.Clear()
+    Initialize-LocalMcpStorage $context
+    Assert ($script:recordingVolume -and
+        @($script:calls | Where-Object { $_ -match '^volume\|create\|' }).Count -eq 1 -and
+        (Get-FileHash -LiteralPath (Join-Path $context.State 'mcp-storage.json')).Hash -ceq $oauthReceiptHash) 'Missing disposable diagnostics could not recover independently of retained OAuth state.'
+    Assert (-not (($script:calls -join "`n") -match 'agent_control_mcp.recording\|(start|enable)\|')) 'Ordinary startup activated recording.'
     Fails { Invoke-LocalMcpChecks $context $null -Image 'mutable:tag' } 'immutable image'
     $script:calls.Clear()
     Invoke-LocalMcpChecks $context $null -Image $script:image
@@ -245,8 +313,18 @@ try {
         mounts=@(@{Destination='/run/secrets/mcp-client';Source=(Join-Path $secretDirectory 'mcp-client');Type='bind';RW=$false},
             @{Destination='/run/secrets/mcp-signing';Source=(Join-Path $secretDirectory 'mcp-signing');Type='bind';RW=$false},
             @{Destination='/run/secrets/mcp-encryption';Source=(Join-Path $secretDirectory 'mcp-encryption');Type='bind';RW=$false},
-            @{Destination='/var/lib/agent-control-mcp/oauth';Name=$context.McpVolume;Type='volume';RW=$true})}
+            @{Destination='/var/lib/agent-control-mcp/oauth';Name=$context.McpVolume;Type='volume';RW=$true},
+            @{Destination='/var/lib/agent-control-mcp/recordings';Name=$context.McpRecordingVolume;Type='volume';RW=$true})}
     Assert-LocalMcpContainer $context $script:container
+    foreach ($field in @('Name','Type','RW')) {
+        $saved=$script:mountDetails.mounts[-1][$field]
+        $script:mountDetails.mounts[-1][$field]=if ($field -eq 'RW') {$false} elseif ($field -eq 'Type') {'bind'} else {$context.McpVolume}
+        Fails { Assert-LocalMcpContainer $context $script:container } 'volume identity'
+        $script:mountDetails.mounts[-1][$field]=$saved
+    }
+    $script:recordingVolumeOverrides=@{'com.docker.compose.project'='other-project'}
+    Fails { Assert-LocalMcpContainer $context $script:container } 'recording volume ownership/purpose'
+    $script:recordingVolumeOverrides=@{}
     $script:mountDetails.mounts[0].RW=$true
     Fails { Assert-LocalMcpContainer $context $script:container } 'mount identity'
     $script:mountDetails.mounts[0].RW=$false
