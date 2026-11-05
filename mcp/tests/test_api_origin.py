@@ -160,12 +160,12 @@ async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence
         {"scp": "Mcp.Access"},
         {"roles": []},
         {"roles": ["GlobalAdministrator"]},
-        {"iat": -310},
+        {"iat": 120},
         {"nbf": 120},
         {"exp": -1},
     ],
 )
-async def test_obo_denies_wrong_or_stale_authority(invocation, entra, claims):
+async def test_obo_denies_wrong_or_invalid_authority(invocation, entra, claims):
     # Resolve time offsets at invocation so collection order cannot age the claims.
     now = int(time.time())
     entra.response_claims = {
@@ -175,6 +175,19 @@ async def test_obo_denies_wrong_or_stale_authority(invocation, entra, claims):
         await invocation.get_capabilities()
     assert error.value.status == 401
     assert entra.api_calls == []
+
+
+@pytest.mark.parametrize("age", [299, 300, 301, 900, 3600])
+async def test_obo_accepts_backdated_valid_tokens_and_reuses_them_until_expiry(
+    invocation, entra, age
+):
+    now = int(time.time())
+    entra.response_claims = {"iat": now - age, "nbf": now - age}
+    await invocation.get_capabilities()
+    await invocation.get_capabilities()
+    assert invocation.api_token.claims["iat"] == now - age
+    assert invocation.exchanges == 1
+    assert len(entra.api_calls) == 2
 
 
 async def test_claims_challenge_redaction_and_throttling(invocation, entra):
@@ -261,8 +274,8 @@ async def test_obo_rejects_non_string_token_types(invocation, entra, token_type)
     )
     with pytest.raises(AdapterError) as error:
         await invocation.get_capabilities()
-    assert error.value.status == 401
-    assert error.value.code == "reauthorization_required"
+    assert error.value.status == 502
+    assert error.value.code == "invalid_authorization_response"
     assert entra.api_calls == []
 
 
@@ -361,12 +374,33 @@ async def test_allowlist_malformed_output_bounds_and_safe_read_retry(invocation,
         await invocation.get_capabilities()
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        "sensitive-malformed-provider-body",
+        "null",
+        "[]",
+        "{}",
+        '{"access_token":42,"token_type":"Bearer"}',
+        '{"access_token":"sensitive-provider-token","token_type":"DPoP"}',
+    ],
+)
+async def test_malformed_exchange_metadata_is_not_a_reconnect_request(invocation, entra, body):
+    entra.exchange_error = httpx2.Response(200, content=body)
+    with pytest.raises(AdapterError) as error:
+        await invocation.get_capabilities()
+    assert error.value.status == 502
+    assert error.value.code == "invalid_authorization_response"
+    assert "sensitive-" not in json.dumps(error.value.as_dict())
+    assert entra.api_calls == []
+
+
 async def test_expiry_exchange_budget_and_invocation_deadline(invocation, entra):
     await invocation.get_capabilities()
-    invocation.api_token.claims["iat"] = int(time.time()) - 301
+    invocation.api_token.claims["exp"] = int(time.time()) - 1
     await invocation.get_capabilities()
     assert invocation.exchanges == 2
-    invocation.api_token.claims["iat"] = int(time.time()) - 301
+    invocation.api_token.claims["exp"] = int(time.time()) - 1
     with pytest.raises(AdapterError, match="exchange budget"):
         await invocation.get_capabilities()
     invocation.started -= 61

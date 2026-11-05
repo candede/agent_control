@@ -26,6 +26,7 @@ function Get-LocalMcpFixtureContainers {
         $expected = @{ '/fixture/key.json'=(Join-Path $Directory 'key.json') }
         if ($service -ceq 'mcp') {
             foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) { $expected["/run/secrets/$name"] = Join-Path $Context.State "secrets/$name" }
+            if (Test-LocalMcpMetadataCredential $Context) { $expected['/run/secrets/mcp-metadata'] = Join-Path $Context.State 'secrets/mcp-metadata' }
             $expected['/var/lib/agent-control-mcp/oauth'] = $Context.McpVolume
             if ($details.memory -ne 536870912 -or $details.cpus -ne 500000000 -or $details.pids -ne 128 -or
                 -not $details.readOnly -or ($details.capDrop -join ',') -cne 'ALL' -or

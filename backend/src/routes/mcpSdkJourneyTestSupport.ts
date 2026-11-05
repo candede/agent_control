@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { apiToken, account, jwk } from "../auth/authFoundationTestSupport.js";
 import type { setupAuditOriginHttp } from "./auditOriginHttpTestSupport.js";
 
+// Names identify canonical operations for SQL/browser parity assertions. The Python
+// test adapter resolves the current public tool/action; no old wire alias is called.
 export type SdkCall = { name: string; request: Record<string, unknown>; expected?: unknown };
 
 export async function sdkJourney(fixture: Awaited<ReturnType<typeof setupAuditOriginHttp>>, calls: SdkCall[]) {

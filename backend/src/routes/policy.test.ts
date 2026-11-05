@@ -11,7 +11,7 @@ describe("route policy declarations", () => {
       "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}",
       "GET /auth/login", "POST /auth/login", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
-      "GET /workbench/metadata", "GET /workbench/jobs", "POST /audit/events/export.csv",
+      "GET /workbench/metadata", "GET /workbench/jobs", "GET /mcp/settings", "POST /audit/events/export.csv",
       "GET /agent-inventory", "GET /agent-inventory/summary", "GET /agent-inventory/facets", "POST /agent-inventory/selections",
       "GET /agent-inventory/health",
       "GET /agent-inventory/:recordId/about",

@@ -1,7 +1,8 @@
 #requires -Version 7.0
 param([Parameter(Mandatory)][string]$Suite, [string]$BrowserFiles = 'reportSets.spec.ts',
     [string]$BaselineImage = 'agent-control-scale-5096-operator:local',
-    [string]$BaselineImageId = 'sha256:78f3cb9fa91e7a64960699899d8fe2eb56bdd77c8ee56490f1f5255855b3c235')
+    [string]$BaselineImageId = 'sha256:78f3cb9fa91e7a64960699899d8fe2eb56bdd77c8ee56490f1f5255855b3c235',
+    [string]$BrowserImage, [string]$BrowserImageId)
 $ErrorActionPreference = 'Stop'
 if ($BaselineImage -cnotmatch '^[a-z0-9][a-z0-9./:_-]{0,200}$' -or $BaselineImageId -cnotmatch '^sha256:[a-f0-9]{64}$') {
     throw 'Fixture baseline requires an explicit local image and exact SHA-256 identity.'
@@ -43,18 +44,18 @@ $project = "agent-control-ltdp-$id"
 $directory = Join-Path $root "artifacts/large-tenant-data-platform/$id"
 [IO.Directory]::CreateDirectory($directory) | Out-Null
 $image = "$project-operator:local"
-$baseline = $BaselineImage
-$baselineId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$baseline) -Capture
-if ($baselineId -cne $BaselineImageId) { throw 'Campaign baseline image identity changed.' }
-[IO.File]::WriteAllText((Join-Path $directory 'baseline.txt'),$baselineId)
 if ($Suite -eq 'mcp-container') {
     # This suite builds only the separately locked Python image; it reuses no Node dependencies.
     . (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
     Invoke-LocalMcpFixture -Root $root -Directory $directory
     exit 0
 }
+$baseline = $BaselineImage
+$baselineId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$baseline) -Capture
+if ($baselineId -cne $BaselineImageId) { throw 'Campaign baseline image identity changed.' }
+[IO.File]::WriteAllText((Join-Path $directory 'baseline.txt'),$baselineId)
 $hashes = (Invoke-DockerCommand @('run','--rm','--network','none','--entrypoint','node',$baseline,'-e',
-    'const fs=require("node:fs"),crypto=require("node:crypto");console.log(JSON.stringify(Object.fromEntries(["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(f=>[f,crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")]))))') -Capture) | ConvertFrom-Json -AsHashtable
+    'const fs=require("node:fs"),crypto=require("node:crypto"),semver=require("/app/node_modules/semver");if(!semver.satisfies(process.versions.node,require("/app/package.json").engines.node))throw Error("Node engine mismatch");console.log(JSON.stringify(Object.fromEntries(["package.json","package-lock.json","backend/package.json","frontend/package.json"].map(f=>[f,crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")]))))') -Capture) | ConvertFrom-Json -AsHashtable
 foreach ($path in $hashes.Keys) {
     if ((Get-FileHash -LiteralPath (Join-Path $root $path) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $hashes[$path]) {
         throw 'Dependency manifests changed: rebuild an approved-feed baseline after checking every lockfile URL; this runner never installs packages.'
@@ -72,14 +73,35 @@ if ($Suite -in @('browser','restart')) {
 }
 # Reuse installed, approved dependencies; no installer or registry access.
 if ($Suite -eq 'cutover-browser-contract') {
-    $browser = 'agent-control:permission-browser-test-phase06'
+    if ($BrowserImage -cnotmatch '^[a-z0-9][a-z0-9./:_-]{0,200}$' -or $BrowserImageId -cnotmatch '^sha256:[a-f0-9]{64}$') {
+        throw 'Browser qualification requires -BrowserImage and its immutable -BrowserImageId.'
+    }
+    $browser = $BrowserImage
     $browserId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$browser) -Capture
-    if ($browserId -cne 'sha256:b4eda044a9e58194703b1aa3e3209d3a7ea9cc219f9df14d36d418db873bb60b') { throw 'Protected browser identity changed.' }
+    if ($browserId -cne $BrowserImageId) { throw 'Selected browser identity changed.' }
     $architectures = @($baseline,$browser | ForEach-Object { Invoke-DockerCommand @('image','inspect','--format','{{.Architecture}}',$_) -Capture })
     if (@($architectures | Select-Object -Unique).Count -ne 1) { throw 'Installed dependency and browser architectures differ.' }
-    Invoke-DockerCommand @('build','--network','none','--build-arg',"DEPENDENCY_BASE=$baseline",
-        '--build-arg',"BROWSER_BASE=$browser",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1',
-        '--target','permission-browser-test','-t',$image,$root)
+    $browserContract = Invoke-DockerCommand @('run','--rm','--network','none','--read-only','--entrypoint','node',$browserId,'-e',
+        'const fs=require("node:fs"),root="/app/node_modules/",p=require(root+"@playwright/test/package.json"),c=require(root+"playwright-core/package.json"),b=require(root+"playwright-core/browsers.json");for(const x of b.browsers.filter(x=>x.installByDefault))if(!fs.existsSync("/ms-playwright/"+x.name.replaceAll("-","_")+"-"+x.revision))throw Error("Browser binary revision missing");console.log(JSON.stringify({version:p.version,core:c.version}));') -Capture | ConvertFrom-Json
+    $lock = [IO.File]::ReadAllText((Join-Path $root 'package-lock.json')) | ConvertFrom-Json -AsHashtable
+    if ($browserContract.version -cne $lock.packages['node_modules/@playwright/test'].version -or
+        $browserContract.core -cne $browserContract.version) { throw 'Selected browser package/binary contract differs from current lockfile.' }
+    Write-LocalText (Join-Path $directory 'browser-image.json') (@{tag=$browser;id=$browserId;architecture=$architectures[1];version=$browserContract.version} | ConvertTo-Json)
+    $build = @('build','--provenance=false','--network','none','--build-arg',"DEPENDENCY_BASE=$baseline",
+        '--build-arg',"BROWSER_BASE=$browser",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1')
+    $target = 'permission-browser-test'
+    if ('mcpSettings.spec.ts' -cin $selectedFiles) {
+        . (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
+        Assert-LocalMcpFixtureEngine
+        $sdk = "$project-sdk:local"
+        Invoke-DockerCommand @('build','--provenance=false','--target','test','-f',(Join-Path $root 'mcp/Dockerfile'),
+            '--label',"io.agent-control.fixture=$project",'-t',$sdk,$root)
+        $sdkId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$sdk) -Capture
+        Write-LocalText (Join-Path $directory 'sdk-image.json') (@{tag=$sdk;id=$sdkId;purpose='synthetic browser API MCP metadata fixture'} | ConvertTo-Json)
+        $build += @('--build-arg',"MCP_FIXTURE_BASE=$sdk")
+        $target = 'mcp-settings-browser-test'
+    }
+    Invoke-DockerCommand ($build + @('--label',"io.agent-control.fixture=$project",'--target',$target,'-t',$image,$root))
 } else {
 $dockerfile = Join-Path $directory 'Dockerfile'
 $base = "FROM $baseline`n"
@@ -92,16 +114,6 @@ if ($Suite -eq 'mcp-end-to-end') {
     $sdkId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$sdk) -Capture
     Write-LocalText (Join-Path $directory 'sdk-image.json') (@{tag=$sdk;id=$sdkId;purpose='synthetic SDK to canonical SQL HTTP fixture'} | ConvertTo-Json)
     $base = "FROM $baseline AS installed`nFROM $sdk`nUSER root`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`nENV AGENT_CONTROL_MCP_SQL_JOURNEY=/opt/mcp/.venv/bin/python NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/`nRUN node --version && /opt/mcp/.venv/bin/python --version`n"
-}
-if ($Suite -eq 'cutover-browser-contract') {
-    $browser = 'agent-control:permission-browser-test-phase06'
-    $browserId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$browser) -Capture
-    if ($browserId -cne 'sha256:b4eda044a9e58194703b1aa3e3209d3a7ea9cc219f9df14d36d418db873bb60b') { throw 'Cached synthetic browser image identity changed.' }
-    $browserArchitecture = Invoke-DockerCommand @('image','inspect','--format','{{.Architecture}}',$browser) -Capture
-    $baselineArchitecture = Invoke-DockerCommand @('image','inspect','--format','{{.Architecture}}',$baseline) -Capture
-    if ($browserArchitecture -cne $baselineArchitecture) { throw 'Cached browser and approved installed dependencies must have the same architecture.' }
-    [IO.File]::WriteAllText((Join-Path $directory 'browser-baseline.txt'),$browserId)
-    $base = "FROM $baseline AS installed`nFROM $browser`nRUN rm -rf /app /browser`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`n"
 }
 [IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY Dockerfile compose.yaml compose.large-tenant-test.yaml /app/`n")
 if ($Suite -eq 'software-gate') { [IO.File]::AppendAllText($dockerfile,"RUN npm run build`n") }

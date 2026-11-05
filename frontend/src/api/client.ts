@@ -15,8 +15,9 @@ import type { AutomaticRefreshResult, DataSyncRun, DataSyncState, PackageDetailS
 import type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
 export type { UnifiedAgentInventoryHealth } from "../../../backend/src/types/unifiedAgents";
 import type { QuarantineAction, QuarantineConfirmationSummary, QuarantineJob, QuarantineReconciliationResult } from "../../../backend/src/types/copilotStudioQuarantine";
-import type { WorkbenchJobsResponse, WorkbenchMetadata } from "../../../backend/src/types/workbench";
+import type { WorkbenchJobsResponse } from "../../../backend/src/types/workbench";
 import { parseWorkbenchMetadataJson, workbenchMetadataMaximumBytes } from "../../../backend/src/types/workbench";
+import { parseMcpSettingsJson, mcpSettingsMaximumBytes } from "../../../backend/src/types/mcpSettings";
 import type { UnifiedAgentInventoryPage, UnifiedAgentInventoryQuery, UnifiedAgentInventoryUnavailable, UnifiedAgentRecord } from "../../../backend/src/types/unifiedAgents";
 import { encodeInventoryFacet, inventoryFacetFields, type InventoryFacetValue } from "../../../backend/src/types/inventoryFacets";
 import type { AgentInvestigationContext } from "../../../backend/src/types/agentInvestigations";
@@ -427,11 +428,17 @@ function validCheckProgress(value: unknown): value is CapabilityCheckProgress {
 
 export function getWorkbenchMetadata(options: { signal?: AbortSignal } = {}) {
   return requestBody("/api/workbench/metadata", { signal: options.signal, headers: { Accept: "application/json" } },
-    response => readWorkbenchMetadata(response, options.signal));
+    response => readMetadata(response, options.signal, workbenchMetadataMaximumBytes, parseWorkbenchMetadataJson, "workbench metadata"));
 }
 
-async function readWorkbenchMetadata(response: Response, signal?: AbortSignal): Promise<WorkbenchMetadata> {
-  const invalid = () => new ApiError(response.status, "invalid_response", "The server returned invalid workbench metadata.", {
+export function getMcpSettings(options: { signal?: AbortSignal } = {}) {
+  return requestBody("/api/mcp/settings", { signal: options.signal, headers: { Accept: "application/json" } },
+    response => readMetadata(response, options.signal, mcpSettingsMaximumBytes, parseMcpSettingsJson, "MCP settings"));
+}
+
+async function readMetadata<T>(response: Response, signal: AbortSignal | undefined, maximum: number,
+  parse: (raw: string) => T, label: string): Promise<T> {
+  const invalid = () => new ApiError(response.status, "invalid_response", `The server returned invalid ${label}.`, {
     requestId: response.headers.get("X-Request-ID") ?? undefined,
   });
   if (!response.body) throw invalid();
@@ -453,12 +460,12 @@ async function readWorkbenchMetadata(response: Response, signal?: AbortSignal): 
       signal?.throwIfAborted();
       if (chunk.done) break;
       bytes += chunk.value.byteLength;
-      if (bytes > workbenchMetadataMaximumBytes) throw invalid();
+      if (bytes > maximum) throw invalid();
       text += decode(chunk.value, true);
     }
     text += decode();
     signal?.throwIfAborted();
-    try { return parseWorkbenchMetadataJson(text); }
+    try { return parse(text); }
     catch (error) {
       if (error instanceof SyntaxError) throw invalid();
       throw error;

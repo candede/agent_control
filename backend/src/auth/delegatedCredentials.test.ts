@@ -25,6 +25,39 @@ beforeEach(async () => {
 afterEach(() => { config.tenants = originalTenants; vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("ephemeral exact-principal delegated credentials", () => {
+  it("accepts GUID-qualified Graph grants returned alongside metadata-only OBO scopes", async () => {
+    const fetcher = oboFetcher({
+      scope: "openid profile email 00000003-0000-0000-c000-000000000000/CopilotPackages.ReadWrite.All 00000003-0000-0000-c000-000000000000/Group.Read.All",
+    });
+    const source = await createBearerCredentials(await verifiedBearer(), epochAuthority(), { fetcher });
+    expect(source.principal.roles).toEqual(["AgentControl.Viewer"]);
+    expect(fetcher).toHaveBeenCalledOnce();
+    const requested = new URLSearchParams(String(fetcher.mock.calls[0][1]?.body)).get("scope")!.split(" ");
+    expect(requested).toEqual(expect.arrayContaining(["openid", "profile"]));
+    expect(requested.every(scope => ["openid", "profile", "offline_access"].includes(scope))).toBe(true);
+    await source.revalidate();
+    expect(source.principal.roles).toEqual(["AgentControl.Viewer"]);
+  });
+
+  it.each(["graph.package.read.delegated", "powerPlatform.inventory.read"] as const)(
+    "accepts the exact provider GUID scope resource for %s without accepting another resource",
+    async capability => {
+      const fetcher = oboFetcher();
+      const source = await createBearerCredentials(await verifiedBearer({ roles: ["AgentControl.Admin"] }), epochAuthority(), { fetcher });
+      const graph = capability === "graph.package.read.delegated";
+      const resource = graph ? "00000003-0000-0000-c000-000000000000" : "8578e004-a5c6-46e7-913e-12f58912df43";
+      const permission = graph ? "CopilotPackages.ReadWrite.All" : "ResourceQuery.Resources.Read";
+      fetcher.mockImplementationOnce(async (_url, request) => sdkResponse({
+        scope: `openid profile ${resource}/${permission}`,
+      }, request));
+      await expect(source.acquire(capability)).resolves.toBe("synthetic-opaque-provider-access");
+      fetcher.mockImplementationOnce(async (_url, request) => sdkResponse({
+        scope: `openid profile https://other.example.invalid/${permission}`,
+      }, request));
+      await expect(source.acquire(capability)).rejects.toMatchObject({ code: "unauthorized" });
+    },
+  );
+
   it("silently revalidates the initiating browser authority throughout a ten-minute read and stops when it ends", async () => {
     vi.useFakeTimers();
     const epochs = epochAuthority();

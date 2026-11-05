@@ -17,7 +17,9 @@ export function fixtureCommands(suite: string): string[][] {
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "mcp-end-to-end") return [
-    ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/sharedAgentControls.test.ts", "--silent=false"],
+    ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
+      "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
+      "src/routes/sharedAgentControls.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "deployment-current") return [
@@ -666,6 +668,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (process.argv[2] === "cutover-browser-contract") Object.assign(environment, {
     AGENT_CONTROL_FIXTURE_MODE: "browser", PLAYWRIGHT_BROWSERS_PATH: "/ms-playwright",
     PLAYWRIGHT_EVIDENCE_DIR: "/evidence", AGENT_CONTROL_BROWSER_TEST_FILES: browserFixtureTestFiles(process.argv[3] ?? "reportSets.spec.ts").join(","),
+    ...(process.env.AGENT_CONTROL_MCP_METADATA_PYTHON === "/opt/mcp/.venv/bin/python"
+      ? { AGENT_CONTROL_MCP_METADATA_PYTHON: "/opt/mcp/.venv/bin/python" } : {}),
   });
   const failures: Error[] = [];
   const receipts: { command: string; exit: number | null; signal: string | null; elapsedMs: number; error: string | null }[] = [];

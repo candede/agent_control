@@ -8,6 +8,9 @@ from pathlib import Path
 
 import httpx2
 from conftest import OTHER, USER, connect
+from public_contract import canonical_result, public_request
+
+from agent_control_mcp.domains import PUBLIC_TOOLS
 
 PUBLIC = "https://mcp.example.test"
 RECEIPT = Path("/work/connection.json")
@@ -62,9 +65,12 @@ async def rpc(browser, token, *, drain=False):
         json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
     assert catalog.status_code == 200, catalog.text
-    assert len(catalog.json()["result"]["tools"]) == 124
+    assert len(catalog.json()["result"]["tools"]) == len(PUBLIC_TOOLS) == 50
     if drain:
         await asyncio.to_thread(Path("/work/drain-started.json").write_text, '{"started":true}')
+    name, request = public_request(
+        "get_capability_check_progress" if drain else "list_capabilities", {}
+    )
     response = await browser.post(
         "/mcp",
         headers=headers,
@@ -73,15 +79,18 @@ async def rpc(browser, token, *, drain=False):
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "get_capability_check_progress" if drain else "list_capabilities",
-                "arguments": {"request": {}},
+                "name": name,
+                "arguments": {"request": request},
             },
         },
     )
     assert response.status_code == 200, response.text
     result = response.json()["result"]
     assert not result.get("isError"), result
-    assert result["structuredContent"] == ({"progress": None} if drain else {"value": []}), result
+    assert result["structuredContent"] == {
+        "action": "progress" if drain else "list",
+        "result": {"progress": None} if drain else {"value": []},
+    }, result
     if not drain:
         await browser.delete("/mcp", headers=headers)
 
@@ -193,6 +202,7 @@ async def capacity():
 
         async def call(index):
             browser = clients[index % 2]
+            name, request = public_request("get_capability_check_progress", {"retry": "failed"})
             response = await browser.post(
                 "/mcp",
                 headers=browser.fixture_headers,
@@ -201,8 +211,8 @@ async def capacity():
                     "id": index + 2,
                     "method": "tools/call",
                     "params": {
-                        "name": "get_capability_check_progress",
-                        "arguments": {"request": {"retry": "failed"}},
+                        "name": name,
+                        "arguments": {"request": request},
                         "_meta": {
                             "com.agentcontrol/origin": {"callingAgent": {"id": browser.fixture_oid}}
                         },
@@ -212,7 +222,7 @@ async def capacity():
             assert response.status_code in {200, 503}, response.text
             if response.status_code == 503:
                 return {"outcome": "backpressure", "bytes": len(response.content)}
-            result = response.json()["result"]
+            result = canonical_result("get_capability_check_progress", response.json()["result"])
             if result.get("isError"):
                 error = json.loads(result["content"][0]["text"])
                 assert error["status"] == 503, error

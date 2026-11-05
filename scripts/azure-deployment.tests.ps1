@@ -7,6 +7,7 @@ $scratch = Join-Path $scratchRoot "azure-deployment-$([Guid]::NewGuid().ToString
 [IO.Directory]::CreateDirectory($scratch) | Out-Null
 $script:Checks = 0
 $script:Contexts = [Collections.Generic.List[object]]::new()
+$script:PowerShellExecutable = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -159,13 +160,13 @@ function Add-McpTarget {
         }
         secrets=[PSCustomObject]@{}
         network=[PSCustomObject]@{
-            inboundIpv4Cidrs=@('192.0.2.0/24'); outboundIpv4Addresses=@('192.0.2.30')
+            inboundIpv4Cidrs=@('192.0.2.0/24'); apiInboundIpv4Addresses=@($Target.resources.approvedAppOutboundIpv4Addresses); outboundIpv4Addresses=@('192.0.2.30')
             apiReachabilityReference='fixture-authenticated-route-network-reference'; forwardedHeaders='ignored'
         }
         operationsOwner='fixture-mcp-operator'; registrationApprovalReference='fixture-exact-registration-grants'
         cost=[PSCustomObject]@{plan=1;storage=1;registry=1;network=1;monitoring=1;restoreDrill=1;monthlyTotal=6}
     }
-    foreach ($key in @('client','signing','encryption')) {
+    foreach ($key in @('client','signing','encryption','metadata')) {
         $mcp.secrets | Add-Member -NotePropertyName $key -NotePropertyValue ([PSCustomObject]@{
             name="agent-control-mcp-$key"; version='fixturemcp2'
             currentVersion=$(if ($Mode -eq 'existing') { 'fixturemcp1' } else { '' })
@@ -245,6 +246,12 @@ function Add-RuntimeCommands {
     Add-Az $Fixture runtime_access_verify @('role', 'assignment', 'list', '--assignee-object-id',
         '44444444-4444-4444-8444-444444444444', '--scope',
         "$($Target.existingVaultResourceId)/secrets/agent-control-postgres-admin-password", '--include-inherited') -Json @()
+    if ($Target.mcp) {
+        foreach ($key in @('client','signing','encryption')) {
+            Add-Az $Fixture runtime_access_verify @('role','assignment','list','--assignee-object-id','44444444-4444-4444-8444-444444444444',
+                '--scope',"$($Target.existingVaultResourceId)/secrets/$($Target.mcp.secrets.$key.name)",'--include-inherited') -Json @()
+        }
+    }
     Add-DatabaseCommand $Fixture runtime_access_verify $Target @('backend/scripts/azure-database.ts', 'runtime') -RuntimeRole
 }
 
@@ -388,7 +395,7 @@ function New-Fixture {
     }
     Add-Az $fixture monitoring_verify @('monitor', 'metrics', 'alert', 'list', '--resource-group', $Target.resourceGroup,
         '--subscription', $Target.subscriptionId) -Json $metricAlerts
-    $eventPrefix = 'AppServiceConsoleLogs | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent '
+    $eventPrefix = "AppServiceConsoleLogs | where _ResourceId =~ `"$($Target.expectedResourceIds.appService)`" | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent "
     Add-Az $fixture monitoring_verify @('monitor', 'scheduled-query', 'list', '--resource-group', $Target.resourceGroup,
         '--subscription', $Target.subscriptionId) -Json @(
         @{ name = "$($Target.resources.appService.name)-restarts"; enabled = $true; criteria = @{ allOf = @(@{
@@ -549,7 +556,7 @@ function Add-McpFixture {
         autoHealEnabled=$false;vnetRouteAllEnabled=$true;acrUseManagedIdentityCreds=$true;acrUserManagedIdentityID=$m.identityClientId
         healthCheckPath='/ready';minTlsVersion='1.2';ipSecurityRestrictionsDefaultAction='Deny'
         scmIpSecurityRestrictionsDefaultAction='Deny'
-        ipSecurityRestrictions=@(@{action='Allow';ipAddress='192.0.2.0/24'})
+        ipSecurityRestrictions=@(@{action='Allow';ipAddress='192.0.2.0/24'}) + @($m.network.apiInboundIpv4Addresses | ForEach-Object { @{action='Allow';ipAddress="$_/32"} })
     }
     Add-Az $Fixture mcp_verify @('rest','--method','post','--url',"https://management.azure.com$($m.appServiceResourceId)/config/azurestorageaccounts/list?api-version=2024-11-01") -Json @{
         properties=@{}
@@ -659,8 +666,8 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     Assert-True ($LASTEXITCODE -eq 0) 'Actual Azure ZIP inspector did not enforce numeric-cache/ordinary-source boundaries.'
     Assert-True (($zipResult | ConvertFrom-Json).cases -eq 6) 'Azure ZIP cache regression did not execute every case.'
     $vaultAccess = Get-Content -LiteralPath (Join-Path $root 'infra/key-vault-access.bicep') -Raw
-    Assert-True ($vaultAccess -cmatch '(?m)^[ \t]*@minLength\(3\)[ \t]*\r?\n[ \t]*@maxLength\(3\)[ \t]*\r?\n[ \t]*param runtimeSecretNames array[ \t]*$') `
-        'Key Vault access module must require exactly three runtime secret names.'
+    Assert-True ($vaultAccess -cmatch '(?m)^[ \t]*@minLength\(1\)[ \t]*\r?\n[ \t]*@maxLength\(4\)[ \t]*\r?\n[ \t]*param runtimeSecretNames array[ \t]*$') `
+        'Key Vault access module must bound exact per-secret grants including the optional shared metadata secret.'
     $bicep = Get-Content -LiteralPath (Join-Path $root 'infra/main.bicep') -Raw
     Assert-True (-not $bicep.Contains("categoryGroup: 'allLogs'") -and
         $bicep.Contains("category: 'AppServiceConsoleLogs'") -and
@@ -693,7 +700,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
         @('-InstallationMode', 'unsupported'),
         @('-UnexpectedField', 'invalid-input')
     )) {
-        $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+        $output = & $script:PowerShellExecutable -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
             -Action Plan -ExecutionMode Mock -ReceiptPath $rejectedReceipt @arguments 2>&1
         Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'ValidateSet|does not belong to the set|parameter cannot be found') `
             'Invalid named input did not fail at parameter binding.'
@@ -701,7 +708,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     }
     foreach ($invalid in @($invalidModeTarget, $invalidCase)) {
         $invalidPath = Save-Json $invalid 'invalid-target.json'
-        $output = & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+        $output = & $script:PowerShellExecutable -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
             -Action Plan -ExecutionMode Mock -TargetFile $invalidPath -ReceiptPath $rejectedReceipt 2>&1
         Assert-True ($LASTEXITCODE -ne 0 -and ($output -join "`n") -match 'installationMode|unsupported') `
             "Invalid target input did not fail before context creation: $($output -join "`n")"
@@ -1121,7 +1128,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
         $processFailureFixture = New-Fixture $freshTarget
         $processFailureFixture.commands.($processCase.failureOperation)[0].exitCode = 9
         $processFailurePath = Save-Json $processFailureFixture "$($processCase.name)-failure-fixture.json"
-        & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
+        & $script:PowerShellExecutable -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
             -TargetFile $processTargetPath -MockFixturePath $processFailurePath `
             -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processReceiptPath 2>$null | Out-Null
         Assert-True ($LASTEXITCODE -eq 1) "$($processCase.name) did not stop at its injected process failure."
@@ -1129,7 +1136,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
         $processCommandLog = Join-Path $scratch "$($processCase.name)-commands.jsonl"
         $processResumeFixture.commandLogPath = $processCommandLog
         $processResumePath = Save-Json $processResumeFixture "$($processCase.name)-resume-fixture.json"
-        & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
+        & $script:PowerShellExecutable -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
             -TargetFile $processTargetPath -MockFixturePath $processResumePath `
             -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processReceiptPath `
             -ResumeReceiptPath $processReceiptPath | Out-Null
@@ -1168,7 +1175,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $processCleanupFailure.commands.runtime_access_verify[0].exitCode = 9
     $processCleanupFailure.commands.cleanup[0].exitCode = 9
     $processCleanupFailurePath = Save-Json $processCleanupFailure 'process-cleanup-failure-fixture.json'
-    & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
+    & $script:PowerShellExecutable -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Deploy -ExecutionMode Mock `
         -TargetFile $processCleanupTarget -MockFixturePath $processCleanupFailurePath `
         -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processCleanupReceipt 2>$null | Out-Null
     Assert-True ($LASTEXITCODE -eq 1 -and (Get-Content -LiteralPath $processCleanupReceipt -Raw | ConvertFrom-Json).status -eq 'cleanup_failed') `
@@ -1178,7 +1185,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
         $target.subscriptionId, '--resource-group', $target.resourceGroup, '--name', $target.resources.postgresFlexibleServer.name,
         '--rule-name', 'wizard-{{RUN_ID}}') -Json @{}
     $processCleanupOnlyPath = Save-Json $processCleanupOnly 'process-cleanup-resume-fixture.json'
-    & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Cleanup -ExecutionMode Mock `
+    & $script:PowerShellExecutable -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Cleanup -ExecutionMode Mock `
         -TargetFile $processCleanupTarget -MockFixturePath $processCleanupOnlyPath `
         -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $processCleanupReceipt `
         -ResumeReceiptPath $processCleanupReceipt | Out-Null
@@ -1191,7 +1198,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $itemsJson = $parameterTarget.estimate.items | ConvertTo-Json -Compress
     $versionsJson = $parameterTarget.preparedVaultContract.versions | ConvertTo-Json -Compress
     $existingJson = $parameterTarget.preparedVaultContract.existingVersions | ConvertTo-Json -Compress
-    & (Get-Command pwsh).Source -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Plan -ExecutionMode Mock `
+    & $script:PowerShellExecutable -NoProfile -File (Join-Path $root 'deploy-azure.ps1') -Action Plan -ExecutionMode Mock `
         -MockFixturePath $parameterFixturePath -ArtifactPath (Join-Path $root 'artifacts/release/agent-control-linux-x64.zip') -ReceiptPath $namedReceipt `
         -TenantId $parameterTarget.tenantId -SubscriptionId $parameterTarget.subscriptionId -ResourceGroupName $parameterTarget.resourceGroup `
         -Region $parameterTarget.region -AppRegistrationClientId $parameterTarget.entraApplicationId -TenantRegistryRegistrationApprovalReference $parameterTarget.tenantRegistryRegistrationApprovalReference `
@@ -1301,7 +1308,7 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $cliMcpFixture=Save-Json $mcpDeploy.MockFixture 'mcp-cli-fixture.json'
     $cliMcpTarget=Save-Json $mcpTarget 'mcp-cli-target.json'
     $cliMcpReceipt=Join-Path $scratch 'mcp-cli-receipt.json'
-    & (Get-Command pwsh).Source -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
+    & $script:PowerShellExecutable -NoProfile -NonInteractive -File (Join-Path $root 'deploy-azure.ps1') `
         -Action Deploy -Component Mcp -ExecutionMode Mock -TargetFile $cliMcpTarget -MockFixturePath $cliMcpFixture `
         -ArtifactPath (Join-Path $scratch 'no-api-artifact.zip') -ReceiptPath $cliMcpReceipt | Out-Null
     Assert-True ($LASTEXITCODE -eq 0 -and (Get-Content -LiteralPath $cliMcpReceipt -Raw | ConvertFrom-Json).status -ceq 'deployed_mcp') `

@@ -1,6 +1,14 @@
 {
-  "version": 1,
+  "version": 2,
   "authority": "Synthetic expectations shared with backend/src/routes/mcpReadContracts.test.ts; not a runtime domain engine or model evaluation.",
+  "discovery": {
+    "maximumTools": 50,
+    "canonicalOperations": 105,
+    "firstSavedRead": {
+      "tool": "capabilities",
+      "request": {"action": "list", "input": {}}
+    }
+  },
   "ids": {
     "canonicalPrefix": "10000000-0000-4000-8000-",
     "personPrefix": "20000000-0000-4000-8000-",

@@ -17,7 +17,7 @@ const assertions = new WeakMap<VerifiedBearer, { assertion: string; fingerprint:
 export type VerifiedBearer = Readonly<{
   tenantId: string; apiClientId: string; integrationClientId: string; localAccountId: string;
   roles: readonly AppRole[]; providerRoleIds: readonly string[];
-  issuedAt: number; expiresAt: number;
+  issuedAt: number; verifiedAt: number; expiresAt: number;
 }>;
 
 export function bearerAssertion(value: VerifiedBearer) {
@@ -26,7 +26,7 @@ export function bearerAssertion(value: VerifiedBearer) {
   assertTenantConfiguration(value.tenantId, stored.fingerprint);
   const now = Date.now();
   if (value.expiresAt <= now) throw new AppError(401, "authorization_expired", "The API authorization expired.");
-  if (now - value.issuedAt >= authorizationFreshnessMs) throw new AppError(401, "authorization_stale", "Obtain a newly issued API access token to revalidate app roles.");
+  if (now - value.verifiedAt >= authorizationFreshnessMs) throw new AppError(401, "authorization_stale", "Revalidate the delegated API access token.");
   return stored.assertion;
 }
 
@@ -36,7 +36,6 @@ function invalidBearer() {
 
 type KeyCache = { keys: Map<string, KeyObject>; expiresAt: number; refreshAfter: number; pending?: SharedAuthOperation<void> };
 
-// Dormant: no instance is created or registered by the application.
 export class McpBearerVerifier {
   private readonly cache = new Map<string, KeyCache>();
   constructor(private readonly fetcher: typeof fetch = fetch) {}
@@ -46,8 +45,10 @@ export class McpBearerVerifier {
     if (typeof assertion !== "string" || assertion.length > 64_000 || !assertion.split(".").every(part =>
       part.length > 0 && /^[A-Za-z0-9_-]+$/.test(part) && Buffer.from(part, "base64url").toString("base64url") === part)
       || assertion.split(".").length !== 3) throw invalidBearer();
-    const decoded = jwt.decode(assertion, { complete: true });
-    if (!decoded || typeof decoded.payload === "string") throw invalidBearer();
+    let decoded: jwt.Jwt | null;
+    try { decoded = jwt.decode(assertion, { complete: true }); }
+    catch { throw invalidBearer(); }
+    if (!decoded || !decoded.payload || typeof decoded.payload !== "object" || Array.isArray(decoded.payload)) throw invalidBearer();
     const header = decoded.header;
     if (header.alg !== "RS256" || typeof header.kid !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(header.kid)
       || header.typ !== undefined && header.typ !== "JWT" && header.typ !== "at+jwt"
@@ -89,15 +90,12 @@ export class McpBearerVerifier {
       || payload.roles.some(role => !isAppRole(role))
       || payload.wids !== undefined && (!Array.isArray(payload.wids) || payload.wids.length > 64
         || payload.wids.some(role => typeof role !== "string" || !guid.test(role)))) throw invalidBearer();
-    if (now - payload.iat * 1000 >= authorizationFreshnessMs) {
-      throw new AppError(401, "authorization_stale", "Obtain a newly issued API access token to revalidate app roles.");
-    }
     const roles = payload.roles.filter(isAppRole);
     const result: VerifiedBearer = Object.freeze({
       tenantId: tenant.tenantId, apiClientId: tenant.clientId, integrationClientId: tenant.integration.clientId,
       localAccountId: payload.oid, roles: Object.freeze([...new Set(roles)].sort()),
       providerRoleIds: Object.freeze(normalizeInventoryProviderRoleIds(payload.wids)),
-      issuedAt: payload.iat * 1000, expiresAt: payload.exp * 1000,
+      issuedAt: payload.iat * 1000, verifiedAt: now, expiresAt: payload.exp * 1000,
     });
     assertions.set(result, { assertion, fingerprint });
     return result;

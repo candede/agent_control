@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,8 +11,10 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
 from fastmcp import FastMCP
+from fastmcp.utilities.versions import dedupe_with_versions
 from key_value.aio.errors import BaseKeyValueError
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.types import Implementation
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -21,10 +24,12 @@ from .api import CanonicalApi
 from .auth import ApiTokenExchange, TenantAzureProvider
 from .config import ConfigurationError, Settings
 from .errors import AdapterError
+from .instructions import INSTRUCTIONS
 from .storage import MAX_DISK_BYTES, MAX_FILES, OAuthStore
 from .tools import OPERATIONS, register_tools
 
 logger = logging.getLogger(__name__)
+METADATA_PATH = "/internal/mcp-metadata"
 
 
 class ProtocolBoundary:
@@ -37,7 +42,7 @@ class ProtocolBoundary:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if self.store is not None and scope["path"] != "/health":
+        if self.store is not None and scope["path"] not in {"/health", METADATA_PATH}:
             try:
                 await self.store.assert_authority()
             except ConfigurationError:
@@ -189,12 +194,12 @@ class ProtocolBoundary:
                 message["type"] == "http.response.body"
                 and self.store is not None
                 and self.store.blob is not None
-                and path != "/health"
+                and path not in {"/health", METADATA_PATH}
             ):
                 # Headers may already be sent: terminate rather than publish a stale body.
                 await self.store.assert_authority()
             if message["type"] == "http.response.start":
-                if self.store is not None and path != "/health":
+                if self.store is not None and path not in {"/health", METADATA_PATH}:
                     try:
                         await self.store.assert_authority()
                     except ConfigurationError:
@@ -295,13 +300,65 @@ def build_service(
     mcp = FastMCP(
         "Agent Control",
         version="0.1.0",
+        instructions=INSTRUCTIONS,
         auth=provider,
         lifespan=lifespan,
         mask_error_details=True,
         strict_input_validation=True,
+        dereference_schemas=False,
         tasks=False,
     )
     register_tools(mcp, api)
+
+    @mcp.custom_route(METADATA_PATH, methods=["GET"])
+    async def metadata(request: Request) -> JSONResponse:
+        headers = {"Cache-Control": "no-store"}
+        if settings.metadata_key is None:
+            return JSONResponse(
+                {"error": "metadata_configuration_unavailable"}, 503, headers=headers
+            )
+        supplied = request.headers.getlist("X-Agent-Control-Mcp-Metadata-Token")
+        if len(supplied) != 1 or not hmac.compare_digest(
+            supplied[0].encode("utf-8"), settings.metadata_key
+        ):
+            return JSONResponse({"error": "unauthorized"}, 401, headers=headers)
+        ready = True
+        try:
+            await store.observe_readiness()
+        except ConfigurationError, OSError, BaseKeyValueError:
+            ready = False
+        options = mcp._mcp_server.create_initialization_options()
+        info = Implementation(
+            name=options.server_name,
+            version=options.server_version,
+            title=options.title,
+            description=options.description,
+            website_url=options.website_url,
+            icons=options.icons,
+        )
+        tools = dedupe_with_versions(list(await mcp.list_tools()), lambda tool: tool.name)
+        return JSONResponse(
+            {
+                "binding": {
+                    "tenantId": settings.tenant_id,
+                    "apiClientId": settings.api_client_id,
+                    "mcpClientId": settings.client_id,
+                    "resourceUrl": settings.public_url,
+                },
+                "redirectUris": list(settings.redirect_uris),
+                "serverInfo": info.model_dump(mode="json", by_alias=True, exclude_none=True),
+                "instructions": options.instructions,
+                "tools": [
+                    tool.to_mcp_tool(name=tool.name).model_dump(
+                        mode="json", by_alias=True, exclude_none=True
+                    )
+                    for tool in tools
+                ],
+                "storageReady": ready,
+                "transport": "streamable-http",
+            },
+            headers=headers,
+        )
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> JSONResponse:
@@ -334,7 +391,8 @@ def build_service(
                 "fastmcp": "4.1.0",
                 "resource": settings.public_url,
                 "transport": "streamable-http",
-                "businessTools": len(OPERATIONS),
+                "businessTools": len(await mcp.list_tools()),
+                "canonicalOperations": len(OPERATIONS),
                 "authenticatedOAuthClientId": verified.client_id,
                 "apiAuthority": "canonical",
                 "oauthStorage": "encrypted-leased-blob"

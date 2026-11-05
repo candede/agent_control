@@ -832,6 +832,9 @@ test("quarantine uses real policy, exact saved targets, confirmation and verifie
   const quarantineRequests: string[] = [];
   page.on("request", request => { const url = new URL(request.url()); if (url.pathname.startsWith("/api/quarantine/")) quarantineRequests.push(`${request.method()} ${url.pathname}`); });
   await login(page, "role-Admin");
+  await page.addLocatorHandler(page.getByRole("dialog", { name: "Set up your workspace", exact: true }), async dialog => {
+    await dialog.getByRole("button", { name: "Continue to workspace", exact: true }).click();
+  });
   await collectSavedNativeAgents(page);
   const targetResponse = await page.request.get("/api/agent-inventory");
   expect(targetResponse.ok(), await targetResponse.text()).toBe(true);

@@ -4,14 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config } from "../config.js";
 import { errorTelemetry } from "../errors.js";
 import { authExchangeTimeoutMs } from "./boundedAuth.js";
-import { McpBearerVerifier, bearerAssertion, jwksCacheLifetimeMs, jwksRefreshCooldownMs } from "./mcpBearer.js";
+import { McpBearerVerifier, authorizationFreshnessMs, bearerAssertion, jwksCacheLifetimeMs, jwksRefreshCooldownMs } from "./mcpBearer.js";
 import { apiClaims, apiToken, jwk, keys, signingFetcher, tenant } from "./authFoundationTestSupport.js";
 
 const originalTenants = config.tenants;
 beforeEach(() => { config.tenants = [tenant]; });
 afterEach(() => { config.tenants = originalTenants; vi.useRealTimers(); vi.restoreAllMocks(); });
 
-describe("dormant Entra delegated API verification", () => {
+describe("Entra delegated API verification", () => {
   it("recognizes a single Usage Report Uploader API role without manufacturing additional assignments", async () => {
     const verified = await new McpBearerVerifier(signingFetcher()).verify(apiToken({ roles: ["AgentControl.UsageReportUploader"] }));
     expect(verified.roles).toEqual(["AgentControl.UsageReportUploader"]);
@@ -57,9 +57,44 @@ describe("dormant Entra delegated API verification", () => {
     }
   });
 
-  it("never accepts stale role evidence by relabeling old token issuance as validation time", async () => {
+  it.each(["{", "null", "true", "42", "[]", '"scalar"'])(
+    "rejects malformed or non-object JWT payloads %j before fetching signing keys",
+    async payload => {
+      const encode = (value: string) => Buffer.from(value).toString("base64url");
+      const content = `${encode(JSON.stringify({ alg: "RS256", typ: "JWT", kid: "fixture-key" }))}.${encode(payload)}`;
+      const token = `${content}.${sign("RSA-SHA256", Buffer.from(content), keys.privateKey).toString("base64url")}`;
+      const fetcher = signingFetcher();
+      await expect(new McpBearerVerifier(fetcher).verify(token)).rejects.toMatchObject({ status: 401, code: "invalid_bearer" });
+      expect(fetcher).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([299, 300, 301, 900, 3600])("accepts valid tokens issued %i seconds ago without changing their signed timestamps", async age => {
+    const now = Date.now(), iat = Math.floor(now / 1000) - age;
+    const token = apiToken({ iat, nbf: iat });
+    const verified = await new McpBearerVerifier(signingFetcher()).verify(token);
+    expect(verified.issuedAt).toBe(iat * 1000);
+    expect(verified.verifiedAt).toBeGreaterThanOrEqual(now);
+    expect(bearerAssertion(verified)).toBe(token);
+  });
+
+  it("bounds each verified authority by verification time and expiry without extending it during reuse", async () => {
+    vi.useFakeTimers();
+    const verifier = new McpBearerVerifier(signingFetcher());
     const iat = Math.floor(Date.now() / 1000) - 300;
-    await expect(new McpBearerVerifier(signingFetcher()).verify(apiToken({ iat, nbf: iat }))).rejects.toMatchObject({ code: "authorization_stale" });
+    const exp = Math.floor(Date.now() / 1000) + 360;
+    const token = apiToken({ iat, nbf: iat, exp });
+    const verified = await verifier.verify(token);
+    await vi.advanceTimersByTimeAsync(authorizationFreshnessMs - 1);
+    expect(bearerAssertion(verified)).toBe(token);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(() => bearerAssertion(verified)).toThrow(expect.objectContaining({ code: "authorization_stale" }));
+    const reverified = await verifier.verify(token);
+    expect(reverified.verifiedAt).toBe(Date.now());
+    expect(bearerAssertion(reverified)).toBe(token);
+    vi.setSystemTime(exp * 1000);
+    expect(() => bearerAssertion(reverified)).toThrow(expect.objectContaining({ code: "authorization_expired" }));
+    await expect(verifier.verify(token)).rejects.toMatchObject({ code: "invalid_bearer" });
   });
 
   it("requires configured admission, while absent integration leaves browser tenant configuration intact", async () => {

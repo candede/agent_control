@@ -33,10 +33,11 @@ FROM dependencies AS test
 RUN uv sync --frozen --no-editable --index-url https://packagefeedproxy.microsoft.io/pypi/simple
 COPY mcp/tests tests
 COPY docs/mcp-integration.md /opt/docs/mcp-integration.md
+COPY docs/mcp-reference.md /opt/docs/mcp-reference.md
 ENV PATH=/opt/mcp/.venv/bin:$PATH HOME=/var/lib/agent-control-mcp TMPDIR=/work
 USER 10001:10001
 ENTRYPOINT ["python", "-m", "pytest"]
-CMD ["--basetemp=/work/tests", "-p", "no:cacheprovider", "tests/test_config_storage.py", "tests/test_oauth.py", "tests/test_api_origin.py"]
+CMD ["--basetemp=/work/tests", "-p", "no:cacheprovider", "tests/test_config_storage.py", "tests/test_oauth.py", "tests/test_api_origin.py", "tests/test_settings_metadata.py"]
 
 FROM test AS fixture
 ENTRYPOINT ["python", "tests/container_service.py"]

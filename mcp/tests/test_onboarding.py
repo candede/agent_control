@@ -5,6 +5,8 @@ import json
 import pytest
 from conftest import protocol_client, tokens
 
+from agent_control_mcp.domains import PUBLIC_TOOLS
+
 VSCODE_REDIRECTS = [
     "https://insiders.vscode.dev/redirect",
     "https://vscode.dev/redirect",
@@ -74,7 +76,7 @@ async def test_profile_discovery_exact_dcr_pkce_catalog_refresh_and_revocation(
         },
     )
     tools = result.json()["result"]["tools"]
-    assert len(tools) == 124
+    assert len(tools) == len(PUBLIC_TOOLS) == 50
     for tool in tools:
         assert tool["inputSchema"]["required"] == ["request"]
         assert set(tool["inputSchema"]["properties"]) == {"request"}

@@ -27,7 +27,7 @@ from .auth import (
 )
 from .config import Settings
 from .errors import AdapterError
-from .inputs import AboutInput, Input, InventoryQuery, StartHunt
+from .inputs import AboutInput, Input, InventoryQuery
 from .models import AgentAboutPage, Capabilities, CheckProgress
 from .origin import HEADER, origin_header
 from .storage import OAuthStore
@@ -215,9 +215,6 @@ class ApiInvocation:
         if not isinstance(request, operation.request):
             raise AdapterError(400, "invalid_request", "Use the operation's exact typed input.")
         values = request.model_dump(mode="json", exclude_unset=True, by_alias=True)
-        if isinstance(request, StartHunt):
-            # Hunting requires these arrays even when no identity filters were supplied.
-            values["filters"] = request.filters.model_dump(mode="json", exclude_none=True)
         path = operation.path
         for field in operation.path_fields:
             value = values.pop(field)
@@ -259,7 +256,6 @@ class ApiInvocation:
             params=params,
             body=body,
             headers=headers,
-            deleted_id=request.model_dump().get("id"),
         )
 
     async def _request(
@@ -271,7 +267,6 @@ class ApiInvocation:
         params: dict[str, str | list[str]] | None = None,
         body: dict[str, JsonValue] | None = None,
         headers: dict[str, str] | None = None,
-        deleted_id: str | None = None,
     ) -> T:
         async with self.semaphore:
             await self.assert_current()
@@ -318,11 +313,7 @@ class ApiInvocation:
                                     await asyncio.sleep(delay)
                                     continue
                             if response.status_code not in (
-                                {200}
-                                if method == "GET"
-                                else {204}
-                                if method == "DELETE"
-                                else {200, 201, 202}
+                                {200} if method == "GET" else {200, 201, 202}
                             ):
                                 raise problem(
                                     response,
@@ -333,23 +324,14 @@ class ApiInvocation:
                                         token.token,
                                     ),
                                 )
-                            if response.status_code == 204:
-                                if response_body:
-                                    raise AdapterError(
-                                        502,
-                                        "invalid_api_response",
-                                        "Expected an empty API response.",
-                                    )
-                                parsed = result.model_validate({"deleted": True, "id": deleted_id})
-                            elif (
+                            if (
                                 response.headers.get("content-type", "").split(";")[0]
                                 != "application/json"
                             ):
                                 raise AdapterError(
                                     502, "invalid_api_response", "Expected API JSON."
                                 )
-                            else:
-                                parsed = result.model_validate_json(response_body)
+                            parsed = result.model_validate_json(response_body)
                             self.account_output(
                                 len(
                                     parsed.model_dump_json(

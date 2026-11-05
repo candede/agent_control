@@ -99,7 +99,7 @@ unverified. Do not relax server validation to make a client connect.
    ```
 
 3. Open **MCP: List Servers**, start `agentControl` and complete browser OAuth.
-4. Select its tools in the chat tool picker and request `list_capabilities`.
+4. Select its tools in the chat tool picker and request `capabilities`, action `list`.
    Follow the [first-read checks](#verify-and-use-the-connection).
 
 The native callback listener tries port 33418, then an ephemeral port if busy.
@@ -122,7 +122,7 @@ Agent Control OAuth; the retired `gh copilot` extension is not an MCP host.
    and fallback behavior are also unverified.
 3. Run `/mcp show agentControl`, then `/mcp auth agentControl` to sign in or
    reconnect. Use `/mcp` to manage the connection.
-4. Request `list_capabilities`, then follow the [first-read checks](#verify-and-use-the-connection).
+4. Request `capabilities`, action `list`, then follow the [first-read checks](#verify-and-use-the-connection).
 
 Alternatively, add the transport with:
 
@@ -151,7 +151,7 @@ permission to execute it.
    opencode mcp list
    ```
 
-4. Request `list_capabilities` and follow the [first-read checks](#verify-and-use-the-connection).
+4. Request `capabilities`, action `list`, and follow the [first-read checks](#verify-and-use-the-connection).
 
 Use `opencode mcp debug agentControl` for diagnostics and
 `opencode mcp logout agentControl` to clear authentication. Keep OAuth material
@@ -166,7 +166,7 @@ fails, so check protected-resource metadata if authentication is rejected.
    HTTPS MCP URL.
 3. Choose **Sign in now > Register automatically** (DCR), then sign in as yourself.
    Do not choose “Use Claude's published identity”/CIMD; this server disables it.
-4. Enable the connector for the conversation/task and request `list_capabilities`.
+4. Enable the connector for the conversation/task and request `capabilities`, action `list`.
    Follow the [first-read checks](#verify-and-use-the-connection). For Cowork,
    start a fresh task after adding the connector.
 
@@ -192,7 +192,7 @@ account connectors, not Claude Code's `~/.claude` configuration.
    Alternatively, merge the [project sample](../mcp/examples/clients/claude-code/.mcp.json)
    into `.mcp.json`, replace the URL and connect through `/mcp`. The sample sets
    `oauth.callbackPort:53109`.
-3. Request `list_capabilities` and follow the [first-read checks](#verify-and-use-the-connection).
+3. Request `capabilities`, action `list`, and follow the [first-read checks](#verify-and-use-the-connection).
 
 Use a fixed-callback-capable build; vendor docs identify a redirect mismatch in
 **2.1.229**. Random callback ports are not covered by the exact allowlist.
@@ -223,7 +223,7 @@ placeholder, and send **`anthropic-beta: mcp-client-2025-11-20`**:
 }
 ```
 
-For the first test, ask the model to call `list_capabilities` and inspect the tool
+For the first test, ask the model to call `capabilities` with action `list` and inspect the tool
 result. No additional client callback is configured in this payload; the host's
 OAuth acquisition flow needs its own exact allowlisted callback. Keep tokens out
 of prompts/logs. For controls, the host must display the preview and obtain
@@ -241,7 +241,7 @@ licensing, region and data policies; a trial can test chat but cannot publish.
    allowlist. Use the callback for this Studio connection, not the Teams plugin
    callback simply because both clients are Microsoft products.
 4. Create the connection, sign in and add it to the agent.
-5. In test chat, request `list_capabilities`, then follow the
+5. In test chat, request `capabilities`, action `list`, then follow the
    [first-read checks](#verify-and-use-the-connection). If the build omits required
    OAuth resource/S256 fields, report incompatibility; do not weaken validation.
 6. To publish, publish the agent, add **Teams and Microsoft Copilot**, select
@@ -267,7 +267,7 @@ For a separately authorized, short diagnostic only:
 2. Supply a legitimately issued, current, short-lived MCP-resource token for the
    intended individual through the sample's Agents-secret reference
    `$COPILOT_MCP_AGENT_CONTROL_ACCESS_TOKEN`. The sample does not acquire or rotate it.
-3. Request `list_capabilities` in the task/review and inspect its result. The sample
+3. Request `capabilities`, action `list`, in the task/review and inspect its result. The sample
    exposes only that read-only tool; code review also requires
    `annotations.readOnlyHint:true`.
 4. Stop on expiry, revocation or a sign-in challenge.
@@ -278,8 +278,21 @@ Cloud tools run autonomously; do not expose interactive controls through this re
 
 ## Verify and use the connection
 
-1. Discover the tools and run **`list_capabilities`**. Every tool takes one
-   `request` object; its empty input is **`{"request":{}}`**.
+The web app's **MCP settings** page shows the current server's exact instructions
+and complete advertised tool schemas to Viewer-capable users. It distinguishes
+the server Entra callback from your downstream callback allowlist. Its internal
+reachability/storage evidence does not verify your client, the public tunnel or
+your provider permissions; continue the real client checks below.
+
+Defender/hunting and Purview investigation tools are not in the MCP catalog.
+Their canonical API support is unchanged.
+
+1. Refresh discovery after a catalog change; existing OAuth credentials and keys
+   need not change. Optionally read **`capabilities`**, action `list`, with
+   `{"request":{"action":"list","input":{}}}`. This is saved diagnostic evidence,
+   not a prerequisite to saved reads. Every tool takes one typed `request`.
+   Family results contain `action` and the complete canonical `result`;
+   standalone tools retain direct results and use `{"request":{}}` for empty input.
 2. Request a saved agents/users list using the discovered schemas. Check the
    returned data and any partial/unavailable state, not just tool discovery or
    health. Saved reads do not trigger collection.
@@ -302,6 +315,7 @@ execution and recovery.
 | Discovery/401 loop | Use the MCP resource URL, not `/sse`, the API origin or Entra token URL. Check HTTPS discovery/OAuth forwarding and the client's exact resource on authorize/token/refresh. |
 | Redirect rejected | Compare the full emitted/registered URI with the allowlist, including root slash, host and port. Use all four VS Code callbacks; do not invent `/callback` or wildcard ports. |
 | `reauthorization_required` / claims challenge | Reconnect through client OAuth; never enter credentials in tools/chat. |
+| `invalid_authorization_response` | The token endpoint returned malformed success metadata. This is a server/provider response failure, not evidence that the client is disconnected. |
 | 403 | Check the actual role, consent or provider denial. Do not treat denied data as empty or add a feature flag. |
 | Invalidated selection/cursor | Disclose incomplete results and restart the whole read if appropriate; do not mix pages from different selections. |
 | 413 `output_limit` | Reduce a safe read's page size while retaining its selection/continuation; row count alone does not guarantee byte fit. |

@@ -13,6 +13,7 @@ export function allowedViews(user: SessionUser | undefined): WorkbenchViewId[] {
     "agents",
     "users",
     "sync",
+    "mcp-settings",
   ];
   if (hasRole(user, "AgentControl.Admin")) views.push("audit");
   return [...views, "permissions"];

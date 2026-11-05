@@ -101,7 +101,7 @@ export async function bearerRequestPrincipal(
       localAccountId: verified.localAccountId, username, displayName,
       roles: verified.roles, providerRoleIds: verified.providerRoleIds,
       transport: "bearer", integrationClientId: verified.integrationClientId,
-      rolesValidatedAt: verified.issuedAt, authenticatedAt: verified.issuedAt, expiresAt: verified.expiresAt,
+      rolesValidatedAt: verified.verifiedAt, authenticatedAt: verified.issuedAt, expiresAt: verified.expiresAt,
       sessionEpoch: authority.epoch, authorizationHash: "",
     }, validation);
   }, signal);

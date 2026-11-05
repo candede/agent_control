@@ -53,12 +53,6 @@ for (const { name, request: r, response, status = 200 } of cases) {
       const { recordId, ...query } = r;
       return reports.readAgentReportHistory(recordId, query);
     },
-    get_agent_investigation: () => web.getAgentInvestigationContext(r.recordId),
-    get_purview_catalog: () => web.getPurviewAuditCatalog(),
-    start_purview_search: () => web.submitPurviewAuditSearch(r.tokenMode, r.filters, {
-      agentRecordId: r.agentRecordId,
-    }),
-    get_purview_job: () => web.getPurviewAuditJob(r.id),
     refresh_packages: () => web.startPackageRefresh(r.mode, { idempotencyKey }),
     list_package_refresh_jobs: () => web.request(`/api/agents/refresh-jobs?${new URLSearchParams(r)}`),
     get_package_refresh_job: () => web.request(`/api/agents/refresh-jobs/${r.id}`),

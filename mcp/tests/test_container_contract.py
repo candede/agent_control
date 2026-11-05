@@ -52,7 +52,33 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
     overlay = yaml.safe_load((ROOT / "compose.mcp.yaml").read_text())
     assert set(overlay) == {"services", "volumes"}
     assert set(overlay["volumes"]) == {"mcp-oauth"}
-    assert set(overlay["services"]) == {"mcp"}
+    assert set(overlay["services"]) == {"app", "mcp"}
+    assert overlay["services"]["app"] == {
+        "environment": {
+            "MCP_METADATA_ORIGIN": "http://mcp:8000",
+            "MCP_TENANT_ID": "${MCP_TENANT_ID}",
+            "MCP_CLIENT_ID": "${MCP_CLIENT_ID}",
+            "MCP_API_CLIENT_ID": "${MCP_API_CLIENT_ID}",
+            "MCP_PUBLIC_URL": "${MCP_PUBLIC_URL}",
+            "MCP_LOCAL_HOST_PORT": "${MCP_PORT}",
+        }
+    }
+    metadata = yaml.safe_load((ROOT / "compose.mcp-metadata.yaml").read_text())
+    assert set(metadata) == {"services"}
+    assert set(metadata["services"]) == {"app", "mcp"}
+    for service in metadata["services"].values():
+        assert service == {
+            "environment": {"MCP_METADATA_TOKEN_FILE": "/run/secrets/mcp-metadata"},
+            "volumes": [
+                {
+                    "type": "bind",
+                    "source": "${LOCAL_STATE_DIR}/secrets/mcp-metadata",
+                    "target": "/run/secrets/mcp-metadata",
+                    "read_only": True,
+                    "bind": {"create_host_path": False},
+                }
+            ],
+        }
     mcp = overlay["services"]["mcp"]
     assert "depends_on" not in mcp
     assert mcp["environment"]["MCP_API_ORIGIN"] == "http://app:3001"

@@ -525,6 +525,7 @@ function Initialize-LocalState {
 
 function Write-LocalComposeEnvironment {
     param($Context)
+    if ($Context.Mcp) { Sync-LocalMcpContext $Context @{mcp=$Context.Mcp} }
     $userId = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
     $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
     $trustProxy = if ($Context.PublicUrl -cne $Context.Url) { '1' } else { '0' }

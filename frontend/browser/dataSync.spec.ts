@@ -429,6 +429,8 @@ test("first-sync setup is modal on Agents and the responsive Sync page continues
   await expect(panel).toBeVisible();
   await expect(syncButton).toBeFocused();
   await page.keyboard.press("Tab");
+  await expect(navigation.getByRole("button", { name: "MCP settings", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
   await expect(navigation.getByRole("button", { name: "Permissions", exact: true })).toBeFocused();
   await navigation.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page).toHaveURL(/\/agents$/);

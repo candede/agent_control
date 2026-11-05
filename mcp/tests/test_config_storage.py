@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +35,9 @@ def test_missing_configuration(settings_env, missing):
         ("MCP_CLIENT_ID", "22222222-2222-2222-2222-222222222222"),
         ("MCP_PUBLIC_URL", "http://mcp.example.test/mcp"),
         ("MCP_PUBLIC_URL", "https://mcp.example.test/mcp?tenant=anything"),
+        ("MCP_PUBLIC_URL", "https://mcp.example.test/mcp?"),
+        ("MCP_PUBLIC_URL", "https://mcp.example.test/mcp#"),
+        ("MCP_PUBLIC_URL", "https://mcp.example.test/mcp?#"),
         ("MCP_PUBLIC_URL", "https://user:pass@mcp.example.test/mcp"),
         ("MCP_PUBLIC_URL", "https://mcp.example.test/diagnostics"),
         ("MCP_PUBLIC_URL", "https://MCP.example.test/mcp"),
@@ -46,6 +50,9 @@ def test_missing_configuration(settings_env, missing):
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://*.example.test/callback"]'),
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["http://remote.example.test/callback"]'),
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://client.example.test/callback?x=y"]'),
+        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://client.example.test/callback?"]'),
+        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://client.example.test/callback#"]'),
+        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://client.example.test/callback?#"]'),
     ],
 )
 def test_invalid_configuration(settings_env, name, value):
@@ -121,6 +128,64 @@ async def test_retention_health_corruption_and_no_durable_api_credentials(settin
     settings.storage_path.chmod(0o755)
     with pytest.raises(ConfigurationError):
         await store.check()
+
+
+async def test_overlapping_storage_checks_keep_independent_probes(settings, monkeypatch):
+    store = OAuthStore(settings)
+    await store.check()
+    entered, release = asyncio.Event(), asyncio.Event()
+    get = store.get
+
+    async def held_get(key, *, collection=None):
+        if collection == "health" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await get(key, collection=collection)
+
+    monkeypatch.setattr(store, "get", held_get)
+    first = asyncio.create_task(store.check())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(store.check(), timeout=5)
+    finally:
+        release.set()
+        await first
+    await store.observe_readiness()
+    assert not list((settings.storage_path / "health").glob("*.json"))
+
+
+def test_storage_inspection_tolerates_completed_atomic_replacement(settings, monkeypatch):
+    store = OAuthStore(settings)
+    committed = store.root / "committed.json"
+    pending = store.root / "write.tmp"
+    committed.write_text("{}")
+    pending.write_text("{}")
+    lstat = Path.lstat
+
+    def replace_before_stat(path, *args, **kwargs):
+        if path == pending:
+            path.replace(committed)
+        return lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", replace_before_stat)
+    assert inspect_storage(store.root) == (1, 2)
+
+
+@pytest.mark.parametrize("failure", ["missing", "permissions", "symlink"])
+def test_storage_inspection_still_rejects_unsafe_paths(settings, failure):
+    store = OAuthStore(settings)
+    if failure == "missing":
+        with pytest.raises(FileNotFoundError):
+            inspect_storage(store.root / "missing")
+        return
+    path = store.root / "unsafe"
+    if failure == "permissions":
+        path.write_text("{}")
+        path.chmod(0o644)
+    else:
+        path.symlink_to(store.root / "missing")
+    with pytest.raises(ConfigurationError):
+        inspect_storage(store.root)
 
 
 def test_configuration_repr_redacted(settings):

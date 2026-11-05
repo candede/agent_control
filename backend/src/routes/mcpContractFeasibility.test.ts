@@ -217,7 +217,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         return `${method} ${path.startsWith("/api/") || path === "/{*path}" ? path : `/api${path}`}`;
       });
       expect(new Set(currentRoutes).size).toBe(currentRoutes.length);
-      expect(currentRoutes).toHaveLength(171);
+      expect(currentRoutes).toHaveLength(172);
       expect(currentRoutes.filter(route => route.includes("/office-app-adoption/"))).toHaveLength(8);
       expect(currentRoutes).not.toContain("GET /security");
       expect(currentRoutes).not.toContain("POST /api/auth/consent");
@@ -226,6 +226,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         "GET /api/copilot-usage/users/:objectId/agent-relationships",
         "GET /api/copilot-usage/adoption/champions",
         "GET /api/agent-inventory/:recordId/about",
+        "GET /api/mcp/settings",
       ]));
       expect(currentRoutes.toSorted()).toEqual(registered.toSorted());
       expect(document).toContain("[strict verifier](../backend/src/db/schema.ts)");
@@ -448,7 +449,8 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document).toContain("Context.client_id");
     expect(document).toContain("remains reported meta");
     expect(document).toContain("The API still assigns **reported**");
-    expect(document).toContain("124 named tools");
+    expect(document).toContain("50 native domain tools");
+    expect(document).toContain("105 canonical operations");
     expect(document).toContain("request-local invocation owner");
     expect(document).toContain("POST/PATCH/DELETE submissions are never automatically replayed");
     expect(document).toContain("Do not retain protocol session IDs");
@@ -456,6 +458,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document.replace(/\s+/g, " ")).toContain("Same idempotency key returns original origin");
     expect(document).toContain("no automatic double dispatch");
     const tools = routeRows.map(row => row[3].split("|").at(-3)?.trim()).filter(tool => tool !== "—" && tool !== "HTTP only");
+    expect(tools).toHaveLength(105);
     expect(new Set(tools).size).toBe(tools.length);
   });
 });

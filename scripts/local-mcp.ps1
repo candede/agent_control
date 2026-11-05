@@ -9,20 +9,20 @@ function Assert-LocalMcpSettings {
     if ($Mcp.clientId -ceq $Mcp.apiClientId) { throw 'MCP and API registrations must be distinct.' }
     if ($Mcp.port -isnot [int] -and $Mcp.port -isnot [long] -or $Mcp.port -lt 1024 -or $Mcp.port -gt 65535 -or $Mcp.port -eq $AppPort) { throw 'MCP requires a distinct loopback port from 1024 to 65535.' }
     $uri = $null
-    if ($Mcp.publicUrl -isnot [string] -or -not [Uri]::TryCreate($Mcp.publicUrl,[UriKind]::Absolute,[ref]$uri) -or
+    if ($Mcp.publicUrl -isnot [string] -or $Mcp.publicUrl.Length -gt 2048 -or -not [Uri]::TryCreate($Mcp.publicUrl,[UriKind]::Absolute,[ref]$uri) -or
         $uri.Scheme -cne 'https' -or -not (Test-LocalPublicUrl $uri.GetLeftPart([UriPartial]::Authority)) -or
         $uri.AbsoluteUri -cne $Mcp.publicUrl -or $uri.AbsolutePath -ceq '/' -or $uri.AbsolutePath.EndsWith('/') -or
-        $uri.AbsolutePath -cin @('/health','/ready','/diagnostics','/authorize','/token','/consent','/auth/callback','/register','/revoke') -or
+        $uri.AbsolutePath -cin @('/health','/ready','/diagnostics','/internal/mcp-metadata','/authorize','/token','/consent','/auth/callback','/register','/revoke') -or
         $uri.AbsolutePath.StartsWith('/.well-known/') -or $uri.AbsolutePath.Contains('//') -or
-        $uri.Query -or $uri.Fragment -or $Mcp.publicUrl -match "[%\\\s']") { throw 'MCP publicUrl must be one exact canonical HTTPS resource, separate from its internal API origin.' }
+        $uri.Query -or $uri.Fragment -or $Mcp.publicUrl -match "[%\\\s'*]") { throw 'MCP publicUrl must be one exact canonical HTTPS resource of at most 2048 characters, separate from its internal API origin.' }
     if ($Mcp.redirectUris -isnot [array] -or $Mcp.redirectUris.Count -lt 1 -or $Mcp.redirectUris.Count -gt 32 -or
-        @($Mcp.redirectUris | Sort-Object -Unique).Count -ne $Mcp.redirectUris.Count) { throw 'MCP requires 1-32 distinct exact client redirect URIs.' }
+        @($Mcp.redirectUris | Sort-Object -CaseSensitive -Unique).Count -ne $Mcp.redirectUris.Count) { throw 'MCP requires 1-32 distinct exact client redirect URIs.' }
     foreach ($redirect in $Mcp.redirectUris) {
         $callback = $null
-        if ($redirect -isnot [string] -or -not [Uri]::TryCreate($redirect,[UriKind]::Absolute,[ref]$callback) -or
+        if ($redirect -isnot [string] -or $redirect.Length -gt 2048 -or -not [Uri]::TryCreate($redirect,[UriKind]::Absolute,[ref]$callback) -or
             $callback.AbsoluteUri -cne $redirect -or $callback.UserInfo -or $callback.Query -or $callback.Fragment -or
             $redirect -match "[%\\\s'*]" -or
-            ($callback.Scheme -cne 'https' -and -not ($callback.Scheme -ceq 'http' -and $callback.Host -cin @('localhost','127.0.0.1','[::1]')))) { throw 'MCP client callbacks must be exact canonical HTTPS or HTTP loopback URLs.' }
+            ($callback.Scheme -cne 'https' -and -not ($callback.Scheme -ceq 'http' -and $callback.Host -cin @('localhost','127.0.0.1','[::1]')))) { throw 'MCP client callbacks must be exact canonical HTTPS or HTTP loopback URLs of at most 2048 characters.' }
     }
 }
 
@@ -39,7 +39,11 @@ function Assert-LocalMcpSecretFile {
     param([string]$Path)
     if (-not [IO.Path]::IsPathRooted($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf) -or
         (Get-Item -LiteralPath $Path -Force).LinkType -or (Get-Item -LiteralPath $Path).Length -notin 1..8192) { throw 'MCP secret inputs must be existing absolute non-linked protected files (1-8192 bytes).' }
-    if (-not $IsWindows -and ([int][IO.File]::GetUnixFileMode($Path) -band 63)) { throw 'MCP secret inputs must have 0600 permissions.' }
+    if (-not $IsWindows) {
+        if ([int][IO.File]::GetUnixFileMode($Path) -band 63) { throw 'MCP secret inputs must have 0600 permissions.' }
+        $owner = if ($IsMacOS) { & stat -f '%u' $Path } else { & stat -c '%u' $Path }
+        if ($LASTEXITCODE -ne 0 -or "$owner".Trim() -cne ((& id -u).Trim())) { throw 'MCP secret inputs must belong to the current deployment user.' }
+    }
 }
 
 function Assert-LocalMcpSecretValues {
@@ -53,7 +57,7 @@ function Assert-LocalMcpSecretValues {
     try { $encryption = ConvertFrom-Json -InputObject $Values['mcp-encryption'] -NoEnumerate }
     catch { throw 'MCP encryption keys must be a JSON array.' }
     if ($encryption -isnot [array] -or $encryption.Count -lt 1 -or $encryption.Count -gt 3 -or
-        @($encryption | Sort-Object -Unique).Count -ne $encryption.Count) { throw 'MCP requires a JSON ring of 1-3 independent encryption keys.' }
+        @($encryption | Sort-Object -CaseSensitive -Unique).Count -ne $encryption.Count) { throw 'MCP requires a JSON ring of 1-3 independent encryption keys.' }
     foreach ($key in $encryption) { Assert-LocalMcpKey $key }
     if ($clientSecret -ceq $signing -or
         $clientSecret -cin $encryption -or $signing -cin $encryption) { throw 'MCP confidential, signing and encryption material must be independent.' }
@@ -189,7 +193,7 @@ function Get-LocalMcpPlan {
 function Get-LocalComposeWithoutMcp {
     param([string[]]$Compose)
     for ($index=0; $index -lt $Compose.Count; $index++) {
-        if ($Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Compose[$index+1]) -ceq 'compose.mcp.yaml') { $index++; continue }
+        if ($Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Compose[$index+1]) -cin @('compose.mcp.yaml','compose.mcp-metadata.yaml')) { $index++; continue }
         $Compose[$index]
     }
 }
@@ -206,6 +210,9 @@ function Sync-LocalMcpContext {
     if ($Context.Mcp) {
         $index = $compose.IndexOf('-f')
         $compose.InsertRange($index+2,[string[]]@('-f',$overlay))
+        if (Test-LocalMcpMetadataCredential $Context) {
+            $compose.InsertRange($index+4,[string[]]@('-f',(Join-Path (Split-Path $overlay -Parent) 'compose.mcp-metadata.yaml')))
+        }
     }
     $Context.Compose = $compose.ToArray()
 }
@@ -222,6 +229,50 @@ function Save-LocalMcpConfiguration {
             Protect-LocalPath $destination
         } else { Write-LocalText $destination $Plan.SecretValues[$name] }
     }
+    Initialize-LocalMcpMetadataCredential $Context
+}
+
+function Test-LocalMcpMetadataCredential {
+    param($Context)
+    try {
+        $path = Join-Path $Context.State 'secrets/mcp-metadata'
+        Assert-LocalMcpSecretFile $path
+        if (-not $IsWindows -and [int][IO.File]::GetUnixFileMode($path) -ne 384) { return $false }
+        $value = [IO.File]::ReadAllText($path).Trim()
+        Assert-LocalMcpKey $value
+        foreach ($name in @('mcp-client','mcp-signing','session','postgres-app','postgres-admin')) {
+            $other = Join-Path $Context.State "secrets/$name"
+            if ((Test-Path -LiteralPath $other -PathType Leaf) -and [IO.File]::ReadAllText($other).Trim() -ceq $value) { return $false }
+        }
+        $ring = [IO.File]::ReadAllText((Join-Path $Context.State 'secrets/mcp-encryption')) | ConvertFrom-Json
+        if ($value -cin $ring) { return $false }
+        $registry = Join-Path $Context.State 'secrets/tenants.json'
+        if ((Test-Path -LiteralPath $registry) -and @((ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText($registry))) |
+            Where-Object clientSecret -CEQ $value).Count) { return $false }
+        return $true
+    } catch { return $false }
+}
+
+function Initialize-LocalMcpMetadataCredential {
+    param($Context)
+    try {
+        $path = Join-Path $Context.State 'secrets/mcp-metadata'
+        $existing = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            $value = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).Replace('+','-').Replace('/','_')
+            # CreateNew refuses a concurrent writer or a dangling link; never replace existing material.
+            $stream = [IO.FileStream]::new($path,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+            try {
+                Protect-LocalPath $path
+                $bytes = [Text.Encoding]::UTF8.GetBytes($value)
+                $stream.Write($bytes,0,$bytes.Length)
+                $stream.Flush($true)
+            } finally { $stream.Dispose() }
+        }
+        if (-not (Test-LocalMcpMetadataCredential $Context)) { throw 'unusable' }
+    } catch {
+        Write-Warning 'MCP metadata credential is unavailable. Only optional settings visibility is affected; unusable metadata inputs/mounts are omitted. Recover secrets/mcp-metadata and restart.'
+    }
 }
 
 function Get-LocalMcpRunArguments {
@@ -232,6 +283,10 @@ function Get-LocalMcpRunArguments {
     $arguments = @('--user',"${uid}:${gid}",'--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--memory','512m','--cpus','0.5','--pids-limit','128')
     foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
         $arguments += @('--mount',"type=bind,source=$($Context.State)/secrets/$name,target=/run/secrets/$name,readonly")
+    }
+    if (Test-LocalMcpMetadataCredential $Context) {
+        $arguments += @('--mount',"type=bind,source=$($Context.State)/secrets/mcp-metadata,target=/run/secrets/mcp-metadata,readonly",
+            '--env','MCP_METADATA_TOKEN_FILE=/run/secrets/mcp-metadata')
     }
     $arguments += @('--mount',"type=volume,source=$($Context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy")
     $values = [ordered]@{
@@ -308,7 +363,10 @@ function Assert-LocalMcpContainer {
         '/run/secrets/mcp-client'='secrets/mcp-client'; '/run/secrets/mcp-signing'='secrets/mcp-signing'
         '/run/secrets/mcp-encryption'='secrets/mcp-encryption'; '/var/lib/agent-control-mcp/oauth'=$Context.McpVolume
     }
-    if ($details.mounts.Count -ne 4 -or $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network) -or
+    if (@($details.mounts | Where-Object Destination -CEQ '/run/secrets/mcp-metadata').Count) {
+        $expected['/run/secrets/mcp-metadata']='secrets/mcp-metadata'
+    }
+    if ($details.mounts.Count -ne $expected.Count -or $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network) -or
         $details.user -notmatch '^[1-9][0-9]*:[0-9]+$' -or $details.ports.Count -ne 1 -or $details.ports['8000/tcp'].Count -ne 1 -or
         $details.ports['8000/tcp'][0].HostIp -cne '127.0.0.1' -or
         ($Context.Mcp -and $details.ports['8000/tcp'][0].HostPort -cne [string]$Context.Mcp.port)) { throw 'MCP container user/network/loopback identity differs.' }
@@ -333,6 +391,7 @@ function Start-LocalMcp {
     $hmac = [Security.Cryptography.HMACSHA256]::new($key)
     try {
         $hashes = @('mcp-client','mcp-signing','mcp-encryption') | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $Context.State "secrets/$_")).Hash }
+        $hashes += if (Test-LocalMcpMetadataCredential $Context) { (Get-FileHash -LiteralPath (Join-Path $Context.State 'secrets/mcp-metadata')).Hash } else { 'metadata-unavailable' }
         $text = (@($Context.McpImageId,($Context.Mcp | ConvertTo-Json -Compress)) + $hashes) -join "`n"
         $identity = [Convert]::ToHexString($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
     } finally { $hmac.Dispose(); [Array]::Clear($key,0,$key.Length) }
@@ -361,5 +420,5 @@ function Invoke-LocalMcpChecks {
     $ids = $uid.Split(':')
     Invoke-DockerCommand @('run','--rm','--network','none','--user',$uid,'--read-only','--cap-drop','ALL','--security-opt','no-new-privileges',
         '--memory','512m','--cpus','0.5','--pids-limit','128','--env','TMPDIR=/work','--tmpfs',"/work:rw,noexec,nosuid,size=64m,uid=$($ids[0]),gid=$($ids[1]),mode=0700",
-        '--entrypoint','python',$Image,'-m','pytest','--basetemp=/work/tests','-p','no:cacheprovider','tests/test_config_storage.py','tests/test_oauth.py','tests/test_api_origin.py')
+        '--entrypoint','python',$Image,'-m','pytest','--basetemp=/work/tests','-p','no:cacheprovider','tests/test_config_storage.py','tests/test_oauth.py','tests/test_api_origin.py','tests/test_settings_metadata.py')
 }

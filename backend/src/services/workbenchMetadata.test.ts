@@ -49,7 +49,7 @@ describe("workbench metadata", () => {
 
   it("declares every required view once with Agents first", () => {
     const metadata = getWorkbenchMetadata();
-    expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds);
+    expect(metadata.views.map(view => view.id)).toEqual(workbenchViewIds.filter(id => id !== "mcp-settings"));
     expect(metadata.views.map(view => view.id)).toEqual([
       "agents", "dashboard", "users", "sync", "audit", "permissions",
     ]);

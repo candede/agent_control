@@ -33,6 +33,8 @@ and private selections, not other accounts or completed tenant publications.
   Verified Entra tenant/account claims—not identity headers or client labels—are authoritative.
 - Sign-in uses session-bound, single-use state, nonce and PKCE. Return URLs must
   be local application paths, never network-path redirects.
+- Sign-in discovery and code exchange use sanitized identity-provider errors,
+  preserving consent/MFA guidance and throttling cooldowns without raw provider messages.
 - Browser sessions are opaque PostgreSQL records with an eight-hour maximum.
   Cookies are `HttpOnly`, `SameSite=Lax` and `Secure` on HTTPS. Stored data is
   allowlisted identity/roles, expiry/freshness, CSRF state and a random transaction
@@ -58,8 +60,12 @@ requires exact Origin, but not an authenticated session or CSRF token.
 API bearer requests use verified token authority, not cookie CSRF. Mixed bearer/
 session-cookie credentials are rejected without fallback; browser-only and public
 auth endpoints reject bearers. API tokens bind tenant, audience, client and scope.
-App roles come from that assertion, not Graph roles. Assertions five minutes old
-require newly issued authorization; browser role refresh cannot extend them.
+App roles come from that assertion, not Graph roles. Entra's backdated `iat` is
+not a token-age rejection rule: valid assertions are checked against exact expiry
+on each request. Request authority lasts at most five minutes from server
+verification; nested OBO/browser refresh cannot extend it. Signed issuance still
+fences pre-revocation assertions. External role changes follow token
+expiry/reauthorization/provider denial rather than local verification timestamps.
 
 API identity proof and restart-safe revocation checks are defined in the
 [MCP/API contract](mcp-reference.md). Reported client metadata is attribution, not authority.
@@ -70,7 +76,7 @@ API identity proof and restart-safe revocation checks are defined in the
 | --- | --- |
 | Graph package collection, users, licenses, Office activity and user resolution | Configured tenant application credentials |
 | Power Platform inventory/quarantine, management group lookup and package controls/readback | Initiating user's delegated credentials |
-| Agent identity resolution and MCP/API investigations | Initiating user's delegated credentials |
+| Agent identity resolution and API investigations | Initiating user's delegated credentials |
 | Browser investigations | Delegated credentials, or separately configured application/shared scope where supported |
 
 **Read-only Graph sync starts automatically** after eligible sign-in while visible

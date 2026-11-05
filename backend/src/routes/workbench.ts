@@ -81,8 +81,8 @@ policyRoute(workbenchRouter, "get", "/workbench/metadata", { browserOnly: true,
   access: "authenticated",
   dataClass: "operational_metadata",
   roles: ["AgentControl.Viewer"],
-}, (_request, response) => {
-  response.json(getWorkbenchMetadata());
+}, (request, response) => {
+  response.json(getWorkbenchMetadata(requestUser(request).tenantId));
 });
 
 policyRoute(workbenchRouter, "get", "/workbench/jobs", {

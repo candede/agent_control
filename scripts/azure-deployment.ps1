@@ -19,6 +19,10 @@ $script:EstimateItemNames = @(
     'networking',
     'restoreDrill'
 )
+$script:UncertainAzureWriteSteps = @(
+    'resource_deploy', 'network_reconcile', 'managed_backup', 'package_deploy',
+    'monitoring_verify', 'open_and_verify', 'pitr_restore', 'recovery_switch'
+)
 
 function Get-AzureRequiredSecretNames {
     param($Target)
@@ -33,6 +37,19 @@ function Get-AzureRuntimeSecretReferences {
         PGPASSWORD = 'agent-control-postgres-app-password'
     }
     return $references
+}
+
+function Get-AzureMcpMetadataReference {
+    param($Mcp)
+    if (-not $Mcp -or -not $Mcp.secrets.metadata) { return @{} }
+    try {
+        $reference = $Mcp.secrets.metadata
+        Assert-AzureMcpObject $reference @('name','version','currentVersion') 'MCP metadata reference'
+        if ($reference.name -cne 'agent-control-mcp-metadata' -or
+            $reference.version -cnotmatch '^[a-zA-Z0-9]{1,64}$' -or
+            ($reference.currentVersion -and $reference.currentVersion -cnotmatch '^[a-zA-Z0-9]{1,64}$')) { throw 'invalid' }
+        return @{name=$reference.name;version=$reference.version}
+    } catch { return @{} }
 }
 
 function Get-SelectedSecretVersion {
@@ -170,7 +187,10 @@ function Get-AzureMcpTarget {
             throw 'MCP requires explicit Blob preparation, registration and operations ownership.'
         }
     }
-    Assert-AzureMcpObject $m.secrets @('client','signing','encryption') 'MCP secret references'
+    $secretFields = @('client','signing','encryption')
+    $actualSecretFields = if ($m.secrets -is [Collections.IDictionary]) { @($m.secrets.Keys) } else { @($m.secrets.PSObject.Properties.Name) }
+    if ('metadata' -cin $actualSecretFields) { $secretFields += 'metadata' }
+    Assert-AzureMcpObject $m.secrets $secretFields 'MCP secret references'
     foreach ($key in @('client','signing','encryption')) {
         $secret = $m.secrets.$key
         Assert-AzureMcpObject $secret @('name','version','currentVersion') 'MCP secret version'
@@ -181,7 +201,12 @@ function Get-AzureMcpTarget {
             throw 'MCP secrets require independent exact native Key Vault names and immutable versions, never raw values.'
         }
     }
-    Assert-AzureMcpObject $m.network @('inboundIpv4Cidrs','outboundIpv4Addresses','apiReachabilityReference','forwardedHeaders') 'MCP network'
+    Assert-AzureMcpObject $m.network @('inboundIpv4Cidrs','apiInboundIpv4Addresses','outboundIpv4Addresses','apiReachabilityReference','forwardedHeaders') 'MCP network'
+    if ($m.network.apiInboundIpv4Addresses -isnot [array] -or -not $m.network.apiInboundIpv4Addresses.Count -or
+        @($m.network.apiInboundIpv4Addresses | Select-Object -Unique).Count -ne $m.network.apiInboundIpv4Addresses.Count -or
+        @(Compare-Object @($m.network.apiInboundIpv4Addresses) @($Target.resources.approvedAppOutboundIpv4Addresses)).Count) {
+        throw 'MCP API ingress must exactly identify the approved API outbound IPv4 addresses.'
+    }
     if ($m.network.forwardedHeaders -cne 'ignored' -or -not $m.network.apiReachabilityReference -or
         $m.network.inboundIpv4Cidrs -isnot [array] -or $m.network.outboundIpv4Addresses -isnot [array] -or
         -not @($m.network.inboundIpv4Cidrs).Count -or @($m.network.inboundIpv4Cidrs).Count -gt 32 -or
@@ -196,7 +221,7 @@ function Get-AzureMcpTarget {
             throw 'MCP ingress requires explicit IPv4 CIDRs, never wildcard or 0.0.0.0/0.'
         }
     }
-    foreach ($address in @($m.network.outboundIpv4Addresses)) {
+    foreach ($address in @($m.network.outboundIpv4Addresses) + @($m.network.apiInboundIpv4Addresses)) {
         $ip = $null
         if (-not [Net.IPAddress]::TryParse([string]$address, [ref]$ip) -or
             $ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'MCP egress requires exact IPv4 addresses.' }
@@ -211,7 +236,17 @@ function Get-AzureMcpTarget {
         [decimal]$Target.estimate.monthlyTotal + $sum -gt [decimal]$Target.approvedMonthlyBudget) {
         throw 'MCP itemized additional monthly cost must be exact and inside the total approved budget.'
     }
-    return $m
+    $contract = [ordered]@{}
+    $propertyNames = if ($m -is [Collections.IDictionary]) { @($m.Keys) } else { @($m.PSObject.Properties.Name) }
+    foreach ($name in $propertyNames) { $contract[$name] = $m.$name }
+    $secrets = [ordered]@{}
+    foreach ($key in @('client','signing','encryption')) { $secrets[$key] = $m.secrets.$key }
+    $metadata = Get-AzureMcpMetadataReference $m
+    if ($metadata.Count) {
+        $secrets.metadata = @{ name=$metadata.name; version=$metadata.version; currentVersion=[string]$m.secrets.metadata.currentVersion }
+    }
+    $contract.secrets = [PSCustomObject]$secrets
+    return [PSCustomObject]$contract
 }
 
 function ConvertTo-CanonicalJson {
@@ -951,6 +986,7 @@ function Invoke-RealAzureOperation {
             $app = Get-AzJson @('webapp', 'show', '--ids', $target.expectedResourceIds.appService)
             if (-not $app.identity.principalId) { throw 'App managed identity is missing.' }
             $expectedReferences = Get-AzureRuntimeSecretReferences $target
+            $metadataReference = Get-AzureMcpMetadataReference $target.mcp
             $referenceUrl = "https://management.azure.com$($target.expectedResourceIds.appService)/config/configreferences/appsettings/list?api-version=2022-03-01"
             $resolved = $false
             $attempts = 0
@@ -958,7 +994,7 @@ function Invoke-RealAzureOperation {
                 $attempts++
                 $referenceStatus = Get-AzJson @('rest', '--method', 'post', '--url', $referenceUrl) -AllowFailure
                 if (-not $referenceStatus.commandFailed -and $referenceStatus.properties) {
-                    $actualNames = @($referenceStatus.properties.PSObject.Properties.Name)
+                    $actualNames = @($referenceStatus.properties.PSObject.Properties.Name | Where-Object { $_ -cne 'MCP_AZURE_METADATA_TOKEN' })
                     $resolved = @(Compare-Object @($expectedReferences.Keys) $actualNames -CaseSensitive).Count -eq 0
                     foreach ($settingName in $expectedReferences.Keys) {
                         $entry = $referenceStatus.properties.PSObject.Properties[$settingName].Value
@@ -976,10 +1012,20 @@ function Invoke-RealAzureOperation {
             if (-not $resolved) {
                 throw 'All exact native Key Vault references, including TENANTS_JSON, must report Resolved with the approved names and versions.'
             }
-            $adminScope = "$($target.existingVaultResourceId)/secrets/agent-control-postgres-admin-password"
-            $adminAccess = Get-AzJson @('role', 'assignment', 'list', '--assignee-object-id', $app.identity.principalId,
-                '--scope', $adminScope, '--include-inherited')
+            $metadataStatus = if (-not $target.mcp) { 'not_configured' } else { 'unavailable' }
+            if ($metadataReference.Count) {
+                $entry = $referenceStatus.properties.PSObject.Properties['MCP_AZURE_METADATA_TOKEN'].Value
+                $status = if ($entry.status -is [string]) { [string]$entry.status } else { [string]$entry.status.code }
+                if ($entry -and $status -ceq 'Resolved' -and $entry.secretName -ceq $metadataReference.name -and
+                    $entry.secretVersion -ceq $metadataReference.version -and $entry.vaultName -ceq (($target.existingVaultResourceId -split '/')[-1])) { $metadataStatus = 'resolved' }
+            }
+            $forbiddenNames = @('agent-control-postgres-admin-password')
+            if ($target.mcp) { $forbiddenNames += @('client','signing','encryption' | ForEach-Object { $target.mcp.secrets.$_.name }) }
             $secretReadAction = 'Microsoft.KeyVault/vaults/secrets/getSecret/action'
+            foreach ($forbiddenName in $forbiddenNames) {
+            $forbiddenScope = "$($target.existingVaultResourceId)/secrets/$forbiddenName"
+            $adminAccess = Get-AzJson @('role', 'assignment', 'list', '--assignee-object-id', $app.identity.principalId,
+                '--scope', $forbiddenScope, '--include-inherited')
             foreach ($assignment in @($adminAccess | Where-Object { $null -ne $_ })) {
                 $definitions = @(Get-AzJson @('role', 'definition', 'list', '--name', $assignment.roleDefinitionId))
                 if ($definitions.Count -ne 1) { throw 'App administrator-secret access could not be resolved fail-closed.' }
@@ -993,12 +1039,14 @@ function Invoke-RealAzureOperation {
                         $secretReadAction -match $pattern
                     }).Count -gt 0
                     if ($allows -and -not $denies) {
-                        throw 'App identity has inherited access to the administrator database secret.'
+                        if ($forbiddenName -ceq 'agent-control-postgres-admin-password') { throw 'App identity has inherited access to the administrator database secret.' }
+                        throw 'API identity must not read an MCP OAuth secret; only its independent metadata secret may be shared.'
+                    }
                     }
                 }
             }
             Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'runtime') -RuntimeRole | Out-Null
-            return @{ principalIdPresent = $true; runtimeSecretCount = $expectedReferences.Count; nativeReferencesResolved = $true; propagationAttempts = $attempts; administratorSecretReadable = $false; databaseRuntimeLeastPrivilege = $true }
+            return @{ principalIdPresent = $true; runtimeSecretCount = $expectedReferences.Count; nativeReferencesResolved = $true; propagationAttempts = $attempts; administratorSecretReadable = $false; mcpOAuthSecretsReadable = $false; metadataReferenceStatus = $metadataStatus; databaseRuntimeLeastPrivilege = $true }
         }
         'monitoring_verify' {
             $appDiagnostics = Get-AzJson @('monitor', 'diagnostic-settings', 'show', '--resource',
@@ -1048,11 +1096,13 @@ function Invoke-RealAzureOperation {
                     'job_write_uncertain', 'quarantine_write_uncertain', 'official_usage_upload_cleanup_failed',
                     'database_pool_error', 'database_pool_saturated', 'session_store_error') }
             )
+            $queryPrefix = "AppServiceConsoleLogs | where _ResourceId =~ `"$($target.expectedResourceIds.appService)`" | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent "
             foreach ($contract in $queryContracts) {
                 $matching = @($queryAlerts | Where-Object { $_.name -ceq $contract.name -and $_.enabled -eq $true })
                 $criterion = @($matching[0].criteria.allOf)[0]
                 $query = [string]$criterion.query
                 if ($matching.Count -ne 1 -or -not $criterion -or
+                    -not $query.StartsWith($queryPrefix, [StringComparison]::OrdinalIgnoreCase) -or
                     -not $query.Contains('parse_json(ResultDescription).event') -or $query.Contains('has_any') -or
                     $criterion.timeAggregation -cne 'Count' -or $criterion.operator -cne $contract.operator -or
                     [decimal]$criterion.threshold -ne [decimal]$contract.threshold) {
@@ -1152,9 +1202,7 @@ function Invoke-RealAzureOperation {
         }
         'resume_verify' {
             if (-not $Context.Resuming) { throw 'Resume verification requires an imported receipt.' }
-            $uncertainExternalWrites = @('resource_deploy', 'network_reconcile', 'managed_backup', 'package_deploy',
-                'monitoring_verify', 'open_and_verify', 'pitr_restore', 'recovery_switch')
-            if ($Context.PreviousFailedStep -in $uncertainExternalWrites) {
+            if ($Context.PreviousFailedStep -in $script:UncertainAzureWriteSteps) {
                 throw "Receipt stopped during '$($Context.PreviousFailedStep)', whose external outcome is uncertain; reconcile it explicitly before any replay."
             }
             if ($Context.Completed.Contains('resource_deploy')) {
@@ -1330,6 +1378,14 @@ function New-AzureParameterFile {
             @{ wizardRunId = $Context.RunId; wizardManaged = 'true' }
         } else { @{} }) }
     }
+    $mcp = Get-AzureMcpTarget $target
+    if ($mcp) {
+        $parameters.mcpMetadata = @{value=@{
+            origin=([Uri]$mcp.publicUrl).GetLeftPart([UriPartial]::Authority)
+            tenantId=$mcp.tenantId;apiClientId=$mcp.apiClientId;mcpClientId=$mcp.clientId;resourceUrl=$mcp.publicUrl
+            secret=(Get-AzureMcpMetadataReference $mcp)
+        }}
+    }
     $directory = Join-Path $Context.Root "artifacts/azure-parameters/$($Context.RunId)"
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     Protect-AzureBootstrapPath $directory -Directory
@@ -1363,6 +1419,9 @@ function Invoke-AzureDatabaseContainer {
 
 function Write-AzureDeploymentReceipt {
     param($Context, [string]$Status, [string]$FailedStep, $Evidence)
+    if ($Context.Resuming -and $Context.PreviousFailedStep -in $script:UncertainAzureWriteSteps) {
+        $FailedStep = $Context.PreviousFailedStep
+    }
     $artifact = if ($Context.Component -ne 'Mcp' -and (Test-Path -LiteralPath $Context.ArtifactPath)) { Test-ReleaseArtifact $Context.ArtifactPath } else { $null }
     $receipt = [ordered]@{
         receiptVersion = 2
@@ -1398,7 +1457,7 @@ function Write-AzureDeploymentReceipt {
         secretVersionReferences = @($Context.Target.preparedVaultContract.versions)
         mcp = $(if (Get-AzureMcpTarget $Context.Target) {
             @{
-                contract = $Context.Target.mcp
+                contract = Get-AzureMcpTarget $Context.Target
                 authenticatedApiConnectivity = 'not_proven_by_deployment_health'
                 azurePersistenceStreamingAndClientJourneys = 'requires_exact_authorized_target_proof'
             }
@@ -1427,6 +1486,7 @@ function New-AzureMcpParameterFile {
     Protect-AzureBootstrapPath $directory -Directory
     $parameters = @{
         mcp = @{ value = $m }
+        metadataSecret = @{ value = (Get-AzureMcpMetadataReference $m) }
         location = @{ value = $Context.Target.region }
         vaultResourceId = @{ value = $Context.Target.existingVaultResourceId }
         logAnalyticsResourceId = @{ value = (Get-TargetResourceId $Context.Target 'Microsoft.OperationalInsights/workspaces' "$($Context.Target.resources.appService.name)-logs") }
@@ -1446,6 +1506,7 @@ function Assert-AzureMcpIsolation {
     $secretScopes = @('client','signing','encryption' | ForEach-Object {
         "$($Context.Target.existingVaultResourceId)/secrets/$($m.secrets.$_.name)"
     })
+    $secretScopes += "$($Context.Target.existingVaultResourceId)/secrets/agent-control-mcp-metadata"
     # --all covers descendants, not management-group inheritance.
     $assignments = @(Get-AzJson @('role','assignment','list','--assignee-object-id',$Identity.properties.principalId,
         '--subscription',$Context.Target.subscriptionId,'--all','--include-groups',
@@ -1466,7 +1527,7 @@ function Assert-AzureMcpIsolation {
             $blob = $true
         } elseif ($assignment.roleDefinitionId -notlike '*/4633458b-17de-408a-b874-0445c86b69e6' -or
             $assignment.scope -inotin $secretScopes) {
-            throw 'MCP identity supports only exact registry AcrPull, object-conditioned container Blob Data Contributor and three per-secret Key Vault grants; broad/custom/inherited API access is forbidden.'
+            throw 'MCP identity supports only exact registry AcrPull, object-conditioned container Blob Data Contributor and its per-secret Key Vault grants; broad/custom/inherited API access is forbidden.'
         }
     }
     if (-not $pull) { throw 'MCP requires an already prepared exact AcrPull grant; the deployer never creates it.' }
@@ -1626,7 +1687,7 @@ function Invoke-AzureMcpOperation {
                 $configuration.healthCheckPath -cne '/ready' -or $configuration.minTlsVersion -cne '1.2' -or
                 $configuration.ipSecurityRestrictionsDefaultAction -cne 'Deny' -or
                 $configuration.scmIpSecurityRestrictionsDefaultAction -cne 'Deny' -or
-                @(Compare-Object @($m.network.inboundIpv4Cidrs | Sort-Object -Unique) @($configuration.ipSecurityRestrictions | Where-Object action -CEQ 'Allow' | ForEach-Object ipAddress | Sort-Object -Unique)).Count -or
+                @(Compare-Object @((@($m.network.inboundIpv4Cidrs) + @($m.network.apiInboundIpv4Addresses | ForEach-Object { "$_/32" })) | Sort-Object -Unique) @($configuration.ipSecurityRestrictions | Where-Object action -CEQ 'Allow' | ForEach-Object ipAddress | Sort-Object -Unique)).Count -or
                 @($mount.properties.PSObject.Properties).Count -ne 0 -or
                 @(Compare-Object @($m.network.outboundIpv4Addresses | Sort-Object -Unique) @(([string]$app.outboundIpAddresses -split ',') | Sort-Object -Unique)).Count) {
                 throw 'MCP runtime image/blob/egress/single-instance identity mismatch.'

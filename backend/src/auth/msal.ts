@@ -124,38 +124,46 @@ export function createAuthFlow(kind: "login", options: { tenantId: string; usern
 
 export async function createAuthorizationUrl(flow: AuthFlow) {
   assertLiveAuthFlow(flow);
-  const url = await getMsalClient(flow.tenantId).getAuthCodeUrl({
-    authority: tenantAuthority(flow.tenantId),
-    loginHint: flow.username,
-    scopes: [...authenticationScopes],
-    redirectUri: config.redirectUri,
-    state: flow.state,
-    nonce: flow.nonce,
-    codeChallenge: createHash("sha256").update(flow.codeVerifier).digest("base64url"),
-    codeChallengeMethod: "S256",
-    // MSAL suppresses login_hint for select_account.
-    prompt: "login",
-  });
-  assertLiveAuthFlow(flow);
-  return validateAuthorizationUrl(url, flow.tenantId);
+  try {
+    const url = await getMsalClient(flow.tenantId).getAuthCodeUrl({
+      authority: tenantAuthority(flow.tenantId),
+      loginHint: flow.username,
+      scopes: [...authenticationScopes],
+      redirectUri: config.redirectUri,
+      state: flow.state,
+      nonce: flow.nonce,
+      codeChallenge: createHash("sha256").update(flow.codeVerifier).digest("base64url"),
+      codeChallengeMethod: "S256",
+      // MSAL suppresses login_hint for select_account.
+      prompt: "login",
+    });
+    assertLiveAuthFlow(flow);
+    return validateAuthorizationUrl(url, flow.tenantId);
+  } catch (error) {
+    throw normalizeTokenError(error);
+  }
 }
 
 export async function redeemAuthorizationCode(code: string, flow: AuthFlow) {
   assertLiveAuthFlow(flow);
-  const result = await getMsalClient(flow.tenantId).acquireTokenByCode({
-    authority: tenantAuthority(flow.tenantId),
-    code,
-    scopes: [...authenticationScopes],
-    redirectUri: config.redirectUri,
-    codeVerifier: flow.codeVerifier,
-  });
+  try {
+    const result = await getMsalClient(flow.tenantId).acquireTokenByCode({
+      authority: tenantAuthority(flow.tenantId),
+      code,
+      scopes: [...authenticationScopes],
+      redirectUri: config.redirectUri,
+      codeVerifier: flow.codeVerifier,
+    });
 
-  assertLiveAuthFlow(flow);
-  validateAuthenticationPrincipal(getTenantConfiguration(flow.tenantId), result);
-  const claims = result.idTokenClaims as { nonce?: unknown; tid?: unknown } | undefined;
-  if (claims?.nonce !== flow.nonce) throw AppError.unauthorized("Microsoft Entra ID returned an invalid nonce.");
+    assertLiveAuthFlow(flow);
+    validateAuthenticationPrincipal(getTenantConfiguration(flow.tenantId), result);
+    const claims = result.idTokenClaims as { nonce?: unknown; tid?: unknown } | undefined;
+    if (claims?.nonce !== flow.nonce) throw AppError.unauthorized("Microsoft Entra ID returned an invalid nonce.");
 
-  return result;
+    return result;
+  } catch (error) {
+    throw normalizeTokenError(error);
+  }
 }
 
 function assertLiveAuthFlow(flow: AuthFlow) {
@@ -405,11 +413,11 @@ export function validateTokenResult(tenant: TenantConfiguration, result: Authent
 
 function responsePermissions(scopes: string[], audience: string) {
   const granted = new Set<string>();
-  const scopeResource = audience === "8578e004-a5c6-46e7-913e-12f58912df43" ? "https://api.powerplatform.com" : audience;
+  const resources = audience === "https://graph.microsoft.com" ? graphAudienceIds : powerPlatformAudienceIds;
   for (const scope of scopes) {
     if (scope.includes("/")) {
       const separator = scope.lastIndexOf("/");
-      if (scope.slice(0, separator).toLowerCase() !== scopeResource.toLowerCase()) {
+      if (!resources.has(scope.slice(0, separator).toLowerCase())) {
         throw AppError.unauthorized("Microsoft Entra ID returned a token for a different resource.");
       }
       granted.add(scope.slice(separator + 1).toLowerCase());

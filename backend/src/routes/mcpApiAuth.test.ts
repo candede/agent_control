@@ -198,9 +198,26 @@ describe("registered canonical HTTP authentication", () => {
   });
 
   it.each([{ aud: "wrong" }, { azp: tenant.clientId }, { roles: [] }, { scp: "wrong" }, { tid: guestTenant },
-    { iat: Math.floor(Date.now() / 1000) - 300 }, { exp: Math.floor(Date.now() / 1000) - 1 }])("denies wrong or stale bearer authority %j without fallback", async changes => {
+    { iat: Math.floor(Date.now() / 1000) + 300 }, { exp: Math.floor(Date.now() / 1000) - 1 }])("denies wrong or invalid bearer authority %j without fallback", async changes => {
     const response = await call("/agent-inventory/health", apiToken(changes));
     expect(response.status).toBe(401); expect(sql).toHaveLength(0);
+  });
+
+  it.each([300, 301, 1800])("admits a saved read with valid Entra timestamps backdated by %i seconds", async age => {
+    identityFetch.mockImplementation(async (url, request) => {
+      if (String(url).endsWith("/discovery/v2.0/keys")) return new Response(JSON.stringify({ keys: [jwk] }));
+      exchanges.push(String(new URLSearchParams(String(request?.body)).get("scope")));
+      return sdkResponse({
+        scope: "openid profile email 00000003-0000-0000-c000-000000000000/CopilotPackages.ReadWrite.All 00000003-0000-0000-c000-000000000000/Group.Read.All",
+      }, request);
+    });
+    const iat = Math.floor(Date.now() / 1000) - age;
+    const response = await call("/agent-inventory/health", apiToken({ iat, nbf: iat }));
+    expect(response.status).toBe(200);
+    expect(sql[0].values).toEqual([tenant.tenantId]);
+    expect(exchanges).toHaveLength(1);
+    expect(exchanges[0].split(" ")).toEqual(expect.arrayContaining(["openid", "profile"]));
+    expect(identityFetch.mock.calls.every(([url]) => String(url).startsWith("https://login.microsoftonline.com/"))).toBe(true);
   });
 
   it("rejects mixed credentials before any exchange or SQL", async () => {
@@ -240,13 +257,14 @@ describe("registered canonical HTTP authentication", () => {
     expect(exchanges).toHaveLength(0);
   });
 
-  it("retains verified client evidence and immutable issuance through nested adapters, then admits only a newer assertion", async () => {
+  it("retains verified client evidence through nested adapters and requires revalidation of expired request authority", async () => {
     let source: DelegatedCredentialSource | undefined;
     vi.spyOn(database, "query").mockImplementation(async () => {
       source = currentAuthority();
       return { rows: [], rowCount: 0, command: "SELECT", oid: 0, fields: [] };
     });
-    expect((await call("/agent-inventory/health", apiToken(), { headers: { "x-integration-client": "untrusted" } })).status).toBe(200);
+    const token = apiToken();
+    expect((await call("/agent-inventory/health", token, { headers: { "x-integration-client": "untrusted" } })).status).toBe(200);
     expect(source?.principal).toMatchObject({ transport: "bearer", integrationClientId: tenant.integration!.clientId });
     if (!source) throw new Error("The canonical handler did not carry its initiating source.");
     const initiating = source, issuedAt = initiating.principal.rolesValidatedAt;
@@ -255,7 +273,7 @@ describe("registered canonical HTTP authentication", () => {
     expect(initiating.principal.rolesValidatedAt).toBe(issuedAt);
     vi.spyOn(Date, "now").mockReturnValue(issuedAt + 300_000);
     expect(() => withAuthority(initiating, () => undefined)).toThrow(expect.objectContaining({ code: "authorization_stale" }));
-    expect((await call("/agent-inventory/health", apiToken({ iat: issuedAt / 1000 }))).status).toBe(401);
+    expect((await call("/agent-inventory/health", token)).status).toBe(200);
     expect((await call("/agent-inventory/health", apiToken())).status).toBe(200);
   });
 

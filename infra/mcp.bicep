@@ -7,16 +7,24 @@ param vaultResourceId string
 param logAnalyticsResourceId string
 param actionGroupResourceId string
 param tags object = {}
+param metadataSecret object = {}
 
 var vaultParts = split(vaultResourceId, '/')
 var secretUri = 'https://${vaultParts[8]}${environment().suffixes.keyvaultDns}/secrets/'
 var image = '${mcp.registryLoginServer}/${mcp.repository}@${mcp.imageDigest}'
 var credentialNames = ['client', 'signing', 'encryption']
 var credentialSettings = ['MCP_AZURE_CLIENT_SECRET', 'MCP_AZURE_JWT_SIGNING_KEY', 'MCP_AZURE_OAUTH_ENCRYPTION_KEY']
-var credentials = [for (key, index) in credentialNames: {
+var requiredCredentials = [for (key, index) in credentialNames: {
   name: credentialSettings[index]
   value: '@Microsoft.KeyVault(SecretUri=${secretUri}${mcp.secrets[key].name}/${mcp.secrets[key].version})'
 }]
+var credentials = concat(requiredCredentials, !empty(metadataSecret) ? [{
+  name: 'MCP_AZURE_METADATA_TOKEN'
+  value: '@Microsoft.KeyVault(SecretUri=${secretUri}${metadataSecret.name}/${metadataSecret.version})'
+}] : [])
+var apiIngress = [for address in mcp.network.apiInboundIpv4Addresses: '${address}/32']
+var ingress = union(mcp.network.inboundIpv4Cidrs, apiIngress)
+var credentialSecretNames = [for key in credentialNames: mcp.secrets[key].name]
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
   scope: resourceGroup(split(mcp.identityResourceId, '/')[2], split(mcp.identityResourceId, '/')[4])
@@ -62,7 +70,7 @@ resource app 'Microsoft.Web/sites@2024-11-01' = {
       autoHealEnabled: false
       healthCheckPath: '/ready'
       ipSecurityRestrictionsDefaultAction: 'Deny'
-      ipSecurityRestrictions: [for (cidr, index) in mcp.network.inboundIpv4Cidrs: {
+      ipSecurityRestrictions: [for (cidr, index) in ingress: {
         ipAddress: cidr
         action: 'Allow'
         priority: 100 + index
@@ -98,7 +106,7 @@ module vaultAccess './key-vault-access.bicep' = {
   scope: resourceGroup(vaultParts[2], vaultParts[4])
   params: {
     vaultName: vaultParts[8]
-    runtimeSecretNames: [for key in credentialNames: mcp.secrets[key].name]
+    runtimeSecretNames: concat(credentialSecretNames, !empty(metadataSecret) ? [metadataSecret.name] : [])
     appServicePrincipalId: identity.properties.principalId
   }
 }

@@ -39,8 +39,8 @@ def checked_url(value: str, *, resource: bool = False, redirect: bool = False) -
         or not url.hostname
         or url.username
         or url.password
-        or url.query
-        or url.fragment
+        or "?" in value
+        or "#" in value
         or "*" in value
         or "\\" in value
         or "%" in value
@@ -70,6 +70,7 @@ def checked_url(value: str, *, resource: bool = False, redirect: bool = False) -
             "/health",
             "/ready",
             "/diagnostics",
+            "/internal/mcp-metadata",
             "/authorize",
             "/token",
             "/consent",
@@ -144,6 +145,7 @@ class Settings:
     signing_key: bytes = field(repr=False)
     encryption_keys: tuple[bytes, ...] = field(repr=False)
     azure_blob: AzureBlobSettings | None = None
+    metadata_key: bytes | None = field(default=None, repr=False)
 
     @property
     def authority(self) -> str:
@@ -198,6 +200,7 @@ class Settings:
                 "MCP_AZURE_BLOB_CONTAINER",
                 "MCP_AZURE_BLOB_NAME",
                 "MCP_AZURE_IDENTITY_CLIENT_ID",
+                "MCP_AZURE_METADATA_TOKEN",
             }
             if values.get("MCP_OAUTH_STORAGE_PATH") or any(
                 name.startswith("MCP_AZURE_") and name not in allowed_azure for name in values
@@ -215,7 +218,10 @@ class Settings:
                     "Azure requires three resolved native Key Vault references."
                 )
         else:
-            if any(name.startswith("MCP_AZURE_") for name in values):
+            if any(
+                name.startswith("MCP_AZURE_") and name != "MCP_AZURE_METADATA_TOKEN"
+                for name in values
+            ):
                 raise ConfigurationError(
                     "Azure storage/credentials require the explicit Azure source."
                 )
@@ -247,6 +253,29 @@ class Settings:
             )
         for key in keys:
             Fernet(key.encode())
+        metadata_key = None
+        try:
+            if azure:
+                metadata = values.get("MCP_AZURE_METADATA_TOKEN", "")
+                if values.get("MCP_METADATA_TOKEN_FILE"):
+                    raise ConfigurationError("Mixed metadata credential sources.")
+            else:
+                metadata_path = values.get("MCP_METADATA_TOKEN_FILE", "")
+                if not metadata_path or values.get("MCP_AZURE_METADATA_TOKEN"):
+                    raise ConfigurationError("Metadata credential unavailable.")
+                path = Path(metadata_path)
+                if stat.S_IMODE(path.lstat().st_mode) != 0o600:
+                    raise ConfigurationError("Metadata file must have 0600 permissions.")
+                if path.resolve() in {item.resolve() for item in paths}:
+                    raise ConfigurationError("Metadata credential must be independent.")
+                metadata = protected_file(path)
+            raw = key_bytes(metadata)
+            if metadata == secret or raw == signing_bytes or raw in encryption_bytes:
+                raise ConfigurationError("Metadata credential must be independent.")
+            metadata_key = metadata.encode("ascii")
+        except ConfigurationError, OSError:
+            # Optional visibility never changes OAuth/bootstrap admission.
+            pass
         storage = Path(values.get("MCP_OAUTH_STORAGE_PATH", "/unused/azure-blob"))
         if not azure and (
             not storage.is_absolute() or len(storage.parts) < 3 or ".." in storage.parts
@@ -264,4 +293,5 @@ class Settings:
             signing_bytes,
             tuple(key.encode() for key in keys),
             AzureBlobSettings.from_env(values) if azure else None,
+            metadata_key,
         )

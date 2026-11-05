@@ -22,18 +22,91 @@ deployment/reset and sign-in.
 
 ## Typed business catalog
 
-The service registers **124 named tools**, each with one typed `request`
-object (`{"request":{}}` for empty input) and explicit nested output schemas.
-[`tools.py`](../mcp/src/agent_control_mcp/tools.py) owns names/methods/routes/DTOs:
+The service registers **50 native domain tools** covering **105 canonical operations**,
+each with one typed `request` object and complete nested input/output schemas.
+[`domains.py`](../mcp/src/agent_control_mcp/domains.py) owns the public families;
+[`tools.py`](../mcp/src/agent_control_mcp/tools.py) owns canonical names/methods/routes/DTOs:
 no caller-selected URLs, arbitrary queries, resources/prompts or hidden proxies.
 The request-local invocation owner forwards authenticated attribution and
 canonical defaults/errors; the API authorizes.
 
+For a family use `{"request":{"action":"list","input":{}}}`, for example
+`capabilities` (saved list), or `inventory` with action `about` and its exact
+selection/source/field input. Family output is `{"action":"list","result":...}`;
+`result` is the full unchanged canonical payload. Discriminated variants reject
+unknown actions and another action's fields. Standalone tools (including previews,
+provider-specific resume/reconcile) keep their exact request
+and direct result. Package block/access execution uses explicit typed actions,
+not a universal control executor. Full schemas retain local `$defs` references.
+
+Read families are `capabilities`, `inventory`, `packages`, `native_inventory`,
+`users`, `adoption`, `report_agents`, `report_users`, `report_datasets`,
+`agent_usage`, `sync`, `package_refresh_jobs`, `studio_refresh_jobs`,
+`package_control_jobs` and `studio_control_jobs`. Provider families
+`collect_sync`, `collect_packages`, `access_principals` and destructive execution
+families `set_package_block`, `set_package_access` are not advertised read-only.
+The current operation-to-tool/action mapping is defined by `domains.py` and the
+canonical map below. `/diagnostics` reports registered `businessTools` separately
+from `canonicalOperations`.
+
+Defender/hunting and Purview investigation tools, including their dedicated
+identity/context helpers, are not exposed through MCP. Their canonical APIs and
+provider implementations remain available, with unchanged authorization. Remaining
+generic tools retain complete API payloads, including saved related audit/security
+evidence, capability definitions and administrative audit actions from these sources.
+
+The server's sole instruction owner is
+[`instructions.py`](../mcp/src/agent_control_mcp/instructions.py), sent at initialize.
+After a catalog rename refresh/reconnect tool discovery in the client. Do not
+delete OAuth caches or rotate keys merely to refresh tools.
+
 SDK annotations distinguish saved reads, selections, provider work and destructive
 controls; idempotency is not replay permission. CSV import, capability configuration,
 automatic browser refresh, binary download and optional operator canaries have no
-tools. Local Purview/Defender cache deletion is destructive and confirms the exact
-job ID.
+tools.
+
+## Read-only runtime visibility
+
+Viewer, Uploader and Admin can open **MCP settings** at `/mcp-settings`.
+Navigation is tenant-bound and remains present during metadata outages; a direct
+link for an unconfigured tenant reports that no server is configured. This page
+does not edit configuration, execute tools, enroll clients, probe providers or
+start synchronization. Existing first-sign-in read synchronization is unchanged.
+
+Connection details and observed runtime status are separate cards. Client
+redirects, exact server instructions and individual tool contracts expand on
+demand, without truncating their contents. The catalog searches complete names,
+descriptions and schemas; tools without a nonblank display title show their
+advertised name. Its read-only filter uses explicit SDK annotation hints,
+not inferred permission. Endpoint/instruction copy actions affect only the
+clipboard and report failure explicitly. No action on this page runs a tool.
+Expanded schema panes are named, keyboard-focusable regions with bounded
+scrolling; the complete schema remains available without widening the page.
+
+The API reads `GET /internal/mcp-metadata` at its fixed deployment-controlled
+origin with the independent `X-Agent-Control-Mcp-Metadata-Token` header.
+The private HTTP(S) transport sends the validated public resource's `Host`,
+as the local readiness check does; MCP's public Host/Origin protection remains
+enabled. Node's built-in `fetch` does not preserve this Host override.
+`GET /api/mcp/settings` accepts browser sessions and Viewer hierarchy only,
+rechecks initiating authority and disables caching. The private metadata read
+enforces a three-second total deadline and 4 MiB streamed bound. The browser
+allows an additional 16 KiB for the settings envelope, plus its outer JSON level
+and bounded wrapper tokens, so a valid boundary-sized catalog remains readable.
+Instructions and the complete tool objects
+come from the same registered SDK serialization as initialize/tools-list.
+The existing shallow 65,536-byte workbench response contains navigation only.
+
+Configured intent, internal reachability, observed OAuth storage readiness and
+observation time are separate evidence. Readiness retains the last completed
+probe result while a new health check runs; a failed check publishes not-ready.
+Metadata observation itself never runs that probe. Public HTTPS/tunnel reachability and
+authenticated native-client operation remain **unverified** by this page.
+The displayed local host port is deployment-owned, not container port 8000.
+Server `/auth/callback` and downstream client redirects serve different roles.
+Missing, invalid or unresolved metadata protection fails this optional path
+explicitly; it never vetoes business startup, sign-in or ordinary MCP admission.
+Readiness observation reads no OAuth transactions/credentials and writes no probes.
 
 ## Supported implementation
 
@@ -75,6 +148,8 @@ GUID audience/issuer/tenant, delegated scope, integration `azp`, same user,
 finite issuance/not-before/expiry, no ID/app token mode. Resource/S256 guards
 cover both HTTP endpoints; refresh must preserve the original user.
 Only maintained cryptography/storage verification is used.
+Reference credentials that expire during the awaited upstream token swap are
+rejected as unauthenticated (401), not reported as a server failure.
 
 ### Current principal and credential foundation
 
@@ -90,14 +165,27 @@ Bootstrap requests only `openid profile` metadata, not Graph data or directory
 read grants, and requires no prior browser login/cache. Provider acquisition is
 for explicit provider work, not saved-data GETs. Unsupported live Entra responses
 return `principal_mapping_unavailable`.
+Entra may return already-consented grants with resource-GUID-qualified scopes,
+including Graph's `00000003-0000-0000-c000-000000000000/<permission>`.
+Scope validation recognizes the same exact provider URI/GUID identities as token
+audience validation; other resources remain rejected. Returned grants do not
+change Agent Control roles or trigger provider calls.
 
 JWKS verification is RS256 at the fixed tenant endpoint, with bounded key/body
 sizes, five-minute cache, 30-second unknown-key cooldown and ten-second fetch/
-waiter deadline. Expired keys are not an outage fallback. API role evidence is
-fresh for at most five minutes from immutable token issuance: OBO/local timestamp
-changes cannot extend it; obtain a newer API assertion. Browser sessions retain
-their original eight-hour sign-in ceiling. Provider leases honor the earlier
-verified assertion/session/provider expiry.
+waiter deadline. Malformed JWT JSON and non-object payloads return
+`401 invalid_bearer` before signing-key lookup. Expired keys are not an outage
+fallback. Entra can backdate
+`iat`/`nbf` by five minutes; token validity follows the verified signature, claims
+and exact expiry, not a five-minute age limit on `iat`. Each API request verifies
+its assertion and gives that immutable request authority at most five minutes
+from server verification. Nested OBO/browser refresh cannot extend the same
+authority; a subsequent request must verify its assertion again. Signed issuance
+remains unchanged for account-revocation fences and provenance. External role
+changes remain bounded by token expiry/reauthorization/provider denial, not by
+local verification time. Browser sessions retain their original eight-hour
+sign-in ceiling. Provider leases honor the earlier verified
+assertion/session/provider expiry.
 
 Reference-token lifetimes follow the [storage contract](#storage-rotation-and-recovery);
 renewal threshold is 60 seconds. Local signing cannot renew expired/revoked
@@ -105,6 +193,9 @@ upstream connections. Claims challenges return bounded safe reauthorization data
 never raw provider bodies or silent provider-write retries. External revocation
 is bounded by token expiry/reauthorization/provider denial; internal epochs fence
 immediately.
+
+Malformed token-endpoint success metadata returns 502
+`invalid_authorization_response`, not a misleading request to reconnect.
 
 ### Current canonical integration
 
@@ -127,18 +218,17 @@ Delegated MCP/API authentication does **not** make every provider read delegated
 | Operations | Provider identity |
 | --- | --- |
 | Package catalog/exact/selected refresh, resume, package detail sync | Configured API application's Graph token |
-| `start_sync` / `retry_sync`: users, licensing, app activity, Graph packages | Application Graph tokens; actor's current API authority still required |
+| `collect_sync`, actions `start` / `retry`: users, licensing, app activity, Graph packages | Application Graph tokens; actor's current API authority still required |
 | `resolve_agent_people`; user entries in access-principal lookup/resolution | Application Graph `graph.users.read` |
 | Studio inventory refresh/resume; Power Platform sync | Delegated Power Platform |
 | Group entries in access-principal lookup/resolution | Delegated Graph `graph.directory.read` |
-| Agent identity resolution, MCP Purview searches and Defender hunts | Delegated provider tokens |
 
 Application collection capabilities are `graph.package.read.application`,
 `graph.users.read`, `graph.licenses.read` and `reports.copilotUsage.read`.
 The API permits these for authenticated bearer actors; probes follow their
 registered mode. This is collection authority, not fallback from denied delegated
-requests. MCP investigations accept delegated only; configured browser
-application/shared investigations retain separate authority.
+requests. API-only identity resolution and investigations retain their existing
+delegated or explicitly configured application/shared authority; they have no MCP tools.
 
 ## Source/schema/private identity baseline
 
@@ -184,9 +274,9 @@ Refreshes require the initiating actor's current application/provider authority.
 - **Q** Studio preview: action, snapshot and 1–25 exact native IDs, optional
   forceStatus; execute drops forceStatus and adds confirmation hash/key.
 - **J** job history: limit 1–50 (20); item pages limit 1–100 (50) with exact
-  revision/signed cursor. **H** hunting target is optional exact agent/person;
-  duplicate body/query fields must agree. **AF/HF** are curated Purview/Defender
-  filters, never arbitrary KQL. MCP submissions require `tokenMode:"delegated"`.
+  revision/signed cursor. For the API-only investigation routes, **H** is an
+  optional exact agent/person target; duplicate body/query fields must agree.
+  **AF/HF** are curated Purview/Defender filters, never arbitrary KQL.
 - **A** audit query: default limit 100 (clamped 1–5000), offset 0–100000,
   exact registered action/status/scope and actor/target filters; literal
   operation prefix ≤64 `[A-Za-z0-9_-]`, trimmed search ≤200; retention 90 days.
@@ -302,19 +392,21 @@ atomicity/ETag guarantees; external post-reread change remains a readback risk.
 
 ## Canonical operation map
 
-These are the **171** current registrations. API modules mount once under `/api`;
+These are the **172** current registrations. API modules mount once under `/api`;
 parameter names are literal route grammar. `V` includes Viewer, Uploader and
 Admin; `U` includes Uploader/Admin; `A` Admin; `S` any validated session; `P` public.
 
-`—` means no named MCP tool **and no bearer admission**. `HTTP only` is a shared
-canonical read without a named tool. Named tools use these exact handlers.
+The operation column below uses **internal canonical operation names**, not
+public tool aliases; consult the mapping above for the current tool/action.
+`—` means no MCP binding **and no bearer admission**. `HTTP only` is a shared
+canonical API operation without a tool branch. Public tools use these exact handlers.
 Browser mutations retain Origin/CSRF. Capabilities are registered IDs; dynamic
 checks remain service-owned. Route/tool tests parse this table; update
 registrations, schemas and rows together.
 
 ### Public, authentication, setup and Permissions
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/health` | none → ok | liveness | — | P |
 | `GET /api/ready` | none → schema/maintenance readiness, 503 unavailable | readiness | — | P |
@@ -328,6 +420,7 @@ registrations, schemas and rows together.
 | `GET /api/me` | none → user/CSRF/role state | current user | — | S |
 | `GET /api/workbench/metadata` | none → code-owned definitions | navigation | — | V |
 | `GET /api/workbench/jobs` | none → ≤100 summaries/unavailable sources | Sync recovery | list_workspace_jobs | V |
+| `GET /api/mcp/settings` | none → tenant-bound runtime metadata or explicit unavailable state | MCP settings | — | V |
 | `GET /api/capabilities` | none → saved capability views | Permissions | list_capabilities | V |
 | `GET /api/capabilities/check-progress` | retry?:failed → progress | check progress | get_capability_check_progress | V |
 | `POST /api/capabilities/check` | empty body, retry?:failed → explicit token/read checks | Check status | check_capabilities | V |
@@ -336,7 +429,7 @@ registrations, schemas and rows together.
 
 ### Inventory, About, configuration and responsibility
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agent-inventory/selections` | query:I → selection/availability | inventory capture | capture_agent_inventory | V |
 | `GET /api/agent-inventory` | I + selected paging → inventory page | Agents | list_agents | V |
@@ -360,7 +453,7 @@ registrations, schemas and rows together.
 
 These are saved reads, not provider requests or CSV reparses.
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/copilot-usage/users` | R(copilot_users) → user page | paid roster/licenses | list_users | V |
 | `GET /api/copilot-usage/users/facets` | R, field, search? → facets | Users filters | list_user_facets | V |
@@ -414,7 +507,7 @@ User-Agent rows; one file/six metadata fields, four global/two tenant streams,
 30-minute deadline and separate staging quotas. Latest follows report content
 period automatically. Personal `setId` reads do not write a tenant selection.
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/official-usage/staging` | multipart + bounded metadata/bundle/correction → preview | Add CSV reports | — | U; corrections A |
 | `GET /api/official-usage/staging/:id` | UUID → preview | resume draft | — | U; own new drafts; corrections A |
@@ -433,11 +526,11 @@ period automatically. Personal `setId` reads do not write a tenant selection.
 ### Refresh and job recovery
 
 MCP refresh is explicit. Browser initial/visibility/due synchronization stays
-automatic; ordinary saved handlers do not refresh. MCP `start_sync`/`retry_sync`
+automatic; ordinary saved handlers do not refresh. MCP `collect_sync` actions `start`/`retry`
 accept distinct users/graph_packages/power_platform source names, not report
 upload or `clearSavedData`. Omission retains API default source selection.
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `GET /api/data-sync/state` | none → sync state | Sync history | get_sync_state | V |
 | `POST /api/data-sync/auto-refresh` | empty → automatic result | visible workbench | — | V |
@@ -464,7 +557,7 @@ upload or `clearSavedData`. Omission retains API default source selection.
 
 ### Package controls and explicit Studio controls
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agents/mutation-selection` | T + selection → counts | target counts | count_package_targets | A |
 | `POST /api/agents/mutation-preview` | P → hash/summary/prestates | confirmation preview | preview_package_control | A; dynamic capability |
@@ -499,43 +592,45 @@ upload or `clearSavedData`. Omission retains API default source selection.
 | `GET /api/directory/principals` | search2–120, limit≤50(default25) → bounded principals | access picker | search_access_principals | V; application graph.users.read for users; delegated graph.directory.read for groups |
 | `POST /api/directory/principals/resolve` | 1–500 typed UUIDs → principals | access validation | resolve_access_principals | V; application graph.users.read for user IDs; delegated graph.directory.read for group IDs; require only the supplied types |
 
-### Investigations, Purview, Defender and administrative Audit
+### API-only investigations and MCP administrative audit
 
-Saved context/history/results do not silently refresh providers. Live queries
+Investigation routes remain available through the canonical API but have no MCP
+bindings. Administrative audit remains an MCP tool. Saved
+context/history/results do not silently refresh providers. Live API queries
 use curated presets and exact identities. Purview is bounded to 168 hours,
 20 pages/5000 rows/8 MiB, six polls/activation, 64 requests/12 activations;
 Defender to 168 hours, 200 rows/2 MiB, 12 requests/four activations. Partial/
 unknown coverage or empty no_data is not proof of completeness.
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
-| `GET /api/agent-inventory/investigations/context` | recordId → saved context | agent Activity | get_agent_investigation | V |
-| `POST /api/agent-inventory/investigations/resolve` | recordId → verified identity context | explicit identity lookup | resolve_agent_identity | V; graph.agentIdentity.read |
-| `GET /api/agent-inventory/investigations/purview` | recordId, paging/search/operation → saved records | agent audit records | list_agent_purview_records | V |
-| `GET /api/audit-search/catalog` | none → presets/limits/notices | Purview catalog | get_purview_catalog | V |
-| `POST /api/audit-search/jobs` | tokenMode/AF/agentRecordId?, key? → job | explicit search | start_purview_search | V; purview.audit.search.delegated |
-| `GET /api/audit-search/jobs` | J, offset/user/agent? → history | Purview history | list_purview_jobs | V |
-| `GET /api/audit-search/jobs/:id` | UUID → job | Purview status | get_purview_job | V |
-| `POST /api/audit-search/jobs/:id/resume` | UUID → authorized job | explicit activation | resume_purview_search | V |
-| `POST /api/audit-search/jobs/:id/cancel` | UUID → cancelled | cancel | cancel_purview_search | V |
-| `DELETE /api/audit-search/jobs/:id` | confirmation:exact job ID → 204 | local cache deletion | delete_purview_cache | V |
-| `GET /api/audit-search/jobs/:id/records` | limit100≤500/offset → records/count/job | saved results | list_purview_records | V |
+| `GET /api/agent-inventory/investigations/context` | recordId → saved context | API-only saved context | HTTP only | V |
+| `POST /api/agent-inventory/investigations/resolve` | recordId → verified identity context | API-only identity lookup | HTTP only | V; graph.agentIdentity.read |
+| `GET /api/agent-inventory/investigations/purview` | recordId, paging/search/operation → saved records | API-only agent audit records | HTTP only | V |
+| `GET /api/audit-search/catalog` | none → presets/limits/notices | API-only Purview catalog | HTTP only | V |
+| `POST /api/audit-search/jobs` | tokenMode/AF/agentRecordId?, key? → job | API-only search | HTTP only | V; purview.audit.search.delegated |
+| `GET /api/audit-search/jobs` | J, offset/user/agent? → history | API-only Purview history | HTTP only | V |
+| `GET /api/audit-search/jobs/:id` | UUID → job | API-only Purview status | HTTP only | V |
+| `POST /api/audit-search/jobs/:id/resume` | UUID → authorized job | API-only activation | HTTP only | V |
+| `POST /api/audit-search/jobs/:id/cancel` | UUID → cancelled | API-only cancel | HTTP only | V |
+| `DELETE /api/audit-search/jobs/:id` | confirmation:exact job ID → 204 | API-only local cache deletion | HTTP only | V |
+| `GET /api/audit-search/jobs/:id/records` | limit100≤500/offset → records/count/job | API-only saved results | HTTP only | V |
 | `GET /api/audit-search/jobs/:id/export.csv` | UUID → CSV ≤5000 rows/8 MiB/15s | CSV download | — | V |
-| `GET /api/hunting/catalog` | H → templates/limits | hunting catalog | get_hunting_catalog | V |
-| `POST /api/hunting/jobs` | tokenMode/HF/H, key? → job | explicit hunt | start_hunt | V; defender.hunting.delegated |
-| `GET /api/hunting/jobs` | J, offset/H → history | hunting history | list_hunting_jobs | V |
-| `GET /api/hunting/jobs/:id` | UUID/H → job | hunting status | get_hunting_job | V |
-| `POST /api/hunting/jobs/:id/resume` | UUID/H → authorized job | activation | resume_hunt | V |
-| `POST /api/hunting/jobs/:id/cancel` | UUID/H → cancelled | cancel | cancel_hunt | V |
-| `DELETE /api/hunting/jobs/:id` | confirmation:exact ID/H → 204 | local cache deletion | delete_hunting_cache | V |
-| `GET /api/hunting/jobs/:id/rows` | limit100≤200/offset/H → rows/job | saved hunt results | list_hunting_rows | V |
+| `GET /api/hunting/catalog` | H → templates/limits | API-only hunting catalog | HTTP only | V |
+| `POST /api/hunting/jobs` | tokenMode/HF/H, key? → job | API-only hunt | HTTP only | V; defender.hunting.delegated |
+| `GET /api/hunting/jobs` | J, offset/H → history | API-only hunting history | HTTP only | V |
+| `GET /api/hunting/jobs/:id` | UUID/H → job | API-only hunting status | HTTP only | V |
+| `POST /api/hunting/jobs/:id/resume` | UUID/H → authorized job | API-only activation | HTTP only | V |
+| `POST /api/hunting/jobs/:id/cancel` | UUID/H → cancelled | API-only cancel | HTTP only | V |
+| `DELETE /api/hunting/jobs/:id` | confirmation:exact ID/H → 204 | API-only local cache deletion | HTTP only | V |
+| `GET /api/hunting/jobs/:id/rows` | limit100≤200/offset/H → rows/job | API-only saved hunt results | HTTP only | V |
 | `GET /api/hunting/jobs/:id/export.csv` | UUID/H → CSV ≤200 rows/2 MiB/15s | hunt CSV | — | V |
 | `GET /api/audit/events` | A → events/count | Admin Audit | list_administrative_audit | A |
 | `POST /api/audit/events/export.csv` | 1–100 exact event IDs → CSV ≤1 MiB/15s | selected audit CSV | — | A |
 
 ### Shared generic controls
 
-| Method route | Input → output | Browser consumer / feature | MCP tool | Policy |
+| Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
 | `POST /api/agent-controls/preview` | selection, 1–100 recordIds, block/unblock → exact immutable effects/receipt | API-only generic control | preview_agent_control | A; dynamic provider capability |
 | `POST /api/agent-controls/execute` | receiptId/hash, required key → child references/admission | existing child writers | execute_agent_control | A; dynamic provider capability |
@@ -603,6 +698,14 @@ Enter retains a saved credential. Missing/corrupt keys are not regenerated,
 including when metadata is missing but OAuth state/receipts already exist.
 Restore them instead. Omitted paths preserve saved values.
 
+Normal configured startup also automatically creates the independent 32-random-byte
+`secrets/mcp-metadata` file, then reuses it on subsequent starts. API and MCP share
+only this protected read-only file through the conditional metadata Compose overlay.
+An invalid, linked, incorrectly owned or unreadable existing file is never silently
+replaced: deployment reports a scoped warning and omits only that optional mount.
+Restoring/removing that metadata-only file permits recovery without touching OAuth
+keys, sessions, databases or persisted OAuth state.
+
 `-ConfigureMcp` is a setup operation accepted by `start`/`edit-config`, not a
 runtime flag or a pinned-release option. Configured MCP starts without it;
 projects without MCP do not prompt for credentials. The optional Compose service
@@ -643,7 +746,12 @@ external host/resource must remain exact.
 | `MCP_AZURE_CLIENT_SECRET`, `MCP_AZURE_JWT_SIGNING_KEY`, `MCP_AZURE_OAUTH_ENCRYPTION_KEY` | Azure mode only: resolved native Key Vault values in memory, not simultaneous file inputs or raw CLI values |
 | `MCP_AZURE_BLOB_ACCOUNT_URL`, `MCP_AZURE_BLOB_CONTAINER`, `MCP_AZURE_BLOB_NAME` | Azure mode: exact HTTPS Blob account, dedicated private container, prepared `oauth-state.v1.fernet` object |
 | `MCP_AZURE_IDENTITY_CLIENT_ID` | Azure mode: exact user-assigned managed identity client GUID |
+| `MCP_METADATA_TOKEN_FILE` | Optional local metadata-only owned regular 0600 file; canonical URL-safe base64 of 32 independent random bytes |
+| `MCP_AZURE_METADATA_TOKEN` | Optional resolved native Azure reference to the same pinned metadata-only secret on API/MCP; unresolved values are scoped failures |
+| API `MCP_METADATA_ORIGIN` | Fixed internal `http://mcp:8000` locally; approved MCP HTTPS origin on Azure, never a request parameter |
+| API `MCP_LOCAL_HOST_PORT` | Known deployment host port only; omitted on Azure |
 
+Configured URLs reject query and fragment delimiters even when their values are empty.
 Secret files are distinct, non-linked, owned regular files of 1–8192 bytes.
 Signing/encryption/confidential values must be independent; direct configuration
 does not generate or derive keys. API tenant/session/PostgreSQL secrets stay API-only.
@@ -672,7 +780,11 @@ Prepared resources and permissions:
 - Use the exact same-tenant/subscription UAMI, registry RBAC `AcrPull` on the
   exact registry, disabled ACR admin credentials, and `Key Vault Secrets User`
   on only `agent-control-mcp-client`, `agent-control-mcp-signing`,
-  `agent-control-mcp-encryption`. Pin secret versions. Broad/inherited/custom or
+  `agent-control-mcp-encryption`, plus optional `agent-control-mcp-metadata`.
+  The prepared metadata value canonically encodes 32 independent random bytes.
+  Pin its same immutable version in both API and MCP native references. The API
+  identity can read only this MCP metadata secret, never the three OAuth secrets.
+  No secret values are generated or written by Azure deployment. Broad/inherited/custom or
   group-derived grants, including access to API/session/database secrets, are
   rejected. Operators need effective role-assignment visibility; failed
   enumeration is not evidence that access is narrow.
@@ -732,6 +844,9 @@ Storage binds tenant/MCP/API/resource and validates ownership/modes.
 | Disconnect | Revoke both held access and refresh credentials at `/revoke`; exact-token revocation is not API account-wide logout |
 
 Readiness checks storage/binding, not provider permission or database readiness.
+Overlapping local readiness checks use independent encrypted probes; storage scans
+tolerate files disappearing during atomic writes or expiry culling, while still
+rejecting missing roots, insecure permissions and symbolic links.
 Public `/health` is process health; `/ready` returns 503 on storage failure;
 authenticated `/diagnostics` reports non-secret protocol/build/storage usage
 and downstream OAuth client ID, not user names/tokens/provider/SQL details.
@@ -783,6 +898,7 @@ transport. This is the maintainer regression checklist, not a release/runtime ga
 | --- | --- | --- |
 | Setup/sign-in/session | Existing callback, Origin/CSRF, eight-hour ceiling, logout/revocation; saved reads after restart do not fabricate provider authority | authHttp, mcpApiAuth, App.signIn/session, signIn.spec.ts |
 | `permissions` | Roles versus provider consent, current capability checks, tenant saved reads during provider outage; no new consent/hunt prerequisite | capabilities, PermissionCenter, permissions.spec.ts |
+| `mcp-settings` | Exact registered runtime strings/schemas, tenant binding, Viewer hierarchy, bounded independent metadata access and explicit outages; no execution/editing | test_settings_metadata, mcpSettings route/service, McpSettings, mcpSettings.spec.ts |
 | `agents` | Full selected paging/facets/About/configuration, unknown evidence, exact previews/confirmation, package versus quarantine effects | mcpReadContracts, inventory/agent-controls suites, agentExperience/packageConfirmation |
 | `users` | Paid/unpaid/unknown licenses, exact identity/relationships, API-ranked champions, report windows and personal set isolation | mcpReadContracts, adoptionGroups, savedReadContracts, userDetails/adoption |
 | `sync` | Automatic first-run/due admission, actual source outcomes, report-preserving refresh, CSV acceptance and confirmed deletion, authorization-wait/export recovery | automaticRefreshIntegration, dataSyncPersistence, dataSync/savedReadLifecycle |
@@ -790,6 +906,17 @@ transport. This is the maintainer regression checklist, not a release/runtime ga
 | API-only operations | Generic control receipts and child outcomes remain API-only; optional canaries do not gate ordinary controls | sharedAgentControls, policy, packageCanaryAuthorization |
 
 ## Verification
+
+Metadata transport and request-lifecycle checks can run without sockets or services.
+The native HTTP(S) transport is mocked with in-memory streams; both typechecks
+cover the shared reader contract under Node and browser DOM declarations.
+
+```sh
+npm run typecheck --workspace backend
+npm run typecheck --workspace frontend
+npm run test --workspace backend -- src/services/mcpSettings.unit.test.ts src/routes/mcpSettings.unit.test.ts
+npm run test --workspace frontend -- src/components/McpSettings.test.tsx
+```
 
 Run focused local contracts with the existing dependencies:
 

@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
 $root = Join-Path $repository "artifacts/test-scratch/runtime-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory((Join-Path $root 'backend')) | Out-Null
-foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.large-tenant-test.yaml')) {
+foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.large-tenant-test.yaml')) {
     Copy-Item -LiteralPath (Join-Path $repository $file) -Destination (Join-Path $root $file)
 }
 [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'snapshot-v1')
@@ -57,7 +57,7 @@ function git {
         [IO.File]::WriteAllText((Join-Path $root 'backend/added.ts'),'added-during-capture')
         return ((@('Dockerfile','compose.yaml','backend/input.ts','backend/added.ts')) -join "`0") + "`0"
     }
-    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
+    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
 }
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
@@ -177,7 +177,7 @@ function Run-Deploy {
 try {
     $context = New-LocalContext $root 'runtime-test'
     & {
-        $gitPath = (Microsoft.PowerShell.Core\Get-Command git -CommandType Application).Source
+        $gitPath = (Microsoft.PowerShell.Core\Get-Command git -CommandType Application | Select-Object -First 1).Source
         function git { & $gitPath @args }
         $filterRoot = Join-Path $root 'source-filter'
         [IO.Directory]::CreateDirectory($filterRoot) | Out-Null
@@ -237,7 +237,7 @@ try {
     $script:addDuringCapture=$false
     Remove-Item -LiteralPath (Join-Path $root 'backend/added.ts')
     & {
-        $nativeExecutable=(Microsoft.PowerShell.Core\Get-Command pwsh -CommandType Application).Source
+        $nativeExecutable=(Microsoft.PowerShell.Core\Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
         $nativeFixture=Join-Path $root 'native build fixture.ps1'
         [IO.File]::WriteAllText($nativeFixture,@'
 param([string]$IdentityFile,[string]$Identity,[int]$ExitCode)
@@ -293,6 +293,58 @@ exit $ExitCode
     Assert (Test-Path -LiteralPath (Join-Path $context.State 'deployment.json')) 'Successful deployment did not record its identity.'
     Assert ($script:operationalMode -eq 'normal' -and ($script:calls -join "`n") -match 'database\.ts\|resume') 'Normal deployment blocked automatic first sync.'
     Assert (@(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts/local-builds')).Count -eq 0) 'Source snapshot was not removed.'
+    & {
+        $releaseContext = $context.Clone()
+        $releaseContext.SchemaFingerprint = $script:targetFingerprint
+        $releaseContext.DatabaseAction = 'deploy'
+        $releaseContext.CandidateSha256 = 'f' * 64
+        $inspectedAppName = $null
+        function Get-OwnedLocalContainers {
+            param($Context)
+            foreach ($id in $script:containers.Keys) {
+                $container = $script:containers[$id]
+                @{Id=$id;Service=$container.service;Image=$container.image}
+            }
+        }
+        function Invoke-DockerCommand {
+            param([string[]]$Arguments,[switch]$Capture)
+            if ($Arguments[0] -ceq 'inspect') {
+                $service = $script:containers[$Arguments[-1]].service
+                $mounts = if ($service -ceq 'postgres') {
+                    @(@{Destination='/var/lib/postgresql/data';Type='volume';Name=$releaseContext.Volume;RW=$true},
+                        @{Destination='/run/secrets/postgres-admin';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/postgres-admin');RW=$false})
+                } else {
+                    @(@{Destination='/run/control';Type='bind';Source=(Join-Path $releaseContext.State 'control');RW=$false},
+                        @{Destination='/run/agent-sharing-diagnostics';Type='bind';Source=(Join-Path $releaseContext.State 'agent-sharing-diagnostics');RW=$true},
+                        @{Destination='/run/secrets/tenants.json';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/tenants.json');RW=$false},
+                        @{Destination='/run/secrets/session';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/session');RW=$false},
+                        @{Destination='/run/secrets/postgres-app';Type='bind';Source=(Join-Path $releaseContext.State 'secrets/postgres-app');RW=$false})
+                }
+                $name = if ($service -ceq 'app' -and $inspectedAppName) { $inspectedAppName }
+                    else { "/$($releaseContext.Project)-agent-control-$service-1" }
+                $ports = if ($service -ceq 'postgres') { @{} }
+                    else { @{'3001/tcp'=@(@{HostIp='127.0.0.1';HostPort=[string]$releaseContext.Port})} }
+                return (@{name=$name;mounts=$mounts;ports=$ports;networks=@{$releaseContext.Network=@{}};memory=0;cpus=0} | ConvertTo-Json -Depth 10)
+            }
+            if ($Arguments[0] -cin @('volume','network')) {
+                if ($Arguments[3] -ceq '{{json .Labels}}') {
+                    return (@{'com.docker.compose.project'=$releaseContext.Project
+                        "com.docker.compose.$($Arguments[0])"=$(if ($Arguments[0] -ceq 'volume') {'data'} else {'default'})} | ConvertTo-Json)
+                }
+                return $(if ($Arguments[0] -ceq 'volume') {'2026-01-01T00:00:00Z'} else {'offline-network-id'})
+            }
+            if ($Arguments[0] -ceq 'context') { return 'offline-docker-context' }
+            if ($Arguments[0] -ceq 'info') { return 'offline-docker-engine' }
+            if ($Arguments[0] -ceq 'exec') { return 'f' }
+            throw 'Unexpected release-target Docker mock command.'
+        }
+        $releaseTarget = Get-LocalReleaseTarget $releaseContext
+        Assert ($releaseTarget.containers.Count -eq 2) 'Read-only target rejected the current explicitly named Compose containers.'
+        foreach ($invalidName in @("/$($context.Project)-app-1",'/different-project-agent-control-app-1')) {
+            $inspectedAppName = $invalidName
+            Fails { Get-LocalReleaseTarget $releaseContext } 'network/name mismatch'
+        }
+    }
     $receipt=(Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
     $health=$script:healthCalls
     $appliedComposeFiles=$context.AppliedComposeFiles -join '|'
@@ -338,6 +390,78 @@ exit $ExitCode
             $context.ConfigureMcp = $false
             Sync-LocalMcpContext $context (Read-LocalSettings $context.State)
         }
+    }
+    & {
+        $previousContainers = $script:containers
+        $script:containers = @{}
+        foreach ($id in $previousContainers.Keys) { $script:containers[$id] = $previousContainers[$id].Clone() }
+        try {
+            $previousContext = $context
+            $context = New-LocalContext $root 'runtime-metadata-test'
+            [IO.Directory]::CreateDirectory((Join-Path $context.State 'secrets')) | Out-Null
+            foreach ($name in @('postgres-admin','postgres-app','session')) {
+                Write-LocalText (Join-Path $context.State "secrets/$name") ([IO.File]::ReadAllText((Join-Path $previousContext.State "secrets/$name")))
+            }
+            $profiles = ConvertFrom-DeploymentTenantRegistry ([IO.File]::ReadAllText((Join-Path $previousContext.State 'secrets/tenants.json')))
+            $profiles[0].integration = @{clientId='33333333-3333-4333-8333-333333333333';audience=$profiles[0].clientId;scope='AgentControl.Access'}
+            $settings = Read-LocalSettings $previousContext.State
+            $settings.tenants = Get-LocalTenantMetadata $profiles
+            $settings.mcp = @{tenantId=$profiles[0].tenantId;apiClientId=$profiles[0].clientId;clientId=$profiles[0].integration.clientId
+                publicUrl='https://mcp.runtime.example.invalid/mcp';redirectUris=@('https://client.example.invalid/callback');port=14400}
+            Write-LocalText (Join-Path $context.State 'settings.json') ($settings | ConvertTo-Json -Depth 20)
+            Write-LocalText (Join-Path $context.State 'secrets/tenants.json') (ConvertTo-Json -InputObject $profiles -Depth 20)
+            Write-LocalText (Join-Path $context.State 'secrets/mcp-client') 'synthetic-mcp-runtime-test-secret'
+            Write-LocalText (Join-Path $context.State 'secrets/mcp-signing') ([Convert]::ToBase64String([byte[]](1..32)).Replace('+','-').Replace('/','_'))
+            Write-LocalText (Join-Path $context.State 'secrets/mcp-encryption') (ConvertTo-Json -InputObject @([Convert]::ToBase64String([byte[]](33..64)).Replace('+','-').Replace('/','_')))
+            $context = New-LocalContext $root $context.Project
+            $context.OperatorImageId = $script:operator
+            $context.RuntimeImageId = $script:runtime
+            Write-LocalComposeEnvironment $context
+            $initialFiles = @((Join-Path $root 'compose.yaml'),(Join-Path $root 'compose.mcp.yaml'))
+            Write-LocalText (Join-Path $context.State 'deployment.json') ((Get-LocalDeploymentIdentity $context $initialFiles) | ConvertTo-Json)
+            Assert (-not (Test-Path -LiteralPath (Join-Path $context.State 'secrets/mcp-metadata'))) 'Metadata regression requires an existing MCP project without the optional credential.'
+            $protected = @{}
+            foreach ($name in @('postgres-admin','postgres-app','session','tenants.json','mcp-client','mcp-signing','mcp-encryption')) {
+                $protected[$name] = (Get-FileHash -LiteralPath (Join-Path $context.State "secrets/$name")).Hash
+            }
+            $validations = [Collections.Generic.List[object]]::new()
+            function Build-LocalMcpArtifact { param($Context,$Snapshot) return ('sha256:' + ('7' * 64)) }
+            function Test-LocalMcpConfiguration {
+                param($Context)
+                $files = @(for ($index=0; $index -lt $Context.Compose.Count-1; $index++) {
+                    if ($Context.Compose[$index] -eq '-f') { $Context.Compose[$index+1] }
+                })
+                $validations.Add(@{Files=$files;SnapshotFiles=@($snapshot.ComposeFiles);AppliedFiles=@($Context.AppliedComposeFiles)
+                    CommandMatches=(($snapshot.Compose -join '|') -ceq ($Context.Compose -join '|'))
+                    Frozen=(@($files | Where-Object { (Split-Path $_ -Parent) -cne $snapshot.Root -or -not (Test-Path -LiteralPath $_) }).Count -eq 0)})
+                Assert (Test-LocalMcpMetadataCredential $Context) 'Normal configuration save did not automatically create an independent usable metadata credential.'
+            }
+            function Start-LocalMcp { param($Context) }
+            $messages = Run-Deploy
+            $firstApplied = @($context.AppliedComposeFiles)
+            $firstReceipt = (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash
+            $firstApp = @($script:calls | Where-Object { $_ -match '\|up\|' -and $_ -match '\|app$' })
+            $metadataHash = (Get-FileHash -LiteralPath (Join-Path $context.State 'secrets/mcp-metadata')).Hash
+            $context = New-LocalContext $root $context.Project
+            $messages = Run-Deploy
+            $noOp = ($messages -join "`n").Contains('ALREADY RUNNING')
+            $unchangedReceipt = (Get-FileHash -LiteralPath (Join-Path $context.State 'deployment.json')).Hash -ceq $firstReceipt
+            Write-Host "Metadata lifecycle regression: used=$($validations[0].Files.Count), snapshot=$($validations[0].SnapshotFiles.Count), applied=$($firstApplied.Count), unchangedStartNoOp=$noOp, receiptUnchanged=$unchangedReceipt."
+            Assert (($firstApplied -join '|') -ceq ($validations[0].Files -join '|')) 'First metadata start omitted an actually applied Compose input from ownership evidence.'
+            foreach ($validation in $validations) {
+                Assert ($validation.CommandMatches -and $validation.Frozen) 'Final Compose command differs from its fixed source snapshot.'
+                Assert (($validation.SnapshotFiles -join '|') -ceq ($validation.Files -join '|') -and
+                    ($validation.AppliedFiles -join '|') -ceq ($validation.Files -join '|')) 'Final snapshot/applied Compose inputs were stale at configuration validation.'
+            }
+            Assert ($validations.Count -eq 2 -and $validations[0].Files.Count -eq 3 -and
+                [IO.Path]::GetFileName($validations[0].Files[-1]) -ceq 'compose.mcp-metadata.yaml') 'Metadata upgrade did not use all three snapshot-root Compose inputs.'
+            Assert ($firstApp.Count -eq 1 -and $firstApp[0].Contains(($firstApplied -join '|-f|'))) 'Applied evidence differs from the first actual app startup command.'
+            Assert ($noOp -and $unchangedReceipt -and -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|initialize$|\|90\|app$')) 'Unchanged start after automatic metadata setup restarted the app or changed its receipt.'
+            Assert ((Get-FileHash -LiteralPath (Join-Path $context.State 'secrets/mcp-metadata')).Hash -ceq $metadataHash) 'Unchanged start rotated the optional metadata credential.'
+            foreach ($name in $protected.Keys) {
+                Assert ((Get-FileHash -LiteralPath (Join-Path $context.State "secrets/$name")).Hash -ceq $protected[$name]) 'Automatic metadata setup changed retained synthetic credentials.'
+            }
+        } finally { $script:containers = $previousContainers }
     }
     $script:runtime='sha256:' + ('e' * 64)
     $messages=Run-Deploy
@@ -466,6 +590,8 @@ exit $ExitCode
         images=@{runtime=@{tag='candidate-runtime:local';id=$script:runtime;sourceManifestHash=$context.SourceHash}
             operator=@{tag='candidate-operator:local';id=$script:operator;sourceManifestHash=$context.SourceHash}}} | ConvertTo-Json -Depth 6)
     $context.CandidateSha256=(Get-FileHash -LiteralPath $context.Candidate).Hash.ToLowerInvariant()
+    $portableCandidate = Read-LocalCandidate $context
+    Assert ($portableCandidate.sourceManifestHash -ceq $context.SourceHash) 'Candidate inventory must match its slash-separated Git manifest on every supported OS.'
     $secretPath=Join-Path $context.State 'secrets/tenants.json'
     $savedRegistry=[IO.File]::ReadAllText($secretPath)
     $beforeIdentity=Get-LocalDeploymentIdentity $context @()

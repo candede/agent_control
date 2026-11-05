@@ -1,4 +1,12 @@
 services:
+  app:
+    environment:
+      MCP_METADATA_ORIGIN: http://mcp:8000
+      MCP_TENANT_ID: ${MCP_TENANT_ID}
+      MCP_CLIENT_ID: ${MCP_CLIENT_ID}
+      MCP_API_CLIENT_ID: ${MCP_API_CLIENT_ID}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL}
+      MCP_LOCAL_HOST_PORT: ${MCP_PORT}
   mcp:
     container_name: "${COMPOSE_PROJECT_NAME:?Compose project name is required}-agent-control-mcp-1"
     image: ${MCP_IMAGE:?MCP image must be explicitly configured}

@@ -1,5 +1,6 @@
 ARG DEPENDENCY_BASE=node:24-bookworm-slim
 ARG BROWSER_BASE=mcr.microsoft.com/playwright:v1.58.2-noble
+ARG MCP_FIXTURE_BASE=agent-control-mcp-test:local
 FROM ${DEPENDENCY_BASE} AS dependencies
 ARG REUSE_INSTALLED_DEPENDENCIES=0
 ENV NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/
@@ -118,3 +119,12 @@ COPY --from=test /app /app
 COPY --from=build /app/frontend/dist /app/frontend/dist
 ENV NODE_ENV=test AGENT_CONTROL_FIXTURE_MODE=browser
 ENTRYPOINT ["node", "/app/node_modules/vitest/vitest.mjs", "run", "--config", "scripts/browser-fixture.config.ts"]
+
+FROM ${MCP_FIXTURE_BASE} AS mcp-settings-python
+FROM permission-browser-test AS mcp-settings-browser-test
+USER root
+COPY --from=mcp-settings-python /usr/local /usr/local
+COPY --from=mcp-settings-python /opt/mcp /opt/mcp
+ENV AGENT_CONTROL_MCP_METADATA_PYTHON=/opt/mcp/.venv/bin/python \
+    TMPDIR=/app/.fixture-work
+RUN mkdir -p /app/.fixture-work && node --version && /opt/mcp/.venv/bin/python --version

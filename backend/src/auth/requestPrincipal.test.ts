@@ -75,6 +75,20 @@ describe("one verified private request principal", () => {
       ["AgentControl.Admin"], [inventoryProviderRoleIds.aiReader]));
   });
 
+  it("separates backdated signed issuance from local verification without bypassing revocation fences", async () => {
+    const iat = Math.floor(Date.now() / 1000) - 300;
+    const verified = await verifiedBearer({ iat, nbf: iat });
+    const epochs = epochAuthority();
+    const source = await createBearerCredentials(verified, epochs, { fetcher: oboFetcher() });
+    expect(source.principal.authenticatedAt).toBe(iat * 1000);
+    expect(source.principal.rolesValidatedAt).toBe(verified.verifiedAt);
+    assertFreshPrincipal(source.principal);
+    expect((await source.revalidate()).rolesValidatedAt).toBe(verified.verifiedAt);
+    epochs.bearerAuthority.mockResolvedValue({ epoch: "1", issuedAfter: String(verified.issuedAt) });
+    await expect(createBearerCredentials(verified, epochs, { fetcher: oboFetcher() }))
+      .rejects.toMatchObject({ code: "unauthorized" });
+  });
+
   it.each([
     { accountId: "other" }, { clientId: guestHome }, { tenantId: guestTenant },
     { signedInAt: undefined }, { rolesValidatedAt: Infinity }, { signedInAt: Date.now() + 60_000 },

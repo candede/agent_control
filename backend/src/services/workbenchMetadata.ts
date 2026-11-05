@@ -3,6 +3,7 @@ import type {
   WorkbenchMetadata,
   WorkbenchViewDefinition,
 } from "../types/workbench.js";
+import { mcpBindingForTenant } from "./mcpSettings.js";
 
 export const workbenchViews: WorkbenchViewDefinition[] = [
   { id: "agents", label: "Agents", path: "/agents", roles: ["AgentControl.Viewer"], source: "Unified saved Graph package and Power Platform Copilot Studio agent inventory" },
@@ -11,6 +12,7 @@ export const workbenchViews: WorkbenchViewDefinition[] = [
   { id: "sync", label: "Sync", path: "/sync", roles: ["AgentControl.Viewer"], source: "Saved data collection, source coverage, durable sync history, and Microsoft 365 report import, management, and snapshot inspection" },
   { id: "audit", label: "Audit", path: "/audit", roles: ["AgentControl.Admin"], source: "Local administrative actions taken from this app" },
   { id: "permissions", label: "Permissions", path: "/permissions", roles: ["AgentControl.Viewer"], source: "Agent Control capability registry" },
+  { id: "mcp-settings", label: "MCP settings", path: "/mcp-settings", roles: ["AgentControl.Viewer"], source: "Read-only MCP runtime metadata" },
 ];
 
 export const workbenchActions: WorkbenchActionDefinition[] = [
@@ -80,9 +82,10 @@ for (const definition of [...workbenchViews, ...workbenchActions]) {
 Object.freeze(workbenchViews);
 Object.freeze(workbenchActions);
 
-export function getWorkbenchMetadata(): WorkbenchMetadata {
+export function getWorkbenchMetadata(tenantId?: string): WorkbenchMetadata {
   return {
-    views: workbenchViews.map(view => ({ ...view, roles: [...view.roles] })),
+    views: workbenchViews.filter(view => view.id !== "mcp-settings" || tenantId !== undefined
+      && mcpBindingForTenant(tenantId) !== undefined).map(view => ({ ...view, roles: [...view.roles] })),
     actions: workbenchActions.map(action => ({ ...action, roles: [...action.roles] })),
   };
 }

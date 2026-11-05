@@ -14,7 +14,7 @@ import { officeApps, type OfficeApp } from "../../backend/src/types/officeAppAdo
 export const maximumAuditPageIndex = Math.floor(auditMaximumOffset / auditDefaultPageSize);
 export const maximumAuditOriginCharacters = 256;
 
-export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions";
+export type WorkbenchViewId = "dashboard" | "agents" | "users" | "sync" | "audit" | "permissions" | "mcp-settings";
 
 export type OfficeRouteState = {
   adoption?: "office"; officeSnapshot?: string; officeBaseline?: string; app?: OfficeApp;
@@ -110,6 +110,7 @@ const viewPaths: Record<WorkbenchViewId, string> = {
   sync: "/sync",
   audit: "/audit",
   permissions: "/permissions",
+  "mcp-settings": "/mcp-settings",
 };
 
 const viewsByPath = new Map(

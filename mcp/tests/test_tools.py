@@ -1,7 +1,7 @@
 import asyncio
 import copy
 import json
-import re
+import time
 from contextlib import suppress
 from urllib.parse import parse_qs, quote
 
@@ -9,12 +9,14 @@ import httpx2
 import pytest
 from conftest import OTHER
 from mcp.types import CallToolResult, TextContent
+from public_contract import public_request
 from pydantic import ValidationError
 
 from agent_control_mcp import control_inputs as ci
 from agent_control_mcp import inputs as i
 from agent_control_mcp import inventory_models as inventory
 from agent_control_mcp import job_models as jobs
+from agent_control_mcp.domains import PUBLIC_TOOLS
 from agent_control_mcp.tools import OPERATIONS, InventoryCaptureResult, InventoryHealthResult
 
 GUID = "12345678-1234-4234-8234-123456789abc"
@@ -105,14 +107,6 @@ SOURCE_TYPES = {
     "DetailSyncState": "details",
     "StudioRefreshJob": "studioJob",
     "RefreshJobs[StudioRefreshJob]": "studioJobs",
-    "InvestigationContext": "investigation",
-    "AgentPurviewRecords": "agentPurview",
-    "PurviewJob": "purviewJob",
-    "JobHistory[PurviewJob]": "purviewJobs",
-    "PurviewRecords": "purviewRecords",
-    "HuntingJob": "huntingJob",
-    "JobHistory[HuntingJob]": "huntingJobs",
-    "HuntingRows": "huntingRows",
     "AuditEvents": "audit",
     "AgentControlPreview": "controlPreview",
     "AgentControlExecution": "controlExecution",
@@ -277,55 +271,6 @@ def response_for(operation, source_fixtures):
             "verificationCounts": {key: 1 for key in inventory.VerificationCounts.model_fields},
             "reports": source_fixtures["users"]["reports"],
         }
-    if model is jobs.PurviewCatalog:
-        return {
-            "presets": [
-                {
-                    "id": "copilot_interactions",
-                    "label": "Copilot",
-                    "service": "Copilot",
-                    "recordTypes": ["copilotInteraction"],
-                    "operations": ["CopilotInteraction"],
-                }
-            ],
-            "limits": {
-                "maximumWindowHours": 168,
-                "maximumPages": 20,
-                "maximumRows": 5000,
-                "maximumBytes": 8000000,
-                "pollsPerActivation": 6,
-                "providerRequests": 64,
-                "activations": 12,
-            },
-            "evidenceNotice": "Not usage totals",
-            "contentNotice": "No content",
-            "retentionNotice": "30 days",
-        }
-    if model is jobs.HuntingCatalog:
-        return {
-            "templates": [
-                {
-                    "id": "agent_activity",
-                    "label": "Activity",
-                    "sourceTable": "CloudAppEvents",
-                    "operations": ["InvokeAgent", "InferenceCall"],
-                }
-            ],
-            "limits": {
-                "maximumWindowHours": 168,
-                "maximumRows": 200,
-                "maximumBytes": 2000000,
-                "providerRequests": 12,
-                "activations": 4,
-            },
-            "scopeNotice": "Provider scoped",
-            "contentNotice": "No content",
-            "readinessNotice": "No data is not coverage",
-            "retentionNotice": "30 days",
-            "defenderPortalUrl": "https://security.microsoft.com/v2/advanced-hunting",
-        }
-    if model is jobs.Deleted:
-        return {"deleted": True, "id": GUID}
     raise AssertionError(f"No independent source fixture for {model.__name__}")
 
 
@@ -401,22 +346,59 @@ async def test_every_registered_tool_is_callable_over_real_sdk(
         request["ids"] = ["Package/Case%Exact"]
     expected = response_for(operation, source_fixtures["complete"] if complete else source_fixtures)
     entra.api_responses.append(
-        httpx2.Response(204)
-        if operation.method == "DELETE"
-        else httpx2.Response(200 if operation.method == "GET" else 202, json=expected)
+        httpx2.Response(200 if operation.method == "GET" else 202, json=expected)
     )
-    result = await rpc(operation.name, request)
+    result = await rpc(operation.name, request, wire=True)
     assert not result.get("isError"), result
-    assert result["structuredContent"] == expected
+    name, public_input = public_request(operation.name, request)
+    domain = next(tool for tool in PUBLIC_TOOLS if tool.name == name)
+    expected_wire = (
+        {"action": public_input["action"], "result": expected} if domain.grouped else expected
+    )
+    assert result["structuredContent"] == expected_wire
+    assert json.loads(result["content"][0]["text"]) == expected_wire
+    domain.request.model_validate(public_input)
+    domain.response.model_validate(expected_wire)
     assert len(entra.api_calls) == 1
     sent = entra.api_calls[0]
     assert sent.method == operation.method
-    assert sent.url.path.startswith("/api/")
+    validated = operation.request.model_validate(request).model_dump(
+        mode="json", by_alias=True, exclude_unset=True
+    )
+    path = operation.path
+    for field in operation.path_fields:
+        path = path.replace("{" + field + "}", quote(str(validated[field]), safe=""))
+    assert sent.url.raw_path.decode().split("?")[0] == path
     assert sent.headers["Authorization"].startswith("Bearer ")
     assert "X-Agent-Control-Mcp-Context" in sent.headers
     assert not any(
         call.url.host in {"graph.microsoft.com", "api.powerplatform.com"} for call in entra.calls
     )
+
+
+@pytest.mark.parametrize("age", [300, 301, 1800])
+async def test_department_adoption_accepts_backdated_entra_tokens(
+    age, rpc, entra, source_fixtures
+):
+    now = int(time.time())
+    entra.response_claims = {"iat": now - age, "nbf": now - age}
+    expected = source_fixtures["adoption"]
+    entra.api_responses.append(httpx2.Response(200, json=expected))
+    result = await rpc(
+        "list_adoption_groups",
+        {"department": "SEHA-Commercial (Dep)", "limit": 10},
+        wire=True,
+    )
+    assert not result.get("isError"), result
+    assert result["structuredContent"] == {"action": "groups", "result": expected}
+    assert len(entra.api_calls) == 1
+    request = entra.api_calls[0]
+    assert request.method == "GET"
+    assert request.url.path == "/api/copilot-usage/adoption"
+    assert parse_qs(request.url.query.decode()) == {
+        "department": ["~string:SEHA-Commercial (Dep)"],
+        "limit": ["10"],
+    }
 
 
 async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rpc):
@@ -426,12 +408,22 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
         json={"jsonrpc": "2.0", "id": 500, "method": "tools/list"},
     )
     tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
-    assert len(tools) == len(OPERATIONS) == len(set(tools))
-    for operation in OPERATIONS:
-        tool = tools[operation.name]
+    assert len(tools) == len(PUBLIC_TOOLS) == len(set(tools)) == 50
+    for domain in PUBLIC_TOOLS:
+        tool = tools[domain.name]
+        operation = domain.branches[0].operation
         assert tool["inputSchema"]["properties"]["request"]
         assert tool["outputSchema"]["type"] == "object"
-        assert "untrusted inert data" in tool["description"]
+        assert tool["outputSchema"] == {
+            **domain.response.model_json_schema(by_alias=True),
+            "type": "object",
+        }
+        if domain.grouped:
+            assert tool["outputSchema"]["discriminator"]["propertyName"] == "action"
+            assert set(tool["outputSchema"]["discriminator"]["mapping"]) == {
+                branch.action for branch in domain.branches
+            }
+        assert tool["description"] == domain.description
         assert tool["annotations"]["readOnlyHint"] == (
             operation.method == "GET" and not operation.provider
         )
@@ -441,7 +433,7 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
         )
         assert tool["annotations"]["openWorldHint"] == operation.provider
         assert "Any" not in json.dumps(tool["outputSchema"])
-    assert tools["search_access_principals"]["annotations"]["readOnlyHint"] is False
+    assert tools["access_principals"]["annotations"]["readOnlyHint"] is False
     assert tools["capture_agent_inventory"]["annotations"]["readOnlyHint"] is False
     for name in (
         "http",
@@ -467,10 +459,9 @@ async def test_uploader_assignment_does_not_add_browser_only_import_tools(browse
         json={"jsonrpc": "2.0", "id": 501, "method": "tools/list"},
     )
     tools = response.json()["result"]["tools"]
-    assert {tool["name"] for tool in tools} == {operation.name for operation in OPERATIONS}
+    assert {tool["name"] for tool in tools} == {tool.name for tool in PUBLIC_TOOLS}
     assert not any(
-        operation.path.startswith("/api/official-usage/")
-        and operation.method in {"POST", "DELETE"}
+        operation.path.startswith("/api/official-usage/") and operation.method in {"POST", "DELETE"}
         for operation in OPERATIONS
     )
     assert (await rpc("import_reports"))["isError"]
@@ -589,69 +580,6 @@ async def test_canonical_input_method_path_query_body_and_defaults(rpc, entra, s
             assert sent.headers["Idempotency-Key"] == "exact-key"
 
 
-async def test_explicit_delegated_search_hunt_and_local_recovery_body_parity(
-    rpc, entra, source_fixtures
-):
-    window = {"startDateTime": "2026-10-16T00:00:00Z", "endDateTime": "2026-10-16T01:00:00Z"}
-    cases = [
-        (
-            "start_purview_search",
-            {
-                "tokenMode": "delegated",
-                "agentRecordId": RECORD,
-                "filters": {
-                    **window,
-                    "presetId": "copilot_interactions",
-                    "operations": ["CopilotInteraction"],
-                    "userPrincipalNames": ["Guest#EXT#@example.invalid"],
-                },
-            },
-        ),
-        (
-            "start_hunt",
-            {
-                "tokenMode": "delegated",
-                "userObjectId": GUID.upper(),
-                "filters": {
-                    **window,
-                    "templateId": "agent_activity",
-                    "userObjectId": GUID.upper(),
-                    "operations": ["InvokeAgent"],
-                },
-            },
-        ),
-        (
-            "start_purview_search",
-            {
-                "tokenMode": "delegated",
-                "filters": {
-                    "startDateTime": "2026-10-16T00:00:00.123Z",
-                    "endDateTime": "2026-10-16T01:00:00.456Z",
-                    "presetId": "copilot_interactions",
-                    "operations": ["CopilotInteraction"],
-                },
-            },
-        ),
-    ]
-    for name, payload in cases:
-        operation = next(operation for operation in OPERATIONS if operation.name == name)
-        entra.api_responses.append(
-            httpx2.Response(202, json=response_for(operation, source_fixtures))
-        )
-        result = await rpc(name, {**payload, "idempotencyKey": "fixed-submission"})
-        assert not result.get("isError"), result
-        expected = copy.deepcopy(payload)
-        if name == "start_hunt":
-            expected["userObjectId"] = GUID
-            expected["filters"]["userObjectId"] = GUID
-            expected["filters"].update(agentIds=[], blueprintIds=[], actorObjectIds=[])
-        sent = entra.api_calls[-1]
-        assert sent.url.path == operation.path
-        assert sent.headers["Idempotency-Key"] == "fixed-submission"
-        assert json.loads(sent.content) == expected
-        assert not sent.url.query
-
-
 async def test_final_protocol_output_including_text_and_structure_is_bounded(
     rpc, entra, source_fixtures
 ):
@@ -676,7 +604,11 @@ async def test_final_sdk_envelope_at_the_exact_representable_byte_boundary(
 
     def envelope(document):
         model = operation.response.model_validate(document)
-        text = model.model_dump_json(exclude_unset=True, by_alias=True)
+        text = (
+            '{"action":"detail","result":'
+            + model.model_dump_json(exclude_unset=True, by_alias=True)
+            + "}"
+        )
         return CallToolResult(
             content=[TextContent(type="text", text=text)], structuredContent=json.loads(text)
         )
@@ -684,15 +616,15 @@ async def test_final_sdk_envelope_at_the_exact_representable_byte_boundary(
     base = len(envelope(body).model_dump_json(by_alias=True).encode())
     body["longDescription"] = "a" * ((524288 - base) // 2 + int(over_limit))
     size = len(envelope(body).model_dump_json(by_alias=True).encode())
-    assert size == (524289 if over_limit else 524287)
+    assert size == 524288 - ((524288 - base) % 2) + 2 * int(over_limit)
     entra.api_responses.append(httpx2.Response(200, json=body))
-    result = await rpc("get_package", {"id": "ExactPackage", "selectionId": GUID})
+    result = await rpc("get_package", {"id": "ExactPackage", "selectionId": GUID}, wire=True)
     if over_limit:
         assert result["isError"]
         assert json.loads(result["content"][0]["text"])["code"] == "output_limit"
     else:
         assert not result.get("isError"), result
-        assert result["structuredContent"] == body
+        assert result["structuredContent"] == {"action": "detail", "result": body}
         assert (
             len(CallToolResult.model_validate(result).model_dump_json(by_alias=True).encode())
             == size
@@ -968,9 +900,6 @@ async def test_missing_reports_incomparable_history_source_gaps_are_not_zero(
         (i.RefreshPackage, {"id": "Exact-Package", "mode": "delegated"}),
         (i.PackageJobs, {"mode": "delegated"}),
         (i.PackageJobId, {"id": GUID, "mode": "delegated"}),
-        (i.StartPurview, {"tokenMode": "application", "filters": {}}),
-        (i.StartHunt, {"tokenMode": "application", "filters": {}}),
-        (i.DeleteCache, {"id": GUID, "confirmation": SOURCE}),
         (
             i.AgentChildren,
             {"recordId": RECORD, "selectionId": GUID, "kind": "element", "sourceScopeId": SOURCE},
@@ -988,9 +917,9 @@ async def test_missing_reports_incomparable_history_source_gaps_are_not_zero(
         (i.UsersInput, {"startDate": "2026-01-02", "endDate": "2026-01-01"}),
         (i.InventoryList, {"limit": None}),
         (i.ResolveUser, {"username": None}),
-        (i.InvestigationInput, {"recordId": "agent:not-a-uuid"}),
-        (i.InvestigationInput, {"recordId": "power_platform:missing-native"}),
-        (i.InvestigationInput, {"recordId": "graph_packages:bad%percent"}),
+        (i.UsageInput, {"recordId": "agent:not-a-uuid"}),
+        (i.UsageInput, {"recordId": "power_platform:missing-native"}),
+        (i.UsageInput, {"recordId": "graph_packages:bad%percent"}),
     ],
 )
 def test_finite_inputs_reject_unsupported_or_unpinned_work(model, payload):
@@ -1018,61 +947,23 @@ def test_sync_source_schemas_require_unique_values(model):
     assert sources["maxItems"] == 3
 
 
-@pytest.mark.parametrize("fraction", ["", ".1", ".12", ".123"])
-@pytest.mark.parametrize("model", [i.PurviewSearchFilters, i.HuntFilters])
-@pytest.mark.parametrize("field", ["startDateTime", "endDateTime"])
-def test_investigation_timestamp_precision_matches_canonical_api(model, fraction, field):
-    payload = {
-        "startDateTime": "2026-10-16T00:00:00Z",
-        "endDateTime": "2026-10-16T01:00:00Z",
-        **(
-            {"presetId": "copilot_interactions", "operations": ["CopilotInteraction"]}
-            if model is i.PurviewSearchFilters
-            else {"templateId": "agents_inventory"}
-        ),
-    }
-    payload[field] = payload[field].replace("Z", fraction + "Z")
-    supported = model is i.HuntFilters or fraction not in {".1", ".12"}
-    pattern = model.model_json_schema()["properties"][field]["pattern"]
-    assert bool(re.fullmatch(pattern, payload[field])) is supported
-    if not supported:
-        with pytest.raises(ValidationError):
-            model.model_validate(payload)
-    else:
-        request = model.model_validate(payload)
-        assert request.startDateTime == payload["startDateTime"]
-        assert request.endDateTime == payload["endDateTime"]
-
-
 @pytest.mark.parametrize(
     "name,payload",
     [
         ("start_sync", {"mode": "full", "sources": ["users", "users"]}),
         ("retry_sync", {"id": GUID, "sources": ["users", "users"]}),
-        (
-            "start_purview_search",
-            {
-                "tokenMode": "delegated",
-                "filters": {
-                    "presetId": "copilot_interactions",
-                    "operations": ["CopilotInteraction"],
-                    "startDateTime": "2026-10-16T00:00:00.1Z",
-                    "endDateTime": "2026-10-16T01:00:00.12Z",
-                },
-            },
-        ),
     ],
 )
-async def test_invalid_sync_sources_and_purview_precision_never_dispatch(name, payload, rpc, entra):
+async def test_invalid_sync_sources_never_dispatch(name, payload, rpc, entra):
     result = await rpc(name, payload)
     assert result["isError"]
     assert not entra.api_calls
 
 
 def test_source_references_preserve_opaque_case_and_normalize_only_canonical_uuids():
-    assert i.InvestigationInput(recordId="agent:" + GUID.upper()).recordId == RECORD
+    assert i.UsageInput(recordId="agent:" + GUID.upper()).recordId == RECORD
     for source in ("graph_packages:Case%2FPackage", "power_platform:ENV%3A1:Native%2FCase"):
-        assert i.InvestigationInput(recordId=source).recordId == source
+        assert i.UsageInput(recordId=source).recordId == source
 
 
 @pytest.mark.parametrize(
@@ -1096,20 +987,6 @@ def test_source_reference_bounds_apply_to_decoded_identities(record_id):
 def test_source_reference_bounds_match_canonical_utf16_units(native_id):
     with pytest.raises(ValidationError):
         i.InventoryQuery(recordId="graph_packages:" + quote(native_id, safe=""))
-
-
-def test_investigation_source_references_keep_their_separate_wire_bound():
-    record_id = "graph_packages:" + quote("\u00e9" * 338 + "a" * 5, safe="")
-    assert len(record_id) == 2048
-    assert i.InvestigationInput(recordId=record_id).recordId == record_id
-    assert i.HuntingTarget(agentRecordId=record_id).agentRecordId == record_id
-    assert i.PurviewHistory(agentRecordId=record_id).agentRecordId == record_id
-    with pytest.raises(ValidationError):
-        i.InvestigationInput(recordId=record_id + "a")
-    with pytest.raises(ValidationError):
-        i.HuntingTarget(agentRecordId=record_id + "a")
-    with pytest.raises(ValidationError):
-        i.PurviewHistory(agentRecordId=record_id + "a")
 
 
 @pytest.mark.parametrize(
@@ -1155,63 +1032,62 @@ async def test_native_activity_environment_remains_an_untagged_identity(
         i.NativeActivityInput(nativeId="Native/Case", snapshotId=GUID, environmentId=None)
 
 
+async def test_native_activity_preserves_related_audit_and_security_evidence(
+    rpc, entra, source_fixtures
+):
+    operation = next(op for op in OPERATIONS if op.name == "get_native_agent_activity")
+    body = response_for(operation, source_fixtures)
+    body["audit"] = {
+        "status": "available",
+        "count": 1,
+        "value": [sample(jobs.RelatedAuditRecord.model_json_schema())],
+    }
+    body["security"] = {
+        "status": "available",
+        "count": 1,
+        "value": [sample(jobs.RelatedSecurityRecord.model_json_schema())],
+    }
+    entra.api_responses.append(httpx2.Response(200, json=body))
+    result = await rpc(operation.name, {"nativeId": "Native/Case", "snapshotId": GUID})
+    assert not result.get("isError"), result
+    assert result["structuredContent"] == body
+    assert json.loads(result["content"][0]["text"]) == body
+
+
 @pytest.mark.parametrize(
-    "template,operations",
+    "capability,data_class",
     [
-        ("agents_inventory", None),
-        ("agent_activity", ["InvokeAgent"]),
-        ("agent_tools", ["ExecuteToolBySDK"]),
+        ("purview.audit.search.delegated", "provider_audit"),
+        ("purview.audit.search.application", "provider_audit"),
+        ("defender.hunting.delegated", "hunting"),
+        ("defender.hunting.application", "hunting"),
     ],
 )
-async def test_hunt_defaults_include_required_arrays_without_optional_nulls(
-    template, operations, rpc, entra, source_fixtures
+async def test_capability_reads_preserve_full_api_definitions(
+    capability, data_class, rpc, entra, source_fixtures
 ):
-    operation = next(operation for operation in OPERATIONS if operation.name == "start_hunt")
-    filters = {
-        "templateId": template,
-        "startDateTime": "2026-10-16T00:00:00Z",
-        "endDateTime": "2026-10-16T01:00:00Z",
-    }
-    if operations is not None:
-        filters["operations"] = operations
-    entra.api_responses.append(httpx2.Response(202, json=response_for(operation, source_fixtures)))
-    result = await rpc(operation.name, {"tokenMode": "delegated", "filters": filters})
+    view = copy.deepcopy(source_fixtures["complete"]["capability"])
+    view["definition"].update(id=capability, dataClass=data_class)
+    view["decision"]["capabilityId"] = capability
+    body = {"value": [view]}
+    entra.api_responses.append(httpx2.Response(200, json=body))
+    result = await rpc("list_capabilities")
     assert not result.get("isError"), result
-    assert json.loads(entra.api_calls[-1].content) == {
-        "tokenMode": "delegated",
-        "filters": {
-            **filters,
-            "agentIds": [],
-            "blueprintIds": [],
-            "actorObjectIds": [],
-            "operations": operations or [],
-        },
-    }
-    assert len(entra.api_calls) == 1
+    assert result["structuredContent"] == body
 
 
-async def test_hunt_serialization_preserves_explicit_identity_filters(rpc, entra, source_fixtures):
-    operation = next(operation for operation in OPERATIONS if operation.name == "start_hunt")
-    filters = {
-        "templateId": "agent_activity",
-        "startDateTime": "2026-10-16T00:00:00Z",
-        "endDateTime": "2026-10-16T01:00:00Z",
-        "agentIds": ["Case/Agent"],
-        "blueprintIds": [GUID.upper()],
-        "actorObjectIds": [SOURCE.upper()],
-        "entraAgentApplicationIds": [GUID.upper()],
-        "operations": ["InvokeAgent"],
-    }
-    entra.api_responses.append(httpx2.Response(202, json=response_for(operation, source_fixtures)))
-    result = await rpc(operation.name, {"tokenMode": "delegated", "filters": filters})
+@pytest.mark.parametrize("action", ["view-audit-search", "view-hunting", "submit-hunting"])
+async def test_administrative_audit_preserves_investigation_actions(
+    action, rpc, entra, source_fixtures
+):
+    body = copy.deepcopy(source_fixtures["complete"]["audit"])
+    body["value"][0]["action"] = action
+    body["value"][0].pop("targetBlockedState", None)
+    entra.api_responses.append(httpx2.Response(200, json=body))
+    result = await rpc("list_administrative_audit", {"action": action})
     assert not result.get("isError"), result
-    expected = {
-        **filters,
-        "blueprintIds": [GUID],
-        "actorObjectIds": [SOURCE],
-        "entraAgentApplicationIds": [GUID],
-    }
-    assert json.loads(entra.api_calls[-1].content)["filters"] == expected
+    assert result["structuredContent"] == body
+    assert parse_qs(entra.api_calls[-1].url.query.decode())["action"] == [action]
 
 
 async def test_stateful_submissions_never_replayed_and_invalid_json_not_empty(rpc, entra):

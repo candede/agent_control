@@ -257,6 +257,16 @@ Plan/Deploy does not rotate existing credentials; see [limitations](azure-produc
 
 ### Optional MCP recovery and backup
 
+Use **MCP settings** (`/mcp-settings`) for read-only, tenant-scoped runtime
+visibility. A metadata outage never requires disabling ordinary MCP/web use or
+automatic synchronization. Local normal startup creates/reuses only the new
+`secrets/mcp-metadata` credential. An invalid/link/unreadable file produces a scoped
+warning and is not mounted; restore that independent file or remove only that
+file before normal startup to regenerate it. Never rotate the original three
+OAuth secrets or clear OAuth/database state to repair visibility. Azure uses the
+same prepared pinned metadata secret version on API/MCP; unresolved optional
+references remain explicit settings failures. No credential appears in the page.
+
 MCP OAuth state/keys are separate from PostgreSQL; MCP failure is not an API/database
 reset request. Follow [MCP storage recovery](mcp-reference.md#storage-rotation-and-recovery)
 and [client reconnection](mcp-clients.md).
@@ -270,3 +280,15 @@ without deploying; `start -ForceChecks` checks before applying the same source.
 Use a disposable non-production environment for infrastructure-backed checks.
 Record local/mock, browser and provider/deployment evidence separately.
 Unrun journeys are not passed; test receipts never authorize application use.
+
+The MCP-only image suite no longer needs a Node baseline:
+`pwsh ./scripts/large-tenant-tests.ps1 -Suite mcp-container`.
+For the real browser/API/Python metadata fixture, run
+`-Suite cutover-browser-contract -BrowserFiles "mcpSettings.spec.ts,signIn.spec.ts,permissions.spec.ts"`
+with explicit `-BaselineImage`/`-BaselineImageId` and
+`-BrowserImage`/`-BrowserImageId` values for verified installed current images.
+The runner checks immutable identities, matching architectures/manifests, Node
+engine, Playwright package version and installed browser revisions. It reuses
+the current fixture authentication/loopback/provider/resource-ownership guards;
+the catalog case does not intercept settings requests. Evidence belongs to the
+runner's project-owned artifact directory, not a host `/evidence` directory.

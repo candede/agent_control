@@ -32,7 +32,9 @@ describe("large tenant fixture and frozen semantic seeds", () => {
   });
   it("runs connected SDK reads and exact control jobs on the existing isolated SQL owner", () => {
     expect(fixtureCommands("mcp-end-to-end")).toEqual([
-      ["run", "test", "--workspace", "backend", "--", "src/routes/mcpReadContracts.test.ts", "src/routes/sharedAgentControls.test.ts", "--silent=false"],
+      ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
+        "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
+        "src/routes/sharedAgentControls.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
       ["run", "typecheck", "--workspace", "backend"],
     ]);
     const runner = readFileSync(new URL("./largeTenantFixture.ts", import.meta.url), "utf8");

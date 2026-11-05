@@ -136,6 +136,9 @@ Enter:
 
 The public MCP URL is required on first setup; the example is not a default.
 On later edits, the wizard shows the saved URL and Enter keeps it.
+Public resource and callback URLs must be canonical, contain no wildcards, and
+be at most 2,048 characters. Callback paths are case-sensitive; paths differing
+only by case are separate allowlist entries.
 
 For VS Code, paste these callbacks as one line:
 
@@ -169,6 +172,14 @@ After setup, normal startup includes MCP:
 pwsh ./deploy-local.ps1 start
 ```
 
+Startup automatically persists a separate metadata-only key and shares it
+read-only with the web API; no additional wizard question or consent is required.
+Viewer-capable users can then open **MCP settings** (`/mcp-settings`) to see exact
+runtime instructions, complete advertised tools/schemas, callbacks and the known
+host port. A stopped service or metadata-key problem remains an explicit settings
+error, not a sign-in or business-admission failure. “Reachable” means API-to-MCP
+only: the page does not certify the public tunnel or a native client's OAuth.
+
 ## 5. Connect and test a client
 
 In VS Code, run **MCP: Add Server > HTTP** and enter
@@ -185,7 +196,8 @@ In VS Code, run **MCP: Add Server > HTTP** and enter
 }
 ```
 
-Start the server connection, complete Entra sign-in and run `list_capabilities`.
+Start the server connection, complete Entra sign-in and optionally read saved
+`capabilities` with `{"request":{"action":"list","input":{}}}`.
 Then request a saved agents/users list. Never put the server secret into client
 settings. Health/readiness alone does not verify OAuth or data access.
 

@@ -699,6 +699,7 @@ async def test_audit_rows_and_reported_labels_keep_current_browser_wire_parity(
         "evidence": "reported",
     }
     event["action"] = "reconcile-control"
+    event.pop("targetBlockedState", None)
     request = {"originChannel": "mcp", "originCallingAgentId": "current-lifecycle-actor"}
     entra.api_responses.append(httpx2.Response(200, json=expected))
     result = await rpc("list_administrative_audit", request)
@@ -833,8 +834,8 @@ def test_control_inputs_reject_guessed_identity_unbound_receipts_and_unsupported
 
 def test_catalog_has_one_owner_and_no_control_gate_or_parallel_recovery_framework():
     added = {operation.name for operation in OPERATIONS} - {row[0] for row in CASES}
-    assert len(added) == 94  # 96 prior tools, two directory adapters reused.
-    assert len(OPERATIONS) == 124
+    assert len(added) == 75
+    assert len(OPERATIONS) == 105
     assert {operation.method for operation in OPERATIONS if operation.method == "PATCH"} == {
         "PATCH"
     }

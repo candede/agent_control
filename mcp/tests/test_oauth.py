@@ -1,6 +1,7 @@
 import asyncio
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import httpx2
 import pytest
@@ -9,6 +10,7 @@ from cryptography.fernet import Fernet
 
 from agent_control_mcp.auth import TenantAzureProvider
 from agent_control_mcp.config import ConfigurationError
+from agent_control_mcp.domains import PUBLIC_TOOLS
 from agent_control_mcp.service import build_service
 from agent_control_mcp.storage import OAuthStore
 from agent_control_mcp.tools import OPERATIONS
@@ -120,7 +122,7 @@ async def test_discovery_initialization_authenticated_catalog_and_diagnostics(br
     )
     assert listed.status_code == 200, listed.text
     assert {tool["name"] for tool in listed.json()["result"]["tools"]} == {
-        operation.name for operation in OPERATIONS
+        tool.name for tool in PUBLIC_TOOLS
     }
     unauthenticated = await browser.post(
         "/mcp",
@@ -133,7 +135,8 @@ async def test_discovery_initialization_authenticated_catalog_and_diagnostics(br
     assert unauthenticated.status_code == 401
     diagnostics = await browser.get("/diagnostics", headers=headers)
     assert diagnostics.status_code == 200
-    assert diagnostics.json()["businessTools"] == len(OPERATIONS)
+    assert diagnostics.json()["businessTools"] == len(await service.mcp.list_tools())
+    assert diagnostics.json()["canonicalOperations"] == len(OPERATIONS) == 105
     usage = diagnostics.json()["oauthStorageUsage"]
     assert 0 < usage["files"] < usage["fileLimit"] == 4096
     assert 0 < usage["bytes"] < usage["byteLimit"] == 67108864
@@ -298,6 +301,29 @@ async def test_public_upstream_recovery_restart_refresh_revocation_and_signing_r
     )
     rotated.set_mcp_path(settings.mcp_path)
     assert await rotated.load_access_token(refreshed.json()["access_token"]) is None
+
+
+async def test_reference_expiring_during_token_swap_returns_unauthenticated(
+    browser, service, monkeypatch
+):
+    _, issued = await tokens(browser)
+    reference = issued["access_token"]
+    expiry = service.provider.jwt_issuer.verify_token(reference)["exp"]
+    checks = []
+
+    def issuer_time():
+        checks.append(True)
+        return expiry - 1 if len(checks) == 1 else expiry + 1
+
+    monkeypatch.setattr(
+        "fastmcp.server.auth.jwt_issuer.time", SimpleNamespace(time=issuer_time)
+    )
+    response = await browser.get(
+        "/diagnostics", headers={"Authorization": f"Bearer {reference}"}
+    )
+    assert response.status_code == 401
+    assert len(checks) == 2
+    assert reference not in response.text
 
 
 async def test_callback_errors_and_deadlines_do_not_expose_provider_diagnostics(

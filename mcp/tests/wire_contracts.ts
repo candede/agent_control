@@ -14,9 +14,6 @@ import type { UserResolution, SavedRelationshipPage, ChampionAgentPage, AgentAbo
 import type { AdoptionPage } from "../../backend/src/types/adoption.js";
 import type { DataSyncState, DataSyncRun, PackageDetailSyncState } from "../../backend/src/types/dataSync.js";
 import type { InventoryRefreshJob, InventoryRefreshJobList } from "../../backend/src/types/powerPlatformInventory.js";
-import type { AgentInvestigationContext, AgentPurviewRecordPage } from "../../backend/src/types/agentInvestigations.js";
-import type { PurviewAuditJob, PurviewAuditHistory, PurviewAuditRecordPage } from "../../backend/src/types/purviewAudit.js";
-import type { DefenderHuntingJob, DefenderHuntingHistory, DefenderHuntingRowPage } from "../../backend/src/types/defenderHunting.js";
 import type { AuditEvent } from "../../backend/src/types/audit.js";
 import type { AgentControlPreview, AgentControlExecution } from "../../backend/src/types/agentControls.js";
 import type { QuarantineJob, QuarantineReconciliationResult } from "../../backend/src/types/copilotStudioQuarantine.js";
@@ -69,14 +66,6 @@ export type Contracts = {
   details: PackageDetailSyncState;
   studioJob: InventoryRefreshJob;
   studioJobs: InventoryRefreshJobList;
-  investigation: AgentInvestigationContext;
-  agentPurview: AgentPurviewRecordPage;
-  purviewJob: PurviewAuditJob;
-  purviewJobs: PurviewAuditHistory;
-  purviewRecords: PurviewAuditRecordPage;
-  huntingJob: DefenderHuntingJob;
-  huntingJobs: DefenderHuntingHistory;
-  huntingRows: DefenderHuntingRowPage;
   audit: { value: AuditEvent[]; count: number };
   controlPreview: AgentControlPreview;
   controlExecution: AgentControlExecution;

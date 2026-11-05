@@ -10,6 +10,7 @@ from collections.abc import Mapping, Sequence
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, SupportsFloat
+from uuid import uuid4
 
 from cryptography.fernet import Fernet, MultiFernet
 from key_value.aio.protocols import AsyncKeyValue
@@ -40,7 +41,13 @@ def inspect_storage(root: Path) -> tuple[int, int]:
         raise ConfigurationError("OAuth storage cannot be a symbolic link.")
     count, size = 0, 0
     for path in chain((root,), root.rglob("*")):
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if path == root:
+                raise
+            # Atomic writes and expiry culling can remove an enumerated child.
+            continue
         if (
             info.st_uid != os.getuid()
             or info.st_mode & 0o077
@@ -99,6 +106,7 @@ class EncryptedEnvelopeStore(BaseWrapper):
 
 class OAuthStore(BaseWrapper):
     def __init__(self, settings: Settings) -> None:
+        self._ready = False
         self.binding = {
             "version": 1,
             "tenant": settings.tenant_id,
@@ -168,19 +176,35 @@ class OAuthStore(BaseWrapper):
             await self.put(key, value, collection=collection, ttl=ttl)
 
     async def check(self) -> None:
-        if self.blob is not None:
-            await self.blob.cull()
-            return
-        await asyncio.to_thread(inspect_storage, self.root)
-        await self.files.cull()
-        binding = await self.get("binding", collection="service")
-        if binding is not None and binding != self.binding:
-            raise ConfigurationError("OAuth state belongs to another resource; reconnect required.")
-        await self.put("binding", self.binding, collection="service", ttl=86400)
-        await self.put("probe", {"version": 1}, collection="health", ttl=30)
-        if await self.get("probe", collection="health") != {"version": 1}:
-            raise ConfigurationError("OAuth persistence verification failed.")
-        await self.delete("probe", collection="health")
+        ready = False
+        try:
+            if self.blob is not None:
+                await self.blob.cull()
+            else:
+                await asyncio.to_thread(inspect_storage, self.root)
+                await self.files.cull()
+                binding = await self.get("binding", collection="service")
+                if binding is not None and binding != self.binding:
+                    raise ConfigurationError(
+                        "OAuth state belongs to another resource; reconnect required."
+                    )
+                await self.put("binding", self.binding, collection="service", ttl=86400)
+                probe = uuid4().hex
+                await self.put(probe, {"version": 1}, collection="health", ttl=30)
+                if await self.get(probe, collection="health") != {"version": 1}:
+                    raise ConfigurationError("OAuth persistence verification failed.")
+                await self.delete(probe, collection="health")
+            ready = True
+        finally:
+            self._ready = ready
+
+    async def observe_readiness(self) -> None:
+        """Observe existing readiness without opening OAuth records or writing probes."""
+        if not self._ready:
+            raise ConfigurationError("OAuth storage readiness is unavailable.")
+        await self.assert_authority()
+        if self.blob is None:
+            await asyncio.to_thread(inspect_storage, self.root)
 
     async def start(self) -> None:
         if self.blob is not None:

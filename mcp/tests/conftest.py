@@ -14,6 +14,7 @@ import pytest
 from cryptography.fernet import Fernet
 from joserfc import jwt
 from joserfc.jwk import RSAKey
+from public_contract import canonical_result, public_request
 
 from agent_control_mcp.config import Settings
 from agent_control_mcp.service import build_service
@@ -44,6 +45,7 @@ def settings_env(tmp_path):
         ("CLIENT_SECRET", "synthetic-confidential-client-secret"),
         ("JWT_SIGNING_KEY", Fernet.generate_key().decode()),
         ("OAUTH_ENCRYPTION_KEY", json.dumps([Fernet.generate_key().decode()])),
+        ("METADATA_TOKEN", Fernet.generate_key().decode()),
     ):
         path = tmp_path / name
         path.write_text(content)
@@ -88,8 +90,8 @@ class Entra:
             "ver": "2.0",
             "oid": oid or self.oid,
             "sub": "synthetic-sub-" + (oid or self.oid),
-            "iat": now - 1,
-            "nbf": now - 1,
+            "iat": now - 300,
+            "nbf": now - 300,
             "exp": now + 3600,
             "scp": "AgentControl.Access" if api else "Mcp.Access",
             **({"roles": ["AgentControl.Viewer"]} if api else {}),
@@ -268,8 +270,10 @@ async def protocol_client(browser, token, *, client_name="Synthetic client", cli
     call_id = 1
     trace = []
 
-    async def call(name, request=None, *, calling_agent="synthetic-agent", meta=None):
+    async def call(name, request=None, *, calling_agent="synthetic-agent", meta=None, wire=False):
         nonlocal call_id
+        operation = name
+        name, request = public_request(operation, request or {})
         call_id += 1
         started = time.perf_counter()
         response = await browser.post(
@@ -306,7 +310,8 @@ async def protocol_client(browser, token, *, client_name="Synthetic client", cli
             }
         )
         assert response.status_code == 200, response.text
-        return response.json()["result"]
+        result = response.json()["result"]
+        return result if wire else canonical_result(operation, result)
 
     call.headers = headers
     call.trace = trace

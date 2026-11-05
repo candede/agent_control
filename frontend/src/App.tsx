@@ -141,6 +141,7 @@ import { SavedQueryProvider } from "./components/SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 import { trapDialogFocus } from "./dialogFocus";
 import { SignInForm } from "./components/SignInForm";
+import { McpSettings } from "./components/McpSettings";
 import "./components/agentWorkspace.css";
 
 const activeBulkJobStoragePrefix = "agent-control:active-bulk-job:v2:";
@@ -1395,8 +1396,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         const id = authorizedViews.find(candidate => candidate === view.id);
         return id && (view.roles.length === 0 || view.roles.some(role => hasRole(user, role))) ? [id] : [];
       })
-    : authorizedViews;
-  const visibleActiveView = visibleViews.includes(activeView) ? activeView : visibleViews[0] ?? "permissions";
+    : authorizedViews.filter(view => view !== "mcp-settings");
+  const visibleActiveView = visibleViews.includes(activeView)
+    || activeView === "mcp-settings" && hasRole(user, "AgentControl.Viewer") ? activeView : visibleViews[0] ?? "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.UsageReportUploader");
   const automaticAction = findWorkbenchAction(workbenchMetadata?.actions, "data-sync.auto-refresh");
@@ -3472,6 +3474,10 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </CapabilityGate>
               ) : null}
               {visibleViews.includes("sync") ? <button type="button" className={visibleActiveView === "sync" ? "view-button active" : "view-button"} aria-current={visibleActiveView === "sync" ? "page" : undefined} onClick={() => navigateToView("sync")}>Sync{syncSetupRequired ? <small className="sync-setup-hint">Setup needed</small> : null}</button> : null}
+              {visibleViews.includes("mcp-settings") ? <button type="button"
+                className={visibleActiveView === "mcp-settings" ? "view-button active" : "view-button"}
+                aria-current={visibleActiveView === "mcp-settings" ? "page" : undefined}
+                onClick={() => navigateToView("mcp-settings")}>MCP settings</button> : null}
               <CapabilityHealth current={visibleActiveView === "permissions"} />
         </nav>
         <div className="user-menu">
@@ -3606,6 +3612,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           route={dashboardRoute} officeRevision={copilotUsersDataRevision} onRouteChange={handleDashboardRouteChange}
           onBaselineChange={baselineId => handleDashboardRouteChange({ ...dashboardRoute, baselineId })}
           onCompanyChange={company => handleDashboardRouteChange({ ...dashboardRoute, company })} />
+        : visibleActiveView === "mcp-settings" && user ? <McpSettings key={principalKey} user={user} />
         : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
         !hasRole(user, "AgentControl.Viewer") ? (
           <>

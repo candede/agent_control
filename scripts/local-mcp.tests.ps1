@@ -6,6 +6,7 @@ $root = Join-Path $repository "artifacts/test-scratch/mcp-$([Guid]::NewGuid().To
 [IO.Directory]::CreateDirectory($root) | Out-Null
 Copy-Item -LiteralPath (Join-Path $repository 'compose.yaml') -Destination $root
 Copy-Item -LiteralPath (Join-Path $repository 'compose.mcp.yaml') -Destination $root
+Copy-Item -LiteralPath (Join-Path $repository 'compose.mcp-metadata.yaml') -Destination $root
 $script:checks = 0
 $script:calls = [Collections.Generic.List[string]]::new()
 $script:running = $false
@@ -53,7 +54,7 @@ function New-McpSetupFixture {
     param([string]$Name,[object[]]$Profiles,[int]$Port=8001,[string]$Project='mcp-test')
     $directory = Join-Path $root $Name
     [IO.Directory]::CreateDirectory($directory) | Out-Null
-    foreach ($file in @('compose.yaml','compose.mcp.yaml')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $directory }
+    foreach ($file in @('compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml')) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $directory }
     $fixture = New-LocalContext $directory $Project
     $secrets = Join-Path $fixture.State 'secrets'
     [IO.Directory]::CreateDirectory($secrets) | Out-Null
@@ -112,7 +113,7 @@ try {
         $bad=$mcp.Clone();$bad.Remove($name)
         Fails { Assert-LocalMcpSettings $bad 14391 } 'configuration'
     }
-    foreach ($url in @('http://mcp.example.test/mcp','https://mcp.example.test/mcp/','https://mcp.example.test/mcp?tenant=x','https://mcp.example.test/mcp#x','https://mcp.example.test','https://MCP.example.test/mcp')) {
+    foreach ($url in @('http://mcp.example.test/mcp','https://mcp.example.test/mcp/','https://mcp.example.test/mcp*','https://mcp.example.test/internal/mcp-metadata','https://mcp.example.test/mcp?tenant=x','https://mcp.example.test/mcp#x','https://mcp.example.test','https://MCP.example.test/mcp')) {
         $bad=$mcp.Clone();$bad.publicUrl=$url
         Fails { Assert-LocalMcpSettings $bad 14391 } 'publicUrl'
     }
@@ -129,13 +130,34 @@ try {
         Assert-LocalMcpSettings $native 14391
         Assert ($native.redirectUris[0] -ceq $callback) 'Exact native callback was changed.'
     }
+    foreach ($field in @('publicUrl','redirectUris')) {
+        $prefix = if ($field -eq 'publicUrl') { 'https://mcp.example.test/' } else { 'https://client.example.test/' }
+        $boundary = $prefix + ('a'*(2048-$prefix.Length))
+        $bounded=$mcp.Clone()
+        if ($field -eq 'publicUrl') { $bounded.publicUrl=$boundary } else { $bounded.redirectUris=@($boundary) }
+        Assert-LocalMcpSettings $bounded 14391
+        if ($field -eq 'publicUrl') { $bounded.publicUrl=$boundary+'a' } else { $bounded.redirectUris=@($boundary+'a') }
+        Fails { Assert-LocalMcpSettings $bounded 14391 } '2048 characters'
+    }
+    $exactCallbacks=$mcp.Clone()
+    $exactCallbacks.redirectUris=@('https://client.example.test/Callback','https://client.example.test/callback')
+    Assert-LocalMcpSettings $exactCallbacks 14391
+    $exactCallbacks.redirectUris=@('https://client.example.test/callback','https://client.example.test/callback')
+    Fails { Assert-LocalMcpSettings $exactCallbacks 14391 } 'distinct exact'
     $secretDirectory=Join-Path $context.State 'secrets'
     [IO.Directory]::CreateDirectory($secretDirectory) | Out-Null
-    foreach ($name in @('mcp-client','mcp-signing','mcp-encryption','session')) {
+    foreach ($name in @('mcp-client','mcp-signing','mcp-encryption','session','postgres-app','postgres-admin')) {
         Write-LocalText (Join-Path $secretDirectory $name) "synthetic-independent-$name"
     }
     $signing=[Convert]::ToBase64String([byte[]](1..32)).Replace('+','-').Replace('/','_')
     $encryption=[Convert]::ToBase64String([byte[]](33..64)).Replace('+','-').Replace('/','_')
+    $caseKeyUpper=('A'*43)+'='
+    $caseKeyLower=('a'*42)+'A='
+    $caseValues=@{'mcp-client'='synthetic-distinct-client-secret';'mcp-signing'=$signing
+        'mcp-encryption'=(ConvertTo-Json -InputObject @($caseKeyUpper,$caseKeyLower) -Compress)}
+    Assert-LocalMcpSecretValues $caseValues
+    $caseValues['mcp-encryption']=ConvertTo-Json -InputObject @($caseKeyUpper,$caseKeyUpper) -Compress
+    Fails { Assert-LocalMcpSecretValues $caseValues } 'independent encryption keys'
     Write-LocalText (Join-Path $secretDirectory 'mcp-signing') $signing
     Write-LocalText (Join-Path $secretDirectory 'mcp-encryption') (ConvertTo-Json -InputObject @($encryption) -Compress)
     Write-LocalText (Join-Path $context.State 'settings.json') ($settings | ConvertTo-Json -Depth 8)
@@ -145,6 +167,29 @@ try {
     Fails { Get-LocalMcpPlan $context $settings @($wrong) } 'explicitly match'
     Fails { Get-LocalMcpPlan $context $settings @() } 'explicitly match'
     Save-LocalMcpConfiguration $context $plan
+    $metadataPath = Join-Path $secretDirectory 'mcp-metadata'
+    Assert (Test-LocalMcpMetadataCredential $context) 'Normal existing-project start did not provision the independent metadata credential.'
+    $originalHashes = @('mcp-client','mcp-signing','mcp-encryption','session','postgres-app','postgres-admin') | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $secretDirectory $_)).Hash }
+    $metadataHash = (Get-FileHash -LiteralPath $metadataPath).Hash
+    Save-LocalMcpConfiguration $context $plan
+    Assert ((Get-FileHash -LiteralPath $metadataPath).Hash -ceq $metadataHash) 'Restart rotated the metadata credential.'
+    foreach ($kind in @('invalid','link','mode','unreadable')) {
+        Remove-Item -LiteralPath $metadataPath
+        if ($kind -eq 'link') { New-Item -ItemType SymbolicLink -Path $metadataPath -Target (Join-Path $secretDirectory 'mcp-signing') | Out-Null }
+        else {
+            Write-LocalText $metadataPath $(if ($kind -eq 'invalid') {'invalid'} else {[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).Replace('+','-').Replace('/','_')})
+            if ($kind -eq 'mode' -and -not $IsWindows) { [IO.File]::SetUnixFileMode($metadataPath,[IO.UnixFileMode]420) }
+            if ($kind -eq 'unreadable' -and -not $IsWindows) { [IO.File]::SetUnixFileMode($metadataPath,[IO.UnixFileMode]0) }
+        }
+        Initialize-LocalMcpMetadataCredential $context 3>$null
+        Sync-LocalMcpContext $context $settings
+        Assert (-not (Test-LocalMcpMetadataCredential $context) -and $context.Compose -notcontains (Join-Path $root 'compose.mcp-metadata.yaml')) "Invalid metadata ($kind) became a mandatory/broken mount or was silently replaced."
+    }
+    Remove-Item -LiteralPath $metadataPath
+    Initialize-LocalMcpMetadataCredential $context
+    Assert (Test-LocalMcpMetadataCredential $context) 'Missing independent metadata key did not recover automatically.'
+    $afterHashes = @('mcp-client','mcp-signing','mcp-encryption','session','postgres-app','postgres-admin') | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $secretDirectory $_)).Hash }
+    Assert (($originalHashes -join ',') -ceq ($afterHashes -join ',')) 'Metadata recovery changed existing OAuth/session credentials.'
     Assert (-not (Test-Path -LiteralPath (Join-Path $context.State 'mcp/oauth'))) 'MCP incorrectly created a host bind store instead of a dedicated named volume.'
     if (-not $IsWindows) {
         Assert ([int][IO.File]::GetUnixFileMode((Join-Path $secretDirectory 'mcp-client')) -eq 384) 'Secret input is not 0600.'
@@ -161,7 +206,7 @@ try {
     foreach ($value in @('MCP_API_CLIENT_ID=22222222-2222-2222-2222-222222222222','MCP_PUBLIC_URL=https://mcp.example.test/mcp','MCP_PORT=14392',"MCP_IMAGE=$script:image")) { Assert ($environment.Contains($value)) "Missing exact environment setting $value." }
     Assert (-not $environment.Contains('synthetic-independent')) 'Secret content entered Compose environment.'
     $run=Get-LocalMcpRunArguments $context
-    Assert ($run -contains '--read-only' -and $run -contains '--pids-limit' -and @($run | Where-Object { $_ -like 'type=bind,*readonly' }).Count -eq 3) 'MCP preflight mounts/security differ.'
+    Assert ($run -contains '--read-only' -and $run -contains '--pids-limit' -and @($run | Where-Object { $_ -like 'type=bind,*readonly' }).Count -eq 4) 'MCP preflight mounts/security differ.'
     Assert (-not (($run -join '|') -match 'tenants.json|postgres|PGPASSWORD|SESSION_SECRET')) 'MCP inherited API/database authority.'
     $env:MCP_PUBLIC_URL='https://wrong.example.test/mcp';$env:MCP_CLIENT_SECRET_FILE='/wrong'
     Start-LocalMcp $context
@@ -404,7 +449,7 @@ try {
     Set-SetupAnswers
     $nextStart=Read-LocalConfiguration $firstRun $true -Onboard
     Assert (-not $nextStart.RegistryChanged -and -not $nextStart.SettingsChanged -and -not $nextStart.McpPlan.SecretsChanged -and $script:prompts.Count -eq 0) 'Ordinary start cannot reuse complete first-run wizard configuration.'
-    $hostExecutable=(Get-Command pwsh -CommandType Application).Source
+    $hostExecutable=(Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     foreach ($case in @(
         @{arguments=@('check','-ConfigureMcp');pattern='-ConfigureMcp is supported only with start'},
         @{arguments=@('stop','-ConfigureMcp');pattern='-ConfigureMcp is supported only with start'},

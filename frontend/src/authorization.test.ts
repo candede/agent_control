@@ -8,8 +8,8 @@ function user(role: AppRole): SessionUser {
 }
 
 describe("role-aware views", () => {
-  const observationalViews = ["dashboard", "agents", "users", "sync", "permissions"];
-  const adminViews = ["dashboard", "agents", "users", "sync", "audit", "permissions"];
+  const observationalViews = ["dashboard", "agents", "users", "sync", "mcp-settings", "permissions"];
+  const adminViews = ["dashboard", "agents", "users", "sync", "mcp-settings", "audit", "permissions"];
 
   it("reserves Audit for Admin while keeping ordinary data views available to Viewer", () => {
     expect(allowedViews(user("AgentControl.Viewer"))).toEqual(observationalViews);

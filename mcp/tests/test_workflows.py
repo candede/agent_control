@@ -962,12 +962,13 @@ async def test_paging_denial_stops_without_recapture_source_substitution_or_writ
         status=status,
     )
     assert problem["code"] == code
-    assert [call["tool"] for call in workflow.trace] == ["list_user_agent_relationships"] * 2
+    assert [call["tool"] for call in workflow.trace] == ["users"] * 2
+    assert all(call["request"]["action"] == "relationships" for call in workflow.trace)
     assert all(request.method == "GET" for request in entra.api_calls)
     verify_trace_and_web(f"paging-denial-{code}", workflow, entra)
 
 
-async def test_explicit_refresh_and_investigation_do_not_hide_inside_saved_reads(
+async def test_explicit_refresh_does_not_hide_inside_saved_reads(
     workflow,
     entra,
     source_fixtures,
@@ -983,52 +984,19 @@ async def test_explicit_refresh_and_investigation_do_not_hide_inside_saved_reads
             "lastSuccessAt": None,
         },
     )
-    context = copy.deepcopy(source_fixtures["investigation"])
-    context["recordId"] = agent(1)
-    context["purview"].update(status="available", mode="search", presets=["copilot_interactions"])
-    await workflow("get_agent_investigation", {"recordId": agent(1)}, context)
-    assert [request.method for request in entra.api_calls] == ["GET", "GET"]
+    assert [request.method for request in entra.api_calls] == ["GET"]
     await workflow(
         "refresh_packages",
         {"mode": "application", "idempotencyKey": "explicit-refresh"},
         job,
         status=202,
     )
-    assert len(entra.api_calls) == 3
+    assert len(entra.api_calls) == 2
     assert entra.api_calls[-1].headers["Idempotency-Key"] == "explicit-refresh"
-    assert not any(
-        "hunting/jobs" in request.url.path or "purview-audit/jobs" in request.url.path
-        for request in entra.api_calls
-    )
-    catalogue = await workflow(
-        "get_purview_catalog",
-        {},
-        response_for(operation_named("get_purview_catalog"), source_fixtures),
-    )
+    saved = await workflow("get_package_refresh_job", {"id": job["id"]}, job)
+    assert saved == job
     assert entra.api_calls[-1].method == "GET"
-    preset = next(row for row in catalogue["presets"] if row["id"] in context["purview"]["presets"])
-    submitted = response_for(operation_named("start_purview_search"), source_fixtures)
-    submitted["id"] = identifier("report", 8)
-    result = await workflow(
-        "start_purview_search",
-        {
-            "tokenMode": "delegated",
-            "agentRecordId": context["recordId"],
-            "filters": {
-                "presetId": preset["id"],
-                "operations": preset["operations"],
-                "startDateTime": "2026-01-30T00:00:00Z",
-                "endDateTime": "2026-01-30T01:00:00Z",
-            },
-        },
-        submitted,
-        status=202,
-    )
-    assert entra.api_calls[-1].method == "POST"
-    saved = await workflow("get_purview_job", {"id": result["id"]}, submitted)
-    assert saved["id"] == identifier("report", 8)
-    assert entra.api_calls[-1].method == "GET"
-    assert sum(request.method == "POST" for request in entra.api_calls) == 2
+    assert sum(request.method == "POST" for request in entra.api_calls) == 1
     verify_trace_and_web("explicit-provider-work", workflow, entra)
 
 

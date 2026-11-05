@@ -1,7 +1,7 @@
 """Finite tool inputs. API defaults are preserved by omitting unsupplied fields."""
 
 import re
-from datetime import UTC, date, datetime
+from datetime import date
 from typing import Annotated, ClassVar, Literal, Self
 from urllib.parse import unquote
 from uuid import UUID
@@ -9,7 +9,7 @@ from uuid import UUID
 from pydantic import AfterValidator, Field, StringConstraints, model_validator
 
 from .inventory_models import ResourceType
-from .job_models import AuditAction, AuditStatus, PresetId, TemplateId
+from .job_models import AuditAction, AuditStatus
 from .models import CapabilityId, Opaque, WireModel
 from .report_models import Entitlement, ServiceState
 
@@ -70,7 +70,6 @@ RecordId = Annotated[
     ),
     AfterValidator(record_id),
 ]
-InvestigationRecordId = Annotated[RecordId, StringConstraints(max_length=2048)]
 Search = Annotated[str, StringConstraints(max_length=256, pattern=r"^[^\x00\r\n]*$")]
 FacetText = Annotated[str, StringConstraints(max_length=4096, pattern=r"^[^\x00\r\n]*$")]
 Limit = Annotated[int, Field(ge=1, le=100)]
@@ -86,29 +85,8 @@ def calendar_date(value: str) -> str:
     return value
 
 
-def utc_instant(value: str) -> str:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if "T" not in value or parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
-        raise ValueError("Use a timezone-qualified UTC instant.")
-    return value
-
-
 CalendarDate = Annotated[
     str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$"), AfterValidator(calendar_date)
-]
-UtcInstant = Annotated[
-    str,
-    StringConstraints(
-        max_length=64, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$"
-    ),
-    AfterValidator(utc_instant),
-]
-PurviewInstant = Annotated[
-    str,
-    StringConstraints(
-        max_length=64, pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$"
-    ),
-    AfterValidator(utc_instant),
 ]
 
 
@@ -641,168 +619,6 @@ class PrincipalInput(Input):
 
 class ResolvePrincipals(Input):
     principals: Annotated[list[PrincipalInput], Field(min_length=1, max_length=500)]
-
-
-class InvestigationInput(Input):
-    recordId: InvestigationRecordId
-
-
-PurviewOperation = Literal[
-    "CopilotInteraction",
-    "BotCreate",
-    "BotDelete",
-    "BotDeleteCleanup",
-    "BotUpdateOperation-BotNameUpdate",
-    "BotUpdateOperation-BotAuthUpdate",
-    "BotUpdateOperation-BotIconUpdate",
-    "BotUpdateOperation-BotPublish",
-    "BotUpdateOperation-BotShare",
-    "BotAppInsightsUpdate",
-    "BotComponentCreate",
-    "BotComponentUpdate",
-    "BotComponentDelete",
-    "BotComponentCollectionCreate",
-    "BotComponentCollectionUpdate",
-    "BotComponentCollectionDelete",
-    "AIPluginOperationCreate",
-    "AIPluginOperationUpdate",
-    "AIPluginOperationDelete",
-    "EnvironmentVariableCreate",
-    "EnvironmentVariableUpdate",
-    "EnvironmentVariableDelete",
-]
-
-
-class AgentPurviewInput(InvestigationInput):
-    limit: Limit | None = None
-    offset: Offset | None = None
-    search: Search | None = None
-    operation: PurviewOperation | None = None
-
-
-class PurviewSearchFilters(Input):
-    presetId: PresetId
-    operations: Annotated[list[PurviewOperation], Field(min_length=1, max_length=100)]
-    startDateTime: PurviewInstant
-    endDateTime: PurviewInstant
-    userPrincipalNames: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
-    ipAddresses: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
-    objectIds: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
-    administrativeUnitIds: Annotated[list[Guid], Field(max_length=20)] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def curated_window(self) -> Self:
-        start = datetime.fromisoformat(self.startDateTime.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(self.endDateTime.replace("Z", "+00:00"))
-        if not 0 < (end - start).total_seconds() <= 168 * 3600:
-            raise ValueError("Select a positive window no longer than 168 hours.")
-        if len(set(self.operations)) != len(self.operations) or any(
-            (operation == "CopilotInteraction") != (self.presetId == "copilot_interactions")
-            for operation in self.operations
-        ):
-            raise ValueError("Select unique operations from the preset's curated allowlist.")
-        return self
-
-
-class StartPurview(Submission):
-    tokenMode: Literal["delegated"]
-    filters: PurviewSearchFilters
-    agentRecordId: InvestigationRecordId | None = None
-
-
-class PurviewHistory(JobList):
-    offset: Offset | None = None
-    userPrincipalName: ExactId | None = None
-    agentRecordId: InvestigationRecordId | None = None
-
-
-class PurviewRecordsInput(JobId):
-    limit: Annotated[int, Field(ge=1, le=500)] | None = None
-    offset: Offset | None = None
-
-
-class HuntingTarget(Input):
-    agentRecordId: InvestigationRecordId | None = None
-    userObjectId: Guid | None = None
-
-
-HuntingOperation = Literal[
-    "InvokeAgent",
-    "InferenceCall",
-    "ExecuteToolBySDK",
-    "ExecuteToolByGateway",
-    "ExecuteToolByMCPServer",
-]
-
-
-class HuntFilters(Input):
-    templateId: TemplateId
-    startDateTime: UtcInstant
-    endDateTime: UtcInstant
-    agentIds: Annotated[list[ExactId], Field(max_length=20)] = Field(default_factory=list)
-    entraAgentIds: Annotated[list[Guid], Field(max_length=20)] | None = None
-    entraAgentApplicationIds: Annotated[list[Guid], Field(max_length=20)] | None = None
-    blueprintIds: Annotated[list[Guid], Field(max_length=20)] = Field(default_factory=list)
-    actorObjectIds: Annotated[list[Guid], Field(max_length=20)] = Field(default_factory=list)
-    userObjectId: Guid | None = None
-    operations: Annotated[list[HuntingOperation], Field(max_length=5)] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def curated_window(self) -> Self:
-        start = datetime.fromisoformat(self.startDateTime.replace("Z", "+00:00"))
-        end = datetime.fromisoformat(self.endDateTime.replace("Z", "+00:00"))
-        if not 0 < (end - start).total_seconds() <= 168 * 3600:
-            raise ValueError("Select a positive window no longer than 168 hours.")
-        allowed = {
-            "agents_inventory": set(),
-            "agent_activity": {"InvokeAgent", "InferenceCall"},
-            "agent_tools": {"ExecuteToolBySDK", "ExecuteToolByGateway", "ExecuteToolByMCPServer"},
-        }[self.templateId]
-        if not set(self.operations) <= allowed or len(set(self.operations)) != len(self.operations):
-            raise ValueError("Select unique operations from the curated template.")
-        if (self.templateId == "agents_inventory") != (not self.operations):
-            raise ValueError("Inventory has no operations; activity/tool templates require one.")
-        if self.templateId == "agents_inventory" and self.actorObjectIds:
-            raise ValueError("Inventory has no actor filter.")
-        if self.userObjectId and (
-            self.templateId != "agent_activity" or self.operations != ["InvokeAgent"]
-        ):
-            raise ValueError(
-                "An exact user target requires the human-attributed InvokeAgent operation."
-            )
-        return self
-
-
-class StartHunt(Submission, HuntingTarget):
-    tokenMode: Literal["delegated"]
-    filters: HuntFilters
-
-
-class HuntingHistory(JobList, HuntingTarget):
-    offset: Offset | None = None
-
-
-class HuntingJobInput(JobId, HuntingTarget):
-    pass
-
-
-class HuntingRowsInput(HuntingJobInput):
-    limit: Annotated[int, Field(ge=1, le=200)] | None = None
-    offset: Offset | None = None
-
-
-class DeleteCache(JobId):
-    confirmation: Guid
-
-    @model_validator(mode="after")
-    def exact_confirmation(self) -> Self:
-        if self.confirmation != self.id:
-            raise ValueError("Confirm the exact local job ID.")
-        return self
-
-
-class DeleteHuntingCache(DeleteCache, HuntingTarget):
-    pass
 
 
 class AuditInput(Input):

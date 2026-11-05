@@ -1,0 +1,19 @@
+services:
+  app:
+    environment:
+      MCP_METADATA_TOKEN_FILE: /run/secrets/mcp-metadata
+    volumes:
+      - type: bind
+        source: ${LOCAL_STATE_DIR}/secrets/mcp-metadata
+        target: /run/secrets/mcp-metadata
+        read_only: true
+        bind: {create_host_path: false}
+  mcp:
+    environment:
+      MCP_METADATA_TOKEN_FILE: /run/secrets/mcp-metadata
+    volumes:
+      - type: bind
+        source: ${LOCAL_STATE_DIR}/secrets/mcp-metadata
+        target: /run/secrets/mcp-metadata
+        read_only: true
+        bind: {create_host_path: false}

@@ -29,6 +29,7 @@ import { purviewAuditRouter } from "./routes/purviewAudit.js";
 import { createUnifiedAgentsRouter } from "./routes/unifiedAgents.js";
 import { createInventoryDataRouter } from "./routes/inventoryData.js";
 import { workbenchRouter } from "./routes/workbench.js";
+import { createMcpSettingsRouter } from "./routes/mcpSettings.js";
 import { policyRoute } from "./routes/policy.js";
 import { maintenanceActive } from "./services/maintenance.js";
 import { providerWorkEnabled, readOperationalState } from "./services/operationalState.js";
@@ -111,7 +112,7 @@ export function createApp(database: pg.Pool = pool, staticDirectory = fileURLToP
     });
   });
   const reports = reportRuntime(database);
-  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createDataSyncRouter(),
+  app.use("/api", authRouter, capabilitiesRouter, workbenchRouter, createMcpSettingsRouter(), createDataSyncRouter(),
     createOfficeAppAdoptionRouter(new OfficeAppAdoptionReads(database, config.sessionSecret)),
     createOfficialReportDataRouter({ reports: reports.reports,
       identity: async request => ({ identity: await reportIdentity(database, requestUser(request)) }),

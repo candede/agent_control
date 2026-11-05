@@ -32,6 +32,17 @@ Other tiers/sizes require template and script changes. Review
 [PostgreSQL compute limitations](https://learn.microsoft.com/azure/postgresql/flexible-server/concepts-compute)
 against the expected workload and budget before choosing this profile.
 
+The [Bicep parameter example](../infra/main.bicepparam) reflects the required
+tenant-registry secret contract; replace its non-secret placeholders with exact
+target identities and immutable secret version IDs. The deployment script writes
+its own parameters from the target file.
+
+API log alerts filter the shared workspace by the API App Service resource ID;
+MCP or other applications' events do not contribute to their thresholds.
+The rules are enabled immediately but skip deployment-time query validation
+because `AppServiceConsoleLogs` is created only after the first console-log
+ingestion. This does not disable alert evaluation once logs arrive.
+
 ## 1. Configure Entra sign-in
 
 Follow [Entra setup](deployment-setup.md#configure-the-entra-application) for
@@ -215,6 +226,8 @@ pwsh ./deploy-azure.ps1 -Action Cleanup -TargetFile $targetFile `
 Cleanup removes tracked temporary resources (runner firewall rule or unswitched
 restore server), not serving data; it does not reopen the app. A containment
 failure requires incident handling—do not assume the app is safely stopped.
+Failed retries and successful temporary-resource cleanup retain the original
+uncertain external-write step; neither establishes that the write can be replayed.
 
 ## Operate the deployment
 
@@ -275,8 +288,24 @@ API secret values. Default `All` applies MCP after API/web opens; `Application`
 refuses targets containing `mcp`. A combined MCP failure leaves API/web online
 with nonzero `deployed_mcp_failed`/`recovered_mcp_failed` outcome.
 
+For browser **MCP settings**, prepare the independent
+`agent-control-mcp-metadata` secret through the existing protected-secret process.
+The `secrets.metadata` reference pins the same version on both API and MCP; no
+deployment step creates its value or grants secret-writing rights. The API gets
+read access to this one MCP secret, never the three OAuth secrets. Missing,
+malformed or unresolved metadata-only references leave business deployment and
+sign-in usable and report unavailable metadata explicitly.
+Malformed metadata references are omitted from generated parameters and receipts;
+the exact metadata-only read grant remains permitted when its reference is
+unavailable, without permitting access to any additional secret.
+`network.apiInboundIpv4Addresses` must exactly equal the approved API outbound
+addresses; these fixed `/32` ingress rules supplement, not replace or broaden,
+the explicit client CIDRs. The API's fixed HTTPS metadata origin and expected
+tenant/API/MCP/resource binding are deployed with its native reference. Offline
+contract checks do not prove live Azure reference resolution or networking.
+
 Connect an authorized [MCP client](mcp-clients.md); sign in and call
-`list_capabilities` and a saved-data tool. Validate OAuth/OBO/API access, effective
+`capabilities` (`action: "list", input: {}`) and a saved-data tool. Validate OAuth/OBO/API access, effective
 network/DNS, client compatibility and restart recovery—not just readiness.
 Use independent
 [MCP recovery procedure](../infra/disaster-recovery.md#independent-azure-mcp-recovery)

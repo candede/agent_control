@@ -36,10 +36,12 @@
   "secrets": {
     "client": {"name": "agent-control-mcp-client", "version": "", "currentVersion": ""},
     "signing": {"name": "agent-control-mcp-signing", "version": "", "currentVersion": ""},
-    "encryption": {"name": "agent-control-mcp-encryption", "version": "", "currentVersion": ""}
+    "encryption": {"name": "agent-control-mcp-encryption", "version": "", "currentVersion": ""},
+    "metadata": {"name": "agent-control-mcp-metadata", "version": "", "currentVersion": ""}
   },
   "network": {
     "inboundIpv4Cidrs": ["192.0.2.10/32"],
+    "apiInboundIpv4Addresses": ["192.0.2.20"],
     "outboundIpv4Addresses": ["192.0.2.30"],
     "apiReachabilityReference": "",
     "forwardedHeaders": "ignored"

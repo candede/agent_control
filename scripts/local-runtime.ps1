@@ -1,7 +1,7 @@
 function Get-LocalSourceFiles {
     param([string]$Root)
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required to snapshot tracked and untracked build inputs without copying local secrets or installed dependencies.' }
-    $output = @(& git -C $Root ls-files -z --cached --others --exclude-standard -- backend frontend mcp scripts docs infra Dockerfile .dockerignore compose.yaml compose.mcp.yaml compose.large-tenant-test.yaml package.json package-lock.json knip.json deploy-local.ps1 deploy-azure.ps1 README.md)
+    $output = @(& git -C $Root ls-files -z --cached --others --exclude-standard -- backend frontend mcp scripts docs infra Dockerfile .dockerignore compose.yaml compose.mcp.yaml compose.mcp-metadata.yaml compose.large-tenant-test.yaml package.json package-lock.json knip.json deploy-local.ps1 deploy-azure.ps1 README.md)
     if ($LASTEXITCODE -ne 0) { throw 'Could not enumerate deployment source files.' }
     foreach ($path in (($output -join "`n") -split "`0" | Where-Object { $_ } | Sort-Object -Unique)) {
         if ($path -match '[\\\r\n]' -or [IO.Path]::IsPathRooted($path) -or $path -match '(^|/)\.\.(/|$)') { throw 'Build input paths must remain inside the repository.' }
@@ -41,7 +41,7 @@ function New-LocalBuildSnapshot {
         for ($index = 0; $index -lt $compose.Count - 1; $index++) {
             if ($compose[$index] -ne '-f') { continue }
             $original = $compose[$index+1]
-            $copy = if ([IO.Path]::GetFullPath($original) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'))) { Join-Path $source ([IO.Path]::GetFileName($original)) }
+            $copy = if ([IO.Path]::GetFullPath($original) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'),(Join-Path $Context.Root 'compose.mcp-metadata.yaml'))) { Join-Path $source ([IO.Path]::GetFileName($original)) }
                 else { Join-Path $source "local-compose-$($composeFiles.Count).yaml" }
             if (-not (Test-Path -LiteralPath $copy)) { [IO.File]::Copy($original,$copy) }
             if ((Get-FileHash -LiteralPath $copy).Hash -cne (Get-FileHash -LiteralPath $original).Hash) { throw 'Compose inputs changed while preparing the deployment snapshot.' }
@@ -106,10 +106,10 @@ function Read-LocalCandidate {
             (Get-FileHash -LiteralPath $source).Hash.ToLowerInvariant() -cne ([string]$manifest[$path]).ToLowerInvariant()) { throw "Candidate source changed: $path." }
     }
     $actual = @(Get-ChildItem -LiteralPath $candidate.sourceRoot -Recurse -File -Force | ForEach-Object {
-        [IO.Path]::GetRelativePath($candidate.sourceRoot,$_.FullName)
+        [IO.Path]::GetRelativePath($candidate.sourceRoot,$_.FullName).Replace('\','/')
     } | Sort-Object)
     if (($actual -join "`n") -cne (@($manifest.Keys | Sort-Object) -join "`n")) { throw 'Candidate source file inventory changed.' }
-    foreach ($path in @('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','compose.yaml') + $(if ($Context.Mcp) { @('compose.mcp.yaml','mcp/Dockerfile') })) {
+    foreach ($path in @('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','compose.yaml') + $(if ($Context.Mcp) { @('compose.mcp.yaml','compose.mcp-metadata.yaml','mcp/Dockerfile') })) {
         if ((Get-FileHash -LiteralPath (Join-Path $Context.Root $path)).Hash.ToLowerInvariant() -cne ([string]$manifest[$path]).ToLowerInvariant()) {
             throw 'Invoking deployment tooling differs from the qualified candidate.'
         }
@@ -165,7 +165,7 @@ function Get-LocalReleaseTarget {
     foreach ($container in @($containers | Sort-Object Service)) {
         $details = Invoke-DockerCommand @('inspect','--format',
             '{"name":{{json .Name}},"mounts":{{json .Mounts}},"networks":{{json .NetworkSettings.Networks}},"ports":{{json .HostConfig.PortBindings}},"memory":{{json .HostConfig.Memory}},"cpus":{{json .HostConfig.NanoCpus}}}',$container.Id) -Capture | ConvertFrom-Json -AsHashtable
-        if ($details.name -cne "/$($Context.Project)-$($container.Service)-1" -or
+        if ($details.name -cne "/$($Context.Project)-agent-control-$($container.Service)-1" -or
             $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network)) { throw 'Release container network/name mismatch.' }
         $expected = if ($container.Service -eq 'postgres') {
             @{ '/var/lib/postgresql/data'=$Context.Volume; '/run/secrets/postgres-admin'=(Join-Path $Context.State 'secrets/postgres-admin') }
@@ -178,6 +178,9 @@ function Get-LocalReleaseTarget {
             @{ '/run/control'=(Join-Path $Context.State 'control'); '/run/agent-sharing-diagnostics'=(Join-Path $Context.State 'agent-sharing-diagnostics')
                 '/run/secrets/tenants.json'=(Join-Path $Context.State 'secrets/tenants.json'); '/run/secrets/session'=(Join-Path $Context.State 'secrets/session')
                 '/run/secrets/postgres-app'=(Join-Path $Context.State 'secrets/postgres-app') }
+        }
+        if (@($details.mounts | Where-Object Destination -CEQ '/run/secrets/mcp-metadata').Count -and $container.Service -cin @('app','mcp')) {
+            $expected['/run/secrets/mcp-metadata']=(Join-Path $Context.State 'secrets/mcp-metadata')
         }
         if ($details.mounts.Count -ne $expected.Count) { throw 'Release mount inventory differs.' }
         foreach ($mount in $details.mounts) {
@@ -318,6 +321,9 @@ function Get-LocalDeploymentIdentity {
         $configuration.Add("$path=$hash")
         if ($path -in @('secrets/postgres-admin','secrets/postgres-app')) { $database.Add("$path=$hash") }
     }
+    if ($Context.Mcp -and (Test-LocalMcpMetadataCredential $Context)) {
+        $configuration.Add("secrets/mcp-metadata=$((Get-FileHash -LiteralPath (Join-Path $Context.State 'secrets/mcp-metadata')).Hash)")
+    }
     foreach ($file in $ComposeFiles) { $configuration.Add((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash) }
     $database.Add($Context.OperatorImageId)
     $key = [Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $Context.State 'secrets/session')))
@@ -451,7 +457,7 @@ function Invoke-LocalApplication {
         if ($candidate) {
             $compose = @($Context.Compose)
             for ($index=0; $index -lt $compose.Count-1; $index++) {
-                if ($compose[$index] -eq '-f' -and [IO.Path]::GetFullPath($compose[$index+1]) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'))) {
+                if ($compose[$index] -eq '-f' -and [IO.Path]::GetFullPath($compose[$index+1]) -cin @((Join-Path $Context.Root 'compose.yaml'),(Join-Path $Context.Root 'compose.mcp.yaml'),(Join-Path $Context.Root 'compose.mcp-metadata.yaml'))) {
                     $compose[$index+1] = Join-Path $candidate.sourceRoot ([IO.Path]::GetFileName($compose[$index+1]))
                 }
             }
@@ -510,6 +516,12 @@ function Invoke-LocalApplication {
         }
         if (-not $candidate) { Save-LocalConfiguration $Context $plan }
         Write-LocalComposeEnvironment $Context
+        # Saving optional metadata credentials can add a Compose input after snapshot capture.
+        $snapshot.Compose = @($Context.Compose)
+        $snapshot.ComposeFiles = @(for ($index=0; $index -lt $snapshot.Compose.Count-1; $index++) {
+            if ($snapshot.Compose[$index] -eq '-f') { $snapshot.Compose[$index+1] }
+        })
+        $Context.AppliedComposeFiles = $snapshot.ComposeFiles
         Test-LocalMcpConfiguration $Context
         $identity = Get-LocalDeploymentIdentity $Context $snapshot.ComposeFiles
         if ($progress -and -not $candidate -and $progress.databaseIdentity -and $progress.databaseIdentity -cne $identity.database) {

@@ -1,0 +1,1250 @@
+{
+  "sdk": "2.3.0",
+  "serializer": "model_dump(mode=\"json\", by_alias=True, exclude_none=True); json.dumps(ensure_ascii=False, separators=(\",\", \":\")).encode(\"utf-8\")",
+  "tools": 124,
+  "bytes": 1130328,
+  "sha256": "f74b993ccb15e04e4a73b0324207c243d6b1ad5776c94c10b11dbeffd6ca8893",
+  "instructions": null,
+  "operations": [
+    {
+      "name": "list_workspace_jobs",
+      "method": "GET",
+      "path": "/api/workbench/jobs",
+      "request": "Empty",
+      "response": "WorkspaceJobs",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_capabilities",
+      "method": "GET",
+      "path": "/api/capabilities",
+      "request": "Empty",
+      "response": "Capabilities",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_capability_check_progress",
+      "method": "GET",
+      "path": "/api/capabilities/check-progress",
+      "request": "CheckInput",
+      "response": "CheckProgress",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "check_capabilities",
+      "method": "POST",
+      "path": "/api/capabilities/check",
+      "request": "CheckInput",
+      "response": "Capabilities",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "probe_capability",
+      "method": "POST",
+      "path": "/api/capabilities/{id}/probe",
+      "request": "ProbeInput",
+      "response": "CapabilityView",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "capture_agent_inventory",
+      "method": "POST",
+      "path": "/api/agent-inventory/selections",
+      "request": "InventoryCapture",
+      "response": "InventoryCaptureResult",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agents",
+      "method": "GET",
+      "path": "/api/agent-inventory",
+      "request": "InventoryList",
+      "response": "InventoryPage",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_inventory_health",
+      "method": "GET",
+      "path": "/api/agent-inventory/health",
+      "request": "Empty",
+      "response": "InventoryHealthResult",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_inventory_summary",
+      "method": "GET",
+      "path": "/api/agent-inventory/summary",
+      "request": "Selected",
+      "response": "SelectedSummary",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_facets",
+      "method": "GET",
+      "path": "/api/agent-inventory/facets",
+      "request": "InventoryFacet",
+      "response": "InventoryFacets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_agent",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/detail",
+      "request": "AgentSelected",
+      "response": "Agent",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_members",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/members",
+      "request": "AgentSelected",
+      "response": "Members",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_children",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/children",
+      "request": "AgentChildren",
+      "response": "Children",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_sections",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/sections",
+      "request": "AgentSections",
+      "response": "Sections",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "read_agent_about",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/about",
+      "request": "AboutInput",
+      "response": "AgentAboutPage",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_responsibility",
+      "method": "GET",
+      "path": "/api/agent-responsibility",
+      "request": "ResponsibilityInput",
+      "response": "Responsibility",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resolve_agent_people",
+      "method": "POST",
+      "path": "/api/agent-inventory/people/resolve",
+      "request": "ResolvePeople",
+      "response": "ResolvedPeople",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "capture_packages",
+      "method": "POST",
+      "path": "/api/agents/selections",
+      "request": "InventoryCapture",
+      "response": "PublishedSelectedRead",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_packages",
+      "method": "GET",
+      "path": "/api/agents",
+      "request": "InventoryList",
+      "response": "PackagePage",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_package",
+      "method": "GET",
+      "path": "/api/agents/{id}/detail",
+      "request": "PackageDetailInput",
+      "response": "PackageDetail",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_native_agent_activity",
+      "method": "GET",
+      "path": "/api/inventory/resources/{nativeId}/related",
+      "request": "NativeActivityInput",
+      "response": "NativeActivity",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resolve_studio_targets",
+      "method": "GET",
+      "path": "/api/inventory/quarantine-selection",
+      "request": "StudioTargetsInput",
+      "response": "StudioTargets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_users",
+      "method": "GET",
+      "path": "/api/copilot-usage/users",
+      "request": "UsersInput",
+      "response": "ReportPage[CombinedUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_user_facets",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/facets",
+      "request": "ReportFacetInput",
+      "response": "ReportFacets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_unresolved_users",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/unresolved-identities",
+      "request": "UsersInput",
+      "response": "ReportPage[UnresolvedUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resolve_user",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/resolve",
+      "request": "ResolveUser",
+      "response": "UserResolution",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_user",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/{objectId}",
+      "request": "UserDetailInput",
+      "response": "ReportDetail[CombinedUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_user_service_plans",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/{objectId}/service-plans",
+      "request": "UserDetailInput",
+      "response": "ReportPage[ServicePlan]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_user_used_agents",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/{objectId}/agents",
+      "request": "UserUsedAgentsInput",
+      "response": "ReportPage[ReportRelationship]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_user_agent_relationships",
+      "method": "GET",
+      "path": "/api/copilot-usage/users/{objectId}/agent-relationships",
+      "request": "SavedRelationshipsInput",
+      "response": "SavedRelationships",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_adoption_groups",
+      "method": "GET",
+      "path": "/api/copilot-usage/adoption",
+      "request": "AdoptionInput",
+      "response": "AdoptionPage",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_adoption_facets",
+      "method": "GET",
+      "path": "/api/copilot-usage/adoption/facets",
+      "request": "ReportFacetInput",
+      "response": "ReportFacets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_champion_agents",
+      "method": "GET",
+      "path": "/api/copilot-usage/adoption/champions",
+      "request": "ChampionsInput",
+      "response": "ChampionAgents",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_agents",
+      "method": "GET",
+      "path": "/api/official-usage/aggregate",
+      "request": "ReportAgentsInput",
+      "response": "ReportPage[ReportAgent]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_agent_facets",
+      "method": "GET",
+      "path": "/api/official-usage/aggregate/facets",
+      "request": "ReportFacetInput",
+      "response": "ReportFacets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_users",
+      "method": "GET",
+      "path": "/api/official-usage/users",
+      "request": "ReportUsersInput",
+      "response": "ReportPage[ReportUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_user_facets",
+      "method": "GET",
+      "path": "/api/official-usage/users/facets",
+      "request": "ReportFacetInput",
+      "response": "ReportFacets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_relationships",
+      "method": "GET",
+      "path": "/api/official-usage/agent-users",
+      "request": "RelationshipInput",
+      "response": "ReportPage[ReportRelationship]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_report_agent",
+      "method": "GET",
+      "path": "/api/official-usage/agents/{agentId}",
+      "request": "ReportAgentDetail",
+      "response": "ReportDetail[ReportAgent]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_agent_users",
+      "method": "GET",
+      "path": "/api/official-usage/agents/{agentId}/users",
+      "request": "ReportAgentUsers",
+      "response": "ReportPage[ReportRelationship]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_report_user",
+      "method": "GET",
+      "path": "/api/official-usage/users/{username}",
+      "request": "ReportUserDetail",
+      "response": "ReportDetail[ReportUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_user_agents",
+      "method": "GET",
+      "path": "/api/official-usage/users/{username}/agents",
+      "request": "ReportUserAgents",
+      "response": "ReportPage[ReportRelationship]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_report_user_directory",
+      "method": "GET",
+      "path": "/api/official-usage/users/{username}/directory",
+      "request": "ReportUserDetail",
+      "response": "ReportDetail[CombinedUser]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_user_service_plans",
+      "method": "GET",
+      "path": "/api/official-usage/users/{username}/service-plans",
+      "request": "ReportUserDetail",
+      "response": "ReportPage[ServicePlan]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_history",
+      "method": "GET",
+      "path": "/api/official-usage/history",
+      "request": "HistoryInput",
+      "response": "ReportPage[HistorySet]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_options",
+      "method": "GET",
+      "path": "/api/official-usage/history/options",
+      "request": "HistoryInput",
+      "response": "ReportList[HistorySet]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_report_observations",
+      "method": "GET",
+      "path": "/api/official-usage/history/{setId}/observations",
+      "request": "ObservationsInput",
+      "response": "ReportPage[Observation]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_report_overview",
+      "method": "GET",
+      "path": "/api/official-usage/overview",
+      "request": "OverviewInput",
+      "response": "ReportPage[OverviewAgent]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_agent_usage",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/usage",
+      "request": "UsageInput",
+      "response": "UsageSummary",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_usage_history",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/usage-history",
+      "request": "UsageHistoryInput",
+      "response": "UsageHistory",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_usage_users",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/usage-users",
+      "request": "UsageUsersInput",
+      "response": "UsageUsers",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_usage_associations",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/usage-associations",
+      "request": "UsageInput",
+      "response": "UsageAssociations",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_usage_candidates",
+      "method": "GET",
+      "path": "/api/agent-inventory/{recordId}/usage-candidates",
+      "request": "UsageCandidatesInput",
+      "response": "UsageCandidates",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_sync_state",
+      "method": "GET",
+      "path": "/api/data-sync/state",
+      "request": "Empty",
+      "response": "SyncState",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "start_sync",
+      "method": "POST",
+      "path": "/api/data-sync/runs",
+      "request": "StartSync",
+      "response": "SyncRun",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_sync_run",
+      "method": "GET",
+      "path": "/api/data-sync/runs/{id}",
+      "request": "JobId",
+      "response": "SyncRun",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "retry_sync",
+      "method": "POST",
+      "path": "/api/data-sync/runs/{id}/retry",
+      "request": "RetrySync",
+      "response": "SyncRun",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_sync",
+      "method": "POST",
+      "path": "/api/data-sync/runs/{id}/cancel",
+      "request": "JobId",
+      "response": "SyncRun",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_package_detail_sync",
+      "method": "GET",
+      "path": "/api/data-sync/package-details",
+      "request": "Empty",
+      "response": "DetailSyncState",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "start_package_detail_sync",
+      "method": "POST",
+      "path": "/api/data-sync/package-details/start",
+      "request": "Empty",
+      "response": "DetailSyncState",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_package_detail_sync",
+      "method": "POST",
+      "path": "/api/data-sync/package-details/cancel",
+      "request": "Empty",
+      "response": "DetailSyncState",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "refresh_packages",
+      "method": "POST",
+      "path": "/api/agents/refresh-jobs",
+      "request": "RefreshPackages",
+      "response": "PackageRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "refresh_package",
+      "method": "POST",
+      "path": "/api/agents/{id}/refresh-jobs",
+      "request": "RefreshPackage",
+      "response": "PackageRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "refresh_selected_packages",
+      "method": "POST",
+      "path": "/api/agents/refresh-selection",
+      "request": "RefreshSelected",
+      "response": "PackageRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_package_refresh_jobs",
+      "method": "GET",
+      "path": "/api/agents/refresh-jobs",
+      "request": "PackageJobs",
+      "response": "RefreshJobs[PackageRefreshJob]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_package_refresh_job",
+      "method": "GET",
+      "path": "/api/agents/refresh-jobs/{id}",
+      "request": "PackageJobId",
+      "response": "PackageRefreshJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_package_refresh_targets",
+      "method": "GET",
+      "path": "/api/agents/refresh-jobs/{id}/targets",
+      "request": "PackageTargets",
+      "response": "RefreshTargets",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resume_package_refresh",
+      "method": "POST",
+      "path": "/api/agents/refresh-jobs/{id}/resume",
+      "request": "PackageJobId",
+      "response": "PackageRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_package_refresh",
+      "method": "POST",
+      "path": "/api/agents/refresh-jobs/{id}/cancel",
+      "request": "PackageJobId",
+      "response": "PackageRefreshJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "refresh_studio_inventory",
+      "method": "POST",
+      "path": "/api/inventory/refresh-jobs",
+      "request": "RefreshStudio",
+      "response": "StudioRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_studio_refresh_jobs",
+      "method": "GET",
+      "path": "/api/inventory/refresh-jobs",
+      "request": "JobList",
+      "response": "RefreshJobs[StudioRefreshJob]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_studio_refresh_job",
+      "method": "GET",
+      "path": "/api/inventory/refresh-jobs/{id}",
+      "request": "JobId",
+      "response": "StudioRefreshJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resume_studio_refresh",
+      "method": "POST",
+      "path": "/api/inventory/refresh-jobs/{id}/resume",
+      "request": "JobId",
+      "response": "StudioRefreshJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_studio_refresh",
+      "method": "POST",
+      "path": "/api/inventory/refresh-jobs/{id}/cancel",
+      "request": "JobId",
+      "response": "StudioRefreshJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "search_access_principals",
+      "method": "GET",
+      "path": "/api/directory/principals",
+      "request": "SearchPrincipals",
+      "response": "DirectoryPrincipals",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resolve_access_principals",
+      "method": "POST",
+      "path": "/api/directory/principals/resolve",
+      "request": "ResolvePrincipals",
+      "response": "DirectoryPrincipals",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_agent_investigation",
+      "method": "GET",
+      "path": "/api/agent-inventory/investigations/context",
+      "request": "InvestigationInput",
+      "response": "InvestigationContext",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resolve_agent_identity",
+      "method": "POST",
+      "path": "/api/agent-inventory/investigations/resolve",
+      "request": "InvestigationInput",
+      "response": "InvestigationContext",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_agent_purview_records",
+      "method": "GET",
+      "path": "/api/agent-inventory/investigations/purview",
+      "request": "AgentPurviewInput",
+      "response": "AgentPurviewRecords",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_purview_catalog",
+      "method": "GET",
+      "path": "/api/audit-search/catalog",
+      "request": "Empty",
+      "response": "PurviewCatalog",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "start_purview_search",
+      "method": "POST",
+      "path": "/api/audit-search/jobs",
+      "request": "StartPurview",
+      "response": "PurviewJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_purview_jobs",
+      "method": "GET",
+      "path": "/api/audit-search/jobs",
+      "request": "PurviewHistory",
+      "response": "JobHistory[PurviewJob]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_purview_job",
+      "method": "GET",
+      "path": "/api/audit-search/jobs/{id}",
+      "request": "JobId",
+      "response": "PurviewJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resume_purview_search",
+      "method": "POST",
+      "path": "/api/audit-search/jobs/{id}/resume",
+      "request": "JobId",
+      "response": "PurviewJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_purview_search",
+      "method": "POST",
+      "path": "/api/audit-search/jobs/{id}/cancel",
+      "request": "JobId",
+      "response": "PurviewJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "delete_purview_cache",
+      "method": "DELETE",
+      "path": "/api/audit-search/jobs/{id}",
+      "request": "DeleteCache",
+      "response": "Deleted",
+      "provider": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "list_purview_records",
+      "method": "GET",
+      "path": "/api/audit-search/jobs/{id}/records",
+      "request": "PurviewRecordsInput",
+      "response": "PurviewRecords",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_hunting_catalog",
+      "method": "GET",
+      "path": "/api/hunting/catalog",
+      "request": "HuntingTarget",
+      "response": "HuntingCatalog",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "start_hunt",
+      "method": "POST",
+      "path": "/api/hunting/jobs",
+      "request": "StartHunt",
+      "response": "HuntingJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_hunting_jobs",
+      "method": "GET",
+      "path": "/api/hunting/jobs",
+      "request": "HuntingHistory",
+      "response": "JobHistory[HuntingJob]",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_hunting_job",
+      "method": "GET",
+      "path": "/api/hunting/jobs/{id}",
+      "request": "HuntingJobInput",
+      "response": "HuntingJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "resume_hunt",
+      "method": "POST",
+      "path": "/api/hunting/jobs/{id}/resume",
+      "request": "HuntingJobInput",
+      "response": "HuntingJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_hunt",
+      "method": "POST",
+      "path": "/api/hunting/jobs/{id}/cancel",
+      "request": "HuntingJobInput",
+      "response": "HuntingJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "delete_hunting_cache",
+      "method": "DELETE",
+      "path": "/api/hunting/jobs/{id}",
+      "request": "DeleteHuntingCache",
+      "response": "Deleted",
+      "provider": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "list_hunting_rows",
+      "method": "GET",
+      "path": "/api/hunting/jobs/{id}/rows",
+      "request": "HuntingRowsInput",
+      "response": "HuntingRows",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_administrative_audit",
+      "method": "GET",
+      "path": "/api/audit/events",
+      "request": "AuditInput",
+      "response": "AuditEvents",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "preview_agent_control",
+      "method": "POST",
+      "path": "/api/agent-controls/preview",
+      "request": "PreviewAgentControl",
+      "response": "AgentControlPreview",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "execute_agent_control",
+      "method": "POST",
+      "path": "/api/agent-controls/execute",
+      "request": "ExecuteAgentControl",
+      "response": "AgentControlExecution",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "get_agent_control",
+      "method": "GET",
+      "path": "/api/agent-controls/{receiptId}",
+      "request": "AgentControlReceipt",
+      "response": "AgentControlExecution",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "count_package_targets",
+      "method": "POST",
+      "path": "/api/agents/mutation-selection",
+      "request": "CountPackageTargets",
+      "response": "TargetCount",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "preview_package_control",
+      "method": "POST",
+      "path": "/api/agents/mutation-preview",
+      "request": "PreviewPackageControl",
+      "response": "PackagePreview",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "block_packages",
+      "method": "POST",
+      "path": "/api/agents/block",
+      "request": "SubmitPackages",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "unblock_packages",
+      "method": "POST",
+      "path": "/api/agents/unblock",
+      "request": "SubmitPackages",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "block_selected_packages",
+      "method": "POST",
+      "path": "/api/agents/block-all",
+      "request": "SubmitSelectedPackages",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "unblock_selected_packages",
+      "method": "POST",
+      "path": "/api/agents/unblock-all",
+      "request": "SubmitSelectedPackages",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "block_package",
+      "method": "POST",
+      "path": "/api/agents/{id}/block",
+      "request": "SubmitPackage",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "unblock_package",
+      "method": "POST",
+      "path": "/api/agents/{id}/unblock",
+      "request": "SubmitPackage",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "update_packages_access",
+      "method": "POST",
+      "path": "/api/agents/access",
+      "request": "UpdatePackagesAccess",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "update_package_access",
+      "method": "PATCH",
+      "path": "/api/agents/{id}/access",
+      "request": "UpdatePackageAccess",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "list_package_control_jobs",
+      "method": "GET",
+      "path": "/api/agents/bulk-jobs",
+      "request": "JobList",
+      "response": "PackageJobs",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_package_control_job",
+      "method": "GET",
+      "path": "/api/agents/bulk-jobs/{id}",
+      "request": "JobId",
+      "response": "PackageJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_package_control_items",
+      "method": "GET",
+      "path": "/api/agents/bulk-jobs/{id}/items",
+      "request": "PackageItems",
+      "response": "PackageItems",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_package_control",
+      "method": "POST",
+      "path": "/api/agents/bulk-jobs/{id}/cancel",
+      "request": "JobId",
+      "response": "PackageJob",
+      "provider": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "resume_package_control",
+      "method": "POST",
+      "path": "/api/agents/bulk-jobs/{id}/resume",
+      "request": "ResumeControl",
+      "response": "PackageJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "reconcile_package_control",
+      "method": "POST",
+      "path": "/api/agents/bulk-jobs/{id}/reconcile",
+      "request": "JobId",
+      "response": "ReconciledPackageJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_studio_status",
+      "method": "GET",
+      "path": "/api/quarantine/status",
+      "request": "StudioStatus",
+      "response": "StudioStatus",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "preview_studio_control",
+      "method": "POST",
+      "path": "/api/quarantine/preview",
+      "request": "PreviewStudioControl",
+      "response": "StudioPreview",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "execute_studio_control",
+      "method": "POST",
+      "path": "/api/quarantine/jobs",
+      "request": "ExecuteStudioControl",
+      "response": "StudioJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": true
+    },
+    {
+      "name": "list_studio_control_jobs",
+      "method": "GET",
+      "path": "/api/quarantine/jobs",
+      "request": "JobList",
+      "response": "StudioJobs",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "get_studio_control_job",
+      "method": "GET",
+      "path": "/api/quarantine/jobs/{id}",
+      "request": "JobId",
+      "response": "StudioJob",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "cancel_studio_control",
+      "method": "POST",
+      "path": "/api/quarantine/jobs/{id}/cancel",
+      "request": "JobId",
+      "response": "StudioJob",
+      "provider": false,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "resume_studio_control",
+      "method": "POST",
+      "path": "/api/quarantine/jobs/{id}/resume",
+      "request": "ResumeControl",
+      "response": "StudioJob",
+      "provider": true,
+      "destructive": true,
+      "idempotent": false
+    },
+    {
+      "name": "reconcile_studio_control",
+      "method": "POST",
+      "path": "/api/quarantine/jobs/{id}/reconcile",
+      "request": "JobId",
+      "response": "ReconciledStudioJob",
+      "provider": true,
+      "destructive": false,
+      "idempotent": false
+    },
+    {
+      "name": "list_studio_control_audit",
+      "method": "GET",
+      "path": "/api/quarantine/audit",
+      "request": "StudioAudit",
+      "response": "StudioAudit",
+      "provider": false,
+      "destructive": false,
+      "idempotent": false
+    }
+  ]
+}

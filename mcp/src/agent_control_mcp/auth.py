@@ -72,8 +72,7 @@ def valid_claims(
             and (expected_oid is None or oid == expected_oid)
             and (
                 not api
-                or now - iat < 300
-                and isinstance(roles, list)
+                or isinstance(roles, list)
                 and any(
                     role
                     in {
@@ -192,7 +191,7 @@ class TenantAzureProvider(AzureProvider):
                     **{**verified.model_dump(), "client_id": client_id},
                     reference=token,
                 )
-        except TimeoutError, ConfigurationError:
+        except TimeoutError, ConfigurationError, JoseError:
             return None
 
     @staticmethod
@@ -384,7 +383,9 @@ class ApiTokenExchange:
                     api=True,
                     expected_oid=upstream.claims["oid"],
                 ):
-                    raise ValueError
+                    raise AdapterError(
+                        401, "reauthorization_required", "Reconnect this signed-in account."
+                    )
                 return verified
         except TimeoutError, httpx2.TimeoutException:
             raise AdapterError(
@@ -396,7 +397,9 @@ class ApiTokenExchange:
             ) from None
         except ValueError, KeyError, TypeError:
             raise AdapterError(
-                401, "reauthorization_required", "Reconnect this signed-in account."
+                502,
+                "invalid_authorization_response",
+                "Microsoft returned invalid API token metadata.",
             ) from None
 
 

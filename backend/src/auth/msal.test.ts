@@ -7,7 +7,7 @@ import { inventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { capabilityDefinitions } from "../services/capabilityRegistry.js";
 import { createBearerCredentials } from "./delegatedCredentials.js";
 import { withAuthority } from "./authorityContext.js";
-import { epochAuthority, oboFetcher, tenant as foundationTenant, verifiedBearer } from "./authFoundationTestSupport.js";
+import { epochAuthority, oboFetcher, sdkResponse, tenant as foundationTenant, verifiedBearer } from "./authFoundationTestSupport.js";
 
 const { tenant, otherTenant } = vi.hoisted(() => {
   const tenant: TenantConfiguration = { tenantId: "11111111-1111-1111-1111-111111111111", clientId: "22222222-2222-2222-2222-222222222222", clientSecret: "fixture", domains: ["example.invalid"], displayName: "First tenant" };
@@ -192,10 +192,17 @@ it("reads identity-provider retry evidence without invoking accessors or proxy t
 });
 
 describe("token error normalization", () => {
-  function rejectToken(error: unknown, operation: "delegated" | "application" | "revalidation" = "delegated") {
+  function rejectToken(error: unknown, operation: "delegated" | "application" | "revalidation" | "authorization" | "redemption" = "delegated") {
     const failure = vi.fn(async () => { throw error; });
-    const { client } = fakeClient({ acquireTokenSilent: failure, acquireTokenByClientCredential: failure });
+    const { client } = fakeClient({
+      acquireTokenSilent: failure, acquireTokenByClientCredential: failure,
+      getAuthCodeUrl: failure, acquireTokenByCode: failure,
+    });
     replaceMsalClientForTest(tenantId, client);
+    if (operation === "authorization" || operation === "redemption") {
+      const flow = createAuthFlow("login", { tenantId, username: account.username });
+      return operation === "authorization" ? createAuthorizationUrl(flow) : redeemAuthorizationCode("code", flow);
+    }
     return operation === "application" ? acquireApplicationToken(tenantId, "graph.package.read.application")
       : operation === "revalidation" ? revalidateAuthenticatedUser(tenantId, account.homeAccountId)
         : acquireDelegatedToken(tenantId, account.homeAccountId, "graph.package.read.delegated");
@@ -272,7 +279,7 @@ describe("token error normalization", () => {
     expect(getter).not.toHaveBeenCalled();
   });
 
-  it.each(["delegated", "application", "revalidation"] as const)(
+  it.each(["delegated", "application", "revalidation", "authorization", "redemption"] as const)(
     "preserves native application errors and safe normalization for %s", async operation => {
       const original = new AppError(401, "authorization_expired", "Sign in again.", { correlationId: "original-id" });
       const getter = vi.fn(() => { throw new Error("replacement provider metadata"); });
@@ -315,11 +322,52 @@ describe("token error normalization", () => {
       code: "identity_provider_error", status: 502, details: { httpStatus: 503 }, retryable: false,
     },
   ])("preserves native MSAL $code semantics and sanitized details", async ({ error, code, status, details, retryable }) => {
-    const normalized = await rejectToken(error).catch((failure: unknown) => failure);
-    expect(normalized).toBeInstanceOf(AppError);
-    expect(normalized).toMatchObject({ code, status, details });
-    expect(isRetryableIdentityProviderError(normalized)).toBe(retryable);
-    expect(JSON.stringify(normalized)).not.toMatch(/private|unsafe|errorMessage|claims/);
+    for (const operation of ["delegated", "authorization", "redemption"] as const) {
+      const normalized = await rejectToken(error, operation).catch((failure: unknown) => failure);
+      expect(normalized).toBeInstanceOf(AppError);
+      expect(normalized).toMatchObject({ code, status, details });
+      expect(isRetryableIdentityProviderError(normalized)).toBe(retryable);
+      expect(JSON.stringify(normalized)).not.toMatch(/private|unsafe|errorMessage|claims/);
+    }
+  });
+
+  it.each([
+    { status: 429, body: "private throttle", expected: { status: 429, code: "provider_throttled", retryAfterSeconds: 120 } },
+    { status: 400, body: JSON.stringify({ error: "invalid_grant", error_description: "AADSTS65001: private consent failure" }),
+      expected: { status: 403, code: "missing_permission", details: { providerErrorCode: "AADSTS65001" } } },
+  ])("normalizes native MSAL code-exchange failures with HTTP $status", async ({ status, body, expected }) => {
+    const fetcher = vi.fn(async () => new Response(body, { status, headers: { "retry-after": "120" } }));
+    vi.stubGlobal("fetch", fetcher);
+    replaceMsalClientForTest(tenantId, nativeClient() as unknown as MsalClient);
+    const flow = createAuthFlow("login", { tenantId, username: account.username });
+    const error: unknown = await redeemAuthorizationCode("code", flow).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AppError);
+    expect(error).toMatchObject(expected);
+    expect(JSON.stringify(error)).not.toContain("private");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("completes initial browser sign-in with native MSAL and a mocked token response", async () => {
+    replaceMsalClientForTest(tenantId, nativeClient() as unknown as MsalClient);
+    const flow = createAuthFlow("login", { tenantId, username: account.username });
+    const fetcher = vi.fn<typeof fetch>(async (_url, request) => sdkResponse({
+      claims: { nonce: flow.nonce, roles: ["AgentControl.Viewer"] },
+    }, request));
+    vi.stubGlobal("fetch", fetcher);
+
+    const authorizationUrl = new URL(await createAuthorizationUrl(flow));
+    expect(authorizationUrl.searchParams.get("scope")!.split(" ").sort()).toEqual([...flow.scopes].sort());
+    expect(fetcher).not.toHaveBeenCalled();
+    const result = await redeemAuthorizationCode("code", flow);
+    expect(toAuthenticatedUser(result)).toMatchObject({
+      tenantId, username: "alex@example.invalid", roles: ["AgentControl.Viewer"],
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
+    const request = new URLSearchParams(String(fetcher.mock.calls[0][1]?.body));
+    expect(request.get("code_verifier")).toBe(flow.codeVerifier);
+    expect(request.get("scope")!.split(" ").sort()).toEqual([...flow.scopes].sort());
+    await expect(getMsalClient(tenantId).getTokenCache().getAccountByHomeId(result.account!.homeAccountId))
+      .resolves.toMatchObject({ tenantId, username: "alex@example.invalid" });
   });
 });
 

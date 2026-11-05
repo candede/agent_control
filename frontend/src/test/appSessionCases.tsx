@@ -355,6 +355,64 @@ export function registerAppSessionTests(register: () => void) {
 }
 
 export function sessionAndNavigationCases() {
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)(
+    "opens MCP settings for %s without interrupting automatic read-only synchronization",
+    async role => {
+      const transport = appTransport({ initialRoles: [role], revalidatedRoles: [role] });
+      const base = transport.fetchMock.getMockImplementation()!;
+      transport.fetchMock.mockImplementation((input, init) => input === "/api/mcp/settings"
+        ? Promise.resolve(Response.json({ state: "unavailable", configured: { resourceUrl: "https://mcp.example.invalid/mcp" },
+          code: "metadata_unavailable" })) : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByText(agent.displayName);
+      await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
+      await userEvent.click(screen.getByRole("button", { name: "MCP settings" }));
+      expect(await screen.findByText("The server is configured, but validated runtime metadata is unavailable.")).toBeVisible();
+      expect(screen.getByRole("heading", { name: "MCP settings", level: 2 })).toBeVisible();
+      expect(screen.getByRole("button", { name: "MCP settings" })).toHaveAttribute("aria-current", "page");
+      expect(window.location.pathname).toBe("/mcp-settings");
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/mcp/settings")).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1);
+      expect(transport.fetchMock.mock.calls.filter(([input, init]) => init?.method === "POST"
+        && !["/api/capabilities/check", "/api/data-sync/auto-refresh", "/api/agent-inventory/selections"].includes(input))).toHaveLength(0);
+      await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+      expect(await screen.findByText(agent.displayName)).toBeVisible();
+      expect(window.location.pathname).toBe("/agents");
+    },
+  );
+
+  it("keeps an unconfigured MCP settings bookmark readable while starting automatic synchronization", async () => {
+    window.history.replaceState({}, "", "/mcp-settings");
+    const transport = appTransport({ revalidatedRoles: viewer.roles });
+    const base = transport.fetchMock.getMockImplementation()!;
+    transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
+      ? Promise.resolve(Response.json({ views: workbenchViews.filter(view => view.id !== "mcp-settings"), actions: workbenchActions }))
+      : input === "/api/mcp/settings" ? Promise.resolve(Response.json({ state: "not_configured" })) : base(input, init));
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    expect(await screen.findByText("No MCP server is configured for this organization.")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "MCP settings", level: 2 })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "MCP settings" })).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe("/mcp-settings");
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([input]) => input === "/api/data-sync/auto-refresh")).toHaveLength(1));
+    expect(transport.fetchMock.mock.calls.filter(([, init]) => init?.method === "POST").map(([input]) => input))
+      .toEqual(["/api/capabilities/check", "/api/data-sync/auto-refresh"]);
+  });
+
+  it("does not grant MCP settings or automatic synchronization without the Viewer role", async () => {
+    window.history.replaceState({}, "", "/mcp-settings");
+    const transport = appTransport({ initialRoles: [], revalidatedRoles: [] });
+    vi.stubGlobal("fetch", transport.fetchMock);
+    render(<App />);
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(screen.queryByRole("button", { name: "MCP settings" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "MCP settings" })).not.toBeInTheDocument();
+    expect(transport.fetchMock.mock.calls.some(([input]) =>
+      ["/api/mcp/settings", "/api/data-sync/auto-refresh"].includes(input))).toBe(false);
+    expect(window.location.pathname).toBe("/permissions");
+  });
+
   it("keeps ordinary agent Dashboard baseline navigation out of the Users URL", async () => {
     window.history.replaceState(null, "", "/dashboard?baseline=10000000-0000-4000-8000-000000000001");
     const transport = appTransport({ revalidatedRoles: viewer.roles });

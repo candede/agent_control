@@ -8,6 +8,7 @@ export const workbenchViewIds = [
   "sync",
   "audit",
   "permissions",
+  "mcp-settings",
 ] as const;
 
 type WorkbenchViewId = (typeof workbenchViewIds)[number];

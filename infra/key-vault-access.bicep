@@ -3,12 +3,12 @@ targetScope = 'resourceGroup'
 @description('Existing administrator-prepared Key Vault. This module changes role assignments only.')
 param vaultName string
 
-@description('Exactly three runtime secret names: tenant registry, session and application database credentials.')
-@minLength(3)
-@maxLength(3)
+@description('Exact per-secret read scopes for this runtime, including only its optional metadata credential.')
+@minLength(1)
+@maxLength(4)
 param runtimeSecretNames array
 
-@description('System-assigned App Service principal receiving per-secret read access.')
+@description('App Service principal receiving only the listed per-secret read access.')
 param appServicePrincipalId string
 
 var keyVaultSecretsUserRoleDefinitionId = subscriptionResourceId(

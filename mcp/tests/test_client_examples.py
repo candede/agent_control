@@ -10,6 +10,8 @@ import yaml
 from conftest import protocol_client, tokens
 from test_onboarding import PROFILES, VSCODE_REDIRECTS
 
+from agent_control_mcp.domains import PUBLIC_TOOLS
+
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "mcp" / "examples" / "clients"
 DOC = ROOT / "docs" / "mcp-clients.md"
@@ -87,7 +89,7 @@ def test_every_template_is_a_native_document_and_linked_from_the_guide():
 )
 def test_each_client_has_an_explicit_first_read(heading):
     section = DOC.read_text().split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0]
-    assert "list_capabilities" in section
+    assert "capabilities" in section
 
 
 def test_messages_api_recipe_has_the_documented_transport_toolset_and_token_boundary():
@@ -267,7 +269,7 @@ async def test_cloud_example_filters_to_real_read_only_tools_with_typed_inputs(b
         json={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
     )
     catalog = {tool["name"]: tool for tool in result.json()["result"]["tools"]}
-    assert len(catalog) == 124
+    assert len(catalog) == len(PUBLIC_TOOLS) == 50
     for name in examples["github-cloud"]["mcpServers"]["agentControl"]["tools"]:
         tool = catalog[name]
         assert tool["annotations"]["readOnlyHint"] is True

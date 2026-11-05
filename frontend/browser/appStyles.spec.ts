@@ -14,12 +14,63 @@ const styles = [
   "../src/components/savedInventoryVerification.css",
   "../src/components/workspaceSkeleton.css",
   "../src/components/adoptionDashboard.css",
+  "../src/components/mcpSettings.css",
 ].map(path => readFileSync(new URL(path, import.meta.url), "utf8")).join("\n");
 
 async function renderStyles(page: Page, content: string) {
   await page.route("**/*", route => route.abort());
   await page.setContent(`<style>${styles}</style>${content}`);
 }
+
+test("MCP runtime identities reflow at their supported limits without widening the page or controls", async ({ page }) => {
+  const name = "N".repeat(256), version = `v${"V".repeat(128)}`;
+  await renderStyles(page, `<main class="app-shell"><section class="mcp-settings">
+    <header class="mcp-page-heading"><div class="mcp-heading-copy"><h2>MCP settings</h2></div>
+      <button type="button" class="secondary mcp-refresh">Refresh metadata</button></header>
+    <div class="mcp-overview">
+      <section class="mcp-card"><h3>Connection details</h3><div class="mcp-endpoint">
+        <div class="mcp-field-heading"><span>Resource URL</span><span class="mcp-copy">
+          <button type="button" class="secondary">Copy</button></span></div>
+        <code>https://mcp.example.invalid/${"path".repeat(400)}</code></div></section>
+      <section class="mcp-card mcp-runtime"><h3>Runtime status</h3>
+        <div class="mcp-server-identity"><svg width="20" height="20" aria-hidden="true"></svg>
+          <strong>${name}</strong><span>${version}</span></div></section>
+    </div></section></main>`);
+  const identity = page.locator(".mcp-server-identity");
+  await expect(identity.locator("strong")).toHaveText(name);
+  await expect(identity.locator("span")).toHaveText(version);
+  for (const width of [320, 360, 600, 760, 1000, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    for (const selector of [".mcp-server-identity", ".mcp-server-identity strong", ".mcp-server-identity > span"]) {
+      expect(await page.locator(selector).evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    }
+    const copy = page.getByRole("button", { name: "Copy", exact: true });
+    expect((await copy.boundingBox())!.width).toBeLessThan(140);
+    expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(28);
+    const refresh = page.getByRole("button", { name: "Refresh metadata" });
+    expect((await refresh.boundingBox())!.height).toBeGreaterThanOrEqual(40);
+    if (width <= 600) {
+      expect((await refresh.boundingBox())!.width).toBeCloseTo((await page.locator(".mcp-page-heading").boundingBox())!.width);
+    }
+  }
+});
+
+test("MCP reduced-motion preferences disable every disclosure transition and loading animation", async ({ page }) => {
+  await renderStyles(page, `<section class="mcp-settings">
+    <details class="mcp-instructions"><summary>Instructions<svg></svg></summary></details>
+    <article class="mcp-tool"><details><summary>Tool<svg></svg></summary></details></article>
+    <div class="mcp-schemas"><details><summary>Schema<svg></svg></summary></details></div>
+    <details class="mcp-redirects"><summary>Redirects<svg></svg></summary></details>
+    <svg class="mcp-spinner"></svg></section>`);
+  for (const reducedMotion of ["reduce", "no-preference"] as const) {
+    await page.emulateMedia({ reducedMotion });
+    for (const arrow of await page.locator("summary > svg:last-child").all()) {
+      await expect(arrow).toHaveCSS("transition-duration", reducedMotion === "reduce" ? "0s" : "0.15s");
+    }
+    await expect(page.locator(".mcp-spinner")).toHaveCSS("animation-name", reducedMotion === "reduce" ? "none" : "mcp-spin");
+  }
+});
 
 test("weekly Office history action stays readable, spaced and keyboard accessible", async ({ page }) => {
   await renderStyles(page, `<main class="app-shell"><p class="dashboard-panel-note office-history-note">

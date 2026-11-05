@@ -54,13 +54,16 @@ param monitoringDailyIngestionLimitGiB string = '0.1'
 
 @description('Optional approved resource tags without secret values.')
 param tags object = {}
+@description('Deployment-owned MCP binding and optional prepared metadata-only secret reference; no secret values.')
+param mcpMetadata object = {}
 
 var secretNames = {
   sessionSecret: 'agent-control-session-secret'
   postgresAdminPassword: 'agent-control-postgres-admin-password'
   postgresAppPassword: 'agent-control-postgres-app-password'
 }
-var runtimeSecrets = [
+var metadataSecret = !empty(mcpMetadata) ? mcpMetadata.secret : {}
+var runtimeSecrets = concat([
   {
     name: tenantRegistrySecretName
     settingName: 'TENANTS_JSON'
@@ -76,7 +79,11 @@ var runtimeSecrets = [
     settingName: 'PGPASSWORD'
     version: postgresAppPasswordSecretVersion
   }
-]
+], !empty(metadataSecret) ? [{
+  name: metadataSecret.name
+  settingName: 'MCP_AZURE_METADATA_TOKEN'
+  version: metadataSecret.version
+}] : [])
 var commonTags = union(tags, {
   app: 'agent-control'
   topology: 'single-app-managed-postgresql'
@@ -201,7 +208,13 @@ resource appService 'Microsoft.Web/sites@2024-11-01' = {
           name: 'MAINTENANCE_MODE'
           value: 'true'
         }
-      ], runtimeAppSettings)
+      ], runtimeAppSettings, !empty(mcpMetadata) ? [
+        { name: 'MCP_METADATA_ORIGIN', value: mcpMetadata.origin }
+        { name: 'MCP_TENANT_ID', value: mcpMetadata.tenantId }
+        { name: 'MCP_API_CLIENT_ID', value: mcpMetadata.apiClientId }
+        { name: 'MCP_CLIENT_ID', value: mcpMetadata.mcpClientId }
+        { name: 'MCP_PUBLIC_URL', value: mcpMetadata.resourceUrl }
+      ] : [])
     }
   }
   tags: commonTags
@@ -447,6 +460,8 @@ resource postgresBackupStorageCostAlert 'Microsoft.Insights/metricAlerts@2018-03
   }
 }
 
+// Console tables are created on first ingestion, after fresh infrastructure deployment.
+// Keep these rules enabled without requiring the table during deployment validation.
 resource runtimeRestartAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
   name: '${appServiceName}-restarts'
   location: location
@@ -462,7 +477,7 @@ resource runtimeRestartAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01'
     criteria: {
       allOf: [
         {
-          query: 'AppServiceConsoleLogs | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent == "listening"'
+          query: 'AppServiceConsoleLogs | where _ResourceId =~ "${appService.id}" | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent == "listening"'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 2
@@ -478,7 +493,7 @@ resource runtimeRestartAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01'
     }
     autoMitigate: false
     checkWorkspaceAlertsStorageConfigured: false
-    skipQueryValidation: false
+    skipQueryValidation: true
   }
 }
 
@@ -497,7 +512,7 @@ resource providerFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01
     criteria: {
       allOf: [
         {
-          query: 'AppServiceConsoleLogs | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent in ("provider_throttled", "provider_schema_omission", "request_error")'
+          query: 'AppServiceConsoleLogs | where _ResourceId =~ "${appService.id}" | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent in ("provider_throttled", "provider_schema_omission", "request_error")'
           timeAggregation: 'Count'
           operator: 'GreaterThanOrEqual'
           threshold: 5
@@ -513,7 +528,7 @@ resource providerFailureAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01
     }
     autoMitigate: false
     checkWorkspaceAlertsStorageConfigured: false
-    skipQueryValidation: false
+    skipQueryValidation: true
   }
 }
 
@@ -532,7 +547,7 @@ resource safetyIncidentAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01'
     criteria: {
       allOf: [
         {
-          query: 'AppServiceConsoleLogs | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent in ("job_execution_stopped", "quarantine_job_stopped", "job_write_uncertain", "quarantine_write_uncertain", "official_usage_upload_cleanup_failed", "database_pool_error", "database_pool_saturated", "session_store_error")'
+          query: 'AppServiceConsoleLogs | where _ResourceId =~ "${appService.id}" | extend AgentControlEvent = tostring(parse_json(ResultDescription).event) | where AgentControlEvent in ("job_execution_stopped", "quarantine_job_stopped", "job_write_uncertain", "quarantine_write_uncertain", "official_usage_upload_cleanup_failed", "database_pool_error", "database_pool_saturated", "session_store_error")'
           timeAggregation: 'Count'
           operator: 'GreaterThan'
           threshold: 0
@@ -548,7 +563,7 @@ resource safetyIncidentAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01'
     }
     autoMitigate: false
     checkWorkspaceAlertsStorageConfigured: false
-    skipQueryValidation: false
+    skipQueryValidation: true
   }
 }
 

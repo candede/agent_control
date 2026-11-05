@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { type Server } from "node:http";
 import { resolve } from "node:path";
 import type { AuthenticationResult } from "@azure/msal-node";
@@ -106,6 +106,50 @@ const selectedBrowserFiles = browserFixtureTestFiles();
 let application: ReturnType<typeof createApp>;
 let server: Server;
 let savedLifecycle: Awaited<ReturnType<typeof savedReadBrowserFixture>> | undefined;
+let metadataProcess: ChildProcess | undefined;
+let metadataDirectory: string | undefined;
+async function startMcpMetadata() {
+  if (!selectedBrowserFiles.includes("mcpSettings.spec.ts")) return;
+  const python = process.env.AGENT_CONTROL_MCP_METADATA_PYTHON;
+  if (python !== "/opt/mcp/.venv/bin/python") throw new Error("Verified MCP browser image required.");
+  metadataDirectory = resolve(`../.local/browser-mcp-${randomUUID()}`);
+  await mkdir(metadataDirectory, { mode: 0o700, recursive: true });
+  metadataProcess = spawn(python, ["/opt/mcp/tests/browser_metadata_service.py", metadataDirectory], {
+    env: { ...process.env, MCP_FIXTURE_METADATA_TOKEN: randomBytes(32).toString("base64url") + "=" },
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const port = await new Promise<number>((resolvePort, reject) => {
+    let output = "";
+    const timer = setTimeout(() => reject(new Error("MCP metadata fixture startup deadline.")), 15_000);
+    metadataProcess!.once("error", error => { clearTimeout(timer); reject(error); });
+    metadataProcess!.once("exit", () => { clearTimeout(timer); reject(new Error("MCP metadata fixture exited during startup.")); });
+    metadataProcess!.stdout!.on("data", (chunk: Buffer) => {
+      output += chunk.toString();
+      if (!output.includes("\n")) return;
+      try {
+        const event = JSON.parse(output.split("\n")[0]);
+        if (event.event !== "browser_mcp_metadata" || !Number.isInteger(event.port) || event.port < 1024) throw new Error();
+        clearTimeout(timer); resolvePort(event.port);
+      } catch { clearTimeout(timer); reject(new Error("Invalid MCP metadata fixture identity.")); }
+    });
+  });
+  const tenant = config.tenants[0];
+  tenant.integration = { clientId: "33333333-3333-3333-3333-333333333333", audience: tenant.clientId, scope: "AgentControl.Access" };
+  Object.assign(process.env, {
+    MCP_TENANT_ID: tenant.tenantId, MCP_CLIENT_ID: tenant.integration.clientId, MCP_API_CLIENT_ID: tenant.clientId,
+    MCP_PUBLIC_URL: "https://browser-mcp.example.invalid/mcp", MCP_METADATA_ORIGIN: `http://127.0.0.1:${port}`,
+    MCP_METADATA_TOKEN_FILE: `${metadataDirectory}/METADATA_TOKEN`, MCP_LOCAL_HOST_PORT: String(port),
+  });
+  let ready = false;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try { ready = (await fetch(`http://127.0.0.1:${port}/ready`, { signal: AbortSignal.timeout(1000) })).ok; }
+    catch { /* The process reports its bound socket before lifespan finishes. */ }
+    if (ready) break;
+    await new Promise(resolveWait => setTimeout(resolveWait, 50));
+  }
+  if (!ready) throw new Error("Real MCP metadata fixture did not become ready.");
+  console.log(JSON.stringify({ event: "real_mcp_metadata_ready", port, tools: "actual_registered_catalog", providerCalls: 0 }));
+}
 async function seedOfficeBrowserEvidence() {
   if (selectedBrowserFiles.length && !selectedBrowserFiles.some(file => ["adoptionDashboard.spec.ts", "adoption.spec.ts"].includes(file))) return;
   const repository = new OfficeAppAdoptionRepository(fixture.runtime);
@@ -164,6 +208,7 @@ function quarantineResources() {
   }));
 }
 beforeAll(async () => {
+  await startMcpMetadata();
   fixture = await testDatabase();
   pool.options.database = fixture.name; pool.options.user = "agentcontrol_app"; pool.options.password = fixturePassword;
   const repository = new CapabilityRepository(fixture.runtime);
@@ -267,6 +312,14 @@ beforeAll(async () => {
     sha256: createHash("sha256").update(served).digest("hex") }));
 });
 afterAll(() => closeFixtureResources(
+  async () => {
+    if (metadataProcess && metadataProcess.exitCode === null) {
+      const exited = new Promise<void>(resolveExit => metadataProcess!.once("exit", () => resolveExit()));
+      metadataProcess.kill("SIGTERM");
+      await exited;
+    }
+    if (metadataDirectory) await rm(metadataDirectory, { recursive: true });
+  },
   () => savedLifecycle?.close(),
   () => dataSync.drain(),
   () => packageInventory.drain(),
