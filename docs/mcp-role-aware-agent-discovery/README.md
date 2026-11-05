@@ -56,8 +56,28 @@ executing the ordered prompts.
   a published Copilot Studio experience. Never use the author's/admin's shared
   connection as the identity for employee questions.
 - The future rollout targets the **existing `seha` production installation on
-  its current host using its existing deployment lifecycle**. Preserve data,
-  volumes, app registrations, OAuth keys and connections.
+  its current host using its existing deployment lifecycle**. Preserve its
+  infrastructure, registrations and OAuth state; the approved reset below
+  replaces the application database contents.
+
+### Approved reset and schema decision
+
+The user subsequently approved: "we can reset db and start over" and "with our
+current goals and usecases, prepare the best schema for your needs."
+This supersedes this folder's earlier saved-data preservation requirement.
+Design one current supported schema for these use cases, then reset the exact
+`seha` application database and initialize that schema through the existing
+deployment lifecycle. Existing application records, imports, history, jobs and
+browser sessions may be discarded. No data migration, old-schema adapter,
+dual writer or historical schema chain is required.
+
+This approval is about application data and schema, not unrestricted production
+actions. Preserve project settings/secrets, PostgreSQL service/volume/roles,
+Entra registrations/assignments, OAuth keys/storage and unrelated resources.
+Preserve real authentication/revocation protection; OAuth continuity does not
+promise that database-backed browser sessions or selections survive reset.
+Phase 02 owns the schema and reset/rebuild contract; phase 04 executes the
+authorized production reset only after a future implementation campaign starts.
 
 ## Current evidence and target flow
 
@@ -88,6 +108,17 @@ Source inspection established the following; it did not run application tests:
   also needs the current caller's projection, not a second static tool list.
 - The [Studio connection reference](../copilot-studio-mcp-connection.md) proves
   author-test saved-data access, not published per-end-user identity.
+- [Schema verification](../../backend/src/db/schema.ts) and the
+  [deployment lifecycle](../../scripts/local-runtime.ps1) reject a different
+  schema fingerprint. They do not supply a data-preserving index/schema upgrade.
+  The approved clean reset uses their existing current-only path instead.
+- [Organization classification](../../backend/src/types/agentPresentation.ts)
+  distinguishes `organization_created` from shared, Microsoft, deployed and
+  reported-use reasons. The broad `organization` view is not a created-here
+  eligibility predicate.
+- The MCP [diagnostics route](../../mcp/src/agent_control_mcp/service.py)
+  currently accepts an authenticated MCP user without a caller-specific API
+  access decision. Tool filtering alone does not cover that HTTP surface.
 
 **Current flow:** assigned user -> common MCP catalog -> canonical API role and
 provider checks -> saved adoption/admin data or an explicit provider operation.
@@ -113,6 +144,15 @@ provider checks -> saved adoption/admin data or an explicit provider operation.
 6. Every invocation is still authorized by the API, even if a client cached an
    old schema, names a hidden tool or forges a family action.
 
+**Release/reset flow:** deploy the coordinated current schema/API/MCP through
+the existing reset lifecycle -> admit roleless employees in the existing Entra
+applications only after the hardened runtime is active -> normal sign-in starts
+authorized application collection -> publish current inventory/directory facts
+-> import a genuine current usage-report bundle through the existing staff
+workflow when available -> qualify report-dependent answers. Catalog access
+does not wait for an import; missing report/workplace evidence stays explicit.
+No historical dataset is restored merely to make the installation look populated.
+
 **Design verdict: reuse and narrow, not build a new catalog platform.** Keep one
 API business owner, existing inventory/report authorities, existing collection
 jobs and the existing Python MCP catalog owner. A separate EndUser assignment,
@@ -128,6 +168,21 @@ actor/subject distinction and reuses those reads, not a session impersonation
 framework or a parallel employee API implementation. These protect real access
 and result correctness; they are not new acceptance or feature-enable gates.
 
+The simpler release choice is now a direct current-schema replacement, not an
+upgrade mechanism around the old database. Phase 02 chooses physical tables,
+columns and indexes from the actual query shapes and scale evidence; it may
+replace unsuitable structures and delete their producers/consumers together.
+Retain existing canonical source/report owners where they fit, not their layout
+for compatibility. Do not prescribe a separate search service, employee catalog
+copy or generic schema redesign. The tradeoff is deliberate loss of saved
+application data and a rebuild interval, including report-dependent answers
+remaining unavailable until genuine reports are imported.
+
+Keep the four phase boundaries: identity/policy, canonical data/API, MCP wire
+projection, and production reset/observation each has an independently
+verifiable contract. Reuse earlier exact-content retrieval, privacy and capacity
+evidence in the final phase instead of commissioning duplicate test campaigns.
+
 ## Repository roots and ordered manifest
 
 All application roots are in this repository: `backend`, `mcp`, `frontend`,
@@ -142,9 +197,9 @@ created during implementation, not fabricated during planning.
 | Order | Prompt | Outcome / owner | Prerequisites | Exact completion record |
 | --- | --- | --- | --- | --- |
 | 01 | [Roleless discovery authority](01-roleless-discovery-authority.md) | Audience/preview authority, deployment privacy configuration, onboarding, automatic first-run collection and browser handoff | None | `completions/01-roleless-discovery-authority.md` |
-| 02 | [Safe agent discovery API](02-safe-agent-discovery-api.md) | Privacy-enforced catalog, stored workplace scope, champion/popularity reads and shared staff preview | 01 | `completions/02-safe-agent-discovery-api.md` |
+| 02 | [Safe agent discovery API](02-safe-agent-discovery-api.md) | Current schema/reset contract, privacy-enforced catalog, workplace/champion/popularity reads and shared staff preview | 01 | `completions/02-safe-agent-discovery-api.md` |
 | 03 | [Role-aware MCP surface](03-role-aware-mcp-surface.md) | Native discovery/preview tools, projected schemas/guidance, invocation protection and matching settings/privacy metadata | 01 and 02 | `completions/03-role-aware-mcp-surface.md` |
-| 04 | [Verify, deploy and observe](04-verify-deploy-and-observe.md) | Aggregate/client/first-run proof, bounded `seha` deployment and live fix-forward convergence | 01, 02 and 03 | `completions/04-verify-deploy-and-observe.md` |
+| 04 | [Verify, deploy and observe](04-verify-deploy-and-observe.md) | Aggregate/client proof, bounded `seha` reset/deployment, source rebuild and live fix-forward convergence | 01, 02 and 03 | `completions/04-verify-deploy-and-observe.md` |
 
 Each phase implements and verifies its own contract. Phase 04 is not the owner
 of unfinished earlier functionality.
@@ -196,6 +251,10 @@ scope; it never means the whole tenant or all people with missing fields.
 Missing report data disables only the corresponding report-based answer.
 Organization catalog search remains usable for an authenticated eligible user.
 Assigned users keep their existing explicitly authorized capabilities.
+Exact membership lookup is not a second stored-workplace writer. An unlicensed
+employee absent from saved directory/report sources can remain catalog-only
+even after automatic collection; test and state that limitation rather than
+promise that sign-in necessarily populates a personal workplace profile.
 
 Staff preview requires the current real actor's Viewer hierarchy, including
 Uploader/Admin. Resolve the supplied UPN/corporate account identifier exactly
@@ -236,6 +295,12 @@ employees manual sync/job APIs, or expose an EndUser sync tool.
 Do not add a second scheduler, collection writer, startup approval or readiness
 check prerequisite. Catalogue/tool reads themselves remain provider-free after
 authentication; record automatic sign-in collection separately in tests.
+The current browser polling hook is not an API sign-in trigger, and the MCP
+adapter currently exchanges API tokens during invocations. Phase 01 owns the
+API authenticated-entry/due-admission contract and browser hook; phase 03 wires
+native initialize/list to that API entry before any business call. Reuse admission to
+deduplicate reconnects, refresh and concurrent sign-ins; do not make every
+catalog read launch work or block authentication on collection completion.
 
 Power Platform's delegated-only inventory cannot be bootstrapped with imaginary
 application permissions. Preserve collection when a genuinely authorized reader
@@ -269,6 +334,10 @@ schemas or total-count aliases.
 
 Include private/draft organization-created records without a new publication
 workflow. Respect actual saved source authority and removal/revocation fences.
+Use the existing `organization_created` evidence, not the broader organization
+view, tenant presence, installation or reported use alone. A canonical record
+qualifies when a current authoritative source proves organization creation;
+unknown origin is an explicit coverage limitation, not guessed eligibility.
 Uncollected agents cannot be discovered; partial coverage is not proof there
 are no other agents. Do not broaden this feature into third-party marketplace
 enumeration or execution of discovered agents.
@@ -321,11 +390,21 @@ every catalog read.
 Names withheld is not no owner/no champions/no data. Return an explicit
 privacy-withheld state while retaining department/company scope, report dates,
 agent identity, nonidentifying descriptions/use cases and the same internal
-ranked set. Champion suggestions can be reported as available with identity
+champion/popularity ranked set. Champion suggestions can be reported as available with identity
 hidden, without person IDs, stable employee pseudonyms, contact hints or usage
 counts. Own suggested/not-suggested/unavailable champion status remains usable
 without naming the subject. Do not recover hidden relationships through search
 filters, match explanations, citations or another discovery/detail/About route.
+
+Catalog eligibility and underlying champion/popularity ranking are independent
+of privacy. Goal search, however, must match permitted task evidence, not use a
+hidden name/email/ID as an invisible retrieval or ranking signal. Reject
+unsupported person/owner filters and test identity-only probes, including a
+hidden identity embedded in a title or description. A task query's safe evidence
+must remain useful; a privacy-withheld field cannot supply a matching excerpt.
+This is not a promise to detect arbitrary personal data using a name regex.
+When authoritative identity evidence or safe field rendering is insufficient,
+withhold the affected source field explicitly rather than release uncertain text.
 
 Staff preview always uses the same privacy policy as genuine EndUser reads,
 even for an Admin actor. Policy follows the EndUser data contract, not just
@@ -393,6 +472,9 @@ Existing unrestricted staff selections are not safe preview or employee
 authorization.
 
 Reuse supported selection capture/paging rather than invent a context store.
+Store the validated subject/mode/profile binding in the existing selection's
+bounded query contract; its authorization principal remains the real actor.
+Do not overwrite `SelectionIdentity.principalId` with the preview subject.
 Bound search to a 512-character goal, at most eight expanded terms of at most
 128 characters, default five and maximum twenty result cards per page, and the
 existing bounded cursor contract. Reject excess/invalid input explicitly.
@@ -401,10 +483,14 @@ bounded snippets disclose clipping and link to safe complete description
 continuation. Preserve identifiers, stable ordering and source provenance.
 Popularity honors the requested top-N within the same twenty-card bound; the
 department/company top-three question requests three separately for each scope.
-Reuse existing time/byte/concurrency budgets. Any necessary search index is a
-derived optimization maintained by the existing inventory owner, not a second
-catalog authority. Preserve data, current-schema/fresh-init parity and grants;
-no reset or historical migration framework is authorized.
+Reuse existing time/byte/concurrency budgets. Phase 02 owns one current schema,
+fresh initialization, runtime grants, reset/restart behavior and all affected
+writers/readers. Choose search and company/department/report-edge access paths
+from representative query plans, including full description continuations.
+Any persisted search optimization is maintained by the canonical publication
+owner in the same revision, never an independently writable catalog or stale
+authorization source. Remove replaced schema/code/tests together. Use the
+approved reset, not a migration framework or compatibility with discarded data.
 
 Filter entire unauthorized tools **and disallowed family variants**, including
 descriptions, input/output schemas and unreachable `$defs`. Never mutate the
@@ -428,7 +514,8 @@ Keep unprojected operational metadata restricted to its existing internal owner.
 | --- | --- | --- |
 | Roleless member, unlicensed employee, guest denial, malformed claims, role changes | 01 | Auth/profile/route tests; real individual OAuth in 04 |
 | Independent deployment privacy switches, both default false | 01 | Typed parsing, persistence and local/Compose/Azure producer parity |
-| Employee-first automatic app reads, no manual sync privileges; existing first-run preserved | 01 | Isolated fresh-init/first-sign-in and source dispatch assertions; live normal sign-in in 04 |
+| Employee-first API/browser automatic app reads, no manual sync privileges; existing first-run preserved | 01 | Isolated first-authentication and source dispatch assertions; native wiring in 03 and live normal sign-in in 04 |
+| Current schema optimized for discovery/workplace reads, with no legacy data contract | 02 | Query plans and capacity, fresh/reset initialization, grants, interrupted reset/resume and revocation protection |
 | "Who is the agent champion in my department?" and "Am I a champion?" | 02 | Same exact top-three set, identity/group isolation, dated unavailable states |
 | "What use cases are in my department?" | 02 | Proven used/created edges without metric/roster leakage |
 | "Top three agents in my department and company" | 02 | Stored company+department versus company-only filters, same-period distinct-user ranking and no counts |
@@ -437,6 +524,8 @@ Keep unprojected operational metadata restricted to its existing internal owner.
 | Private/draft discovery, owner contact, use-link honesty and revocation | 02 | Allowlisted DTOs, removed/stale identities, full descriptions and boundary-sized paging |
 | Identity hiding without changing agent/champion/popularity computations | 02 | All four privacy combinations, raw JSON/text/continuation leak checks and preview/self parity |
 | Adoption tools exclude Admin actions; EndUser has discovery only and no other-user preview | 03 | Actual SDK schemas, forged subject/preview calls, concurrent users, cache/reauth tests |
+| MCP non-tool HTTP routes do not bypass audience policy | 03 | Direct diagnostics/metadata requests by employee, guest and staff; unchanged public OAuth/health boundaries |
+| MCP initialize/list enters the API-owned bootstrap without a business call | 03 | Actual SDK initialization-only, reconnect and refresh; existing due-admission deduplicates jobs |
 | Settings reflects the staff catalog and effective privacy flags | 03 | Real API/MCP metadata equality, separate API policy values and read-only browser tests |
 | Published Studio uses the actual end-user connection | 04 | Two employee identities from different departments and distinct staff-role connections |
 | Existing staff journeys and `seha` production convergence | 04 | Aggregate evidence, exact deployed revision, live observation and fix-forward |
@@ -452,12 +541,13 @@ embedded hostile source instructions. Deterministic expected-result and
 no-leakage checks must pass for all twelve cases; they are not a model benchmark.
 
 Measure API search/popularity p95 at no more than two seconds over at least fifty
-measured requests after warmup on an isolated fixture with 100,000 directory
-people, 200,000 catalog records and 1,000,000 user-agent edges. Time auth/model
-latency separately. Cover department, company and combined preview reads, not
-only a convenient search query. Reuse the existing scale fixture/tooling and
-record machine,
-dataset, query plans, response sizes and actual results. Unavailable capacity
+measured requests per query shape after warmup on an isolated fixture with
+100,000 directory people, 200,000 catalog records and 1,000,000 user-agent edges.
+Time auth/model latency separately. Measure search, department popularity,
+company popularity and combined preview separately so one fast shape cannot
+hide another. Reuse the existing scale fixture/tooling and record machine,
+dataset, query plans, response sizes, rows/bytes scanned and actual results.
+Unavailable capacity
 proof remains unavailable and gets production telemetry, not a fictional pass.
 Phase 04 separately exercises natural-language conversations and records the
 actual client/model, expanded request, selected tool and grounded answer.
@@ -477,8 +567,10 @@ Include a creator who is also a champion; embedded names/addresses in agent
 titles/descriptions/links; identifiers split across source chunks; errors,
 provenance and nested DTOs; self champion status; withheld versus absent data;
 ordinary staff reads; forged client overrides; and cached responses/continuations
-after tightening settings. Assert unchanged eligible agent IDs, report periods
-and internal ranking, while hidden category identities never reach the AI.
+after tightening settings. Assert unchanged unfiltered catalog membership,
+report periods and internal champion/popularity ranking, while hidden category
+identities never reach the AI. Separately assert that identity-only goal probes
+cannot retrieve agents through a hidden relationship or withheld field.
 
 ## Binding always-deploy production contract
 
@@ -494,10 +586,15 @@ It is deployment workflow, never runtime authorization or an application gate.
 - The future campaign covers bounded local isolated validation and deployment
   of the affected app/API/MCP services to that installation, plus the necessary
   assignment-required configuration for the existing OAuth registrations.
-  Preserve explicit role assignments, consent, credentials, callbacks, keys,
-  persisted records and connections. No database reset, live destructive test,
-  broad tenant permission grant, app registration recreation, commit, push or
-  new branch is authorized. Plan creation does not execute these actions.
+  It authorizes one deliberate reset of that installation's `agentcontrol`
+  application database for the current-schema cutover, under the approved
+  reset decision above and existing exact-target safeguards. Preserve explicit
+  role assignments, consent, credentials, callbacks, keys and encrypted OAuth
+  storage; browser sessions and application records are discarded. Do not delete
+  volumes or reset another database, repeat a completed reset on retries, run
+  other live destructive tests, grant broad tenant permissions, recreate app
+  registrations, commit, push or create a branch. Plan editing executes none
+  of these actions.
   Honor the two configured privacy values; do not weaken or cycle production
   privacy through all combinations merely to obtain test evidence.
 - Attempt applicable focused, aggregate, database, SDK, model/client, browser,
@@ -516,6 +613,15 @@ It is deployment workflow, never runtime authorization or an application gate.
   affected unsafe authority. Isolate synthetic qualification in disposable
   environments; live checks use real authorized accounts, read-only production
   journeys and no fixture authentication or customer-data pollution.
+  The separately authorized reset and normal staff import of genuine reports
+  are deployment/rebuild actions, not synthetic live tests. Deploy the hardened
+  API/MCP before widening assignment-required admission; report imports and
+  canary results must not become employee sign-in/catalog authorization.
+  Rebuild application inventory/directory through automatic source owners, then
+  import a genuine current report bundle with the existing authorized workflow.
+  Missing provider/export access leaves specific journeys unavailable and owned;
+  it does not justify invented report data, old-schema restore or manual Sync
+  as an initial-read prerequisite.
 - Observe the exact deployed content and critical/unrelated journeys.
   A live defect requires containment -> root fix -> focused verification ->
   exact redeployment -> rerun. Do not resurrect a superseded implementation.

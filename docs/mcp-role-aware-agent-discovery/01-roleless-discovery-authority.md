@@ -26,6 +26,7 @@ explicitly starts the future campaign.
   [auth routes](../../backend/src/routes/auth.ts).
 - [MCP auth](../../mcp/src/agent_control_mcp/auth.py),
   [API exchange](../../mcp/src/agent_control_mcp/api.py),
+  [request authentication](../../backend/src/middleware/requestAuthentication.ts),
   [directory fields](../../backend/src/services/userSourceGraphFields.ts),
   [directory principals](../../backend/src/services/directoryPrincipals.ts).
 - [Automatic collection](../../backend/src/services/dataSync.ts),
@@ -92,7 +93,13 @@ explicitly starts the future campaign.
    jobs, without lending Viewer authority or enabling manual sync endpoints.
    Keep existing Viewer automatic application/delegated collection intact.
    No extra scheduler or MCP-side provider writer; no source dispatch from
-   normal tool/catalog reads. Record delegated-only source gaps honestly.
+   normal tool/catalog reads. Implement the API authenticated-entry/due-admission
+   contract and browser hook: the existing browser polling hook alone cannot
+   bootstrap an MCP-only caller. Phase 03 owns calling this API entry during
+   native initialize/list, not another scheduler. Verify first bearer entry,
+   reconnect, token refresh, concurrent identities and worker restart against
+   this API contract. Collection runs asynchronously; provider collection failure
+   must not become a new sign-in/catalog gate. Record delegated-only gaps honestly.
 7. Make a roleless browser sign-in a clear discovery-only handoff with sign-out
    and account information, not an error telling the user to obtain an EndUser
    role. Hide adoption/admin pages, provider checks and their background fetches.
@@ -114,6 +121,11 @@ explicitly starts the future campaign.
    values and document the exact deployment keys/environment mapping.
    These settings change identity disclosure only, never automatic source
    collection, role grants, feature availability, OAuth keys or saved source data.
+
+Do not design an alternate schema or an employee-profile store here. Phase 02
+owns the approved current-schema replacement/reset and must retain these identity,
+source-admission and configuration contracts. In particular, membership lookup
+does not promise a saved workplace row for every unlicensed caller.
 
 ## Focused verification
 
@@ -156,6 +168,11 @@ or Sync click. Assert automatic dispatch identity/source set and zero manual
 collection/control authority. Repeat existing Viewer/Admin first-run journeys.
 An unavailable Power Platform source is not a failure of application Graph
 bootstrap and is not a fictitious success.
+Exercise the first authenticated API entry that phase 03's MCP initialize/list
+will call, without requiring the future projected tool surface in this phase.
+Include duplicate/retried sign-ins, expired membership evidence and a catalog-only
+unlicensed caller whose saved workplace stays absent after sync. Pin source
+dispatch count/identity to due admission, not access-profile/catalog request count.
 
 ## Production continuation
 
@@ -171,11 +188,12 @@ Write `completions/01-roleless-discovery-authority.md` with the README completio
 content, baseline and exact access-profile/preview-authority contract,
 privacy defaults/persistence/environment mapping, roleless/guest outcomes,
 first-run source dispatch evidence, browser/API contract deletions, configuration
-changes and affected/unchanged roots.
+changes, exact authenticated-entry hooks/deduplication and affected/unchanged roots.
 
 Done when verified roleless members have a bounded discovery authority contract,
 sensitive existing routes remain protected, normal first-run app reads are
-automatic, browser handoff is truthful and existing staff behavior is preserved.
+automatic at API/browser entry, browser handoff is truthful and existing staff
+behavior is preserved. Phase 03 must wire the native MCP entry to this contract.
 Phase 02 can consume a current verified identity, canonical saved-account
 mapping and access policy without a new role, manual source initialization or
 guessed user. Preview must preserve that real identity while resolving a

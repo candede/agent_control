@@ -1,10 +1,13 @@
-# 02 - Safe organization and department discovery API
+# 02 - Current discovery schema and safe canonical API
 
 ## Mission and prerequisites
 
 Implement evidence-backed employee discovery using shared saved data and
 positive allowlist contracts, not adoption/admin DTOs. Reuse these same reads
 for an explicitly authorized staff preview of another stored member account.
+Own the best-fit current schema for these queries and its clean-reset contract.
+Existing data/layout need not survive; source ownership, authentication,
+privacy and supported staff behavior must.
 Prerequisite: phase 01 and `completions/01-roleless-discovery-authority.md`.
 
 Read and obey [README](README.md), especially contracts C/D/E/F and the binding
@@ -33,10 +36,41 @@ contracts and current campaign record before editing.
 - [Existing scale fixture](../../backend/scripts/largeTenantFixture.ts),
   [MCP workflow corpus](../../backend/scripts/fixtures/mcp-workflows.json),
   [test entry point](../../scripts/large-tenant-tests.ps1) and
-  [current schema](../../backend/src/db/currentSchema.ts) if indexing changes
-  are justified.
+  [current schema](../../backend/src/db/currentSchema.ts),
+  [schema verification](../../backend/src/db/schema.ts),
+  [database operator](../../backend/scripts/database.ts),
+  [reset owner](../../backend/scripts/databaseReset.ts),
+  [deployment lifecycle](../../scripts/local-runtime.ps1) and
+  [reset runbook](../operations.md#reset-application-data).
+- [Organization-created classification](../../backend/src/types/agentPresentation.ts),
+  [inventory publication](../../backend/src/db/inventoryGenerations.ts) and
+  [directory publication](../../backend/src/db/userSourceStages.ts).
 
 ## Concrete work
+
+Before implementing the reads, settle their current schema and query shapes
+against README's approved reset decision. Use existing source/report authorities,
+but do not preserve unsuitable tables, JSON layouts or indexes for compatibility.
+Choose typed fields/relationships, constraints and access paths for:
+
+- current organization-created canonical agents, complete purpose descriptions
+  and safe continuation, with source/revision/expiry provenance;
+- exact tenant-local directory identity and stored company/department scope;
+- deduplicated person-agent report relationships pinned to one report lineage;
+- actor-owned selections with validated subject/mode/profile query bindings.
+
+Reuse suitable structures rather than rewriting the whole database. Any derived
+search text/index belongs to canonical publication and is rebuilt with the same
+revision; it is not a second data owner. Compare actual plans for existing and
+proposed query shapes at the README scale before retaining extra indexes or
+materialization. Own changed producers, consumers, schema verification/grants,
+fixtures, retention/removal and stale-source invalidation together. Delete
+superseded structures and queries; keep only the resulting current schema.
+Preserve supported staff wire behavior while replacing storage; update its
+readers and tightly coupled frontend/MCP types/tests in this phase where affected.
+Phase 03 owns the new employee/preview MCP bindings, not deferred storage repairs.
+Record the final query-to-storage/index/owner map in this phase's completion,
+not a separate design framework. No data migration or old-schema runtime.
 
 1. Define typed safe profile, catalog card/detail, department champions,
    department use-case and department/company popularity responses. Use positive SQL
@@ -66,6 +100,10 @@ contracts and current campaign record before editing.
    to choose a report before asking a question.
 4. Search approved names and full business-purpose descriptions across all
    saved organization-created agents, including private/draft records.
+   Use current `organization_created` evidence rather than the broad
+   organization/deployed/used view; test shared-only, first/third-party,
+   unknown-origin and mixed-source records against that exact predicate,
+   including expiry/removal of the sole source proving organization creation.
    Handle native and chunked description fields; make snippet limits explicit
    and provide complete safe description paging. No raw configuration,
    knowledge sources, connector data or unrestricted inventory detail endpoint.
@@ -73,6 +111,10 @@ contracts and current campaign record before editing.
    cover titles, contacts, URLs and provenance, not only structured person DTOs.
    Use known saved identity evidence and bounded rendering, with an explicit
    field-withheld state if safe rendering is impossible. Preserve the agent.
+   Apply README C's permitted-evidence search rule as well as output redaction:
+   hidden identities cannot silently select/rank an agent or become an excerpt.
+   Preserve catalog membership and internal champion/popularity computation;
+   identity-only probes are not supported task matches.
 5. Reuse safe normalized search helpers for the goal and expanded terms.
    Rank task evidence first; use stable canonical identity tie-breaks and
    deduplicate linked provider records without hiding ambiguous evidence.
@@ -126,10 +168,19 @@ contracts and current campaign record before editing.
     old selections/cursors must not restore identities after a setting tightens.
 11. Meet README request/response/cursor bounds. Measure described-search and
     departmental/company aggregation and combined preview using existing scale
-    tooling. Add only a justified
-    derived index maintained by the current data owner if query-plan evidence
-    requires it; preserve existing data, fresh-init/grants and supported
-    current-schema convergence. No second writer or migration platform.
+    tooling. Finish the current schema/access-path decision above from actual
+    results, not speculative scale. Wire the existing explicit reset lifecycle
+    to fresh initialization and exact fingerprint/grant verification; do not
+    bypass schema guards or add an upgrade/migration path.
+    Test interrupted reset/initialization and restart without repeating a
+    completed reset. Keep only the minimum security authority needed so reset
+    cannot resurrect revoked bearer credentials; business data/history need not
+    be carried forward. Use the protected operator/auth owners, not an employee
+    data copy or an authentication bypass.
+    Give phase 04 an exact reset/resume/source-rebuild contract. Inventory and
+    directory rebuild automatically; deleted official reports/history do not.
+    Genuine report imports use the existing staff workflow, never inferred
+    relationships or synthetic production fixtures.
 12. Update directly controlling data/role documentation. Do not build a browser
     catalog, change staff report semantics or implement an MCP-side business
     query. Phase 03 owns the public MCP bindings.
@@ -149,6 +200,15 @@ Add database-backed discovery cases to the existing large-tenant/MCP fixture
 runner, reusing its isolated current-source, reports and authority setup. Record
 the exact supported selector/command after integrating it; do not claim the
 unit run proves SQL, current-schema initialization or large-tenant behavior.
+
+Exercise fresh initialization and a deliberately populated disposable database
+reset into the final schema using the checked-in operator/lifecycle. Verify
+fingerprint and least-privilege grants, all affected staff reads/writers,
+automatic first-sign-in collection, discarded sessions/selections, retained
+protected OAuth state and no resurrection of previously revoked API authority.
+Test failure before reset, after database recreation and during initialization;
+resume the exact operation without a second destructive reset. No production
+reset is performed in this phase.
 
 Verify all twelve README retrieval fixtures, safe complete descriptions beyond
 the first page, exact current champion-set equality, no metrics in any nested
@@ -174,13 +234,16 @@ identity-bearing titles/URLs, chunk boundaries, errors/provenance, hints and
 forged include-identity requests. Verify no hidden relationship is reconstructed
 through another discovery route or match explanation. Normal staff reads remain
 unchanged. Privacy must not recompute popularity/championship or drop agents;
-own champion status and permitted department metadata remain usable.
+unfiltered catalog membership, own champion status and permitted department
+metadata remain usable. Separately test hidden-identity-only search probes;
+withheld text cannot provide an invisible match, score or excerpt.
 Assert catalog/department reads perform zero provider collection/control calls
 after phase 01 authentication/bootstrap. Verify staff adoption ranking and
 existing saved reads are unchanged.
 
 Attempt the README capacity measurement with the existing isolated scale data,
-fifty measured requests and explicit p95 threshold. Record query plans, source
+at least fifty measured requests per query shape and explicit p95 threshold.
+Record query plans, source
 counts and actual timing separately from auth/model latency. An unavailable
 benchmark remains a scoped residual, not an empty dataset or assumed pass.
 
@@ -199,12 +262,15 @@ content, exact canonical operation/DTO/selection/preview map, allowlisted/exclud
 fields, stored workplace filters, ranking provenance, champion and preview/self
 equality, database/query-plan results,
 privacy-matrix/raw-output/cache results, schema impact, retrieval/capacity
-results and next-phase inputs.
+results, final query-to-storage/index/owner map, reset/authentication-fence/
+resume/source-rebuild contract and next-phase inputs.
 
 Done when the canonical API produces every requested employee answer from
 permitted evidence, including private/draft organization discovery, with
 complete bounded paging, no metric/admin leakage, correct personal scope and
 truthful unavailable/no-match states. Staff preview uses those same reads
 without changing identity or authority, and both audiences can obtain the
-department/company top three. Phase 03 can bind these exact operations
+department/company top three. One current schema and its explicit reset/resume
+path support those reads and existing staff operations without a data migration
+or legacy schema. Phase 03 can bind these exact operations
 without joining data, inventing scores or copying staff DTOs.

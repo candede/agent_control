@@ -5,6 +5,8 @@
 Prove the requested employee, staff and employee-preview journeys together,
 deploy to the existing `seha` production installation and converge through
 live observation/fix-forward.
+Execute the approved application-database reset, then rebuild supported current
+data without preserving or migrating the discarded business dataset.
 Prerequisites: phases 01/02/03 and their exact completion records:
 `completions/01-roleless-discovery-authority.md`,
 `completions/02-safe-agent-discovery-api.md`,
@@ -24,7 +26,11 @@ qualification or feature-enable prerequisite.
   [deployment owner](../../scripts/local-deployment.ps1),
   [runtime owner](../../scripts/local-runtime.ps1),
   [MCP lifecycle](../../scripts/local-mcp.ps1),
-  [operations](../operations.md), [deployment setup](../deployment-setup.md).
+  [operations](../operations.md), [deployment setup](../deployment-setup.md),
+  [reset procedure](../operations.md#reset-application-data),
+  [database operator](../../backend/scripts/database.ts),
+  [reset owner](../../backend/scripts/databaseReset.ts) and
+  [official report import](../official-usage-import.md).
 - [Isolated test entry point](../../scripts/large-tenant-tests.ps1),
   [scale fixture](../../backend/scripts/largeTenantFixture.ts),
   [MCP fixture](../../scripts/local-mcp-fixture.ps1),
@@ -87,16 +93,19 @@ qualification or feature-enable prerequisite.
    assigned Viewer or a permissions/manual-sync step; personal report evidence
    may be unavailable without making organization search unusable.
    Repeat Viewer/Admin first-run, saved-data outage and restart/OAuth continuity.
-   Where schema/index changes occurred, prove data-preserving current-schema
-   convergence, fresh-init parity and isolated restore/restart.
-5. Complete the twelve deterministic relevance cases and capacity attempt in
-   README. Record every measured/failed/unavailable result and actual scale;
-   do not replace the required corpus with a convenient small happy path.
-   Run all four privacy combinations in disposable deployments for genuine
-   EndUser and staff previews. Verify persistence/restart, both raw MCP content
-   forms, embedded/chunked identities, unchanged agent/ranking evidence, policy
-   tightening with cached selections and unaffected ordinary staff operations.
-   Verify default false/false preserves the approved name/contact behavior.
+   Reuse phase 02's current-schema/reset/grant/interruption evidence, rerunning
+   it if deployment/schema content changed. Attempt isolated backup/restore of
+   the final current schema for operational recovery; do not restore the old
+   business dataset or add an old-schema conversion path.
+5. Reconcile phase 02's twelve deterministic relevance cases and per-shape
+   capacity results, and phases 01/02/03's configuration/API/MCP privacy matrix
+   against the exact release content. Reuse valid evidence; rerun affected
+   cases after relevant changes, not a duplicate full campaign by default.
+   Record every measured/failed/unavailable result and actual scale. Do not
+   substitute a small happy path, skip a missing required attempt or claim the
+   semantic client checks below are deterministic retrieval proof.
+   Verify deployment persistence/restart and policy tightening with existing
+   selections where not already proven by unchanged deployment artifacts.
 6. Exercise real natural-language questions through the supported native client:
    champions, department use cases, departmental popular agents, own champion
    status, BRD review and a paraphrased goal. Also ask for top three agents in
@@ -139,33 +148,60 @@ qualification or feature-enable prerequisite.
    registrations, images, mounted volumes and service identities without
    printing credentials. The user's target is that existing installation, not
    whichever Docker daemon happens to be available in this checkout.
-2. Capture best-available health, saved data/revisions, OAuth continuity and
-   checkpoint evidence. Preserve database/volumes/keys and do not use `-DbReset`.
+2. Record the approved reset decision and exact `seha`/`agentcontrol` database
+   identity, deployed/candidate schema fingerprints and expected application
+   data loss. Capture best-available health, OAuth continuity, protected
+   authentication fences and checkpoint evidence. Attempt a supported checkpoint
+   if available, without requiring old-data retention or a restore of that data.
+   Preserve service/volume/roles, project secrets/settings and encrypted OAuth
+   storage; database-backed browser sessions must sign in again after reset.
+   Phase 02's protected reset contract must prevent revoked authority from
+   becoming valid simply because its database rows were discarded.
    For every non-passing check, implement README-scoped containment and record
    signal, numeric threshold, owner and exact forward-repair trigger.
-3. Apply the precise assignment-required No changes identified in phase 01 to
-   the existing registrations where needed. Verify roleless employee OAuth/OBO
-   while retaining admin consent, tenant restrictions, existing app roles,
-   assigned privileges, callbacks and scopes. Use the actual authorized Entra
-   control plane/interactive administrator identity; never grant the runtime
-   service new write privileges or ask for secrets in chat.
-4. Deploy the affected app/API/frontend and MCP services coherently with the
+3. Deploy the affected app/API/frontend and MCP services coherently with the
    existing `seha` lifecycle and exact immutable content identities. A Python-only
-   redeploy cannot satisfy new API/auth contracts. Use the current supported
-   lifecycle command after reading its configuration/receipt rules:
+   redeploy cannot satisfy new API/auth/schema contracts. Apply the approved
+   clean reset and initialize the single current schema through the supported
+   lifecycle after reading its configuration/receipt rules:
 
    ```powershell
-   pwsh -NoLogo -NoProfile -File ./deploy-local.ps1 start -Project seha
+   pwsh -NoLogo -NoProfile -File ./deploy-local.ps1 start -Project seha -DbReset
    ```
 
    Run it only on the resolved installation owner/context; supply current
    pinned-candidate parameters when its lifecycle requires them. Do not add a
-   release receipt as a runtime data/access check. Do not restart/recreate the
-   database merely to deploy API/MCP changes.
+   release receipt as a runtime data/access check. Reset only the authorized
+   application database, not its volume or PostgreSQL service. Record the reset
+   receipt and final fingerprint/grants. If reset completed but initialization
+   failed, repair and resume **without** `-DbReset` as the runbook requires.
+   An unknown destructive outcome stays in maintenance until the exact state is
+   recovered; never repeat the command blindly. Later code-only fix-forward
+   deployments also omit `-DbReset`.
    Preserve the project's explicit privacy values or the approved false/false
    defaults, and record the actual effective API values. Confirm the settings
    page/profile agree after restart. Never cycle production through less
    private settings for qualification; all-combination proof belongs in fixtures.
+4. Only after the hardened API and MCP are active, apply the precise
+   assignment-required No changes identified in phase 01 to the existing
+   enterprise applications where needed. Retain admin consent, tenant
+   restrictions, app roles, assignments, callbacks and scopes. Use the authorized
+   Entra control plane/interactive identity, not new runtime write privileges.
+   If assignment-required is already No, retain it and prove admission guards
+   directly; do not invent another enable/approval process.
+   Verify genuine employee OAuth/OBO and current API roles/member policy,
+   including existing MCP connections after database reset. An old browser
+   session/selection is not expected to survive.
+   Normal employee-first sign-in must automatically rebuild due application
+   inventory/directory through the existing source owners. Observe publication
+   and real delegated-only source gaps; do not press Sync to manufacture initial
+   success. Then use an authorized Uploader/Admin's existing browser import
+   workflow for a genuine current report bundle with the required user-agent
+   lineage. This is report-source ingestion, not employee admission.
+   Report-based champions/popularity stay explicitly unavailable until accepted
+   evidence exists. If export/import access is missing, keep those production
+   journeys open with owner/action while catalog and other safe flows remain
+   usable. Never synthesize reports, infer usage or restore discarded history.
 5. Qualify the exact running revision: verified roleless member connection;
    stored own-department/company and organization catalog questions;
    authorized staff preview with immutable actor and selected subject;
@@ -175,7 +211,9 @@ qualification or feature-enable prerequisite.
    and preview-only controls; settings metadata equality; normal first-sign-in
    automatic reads; configured EndUser/preview privacy enforcement and absence
    of identity leakage through detail/text/link paths. Live provider mutations
-   are not authorized tests.
+   are not authorized tests. Include direct MCP diagnostics/metadata admission,
+   organization-created versus merely shared/deployed/used records, and safe
+   search behavior for hidden-identity-only probes.
 6. Observe for at least thirty minutes and at least ten successful real
    discovery reads across the two employee identities. Include normal
    reauthentication or the supported token-refresh path; preserve existing
@@ -215,8 +253,10 @@ No fabricated consent, provider capabilities, user identity or measurement.
 ## Completion record and done conditions
 
 Write `completions/04-verify-deploy-and-observe.md` with the README completion
-content, exact deployed/observed identities, configuration changes, data/OAuth
-preservation, effective privacy values and fixture matrix/leakage checks,
+content, exact deployed/observed identities, configuration changes, application
+data reset/loss and protected OAuth/authentication continuity, reset receipt and
+resume behavior, final schema/grants and automatic source/report rebuild,
+effective privacy values and fixture matrix/leakage checks,
 each account/channel/self-versus-preview journey and its true result,
 stored workplace filter evidence, observation
 duration/sample counts, capacity/client evidence, fix-forward cycles, cleanup

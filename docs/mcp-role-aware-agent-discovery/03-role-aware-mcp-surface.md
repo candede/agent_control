@@ -61,6 +61,9 @@ contracts and the campaign record.
    `my_department` name; do not add an alias for an unimplemented old contract.
 3. Obtain the current caller's bounded access projection through the API's
    phase 01 authority endpoint using the same validated delegated/OBO identity.
+   Wire that authenticated API entry for native initialize/list even when the
+   client never calls a business tool, so phase 01's internal due-source admission
+   also covers MCP-only first use. Do not duplicate its scheduler/source logic.
    Preserve existing invocation/exchange deadlines, byte limits, revocation,
    attribution and cancellation. No member/admin inference from upstream
    display names, client hints, headers or a tool caller's chosen role.
@@ -85,6 +88,12 @@ contracts and the campaign record.
    Consume the API's effective privacy flags without request/client overrides
    or a separate Python environment-policy owner. Respect privacy revision in
    any cached guidance/projection; canonical safe API output is authoritative.
+   Cover authenticated non-tool HTTP routes too: `/diagnostics` must use the
+   API-owned staff audience/operational access decision, not merely the presence
+   of an MCP OAuth token. Deny roleless employees and unverified guests there;
+   preserve authorized staff diagnostics, public OAuth/health behavior and the
+   separately credentialed private metadata/recorder boundary. Do not put an
+   access-profile check on public OAuth callbacks and create an auth cycle.
 6. Remove the global instructions' employee-inappropriate management/metric
    guidance. Use supported dynamic instructions if available; otherwise keep
    common initialization role-neutral and use projected tool descriptions.
@@ -171,7 +180,13 @@ Required assertions:
 - Expiry, refresh, demotion and canonical revocation invalidate permissions;
   named hidden calls and forged actions are rejected with no provider effect.
 - Normal saved discovery after auth performs zero collection/control dispatches;
-  phase 01 sign-in bootstrap is identified separately.
+  phase 01 sign-in bootstrap is identified separately. First initialize/list
+  without a business call reaches that API-owned bootstrap; repeated list,
+  reconnect and refresh obey due-admission rather than start duplicate jobs.
+- Direct HTTP diagnostics and private metadata requests cannot bypass audience
+  policy. Employee/guest tokens get no operational diagnostics; Viewer,
+  Uploader and Admin retain authorized access. Public OAuth discovery, callbacks,
+  health and the internal metadata-only credential retain their own boundaries.
 - Staff browser metadata equals that staff principal's actual SDK discovery
   definitions and instructions, including outage/freshness behavior.
 - Hostile source descriptions stay data; they cannot cause administrative calls,
@@ -203,7 +218,7 @@ Write `completions/03-role-aware-mcp-surface.md` with the README completion
 content, SDK hook evidence, per-audience operation/schema map, single-action
 family proof, staff-preview/EndUser denial and subject isolation, cache/authority
 behavior, four-combination privacy and effective-settings parity, metadata
-equality, measured count/bytes,
+equality, non-tool route admission and initialize-only bootstrap, measured count/bytes,
 consumer deletions and actual focused/integration results.
 
 Done when real MCP discovery and calls are audience-correct, all six employee
