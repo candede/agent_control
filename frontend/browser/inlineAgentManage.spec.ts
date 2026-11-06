@@ -16,7 +16,7 @@ for (const role of ["AgentControl.Viewer", "AgentControl.UsageReportUploader"] a
         displayName: "Synthetic non-admin", username: "fixture@example.invalid",
         homeAccountId: "layout-principal", tenantId: "layout-tenant", roles: [role],
       },
-      csrfToken: "layout-csrf", roleAssignmentRequired: false,
+      csrfToken: "layout-csrf",
     } }));
     const agent = unifiedAgents.value[0];
     await page.goto("/agents");

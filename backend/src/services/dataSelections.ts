@@ -273,9 +273,10 @@ export class DataSelections {
   read<T>(
     id: string, identity: SelectionIdentity,
     work: (client: pg.PoolClient, selected: Awaited<ReturnType<DataSelections["assert"]>>) => Promise<T>,
-    options: { exportId?: string; signal?: AbortSignal } = {},
+    options: { exportId?: string; signal?: AbortSignal; beforeRead?: (client: pg.PoolClient) => Promise<unknown> } = {},
   ): Promise<T> {
     return this.connections.selectedRead(async client => {
+      await options.beforeRead?.(client);
       const selected = await this.assert(client, id, identity, options.exportId);
       const value = await work(client, selected);
       await this.validateLease(client, id, identity, selected.pins.length, options.exportId);

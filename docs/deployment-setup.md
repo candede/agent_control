@@ -63,13 +63,19 @@ Choose Viewer, Usage Report Uploader or Admin using the
 [role reference](user-roles-and-permissions.md#app-defined-roles).
 App roles grant Agent Control access, not Microsoft API permissions.
 
-### 4. Require assignment
+### 4. Assign staff roles and permit employee sign-in
 
 1. Open **Enterprise applications > your application > Properties**.
-2. Set **Assignment required?** to **Yes**.
+2. After the hardened API/MCP deployment, set **Assignment required?** to **No**
+   on the existing API and (when enabled) MCP enterprise applications.
 3. Under **Users and groups**, assign one appropriate Agent Control role to
-   each user or group. Admin includes Uploader and Viewer; assign only one role.
+   each staff user or group. Admin includes Uploader and Viewer; assign only one role.
 4. Have users sign out and back in after assignment changes.
+
+Active same-tenant employees without app roles use conversational discovery and
+receive a browser handoff, not adoption/admin pages. No EndUser role or manual
+source initialization is needed. Unknown/malformed roles, guests and disabled
+accounts are rejected. See [MCP settings privacy](mcp-reference.md#employee-discovery-privacy).
 
 ### 5. Add API permissions
 

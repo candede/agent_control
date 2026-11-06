@@ -1,9 +1,11 @@
 import { Router } from "express";
+import { config } from "../config.js";
 import { currentAuthority } from "../auth/authorityContext.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { requestUser } from "../middleware/requestAuthentication.js";
 import { readMcpSettings } from "../services/mcpSettings.js";
+import { mcpAccessProfile } from "../services/mcpAccess.js";
 import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 
@@ -24,14 +26,14 @@ export function createMcpSettingsRouter(reader = readMcpSettings) {
     try {
       controller.signal.throwIfAborted();
       assertAccountSessionValidation(validation);
-      const settings = await reader(user.tenantId!, controller.signal);
+      const settings = await reader(user.tenantId!, mcpAccessProfile(), controller.signal);
       controller.signal.throwIfAborted();
       authority?.assertCurrent();
       assertAccountSessionValidation(validation);
       const current = requestUser(request);
       if (current.tenantId !== user.tenantId || current.homeAccountId !== user.homeAccountId
         || !hasAppRole(current.roles, "AgentControl.Viewer")) throw AppError.unauthorized();
-      response.json(settings);
+      response.json({ ...settings, privacy: { ...config.employeePrivacy }, privacyScope: "end_user_and_preview" });
     } finally {
       request.removeListener("aborted", abort);
       response.removeListener("close", close);

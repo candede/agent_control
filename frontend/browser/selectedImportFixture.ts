@@ -215,7 +215,7 @@ export async function mockSelectedImport(page: Page, csvFiles: Array<{ name: str
       return respond({ code: "forbidden", detail: "Current Admin access is required." }, 403);
     }
     if (path === "/api/me") return respond({ user: { displayName: "Usage administrator", username: "admin@example.invalid",
-      homeAccountId: "usage-admin", roles: [`AgentControl.${options.role ?? "Admin"}`] }, csrfToken: "fixture-csrf", roleAssignmentRequired: false });
+      homeAccountId: "usage-admin", roles: [`AgentControl.${options.role ?? "Admin"}`] }, csrfToken: "fixture-csrf" });
     if (path === "/api/workbench/metadata") return respond({ views: workbenchViews, actions: workbenchActions });
     if (path === "/api/capabilities" || path === "/api/capabilities/check") return respond({
       value: capabilityDefinitions.map(definition => ({ enabled: true, definition, decision: { capabilityId: definition.id, status: definition.mode === "local" ? "available" : "unavailable",

@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx2
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AccessToken
 from fastmcp.utilities.versions import dedupe_with_versions
 from key_value.aio.errors import BaseKeyValueError
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
@@ -26,6 +27,7 @@ from .auth import ApiTokenExchange, TenantAzureProvider
 from .config import ConfigurationError, Settings
 from .errors import AdapterError
 from .instructions import INSTRUCTIONS
+from .projection import AccessProfile, AudienceMiddleware, projected_native_tools
 from .recording import Recorder, RecordingMiddleware
 from .storage import MAX_DISK_BYTES, MAX_FILES, OAuthStore
 from .tools import OPERATIONS, register_tools
@@ -333,8 +335,9 @@ def build_service(
         tasks=False,
     )
     register_tools(mcp, api)
+    mcp.add_middleware(AudienceMiddleware(api))
 
-    async def catalog() -> dict[str, Any]:
+    async def catalog(profile: AccessProfile | None = None) -> dict[str, Any]:
         options = mcp._mcp_server.create_initialization_options()
         info = Implementation(
             name=options.server_name,
@@ -344,7 +347,14 @@ def build_service(
             website_url=options.website_url,
             icons=options.icons,
         )
-        tools = dedupe_with_versions(list(await mcp.list_tools()), lambda tool: tool.name)
+        tools = dedupe_with_versions(
+            list(
+                projected_native_tools(api, profile)
+                if profile is not None
+                else await mcp.list_tools(run_middleware=False)
+            ),
+            lambda tool: tool.name,
+        )
         return {
             "serverInfo": info.model_dump(mode="json", by_alias=True, exclude_none=True),
             "instructions": options.instructions,
@@ -368,7 +378,7 @@ def build_service(
         catalog,
     )
 
-    @mcp.custom_route(METADATA_PATH, methods=["GET"])
+    @mcp.custom_route(METADATA_PATH, methods=["POST"])
     async def metadata(request: Request) -> JSONResponse:
         headers = {"Cache-Control": "no-store"}
         if settings.metadata_key is None:
@@ -380,6 +390,18 @@ def build_service(
             supplied[0].encode("utf-8"), settings.metadata_key
         ):
             return JSONResponse({"error": "unauthorized"}, 401, headers=headers)
+        try:
+            if request.query_params:
+                raise ValueError
+            body = await request.body()
+            if (
+                len(body) > 65536
+                or request.headers.get("content-type", "").split(";")[0] != "application/json"
+            ):
+                raise ValueError
+            profile = AccessProfile.model_validate_json(body)
+        except ValueError:
+            return JSONResponse({"error": "invalid_projection"}, 400, headers=headers)
         ready = True
         try:
             await store.observe_readiness()
@@ -394,7 +416,7 @@ def build_service(
                     "resourceUrl": settings.public_url,
                 },
                 "redirectUris": list(settings.redirect_uris),
-                **(await catalog()),
+                **(await catalog(profile)),
                 "storageReady": ready,
             },
             headers=headers,
@@ -419,6 +441,25 @@ def build_service(
         if not isinstance(user, AuthenticatedUser):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         verified = user.access_token
+        if not isinstance(verified, AccessToken):
+            return JSONResponse(
+                {"error": "unauthorized"}, 401, headers={"Cache-Control": "no-store"}
+            )
+        try:
+            async with api.invocation(None, upstream=verified) as invocation:
+                profile = await invocation.access_profile()
+                if (
+                    profile.audience not in {"adoption", "admin"}
+                    or not profile.staffPreviewAuthorized
+                ):
+                    return JSONResponse(
+                        {"error": "operation_forbidden"}, 403, headers={"Cache-Control": "no-store"}
+                    )
+                await invocation.assert_current()
+        except AdapterError as error:
+            return JSONResponse(
+                {"error": error.code}, error.status, headers={"Cache-Control": "no-store"}
+            )
         try:
             count, size = await store.usage()
         except ConfigurationError, OSError:
@@ -431,8 +472,10 @@ def build_service(
                 "fastmcp": "4.1.0",
                 "resource": settings.public_url,
                 "transport": "streamable-http",
-                "businessTools": len(await mcp.list_tools()),
-                "canonicalOperations": len(OPERATIONS),
+                "businessTools": len(projected_native_tools(api, profile)),
+                "canonicalOperations": sum(
+                    profile.permission(operation) is not None for operation in OPERATIONS
+                ),
                 "authenticatedOAuthClientId": verified.client_id,
                 "apiAuthority": "canonical",
                 "oauthStorage": "encrypted-leased-blob"

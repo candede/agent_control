@@ -7,12 +7,13 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.tools import ToolResult
-from mcp.types import CallToolResult, ContentBlock, TextContent
+from fastmcp.tools import Tool, ToolResult
+from mcp.types import CallToolResult, ContentBlock, TextContent, ToolAnnotations
 from pydantic import BaseModel, JsonValue, RootModel
 
 from . import control_inputs as ci
 from . import control_models as controls
+from . import discovery_models as discovery
 from . import inputs as i
 from . import inventory_models as inventory
 from . import job_models as jobs
@@ -51,6 +52,8 @@ class Operation:
     provider: bool = False
     destructive: bool = False
     idempotent: bool = False
+    body_operation: str | None = None
+    saved_read: bool = False
 
     @property
     def path_fields(self) -> set[str]:
@@ -58,6 +61,96 @@ class Operation:
 
 
 OPERATIONS = (
+    Operation(
+        "search_agent_catalog",
+        "POST",
+        "/api/discovery/read",
+        discovery.SearchInput,
+        discovery.Page,
+        "Search organization-created saved task evidence with a goal and up to "
+        "eight AI-expanded terms (BRD: business requirements document). Default five/max twenty "
+        "cards. Omit selectionId to capture provider-free; retain selection and nextCursor.",
+        body_operation="search",
+        saved_read=True,
+    ),
+    Operation(
+        "read_discovery_detail",
+        "POST",
+        "/api/discovery/read",
+        discovery.DetailInput,
+        discovery.Detail,
+        "Read exact safe agent detail and complete purpose text. Continue "
+        "nextCursor with the same agentId/selectionId until null; clipping is not complete text.",
+        body_operation="detail",
+        saved_read=True,
+    ),
+    Operation(
+        "read_my_workplace",
+        "POST",
+        "/api/discovery/read",
+        discovery.WorkplaceInput,
+        discovery.Workplace,
+        "Read department champion suggestions/use cases and popular agents. "
+        "Department is stored company + department; company is stored company across departments. "
+        "Default three/max twenty independently per scope, same report period, no activity counts. "
+        "Distinguish created_here from used_here; champion is a dated suggestion, not a title.",
+        body_operation="workplace",
+        saved_read=True,
+    ),
+    Operation(
+        "read_my_discovery_profile",
+        "POST",
+        "/api/discovery/read",
+        discovery.DiscoveryInput,
+        discovery.Profile,
+        "Read own stored company/department and nameless own suggested/"
+        "not_suggested/unavailable champion status. Missing workplace/report is not a negative "
+        "answer and does not prevent organization catalog search.",
+        body_operation="profile",
+        saved_read=True,
+    ),
+    Operation(
+        "preview_discovery_profile",
+        "POST",
+        "/api/discovery/preview",
+        discovery.PreviewProfile,
+        discovery.Profile,
+        "Read the selected member's safe saved context and own champion status.",
+        body_operation="profile",
+        saved_read=True,
+    ),
+    Operation(
+        "preview_discovery_search",
+        "POST",
+        "/api/discovery/preview",
+        discovery.PreviewSearch,
+        discovery.Page,
+        "Search safe saved organization task evidence for this exact subject; "
+        "preserve this subject's selection/cursor for continuation.",
+        body_operation="search",
+        saved_read=True,
+    ),
+    Operation(
+        "preview_discovery_detail",
+        "POST",
+        "/api/discovery/preview",
+        discovery.PreviewDetail,
+        discovery.Detail,
+        "Read this exact subject-bound safe agent/detail continuation.",
+        body_operation="detail",
+        saved_read=True,
+    ),
+    Operation(
+        "preview_discovery_workplace",
+        "POST",
+        "/api/discovery/preview",
+        discovery.PreviewWorkplace,
+        discovery.Workplace,
+        "Read the selected stored member's department/company top three "
+        "independently, champions and proven use cases, same period and no activity counts.",
+        body_operation="workplace",
+        saved_read=True,
+    ),
     Operation(
         "list_workspace_jobs",
         "GET",
@@ -1022,10 +1115,10 @@ def register_tools(mcp: FastMCP, api: CanonicalApi) -> None:
     from .domains import PUBLIC_TOOLS
 
     for tool in PUBLIC_TOOLS:
-        _register(mcp, api, tool)
+        mcp.add_tool(native_tool(api, tool))
 
 
-def _register(mcp: FastMCP, api: CanonicalApi, tool: PublicTool) -> None:
+def native_tool(api: CanonicalApi, tool: PublicTool) -> Tool:
     from .domains import DomainRequest
 
     async def execute(request: BaseModel, ctx: Context) -> ToolResult:
@@ -1073,18 +1166,21 @@ def _register(mcp: FastMCP, api: CanonicalApi, tool: PublicTool) -> None:
     execute.__annotations__["request"] = tool.request
     schema = tool.response.model_json_schema(by_alias=True)
     schema["type"] = "object"
-    operation = tool.branches[0].operation
-    mcp.tool(
+    operations = [branch.operation for branch in tool.branches]
+    read_only = all(op.saved_read or op.method == "GET" and not op.provider for op in operations)
+    return Tool.from_function(
         execute,
         name=tool.name,
         description=tool.description,
         output_schema=schema,
-        annotations={
-            "readOnlyHint": operation.method == "GET" and not operation.provider,
-            "destructiveHint": operation.destructive,
-            "idempotentHint": operation.idempotent
-            or (operation.method == "GET" and not operation.provider),
-            "openWorldHint": operation.provider,
-        },
-        tags={"provider-operation" if operation.provider else "saved-data"},
+        annotations=ToolAnnotations(
+            read_only_hint=read_only,
+            destructive_hint=any(op.destructive for op in operations),
+            idempotent_hint=all(
+                op.idempotent or op.saved_read or op.method == "GET" and not op.provider
+                for op in operations
+            ),
+            open_world_hint=any(op.provider for op in operations),
+        ),
+        tags={"provider-operation" if any(op.provider for op in operations) else "saved-data"},
     )

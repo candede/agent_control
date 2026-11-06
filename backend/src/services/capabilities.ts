@@ -14,7 +14,7 @@ import type { AuditAction } from "../types/audit.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { operationalLog } from "./telemetry.js";
 import { mapWithConcurrency } from "./mapWithConcurrency.js";
-import { currentAuthority, requireAuthority } from "../auth/authorityContext.js";
+import { automaticApplicationRead, currentAuthority, requireAuthority } from "../auth/authorityContext.js";
 
 const evidenceTtlMs = 5 * 60 * 1000;
 const operationEvidenceTtlMs = 24 * 60 * 60 * 1000;
@@ -190,7 +190,7 @@ export class CapabilityService {
   async decision(capability: CapabilityId | CapabilityDefinition, user: AuthenticatedUser): Promise<CapabilityDecision> {
     const definition = typeof capability === "string" ? requiredDefinition(capability) : capability;
     const generation = this.generation(definition.id, user);
-    if (!hasAnyRole(user.roles, definition.internalRoles)) return decision(definition, "missing_internal_role", undefined, definition.maturity === "preview" ? "unqualified" : "not_required");
+    if (!hasAnyRole(user.roles, definition.internalRoles) && !automaticApplicationRead(user, definition.id)) return decision(definition, "missing_internal_role", undefined, definition.maturity === "preview" ? "unqualified" : "not_required");
     if (definition.mode === "local") return decision(definition, "available", undefined, "not_required");
     if (!definition.probe.adapterRegistered) return decision(definition, "not_configured", undefined, definition.maturity === "preview" ? "unqualified" : "not_required");
     const configuration = await this.currentConfiguration(definition, user, generation);
@@ -243,7 +243,7 @@ export class CapabilityService {
   async requireApplicationDataScope(capabilityId: CapabilityId, user: AuthenticatedUser) {
     if (currentAuthority()?.principal.transport === "bearer" && !isApplicationCollectionCapability(capabilityId)) throw new AppError(403, "invalid_token_mode", "Integration investigations require delegated data scope.");
     const definition = requiredDefinition(capabilityId);
-    if (definition.mode !== "application" || !hasAnyRole(user.roles, definition.internalRoles)) {
+    if (definition.mode !== "application" || !hasAnyRole(user.roles, definition.internalRoles) && !automaticApplicationRead(user, definition.id)) {
       throw new AppError(403, "missing_internal_role", "The application data scope is not authorized for this role.");
     }
     const configuration = await this.currentConfiguration(definition, user);
@@ -307,7 +307,7 @@ export class CapabilityService {
   private async refreshAtGeneration(definition: CapabilityDefinition, user: AuthenticatedUser, generation: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
     this.requireGeneration(definition.id, user, generation);
-    if (!hasAnyRole(user.roles, definition.internalRoles)) return this.decision(definition, user);
+    if (!hasAnyRole(user.roles, definition.internalRoles) && !automaticApplicationRead(user, definition.id)) return this.decision(definition, user);
     if (definition.mode === "local" || !definition.probe.adapterRegistered ||
       !["provider_read", "on_demand"].includes(definition.probe.kind)) return this.decision(definition, user);
     const configuration = await this.currentConfiguration(definition, user, generation);
@@ -573,7 +573,10 @@ function probeSignal(timeoutMs: number, cancellation?: AbortSignal) {
 
 function retryAfter(error: unknown) {
   if (!isApplicationError(error)) return undefined;
-  return boundedRetryAfter(ownEvidenceValue(ownEvidenceValue(error, "details"), "retryAfterMs"));
+  const milliseconds = boundedRetryAfter(ownEvidenceValue(ownEvidenceValue(error, "details"), "retryAfterMs"));
+  if (milliseconds !== undefined) return milliseconds;
+  const seconds = ownEvidenceValue(error, "retryAfterSeconds");
+  return typeof seconds === "number" && Number.isSafeInteger(seconds) ? boundedRetryAfter(seconds * 1_000) : undefined;
 }
 
 function boundedRetryAfter(value: unknown) {

@@ -28,6 +28,7 @@ import {
   getAgentInvestigationContext,
   resolveAgentInvestigationIdentity,
   getCurrentUser,
+  enterDiscovery,
   getWorkbenchMetadata,
   getUnifiedAgents,
   getUnifiedAgentDetail,
@@ -113,7 +114,7 @@ const accessUpdate: PackageAccessReplacement = {
 
 it("checks automatic refresh with an empty JSON body and the current session CSRF token", async () => {
   const fetchMock = vi.fn()
-    .mockResolvedValueOnce(Response.json({ user: {}, csrfToken: "auto-csrf", roleAssignmentRequired: false }))
+    .mockResolvedValueOnce(Response.json({ user: {}, csrfToken: "auto-csrf" }))
     .mockResolvedValueOnce(Response.json({ run: null, detailJob: null, revisions: {}, nextCheckAt: "next" }));
   vi.stubGlobal("fetch", fetchMock);
   await getCurrentUser();
@@ -428,6 +429,50 @@ describe("username sign-in API client", () => {
   });
 });
 
+describe("employee discovery admission", () => {
+  const nextCheckAt = "2026-11-06T17:00:00.000Z";
+
+  it.each(["scheduled", "current", "retryable"])("preserves %s admission with session protection and cancellation", async admission => {
+    const fetchMock = mockJsonResponse({ csrfToken: "discovery-csrf" });
+    await getCurrentUser();
+    const result = { admission, nextCheckAt, ...(admission === "retryable" ? { errorCode: "data_sync_shutdown" } : {}) };
+    fetchMock.mockResolvedValueOnce(Response.json(result, { status: 202 }));
+    const controller = new AbortController();
+    await expect(enterDiscovery({ signal: controller.signal })).resolves.toEqual(result);
+    expect(fetchMock).toHaveBeenLastCalledWith("/api/mcp/authenticated-entry", expect.objectContaining({
+      method: "POST", credentials: "include", signal: controller.signal,
+    }));
+    const headers = new Headers(fetchMock.mock.lastCall?.[1]?.headers);
+    expect(headers.get("X-CSRF-Token")).toBe("discovery-csrf");
+    expect(headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/);
+    expect(fetchMock.mock.lastCall?.[1]?.body).toBeUndefined();
+  });
+
+  it.each([
+    null, false, 42, "scheduled", [], {},
+    { admission: "unknown", nextCheckAt },
+    { admission: "scheduled" },
+    { admission: "scheduled", nextCheckAt: "not-a-date" },
+    { admission: "scheduled", nextCheckAt: 2026 },
+    { admission: "scheduled", nextCheckAt: [nextCheckAt] },
+    { admission: "retryable", nextCheckAt, errorCode: 503 },
+  ].map(response => ({ response })))("rejects malformed admission $response as a typed protocol error", async ({ response }) => {
+    const fetchMock = mockJsonResponse(response);
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionRevalidationRequired(listener);
+    try {
+      const result = enterDiscovery();
+      await expect(result).rejects.toBeInstanceOf(ApiError);
+      await expect(result).rejects.toMatchObject({
+        status: 200, code: "invalid_response", kind: "problem",
+        message: "The server returned an invalid automatic collection admission.",
+      });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(listener).not.toHaveBeenCalled();
+    } finally { unsubscribe(); }
+  });
+});
+
 describe("access API client", () => {
   it.each([false, true])("reads live permission progress without starting checks (retry=%s)", async retryFailed => {
     const progress = { checks: [{ capabilityId: "graph.package.read.application", state: "checking" }] };
@@ -456,7 +501,7 @@ describe("access API client", () => {
   });
 
   it.each([false, true])("persists record-scoped people with CSRF, cancellation and force=%s", async force => {
-    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "people-csrf", roleAssignmentRequired: false });
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "people-csrf" });
     await getCurrentUser();
     fetchMock.mockResolvedValue(new Response(JSON.stringify({ people: {}, changed: true }), {
       headers: { "Content-Type": "application/json" },
@@ -858,7 +903,7 @@ describe("access API client", () => {
   });
 
   it("cancels an exact data-sync run through the CSRF-protected endpoint with a cancellable request", async () => {
-    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf", roleAssignmentRequired: false });
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf" });
     await getCurrentUser();
     fetchMock.mockResolvedValue(Response.json({ id: "job/one", status: "cancelled" }));
     const controller = new AbortController();
@@ -882,7 +927,7 @@ describe("access API client", () => {
   });
 
   it("cancels an exact Power Platform refresh without acquiring provider authorization", async () => {
-    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf", roleAssignmentRequired: false });
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "cancel-csrf" });
     await getCurrentUser();
     fetchMock.mockResolvedValue(Response.json({ id: "job/one", status: "cancelled" }));
     await cancelInventoryRefresh("job/one");
@@ -1396,7 +1441,7 @@ describe("investigation request cancellation", () => {
   ];
 
   it("protects explicit identity resolution with CSRF and sends only the saved agent reference", async () => {
-    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "identity-csrf", roleAssignmentRequired: false });
+    const fetchMock = mockJsonResponse({ user: {}, csrfToken: "identity-csrf" });
     await getCurrentUser();
     fetchMock.mockResolvedValue(Response.json({}));
     await resolveAgentInvestigationIdentity("power_platform:env/one:agent%one");

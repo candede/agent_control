@@ -13,7 +13,7 @@ for (const role of ["Admin", "Viewer"] as const) {
           homeAccountId: "fixture-viewer", tenantId: "fixture-tenant", username: "viewer@example.test",
           displayName: "Viewer", roles: ["AgentControl.Viewer"],
         },
-        roleAssignmentRequired: false, csrfToken: "fixture-csrf",
+        csrfToken: "fixture-csrf",
       } }));
     }
     const requests: string[] = [];

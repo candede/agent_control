@@ -8,10 +8,14 @@ import { withAuthority } from "../auth/authorityContext.js";
 import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
 import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
-import type { McpSettings } from "../types/mcpSettings.js";
+import type { McpAccessProfile, McpConnectionSettings as McpSettings } from "../types/mcpSettings.js";
 import { createMcpSettingsRouter } from "./mcpSettings.js";
 
 const mocks = vi.hoisted(() => ({ handler: undefined as RequestHandler | undefined }));
+vi.mock("../services/mcpAccess.js", () => ({
+  mcpAccessProfile: () => ({ audience: "adoption", operations: [], staffPreviewAuthorized: true,
+    privacy: { hide_employee_details: false, hide_champion_employee: false } }),
+}));
 vi.mock("./policy.js", () => ({
   policyRoute: (_router: unknown, _method: string, _path: string, _policy: unknown, handler: RequestHandler) => {
     mocks.handler = handler;
@@ -25,7 +29,8 @@ vi.mock("../db/pool.js", () => ({
 
 const originalTenants = config.tenants;
 const settings: McpSettings = { state: "not_configured" };
-const reader = vi.fn<(tenantId: string, signal?: AbortSignal) => Promise<McpSettings>>();
+const reader = vi.fn<(tenantId: string, projection: McpAccessProfile, signal?: AbortSignal) => Promise<McpSettings>>();
+const published = { ...settings, privacy: { hide_employee_details: false, hide_champion_employee: false }, privacyScope: "end_user_and_preview" };
 
 beforeEach(async () => {
   config.tenants = [tenant];
@@ -59,9 +64,9 @@ describe("MCP settings request lifecycle without sockets", () => {
   it("uses only the initiating tenant, disables caching, and removes listeners on success", async () => {
     const { response, run, expectCleanup } = transport();
     await run();
-    expect(reader).toHaveBeenCalledExactlyOnceWith(tenant.tenantId, expect.any(AbortSignal));
+    expect(reader).toHaveBeenCalledExactlyOnceWith(tenant.tenantId, expect.objectContaining({ audience: "adoption" }), expect.any(AbortSignal));
     expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
-    expect(response.json).toHaveBeenCalledWith(settings);
+    expect(response.json).toHaveBeenCalledWith(published);
     expectCleanup();
   });
 
@@ -81,7 +86,7 @@ describe("MCP settings request lifecycle without sockets", () => {
     const pending = Promise.withResolvers<McpSettings>();
     reader.mockReturnValueOnce(pending.promise);
     const operation = run();
-    const signal = reader.mock.calls[0][1]!;
+    const signal = reader.mock.calls[0][2]!;
     if (event === "aborted") request.emit(event);
     else response.emit(event);
     expect(signal.aborted).toBe(true);
@@ -108,7 +113,7 @@ describe("MCP settings request lifecycle without sockets", () => {
       response.emit("close");
     });
     await run();
-    expect(reader.mock.calls[0][1]!.aborted).toBe(false);
+    expect(reader.mock.calls[0][2]!.aborted).toBe(false);
     expectCleanup();
   });
 
@@ -132,7 +137,7 @@ describe("MCP settings request lifecycle without sockets", () => {
     } else {
       pending.resolve(settings);
       await operation;
-      expect(response.json).toHaveBeenCalledWith(settings);
+      expect(response.json).toHaveBeenCalledWith(published);
     }
     expect(acquire).not.toHaveBeenCalled();
     expect(revalidate).not.toHaveBeenCalled();

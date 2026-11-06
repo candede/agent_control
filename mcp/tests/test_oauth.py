@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode
 
@@ -16,7 +17,7 @@ from agent_control_mcp.auth import TenantAzureProvider, valid_claims
 from agent_control_mcp.config import ConfigurationError
 from agent_control_mcp.domains import PUBLIC_TOOLS
 from agent_control_mcp.service import ProtocolBoundary, build_service
-from agent_control_mcp.storage import OAuthStore
+from agent_control_mcp.storage import CLIENT_COLLECTION, OAuthStore
 from agent_control_mcp.tools import OPERATIONS
 
 
@@ -139,8 +140,8 @@ async def test_discovery_initialization_authenticated_catalog_and_diagnostics(br
     assert unauthenticated.status_code == 401
     diagnostics = await browser.get("/diagnostics", headers=headers)
     assert diagnostics.status_code == 200
-    assert diagnostics.json()["businessTools"] == len(await service.mcp.list_tools())
-    assert diagnostics.json()["canonicalOperations"] == len(OPERATIONS) == 105
+    assert diagnostics.json()["businessTools"] == len(PUBLIC_TOOLS)
+    assert diagnostics.json()["canonicalOperations"] == len(OPERATIONS)
     usage = diagnostics.json()["oauthStorageUsage"]
     assert 0 < usage["files"] < usage["fileLimit"] == 4096
     assert 0 < usage["bytes"] < usage["byteLimit"] == 67108864
@@ -571,6 +572,38 @@ async def test_public_upstream_recovery_restart_refresh_revocation_and_signing_r
     assert await rotated.load_access_token(refreshed.json()["access_token"]) is None
 
 
+async def test_registered_client_outlives_day_boundary_and_can_reauthorize_refresh_after_restart(
+    browser, service, settings, monkeypatch
+):
+    client_id, issued = await tokens(browser)
+    client, ttl = await service.store.ttl(client_id, collection=CLIENT_COLLECTION)
+    assert client is not None and ttl is None
+    future = datetime.now(UTC) + timedelta(days=30)
+    with monkeypatch.context() as clock:
+        clock.setattr("key_value.aio._utils.managed_entry.now", lambda: future)
+        assert await service.provider.get_client(client_id) is not None
+    restarted_store = OAuthStore(settings)
+    await restarted_store.start()
+    restarted = TenantAzureProvider(settings, restarted_store, service.http)
+    restarted.set_mcp_path(settings.mcp_path)
+    assert await restarted.get_client(client_id) is not None
+    authorize = await browser.get("/authorize", params={
+        "client_id": client_id, "response_type": "code", "scope": "Mcp.Access",
+        "redirect_uri": "https://client.example.test/callback",
+        "code_challenge": "a" * 43, "code_challenge_method": "S256",
+        "resource": settings.public_url,
+    })
+    assert authorize.status_code in {302, 307}
+    refreshed = await browser.post("/token", data={
+        "grant_type": "refresh_token", "client_id": client_id,
+        "refresh_token": issued["refresh_token"], "resource": settings.public_url,
+    })
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["expires_in"] == 900
+    assert await restarted.load_access_token(refreshed.json()["access_token"])
+    await restarted_store.aclose()
+
+
 async def test_reference_expiring_during_token_swap_returns_unauthenticated(
     browser, service, monkeypatch
 ):
@@ -709,6 +742,14 @@ async def test_refresh_denial_reconnect_and_isolated_principals(browser, service
         {"ver": "1.0"},
         {"scp": "AgentControl.Access"},
         {"idtyp": "app"},
+        {"idtyp": None},
+        {"idtyp": True},
+        {"roles": None},
+        {"roles": "AgentControl.Viewer"},
+        {"roles": [1]},
+        {"roles": ["unknown"]},
+        {"roles": ["AgentControl.Viewer", "unknown"]},
+        {"roles": ["AgentControl.Viewer"] * 65},
         {"nbf": int(time.time()) + 300},
         {"exp": None},
     ],

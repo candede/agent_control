@@ -25,7 +25,7 @@ async function mockReportSelection(page: Page, role: "Admin" | "Viewer" | "Usage
   };
   await page.route("**/api/me", route => route.fulfill({ json: {
     user: { homeAccountId: `fixture-${role}`, tenantId: "fixture-tenant", username: `${role}@example.test`, displayName: role,
-      roles: [`AgentControl.${role}`] }, roleAssignmentRequired: false, csrfToken: "fixture-csrf",
+      roles: [`AgentControl.${role}`] }, csrfToken: "fixture-csrf",
   } }));
   const mutations: string[] = [], inventoryRequests: URLSearchParams[] = [], userRequests: URLSearchParams[] = [];
   const overviewScopes: Array<string | null> = [], snapshotRequests: URLSearchParams[] = [];

@@ -62,6 +62,20 @@ describe.sequential("Data sync repository", () => {
     await expect(repository.listRuns(scope, 51)).rejects.toMatchObject({ code: "invalid_data_sync_limit" });
   });
 
+  it("admits one cold employee application source set across simultaneous different identities and retries", async () => {
+    const tenantId = randomUUID();
+    const owners = [randomUUID(), randomUUID()].map(principalId => ({ tenantId, principalId }));
+    const results = await Promise.all(Array.from({ length: 6 }, (_value, index) =>
+      repository.submitDue(owners[index % owners.length], Date.now(), undefined, ["graph_packages", "users"])));
+    expect(results.filter(value => value.created)).toHaveLength(1);
+    const runs = await fixture.runtime.query<{ principal_id: string; id: string }>(
+      "SELECT principal_id,id FROM data_sync_runs WHERE tenant_id=$1", [tenantId]);
+    expect(runs.rows).toHaveLength(1);
+    expect(owners.map(value => value.principalId)).toContain(runs.rows[0].principal_id);
+    const admitted = await repository.getRun({ tenantId, principalId: runs.rows[0].principal_id }, runs.rows[0].id);
+    expect(admitted!.sources.map(value => value.source).sort()).toEqual(["graph_packages", "users"]);
+  });
+
   it.each(["initial", "incremental", "full"] as const)("defaults %s to automatic sources and respects explicit narrower requests", async mode => {
     const owner = { ...scope, tenantId: randomUUID(), principalId: `default-${mode}` };
     const { run } = await repository.submit(owner, { mode });

@@ -101,7 +101,7 @@ validation to make a client connect.
    ```
 
 3. Open **MCP: List Servers**, start `agentControl` and complete browser OAuth.
-4. Select its tools in the chat tool picker and request `capabilities`, action `list`.
+4. Select its tools in the chat tool picker and search `agent_catalog`.
    Follow the [first-read checks](#verify-and-use-the-connection).
 
 The native callback listener tries port 33418, then an ephemeral port if busy.
@@ -124,7 +124,7 @@ Agent Control OAuth; the retired `gh copilot` extension is not an MCP host.
    and fallback behavior are also unverified.
 3. Run `/mcp show agentControl`, then `/mcp auth agentControl` to sign in or
    reconnect. Use `/mcp` to manage the connection.
-4. Request `capabilities`, action `list`, then follow the [first-read checks](#verify-and-use-the-connection).
+4. Search `agent_catalog`, then follow the [first-read checks](#verify-and-use-the-connection).
 
 Alternatively, add the transport with:
 
@@ -153,7 +153,7 @@ permission to execute it.
    opencode mcp list
    ```
 
-4. Request `capabilities`, action `list`, and follow the [first-read checks](#verify-and-use-the-connection).
+4. Search `agent_catalog` and follow the [first-read checks](#verify-and-use-the-connection).
 
 Use `opencode mcp debug agentControl` for diagnostics and
 `opencode mcp logout agentControl` to clear authentication. Keep OAuth material
@@ -170,7 +170,7 @@ protected-resource metadata if authentication is rejected.
    HTTPS MCP URL.
 3. Choose **Sign in now > Register automatically** (DCR), then sign in as yourself.
    Do not choose “Use Claude's published identity”/CIMD; this server disables it.
-4. Enable the connector for the conversation/task and request `capabilities`, action `list`.
+4. Enable the connector for the conversation/task and search `agent_catalog`.
    Follow the [first-read checks](#verify-and-use-the-connection). For Cowork,
    start a fresh task after adding the connector.
 
@@ -196,7 +196,7 @@ account connectors, not Claude Code's `~/.claude` configuration.
    Alternatively, merge the [project sample](../mcp/examples/clients/claude-code/.mcp.json)
    into `.mcp.json`, replace the URL and connect through `/mcp`. The sample sets
    `oauth.callbackPort:53109`.
-3. Request `capabilities`, action `list`, and follow the [first-read checks](#verify-and-use-the-connection).
+3. Search `agent_catalog` and follow the [first-read checks](#verify-and-use-the-connection).
 
 Use a fixed-callback-capable build; vendor docs identify a redirect mismatch in
 **2.1.229**. Random callback ports are not covered by the exact allowlist.
@@ -227,7 +227,7 @@ placeholder, and send **`anthropic-beta: mcp-client-2025-11-20`**:
 }
 ```
 
-For the first test, ask the model to call `capabilities` with action `list` and inspect the tool
+For the first test, ask the model to search `agent_catalog` and inspect the tool
 result. No additional client callback is configured in this payload; the host's
 OAuth acquisition flow needs its own exact allowlisted callback. Keep tokens out
 of prompts/logs. For controls, the host must display the preview and obtain
@@ -255,7 +255,7 @@ licensing, region and data policies; a trial can test chat but cannot publish.
    [container extraction command](copilot-studio-mcp-connection.md#vps-extraction-command)
    to deduplicate and export retained callback rejections safely.
 4. Create the connection, sign in and add it to the agent.
-5. In test chat, request `capabilities`, action `list`, then follow the
+5. In test chat, search `agent_catalog`, then follow the
    [first-read checks](#verify-and-use-the-connection). Studio can omit the OAuth
    `resource` parameter; the server pins omission on authorize and token/refresh
    requests to its sole configured MCP URL. Explicit wrong/empty resources and
@@ -284,7 +284,7 @@ For a separately authorized, short diagnostic only:
 2. Supply a legitimately issued, current, short-lived MCP-resource token for the
    intended individual through the sample's Agents-secret reference
    `$COPILOT_MCP_AGENT_CONTROL_ACCESS_TOKEN`. The sample does not acquire or rotate it.
-3. Request `capabilities`, action `list`, in the task/review and inspect its result. The sample
+3. For an authorized staff connection, request `capabilities`, action `list`, in the task/review and inspect its result. The sample
    exposes only that read-only tool; code review also requires
    `annotations.readOnlyHint:true`.
 4. Stop on expiry, revocation or a sign-in challenge.
@@ -296,7 +296,8 @@ Cloud tools run autonomously; do not expose interactive controls through this re
 ## Verify and use the connection
 
 The web app's **MCP settings** page shows the current server's exact instructions
-and complete advertised tool schemas to Viewer-capable users. It distinguishes
+and complete caller-projected tool schemas to Viewer-capable users, with independent
+API-owned read-only privacy values even during metadata outages. It distinguishes
 the server Entra callback from your downstream callback allowlist. Its internal
 reachability/storage evidence does not verify your client, the public tunnel or
 your provider permissions; continue the real client checks below.
@@ -305,12 +306,19 @@ Defender/hunting and Purview investigation tools are not in the MCP catalog.
 Their canonical API support is unchanged.
 
 1. Refresh discovery after a catalog change; existing OAuth credentials and keys
-   need not change. Optionally read **`capabilities`**, action `list`, with
+   need not change. As the actual signed-in user, read `my_discovery_profile`
+   with `{"request":{"action":"read","input":{}}}` and search `agent_catalog`.
+   Roleless members receive only this safe discovery surface and `my_workplace`.
+   Staff may optionally read **`capabilities`**, action `list`, with
    `{"request":{"action":"list","input":{}}}`. This is saved diagnostic evidence,
    not a prerequisite to saved reads. Every tool takes one typed `request`.
    Family results contain `action` and the complete canonical `result`;
    standalone tools retain direct results and use `{"request":{}}` for empty input.
-2. Request a saved agents/users list using the discovered schemas. Check the
+2. Read saved discovery using the discovered schemas (staff may also read their
+   authorized inventory/users). Explicit other-user requests use `preview_end_user`
+   on every action, with the exact selected subject. Never switch authentication,
+   borrow target roles, mix privileged reads into preview or share an author
+   connection as an employee lens. Check the
    returned data and any partial/unavailable state, not just tool discovery or
    health. Saved reads do not trigger collection.
 3. Check token refresh and reconnect in the client/build you actually use.
@@ -330,6 +338,7 @@ execution and recovery.
 | Symptom | Action |
 | --- | --- |
 | Discovery/401 loop | Use the MCP resource URL, not `/sse`, the API origin or Entra token URL. Check HTTPS discovery/OAuth forwarding and the client's exact resource on authorize/token/refresh. |
+| `Client Not Registered` / saved client ID absent | Clear the affected client's cached OAuth registration, not just its tokens, then reconnect so it performs fresh dynamic client registration. See [stale client registration](#stale-client-registration) below. |
 | Redirect rejected | Inspect the MCP container's `OAuth client registration rejected: invalid_redirect_uri` warning for rejected callback URLs. Compare the full emitted/registered URI with the allowlist, including root slash, host and port. Use all four VS Code callbacks; do not invent `/callback` or wildcard ports. |
 | `reauthorization_required` / claims challenge | Reconnect through client OAuth; never enter credentials in tools/chat. |
 | `invalid_authorization_response` | The token endpoint returned malformed success metadata. This is a server/provider response failure, not evidence that the client is disconnected. |
@@ -338,6 +347,43 @@ execution and recovery.
 | 413 `output_limit` | Reduce a safe read's page size while retaining its selection/continuation; row count alone does not guarantee byte fit. |
 | 429/503 | Respect cooldown; never blindly resubmit a write. Retain its operation/job ID and inspect saved status. |
 | Tools listed, but sign-in/refresh fails | Sample import/discovery is not OAuth interoperability. Check the client-specific limitations above and [authentication contract](mcp-reference.md#oauth-and-token-flow). |
+
+### Stale client registration
+
+Dynamic client registrations (DCR) are
+[durable](mcp-reference.md#storage-rotation-and-recovery): they do not expire
+daily or disappear on an ordinary deployment. Access/refresh credentials and
+temporary authorization state still expire normally.
+
+The former blanket 24-hour storage policy also expired registrations, which could
+leave clients holding an ID the server had forgotten. Lost or explicitly deleted
+registration state can produce the same error. The fixed server preserves
+still-valid registrations on startup, but cannot reconstruct already missing
+metadata from a client ID alone. Do not routinely delete/recreate working Studio
+connections. For an already affected connection, use the client's supported
+registration-recovery flow once. Clearing only access/refresh tokens can leave
+the stale client ID cached.
+
+In VS Code, open the Command Palette and run
+**Authentication: Remove Dynamic Authentication Providers**. Select only the
+provider for this MCP server's HTTPS origin, then reconnect the MCP server and
+complete its normal browser sign-in. This clears the affected provider's cached
+registration; do not remove unrelated providers or the server's Entra registration.
+The [VS Code stale-registration recovery report](https://github.com/microsoft/vscode/issues/269379#issuecomment-3358913230)
+documents the distinction from simply signing out.
+Use the authentication manager for the harness running the current chat.
+For a Copilot harness session, open **Chat: Open Customizations > MCP Servers**
+and select the existing server in that harness's configuration. Editor-managed
+MCP and another harness can have separate authentication caches; resetting one
+does not establish that the other has registered or signed in.
+For another MCP host, use that host's equivalent cached OAuth client-registration
+reset, not an application-database reset.
+
+The new connection must register normally and obtain a new client ID. Do not
+recreate an arbitrary missing client ID on the server, supply the MCP server's
+Entra secret to the client, relax callback checks, or delete the shared OAuth volume.
+Registration expiry alone does not establish that the database reset or deployment
+deleted OAuth state.
 
 Redact tokens, OAuth values and provider diagnostic bodies from support output.
 Registration warnings include only rejected callback URLs, not client names or

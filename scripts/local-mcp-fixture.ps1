@@ -6,6 +6,16 @@ function Assert-LocalMcpFixtureEngine {
     }
 }
 
+function Invoke-LocalMcpFixturePython {
+    param([string]$Image,[string]$Directory,[string]$Code)
+    Assert-LocalMcpFixtureEngine
+    if ($Image -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Fixture Python requires an immutable built image.' }
+    return Invoke-DockerCommand @('run','--rm','--pull','never','--network','none',
+        '--user',"$((& id -u).Trim()):$((& id -g).Trim())",'--read-only','--cap-drop','ALL',
+        '--security-opt','no-new-privileges','--memory','512m','--cpus','0.5','--pids-limit','128',
+        '--mount',"type=bind,source=$Directory,target=/work",'--entrypoint','python',$Image,'-c',$Code,'/work') -Capture -CaptureError
+}
+
 function Get-LocalMcpFixtureContainers {
     param($Context,[string]$Directory,$Images)
     Assert-LocalMcpFixtureEngine
@@ -74,16 +84,25 @@ function Invoke-LocalMcpFixture {
     $snapshot = $null
     $failures = [Collections.Generic.List[Exception]]::new()
     $started = $false
+    $containersCleaned = $true
     $drainId = $null
     $cleanupFailures = 0
     $journeys = @()
     $ownership=@{project=$project;state=$context.State;network=$context.Network;port=$port;context='desktop-linux';endpoint="unix://$HOME/.docker/run/docker.sock";purpose='synthetic MCP container qualification';priorResourcesAbsent=$true}
     Write-LocalText (Join-Path $Directory 'mcp-ownership.json') ($ownership | ConvertTo-Json)
     try {
+        $context.SourceEvidenceFile = Join-Path $Directory 'mcp-source.json'
+        $snapshot = New-LocalBuildSnapshot $context
+        $ownership.snapshot=$snapshot.Directory
+        Write-LocalText (Join-Path $Directory 'mcp-ownership.json') ($ownership | ConvertTo-Json)
+        $context.McpImage = "$project-mcp:local"
+        $context.McpImageId = Build-LocalMcpArtifact $context $snapshot
+        $images[$context.McpImage] = $context.McpImageId
+        $fixtureImage = Build-LocalMcpArtifact $context $snapshot -Target fixture
+        $images["$($context.McpImage)-test"] = $fixtureImage
         [IO.Directory]::CreateDirectory((Join-Path $context.State 'secrets')) | Out-Null
         foreach ($path in @($context.State,(Join-Path $context.State 'secrets'))) { Protect-LocalPath $path -Directory }
-        & (Join-Path $Root 'mcp/.venv/bin/python') -c 'import json,sys;from pathlib import Path;from joserfc.jwk import RSAKey;from cryptography.fernet import Fernet;p=Path(sys.argv[1]);p.joinpath("key.json").write_text(json.dumps(RSAKey.generate_key(parameters={"kid":"fixture-key"}).as_dict(private=True)));p.joinpath("signing").write_text(Fernet.generate_key().decode());p.joinpath("encryption").write_text(json.dumps([Fernet.generate_key().decode()]));[x.chmod(0o600) for x in p.iterdir() if x.is_file()]' $Directory
-        if ($LASTEXITCODE -ne 0) { throw 'Synthetic key generation failed.' }
+        Invoke-LocalMcpFixturePython $fixtureImage $Directory 'import json,sys;from pathlib import Path;from joserfc.jwk import RSAKey;from cryptography.fernet import Fernet;p=Path(sys.argv[1]);p.joinpath("key.json").write_text(json.dumps(RSAKey.generate_key(parameters={"kid":"fixture-key"}).as_dict(private=True)));p.joinpath("signing").write_text(Fernet.generate_key().decode());p.joinpath("encryption").write_text(json.dumps([Fernet.generate_key().decode()]));[p.joinpath(name).chmod(0o600) for name in ("key.json","signing","encryption")]' | Out-Null
         Write-LocalText (Join-Path $context.State 'secrets/mcp-client') 'synthetic-confidential-client-secret'
         Write-LocalText (Join-Path $context.State 'secrets/mcp-signing') ([IO.File]::ReadAllText((Join-Path $Directory 'signing')))
         Write-LocalText (Join-Path $context.State 'secrets/mcp-encryption') ([IO.File]::ReadAllText((Join-Path $Directory 'encryption')))
@@ -94,14 +113,6 @@ function Invoke-LocalMcpFixture {
         Write-LocalText (Join-Path $context.State 'settings.json') ($settings | ConvertTo-Json -Depth 8)
         Write-LocalText (Join-Path $context.State 'secrets/tenants.json') (ConvertTo-Json -InputObject @($profile) -Depth 8)
         Initialize-LocalState $context $false
-        $context.SourceEvidenceFile = Join-Path $Directory 'mcp-source.json'
-        $snapshot = New-LocalBuildSnapshot $context
-        $ownership.snapshot=$snapshot.Directory
-        Write-LocalText (Join-Path $Directory 'mcp-ownership.json') ($ownership | ConvertTo-Json)
-        $context.McpImageId = Build-LocalMcpArtifact $context $snapshot
-        $images[$context.McpImage] = $context.McpImageId
-        $fixtureImage = Build-LocalMcpArtifact $context $snapshot -Target fixture
-        $images["$($context.McpImage)-test"] = $fixtureImage
         Invoke-LocalMcpChecks $context $snapshot -Image $fixtureImage
         Test-LocalMcpConfiguration $context
         $fixture = Join-Path $Directory 'mcp-fixture.yaml'
@@ -142,6 +153,7 @@ networks:
         Write-LocalComposeEnvironment $context
         # First start the unmodified production runtime image, not fixture authentication.
         $started = $true
+        $containersCleaned = $false
         Invoke-DockerCommand ($context.Compose + @('up','-d','--no-build','--no-deps','--wait','--wait-timeout','90','app','mcp'))
         $cold = @(Get-LocalMcpFixtureContainers $context $Directory $images)
         Write-LocalText (Join-Path $Directory 'mcp-production-image.json') ($cold | ConvertTo-Json -Depth 12)
@@ -180,7 +192,7 @@ services:
         # Retain old decryption material while independently rotating only encryption.
         $keyFile = Join-Path $context.State 'secrets/mcp-encryption'
         $keys = @([IO.File]::ReadAllText($keyFile) | ConvertFrom-Json)
-        $newKey = & (Join-Path $Root 'mcp/.venv/bin/python') -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())'
+        $newKey = Invoke-LocalMcpFixturePython $fixtureImage $Directory 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())'
         Write-LocalText $keyFile (ConvertTo-Json -InputObject @($newKey,$keys[0]) -Compress)
         Invoke-DockerCommand ($context.Compose + @('up','-d','--no-build','--no-deps','--force-recreate','--wait','--wait-timeout','90','mcp'))
         $journeys += Invoke-Journey 'encryption-rotation'
@@ -196,7 +208,7 @@ services:
         Invoke-DockerCommand ($context.Compose + @('up','-d','--no-build','--no-deps','--wait','--wait-timeout','90','mcp'))
         $journeys += Invoke-Journey 'revoked'
         $journeys += Invoke-Journey 'reconnect'
-        $signing = & (Join-Path $Root 'mcp/.venv/bin/python') -c 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())'
+        $signing = Invoke-LocalMcpFixturePython $fixtureImage $Directory 'from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())'
         Write-LocalText (Join-Path $context.State 'secrets/mcp-signing') $signing
         Invoke-DockerCommand ($context.Compose + @('up','-d','--no-build','--no-deps','--force-recreate','--wait','--wait-timeout','90','mcp'))
         $journeys += Invoke-Journey 'revoked'
@@ -256,7 +268,7 @@ services:
         Test-LocalMcpConfiguration $context
         Write-LocalText (Join-Path $Directory 'mcp-denials.json') (@{unprotectedSecretRefused=$true;insecureStateRefused=$true;protectedConfigurationRecovered=$true} | ConvertTo-Json)
         Write-LocalText (Join-Path $Directory 'mcp-journeys.json') (@{journeys=$journeys;shutdownSeconds=$clock.Elapsed.TotalSeconds;outcome='passed'} | ConvertTo-Json -Depth 5)
-    } catch { $cleanupFailures++; $failures.Add($_.Exception) }
+    } catch { $failures.Add($_.Exception) }
     finally {
         if ($started) {
             try {
@@ -275,10 +287,12 @@ services:
                     (Invoke-DockerCommand @('network','inspect','--format','{{.Internal}}',$context.Network) -Capture) -cne 'true') { throw 'MCP fixture network identity changed; cleanup refused.' }
                 Invoke-DockerCommand ($context.Compose + @('down','--timeout','75'))
                 if (@(Get-LocalMcpFixtureContainers $context $Directory $images).Count) { throw 'MCP fixture containers remain.' }
-            } catch { $failures.Add($_.Exception) }
+                $containersCleaned = $true
+            } catch { $cleanupFailures++; $failures.Add($_.Exception) }
         }
         try {
             Assert-LocalMcpFixtureEngine
+            if (-not $containersCleaned) { throw 'Fixture containers remain; preserve their volumes, credentials and recovery state.' }
             if ($context.McpVolume -in ((Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture) -split "`n")) {
                 $labels = Invoke-DockerCommand @('volume','inspect','--format','{{json .Labels}}',$context.McpVolume) -Capture | ConvertFrom-Json -AsHashtable
                 if ($labels['com.docker.compose.project'] -cne $project -or $labels['com.docker.compose.volume'] -cne 'mcp-oauth' -or

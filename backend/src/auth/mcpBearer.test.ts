@@ -38,7 +38,7 @@ describe("Entra delegated API verification", () => {
     { aud: tenant.integration!.clientId }, { aud: [tenant.clientId, "other"] }, { aud: undefined },
     { azp: tenant.clientId }, { azp: undefined }, { appid: tenant.integration!.clientId },
     { ver: "1.0" }, { idtyp: "app" }, { scp: undefined }, { scp: "User.Read" }, { scp: ["AgentControl.Access"] },
-    { roles: undefined }, { roles: [] }, { roles: ["Graph.Admin"] }, { roles: ["AgentControl.Viewer", 1] },
+    { roles: null }, { roles: "AgentControl.Viewer" }, { roles: ["Graph.Admin"] }, { roles: ["AgentControl.Viewer", 1] },
     { oid: undefined }, { oid: "not-an-object-guid" }, { sub: undefined }, { sub: ["subject"] },
     { wids: "global-admin" }, { wids: ["not-a-guid"] }, { nonce: "id-token-nonce" },
     { exp: 1 }, { iat: undefined }, { nbf: undefined }, { exp: undefined },
@@ -46,6 +46,12 @@ describe("Entra delegated API verification", () => {
     { exp: Math.floor(Date.now() / 1000) + 25 * 3600 },
   ])("fails closed on invalid required claims %j", async changes => {
     await expect(new McpBearerVerifier(signingFetcher()).verify(apiToken(changes))).rejects.toMatchObject({ status: 401, code: "invalid_bearer" });
+  });
+
+  it.each([{ roles: undefined }, { roles: [] }])("admits signed delegated roleless identity without inventing roles %j", async changes => {
+    const verified = await new McpBearerVerifier(signingFetcher()).verify(apiToken(changes));
+    expect(verified.roles).toEqual([]);
+    expect(verified.localAccountId).toBe(apiClaims().oid);
   });
 
   it("rejects malformed numeric claims even if they bypass the signing library's checks", async () => {

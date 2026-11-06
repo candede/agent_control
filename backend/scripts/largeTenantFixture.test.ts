@@ -14,6 +14,26 @@ import { schemaFingerprint } from "../src/db/schema.js";
 import { testSchemaTemplateIdentity } from "./testDatabaseTemplate.js";
 
 describe("large tenant fixture and frozen semantic seeds", () => {
+  it("qualifies discovery SQL and bounded representative capacity through the existing runner", () => {
+    const functional = fixtureCommands("mcp-agent-discovery");
+    expect(functional[0]).toContain("src/routes/agentDiscovery.test.ts");
+    expect(functional[0]).toContain("scripts/databaseReset.test.ts");
+    const files = functional[0].filter(value => value.endsWith(".test.ts"));
+    expect(new Set(files).size).toBe(files.length);
+    for (const file of fixtureCommands("mcp-roleless-authority")[0].filter(value => value.endsWith(".test.ts"))) {
+      expect(files).toContain(file);
+    }
+    expect(files).toContain("src/services/mcpSettings.test.ts");
+    expect(files).toContain("src/services/copilotUsage.unit.test.ts");
+    const capacity = fixtureCommands("mcp-agent-discovery-capacity");
+    expect(capacity).toEqual([["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts", "--silent=false"]]);
+    const execute = vi.fn(() => ({ pid: 42, status: 0, signal: null,
+      stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), output: [] }));
+    runFixtureCommand(capacity[0], {}, execute);
+    expect(execute).toHaveBeenLastCalledWith("npm", capacity[0], expect.objectContaining({ timeout: 1_740_000, detached: true }));
+    runFixtureCommand(functional[0], {}, execute);
+    expect(execute).toHaveBeenLastCalledWith("npm", functional[0], expect.objectContaining({ timeout: 600_000 }));
+  });
   it("discovers Office SQL/API/publication/lifecycle proof in the isolated existing owner", () => {
     const commands = fixtureCommands("office-app-adoption");
     expect(commands).toHaveLength(2);
@@ -34,7 +54,8 @@ describe("large tenant fixture and frozen semantic seeds", () => {
     expect(fixtureCommands("mcp-end-to-end")).toEqual([
       ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
         "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
-        "src/routes/sharedAgentControls.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
+        "src/routes/sharedAgentControls.test.ts", "src/routes/agentDiscovery.test.ts",
+        "src/services/mcpSettings.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
       ["run", "typecheck", "--workspace", "backend"],
     ]);
     const runner = readFileSync(new URL("./largeTenantFixture.ts", import.meta.url), "utf8");

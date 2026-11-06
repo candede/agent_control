@@ -1,6 +1,7 @@
 #requires -Version 7.0
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
+. (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
 $repository = Split-Path $PSScriptRoot -Parent
 $root = Join-Path $repository "artifacts/test-scratch/mcp-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory($root) | Out-Null
@@ -11,6 +12,7 @@ $script:checks = 0
 $script:calls = [Collections.Generic.List[string]]::new()
 $script:running = $false
 $script:failStart = $false
+$script:preserveMcpPort = $false
 $script:mountDetails = $null
 $script:ready = $true
 $script:volume = $false
@@ -19,6 +21,11 @@ $script:recordingVolumeOverrides = @{}
 $script:endpoint = "unix://$HOME/.docker/run/docker.sock"
 $script:image = 'sha256:' + ('a'*64)
 $script:container = 'b'*64
+$script:dependencyImage = 'sha256:' + ('c'*64)
+$script:dependencyPlatform = 'linux/arm64'
+$script:dependencyHashes = @{}
+$script:dependencyInspectionFailure = $false
+$script:changeDependencyDuringBuild = $false
 function Assert($Condition,[string]$Message) {
     if (-not $Condition) { throw $Message }
     $script:checks++
@@ -31,6 +38,20 @@ function docker {
     param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
     $global:LASTEXITCODE = 0
     $script:calls.Add($Arguments -join '|')
+    if ($Arguments[0] -eq 'image') {
+        if ($Arguments[3] -ceq '{{.Os}}/{{.Architecture}}') { return $script:dependencyPlatform }
+        return $script:dependencyImage
+    }
+    if ($Arguments[0] -eq 'run' -and $Arguments -contains '/opt/mcp/.venv/bin/python') {
+        if ($script:dependencyInspectionFailure) { throw 'Installed MCP dependencies are inconsistent.' }
+        return $script:dependencyHashes | ConvertTo-Json -Compress
+    }
+    if ($Arguments[0] -eq 'build') {
+        $identityFile = $Arguments[[Array]::IndexOf($Arguments,'--iidfile')+1]
+        [IO.File]::WriteAllText($identityFile,$script:image)
+        if ($script:changeDependencyDuringBuild) { $script:dependencyImage='sha256:' + ('d'*64) }
+        return
+    }
     if ($Arguments[0] -eq 'context') {
         if ($Arguments[1] -eq 'show') { return 'desktop-linux' }
         return $script:endpoint
@@ -63,6 +84,7 @@ function docker {
         Assert (-not [Environment]::GetEnvironmentVariable('MCP_CLIENT_SECRET_FILE')) 'Shell MCP credentials replaced project secret mounts.'
         if ($script:failStart) { throw 'Simulated MCP start failure.' }
         $script:running=$true
+        if ($script:mountDetails -and -not $script:preserveMcpPort) { $script:mountDetails.ports['8000/tcp'][0].HostPort=[string]$context.Mcp.port }
     }
 }
 function Get-OwnedLocalContainers {
@@ -94,6 +116,7 @@ function Set-SetupAnswers {
     param([string[]]$Text=@(),[string[]]$Secrets=@())
     $script:textAnswers.Clear(); $script:secretAnswers.Clear(); $script:prompts.Clear()
     foreach ($answer in $Text) { $script:textAnswers.Enqueue($answer) }
+    if ($Text.Count) { foreach ($answer in @('','')) { $script:textAnswers.Enqueue($answer) } }
     foreach ($answer in $Secrets) { $script:secretAnswers.Enqueue($answer) }
 }
 function Read-Host {
@@ -109,15 +132,88 @@ function Read-Host {
     return $script:textAnswers.Dequeue()
 }
 try {
+    Fails { Invoke-LocalMcpFixturePython 'mutable:tag' $root 'print(1)' } 'immutable built image'
+    $before=$script:calls.Count
+    Invoke-LocalMcpFixturePython $script:image $root 'print(1)' | Out-Null
+    $pythonCall=$script:calls[-1]
+    Assert ($script:calls.Count -eq $before + 3) 'Fixture Python did not verify its exact local engine.'
+    Assert ($pythonCall.Contains('|--network|none|') -and $pythonCall.Contains('|--read-only|--cap-drop|ALL|')) 'Fixture Python lost network/filesystem isolation.'
+    Assert ($pythonCall.Contains("|--mount|type=bind,source=$root,target=/work|--entrypoint|python|$script:image|-c|print(1)|/work")) 'Fixture Python did not use its immutable genuine container interpreter.'
     Assert (Test-LocalBindSource '/Users/fixture/key' '/Users/fixture/key') 'Exact bind source was refused.'
     Assert (-not (Test-LocalBindSource '/host_mnt/Users/other/key' '/Users/fixture/key')) 'Foreign mapped bind source was accepted.'
-    if ($IsMacOS) {
+    if (-not $IsWindows) {
         Assert (Test-LocalBindSource '/host_mnt/Users/fixture/key' '/Users/fixture/key') 'Verified Docker Desktop mapping was refused.'
         $script:endpoint='ssh://remote.invalid'
         Assert (-not (Test-LocalBindSource '/host_mnt/Users/fixture/key' '/Users/fixture/key')) 'Remote daemon alias was accepted.'
         $script:endpoint="unix://$HOME/.docker/run/docker.sock"
     }
     $context = New-LocalContext $root 'mcp-test'
+    $buildSource = Join-Path $root 'mcp'
+    [IO.Directory]::CreateDirectory($buildSource) | Out-Null
+    foreach ($path in @('pyproject.toml','uv.lock')) {
+        Copy-Item -LiteralPath (Join-Path $repository "mcp/$path") -Destination $buildSource
+        $script:dependencyHashes[$path]=(Get-FileHash (Join-Path $buildSource $path)).Hash.ToLowerInvariant()
+    }
+    $snapshot=@{Root=$root;Directory=$root}
+    $context.SourceHash='e'*64
+    $savedDependencyImage=[Environment]::GetEnvironmentVariable('AGENT_CONTROL_MCP_DEPENDENCY_IMAGE')
+    try {
+        Remove-Item Env:AGENT_CONTROL_MCP_DEPENDENCY_IMAGE -ErrorAction SilentlyContinue
+        $script:calls.Clear()
+        Assert ((Build-LocalMcpArtifact $context $snapshot) -ceq $script:image) 'MCP build did not return its immutable image.'
+        $buildCall=@($script:calls | Where-Object { $_ -like 'build|*' })[0]
+        Assert ($buildCall.Contains("|--label|io.agent-control.source-sha256=$($context.SourceHash)|") -and
+            -not $buildCall.Contains('REUSE_INSTALLED_DEPENDENCIES') -and
+            -not @($script:calls | Where-Object { $_ -like 'run|*' }).Count) 'Ordinary MCP build lost source provenance or inspected an unrequested dependency image.'
+        $env:AGENT_CONTROL_MCP_DEPENDENCY_IMAGE='cached-mcp:test'
+        $script:calls.Clear()
+        Assert ((Build-LocalMcpArtifact $context $snapshot) -ceq $script:image) 'Offline MCP build failed.'
+        $buildCall=@($script:calls | Where-Object { $_ -like 'build|*' })[0]
+        $inspection=@($script:calls | Where-Object { $_ -like 'run|*' })[0]
+        Assert ($buildCall.Contains('|--network|none|--platform|linux/arm64|--build-arg|MCP_DEPENDENCY_BASE=cached-mcp:test|--build-arg|REUSE_INSTALLED_DEPENDENCIES=1|') -and
+            $context.McpDependencyImageId -ceq $script:dependencyImage -and $context.McpDependencyPlatform -ceq 'linux/arm64') 'Offline MCP build did not bind verified installed dependencies and platform.'
+        Assert ($inspection.Contains("|--entrypoint|/opt/mcp/.venv/bin/python|$($script:dependencyImage)|") -and
+            $inspection.Contains('|--network|none|--read-only|') -and
+            $inspection.EndsWith('|runtime') -and -not $inspection.Contains('secrets/')) 'MCP dependency verification used a mutable image or production authority.'
+        Assert (@($script:calls | Where-Object { $_ -like 'image|inspect|*' -and $_ -notlike '*{{.Os}}*' }).Count -eq 3) 'MCP dependency identity was not checked before and after the build.'
+        $script:calls.Clear()
+        Build-LocalMcpArtifact $context $snapshot -Target test | Out-Null
+        Assert (@($script:calls | Where-Object { $_ -like 'run|*' })[0].EndsWith('|test')) 'MCP test builds did not require their development dependency layout.'
+        foreach ($path in @('pyproject.toml','uv.lock')) {
+            $expected=$script:dependencyHashes[$path]
+            $script:dependencyHashes[$path]='f'*64
+            $script:calls.Clear()
+            Fails { Build-LocalMcpArtifact $context $snapshot } 'dependency manifests differ'
+            Assert (-not @($script:calls | Where-Object { $_ -like 'build|*' }).Count) 'Mismatched MCP dependencies reached the build.'
+            $script:dependencyHashes[$path]=$expected
+        }
+        $script:dependencyHashes['unexpected']='f'*64
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'manifest inventory'
+        $script:dependencyHashes.Remove('unexpected')
+        $script:dependencyInspectionFailure=$true
+        $script:calls.Clear()
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'dependencies are inconsistent'
+        Assert (-not @($script:calls | Where-Object { $_ -like 'build|*' }).Count) 'Invalid Python/dependency layout reached the build.'
+        $script:dependencyInspectionFailure=$false
+        $script:changeDependencyDuringBuild=$true
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'dependency image changed'
+        $script:changeDependencyDuringBuild=$false
+        $script:dependencyImage='invalid-image-identity'
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'dependency image identity'
+        $script:dependencyImage='sha256:' + ('c'*64)
+        $script:dependencyPlatform='windows/amd64'
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'dependency image platform'
+        $script:dependencyPlatform='linux/arm64'
+        $env:AGENT_CONTROL_MCP_DEPENDENCY_IMAGE="invalid`nreference"
+        $script:calls.Clear()
+        Fails { Build-LocalMcpArtifact $context $snapshot } 'dependency image reference'
+        Assert ($script:calls.Count -eq 0) 'Invalid MCP image reference reached Docker.'
+    } finally {
+        if ($null -eq $savedDependencyImage) { Remove-Item Env:AGENT_CONTROL_MCP_DEPENDENCY_IMAGE -ErrorAction SilentlyContinue }
+        else { $env:AGENT_CONTROL_MCP_DEPENDENCY_IMAGE=$savedDependencyImage }
+        $script:dependencyInspectionFailure=$false
+        $script:changeDependencyDuringBuild=$false
+    }
     Assert (-not $context.Mcp -and $context.Compose -notcontains (Join-Path $root 'compose.mcp.yaml')) 'Missing optional configuration provisioned MCP.'
     $before=$script:calls.Count
     Start-LocalMcp $context
@@ -128,6 +224,12 @@ try {
         integration=@{clientId=$mcp.clientId;audience=$mcp.apiClientId;scope='AgentControl.Access'}}
     $settings = @{port=14391;publicUrl='';tenants=@(Get-LocalTenantMetadata @($profile));mcp=$mcp}
     Assert-LocalMcpSettings $mcp 14391
+    foreach ($name in @('hide_employee_details','hide_champion_employee')) {
+        foreach ($value in @($null,'true',0,1)) {
+            $invalid=$mcp.Clone();$invalid[$name]=$value
+            Fails { Assert-LocalMcpSettings $invalid 14391 } 'must be a boolean'
+        }
+    }
     foreach ($name in @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port')) {
         $bad=$mcp.Clone();$bad.Remove($name)
         Fails { Assert-LocalMcpSettings $bad 14391 } 'configuration'
@@ -146,11 +248,13 @@ try {
         $bad=$mcp.Clone();$bad.port=$value
         Fails { Assert-LocalMcpSettings $bad 14391 } 'loopback port'
     }
-    foreach ($callback in @('https://*.example.test/callback','http://remote.example.test/callback','https://client.example.test/callback?x=1')) {
+    foreach ($callback in @('https://*.example.test/callback','http://remote.example.test/callback','https://client.example.test/callback?x=1',
+        'https://client.example.test/a//callback','https://client.example.test:0/callback','http://127.0.0.1:0/callback')) {
         $bad=$mcp.Clone();$bad.redirectUris=@($callback)
         Fails { Assert-LocalMcpSettings $bad 14391 } 'callbacks'
     }
-    foreach ($callback in @('http://127.0.0.1:53110/','http://127.0.0.1:19876/mcp/oauth/callback','https://client.example.test/')) {
+    foreach ($callback in @('http://127.0.0.1:53110/','http://127.0.0.1:19876/mcp/oauth/callback','https://client.example.test/',
+        'https://client.example.test:1/callback','http://[::1]:65535/callback')) {
         $native=$mcp.Clone();$native.redirectUris=@($callback)
         Assert-LocalMcpSettings $native 14391
         Assert ($native.redirectUris[0] -ceq $callback) 'Exact native callback was changed.'
@@ -232,6 +336,22 @@ try {
     $environment=[IO.File]::ReadAllText((Join-Path $context.State 'compose.env'))
     foreach ($value in @('MCP_API_CLIENT_ID=22222222-2222-2222-2222-222222222222','MCP_PUBLIC_URL=https://mcp.example.test/mcp','MCP_PORT=14392',"MCP_IMAGE=$script:image")) { Assert ($environment.Contains($value)) "Missing exact environment setting $value." }
     Assert (-not $environment.Contains('synthetic-independent')) 'Secret content entered Compose environment.'
+    foreach ($employee in @($false,$true)) {
+        foreach ($champion in @($false,$true)) {
+            $context.Mcp.hide_employee_details=$employee
+            $context.Mcp.hide_champion_employee=$champion
+            $settings.mcp=$context.Mcp
+            Write-LocalText (Join-Path $context.State 'settings.json') ($settings | ConvertTo-Json -Depth 8)
+            $roundTrip=Read-LocalSettings $context.State
+            Assert ($roundTrip.mcp.hide_employee_details -ceq $employee -and $roundTrip.mcp.hide_champion_employee -ceq $champion) 'Privacy persistence lost an explicit boolean.'
+            Write-LocalComposeEnvironment $context
+            $emitted=[IO.File]::ReadAllText((Join-Path $context.State 'compose.env'))
+            Assert ($emitted.Contains("MCP_HIDE_EMPLOYEE_DETAILS=$($employee.ToString().ToLowerInvariant())") -and
+                $emitted.Contains("MCP_HIDE_CHAMPION_EMPLOYEE=$($champion.ToString().ToLowerInvariant())")) 'Independent API privacy runtime values differ.'
+        }
+    }
+    $context.Mcp.hide_employee_details=$false
+    $context.Mcp.hide_champion_employee=$false
     $run=Get-LocalMcpRunArguments $context
     Assert ($run -contains '--read-only' -and $run -contains '--pids-limit' -and @($run | Where-Object { $_ -like 'type=bind,*readonly' }).Count -eq 4) 'MCP preflight mounts/security differ.'
     Assert ($run -contains "type=volume,source=$($context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy" -and
@@ -268,6 +388,12 @@ try {
         Assert (-not (($script:calls -join "`n") -match '^run\|')) 'Foreign diagnostics state was mutated before ownership validation.'
     }
     $script:recordingVolumeOverrides=@{}
+    $script:mountDetails=@{user="$((& id -u).Trim()):$((& id -g).Trim())";ports=@{'8000/tcp'=@(@{HostIp='127.0.0.1';HostPort='14392'})};networks=@{$context.Network=@{}}
+        mounts=@(@{Destination='/run/secrets/mcp-client';Source=(Join-Path $secretDirectory 'mcp-client');Type='bind';RW=$false},
+            @{Destination='/run/secrets/mcp-signing';Source=(Join-Path $secretDirectory 'mcp-signing');Type='bind';RW=$false},
+            @{Destination='/run/secrets/mcp-encryption';Source=(Join-Path $secretDirectory 'mcp-encryption');Type='bind';RW=$false},
+            @{Destination='/var/lib/agent-control-mcp/oauth';Name=$context.McpVolume;Type='volume';RW=$true},
+            @{Destination='/var/lib/agent-control-mcp/recordings';Name=$context.McpRecordingVolume;Type='volume';RW=$true})}
     $env:MCP_PUBLIC_URL='https://wrong.example.test/mcp';$env:MCP_CLIENT_SECRET_FILE='/wrong'
     Start-LocalMcp $context
     Assert ($env:MCP_PUBLIC_URL -ceq 'https://wrong.example.test/mcp') 'MCP shell configuration was not restored after Compose.'
@@ -309,13 +435,28 @@ try {
         $script:calls[0].Contains('--tmpfs|/work:rw,noexec,nosuid,size=64m,uid=') -and
         $script:calls[0].Contains(',mode=0700') -and -not $script:calls[0].Contains('--mount') -and
         $script:calls[0].Contains("--entrypoint|python|$script:image|-m|pytest")) 'Bounded non-root image checks did not use private Linux work tmpfs.'
-    $script:mountDetails=@{user="$((& id -u).Trim()):$((& id -g).Trim())";ports=@{'8000/tcp'=@(@{HostIp='127.0.0.1';HostPort='14392'})};networks=@{$context.Network=@{}}
-        mounts=@(@{Destination='/run/secrets/mcp-client';Source=(Join-Path $secretDirectory 'mcp-client');Type='bind';RW=$false},
-            @{Destination='/run/secrets/mcp-signing';Source=(Join-Path $secretDirectory 'mcp-signing');Type='bind';RW=$false},
-            @{Destination='/run/secrets/mcp-encryption';Source=(Join-Path $secretDirectory 'mcp-encryption');Type='bind';RW=$false},
-            @{Destination='/var/lib/agent-control-mcp/oauth';Name=$context.McpVolume;Type='volume';RW=$true},
-            @{Destination='/var/lib/agent-control-mcp/recordings';Name=$context.McpRecordingVolume;Type='volume';RW=$true})}
     Assert-LocalMcpContainer $context $script:container
+    $context.Mcp.port=14393
+    Assert-LocalMcpContainer $context $script:container
+    Fails { Assert-LocalMcpContainer $context $script:container -RequireConfiguredPort } 'user/network'
+    $previousDeployment=[IO.File]::ReadAllText((Join-Path $context.State 'mcp-deployment.json'))
+    $script:preserveMcpPort=$true
+    Fails { Start-LocalMcp $context } 'user/network'
+    Assert ([IO.File]::ReadAllText((Join-Path $context.State 'mcp-deployment.json')) -ceq $previousDeployment -and
+        ([IO.File]::ReadAllText((Join-Path $context.State 'mcp-operation.json')) | ConvertFrom-Json).step -ceq 'prepared') 'MCP port mismatch was recorded as verified.'
+    $script:preserveMcpPort=$false
+    $script:calls.Clear()
+    Start-LocalMcp $context
+    Assert ($script:mountDetails.ports['8000/tcp'][0].HostPort -ceq '14393' -and
+        ($script:calls -join "`n") -match 'force-recreate') 'Saved MCP port change could not replace the retained container.'
+    Assert-LocalMcpContainer $context $script:container -RequireConfiguredPort
+    $context.Mcp.port=14392
+    Start-LocalMcp $context
+    foreach ($port in @('0','1023','65536','invalid')) {
+        $script:mountDetails.ports['8000/tcp'][0].HostPort=$port
+        Fails { Assert-LocalMcpContainer $context $script:container } 'user/network'
+    }
+    $script:mountDetails.ports['8000/tcp'][0].HostPort='14392'
     foreach ($field in @('Name','Type','RW')) {
         $saved=$script:mountDetails.mounts[-1][$field]
         $script:mountDetails.mounts[-1][$field]=if ($field -eq 'RW') {$false} elseif ($field -eq 'Type') {'bind'} else {$context.McpVolume}
@@ -381,7 +522,7 @@ try {
     Assert ($setup.RegistryChanged -and $setup.IdentityChanged -and $setup.SettingsChanged -and -not $setup.ApplicationSettingsChanged) 'Integration binding was added after metadata/change detection.'
     Assert ($setup.Profiles[0].integration.clientId -ceq $profile.integration.clientId -and $setup.Profiles[1].integration.clientId -ceq $wizardClient) 'Wizard overwrote another tenant integration.'
     Assert ($setup.Profiles[1].integration.audience -ceq $other.clientId -and $setup.Profiles[1].integration.scope -ceq 'AgentControl.Access') 'Wizard broadened API audience or scope.'
-    Assert ($script:prompts.Count -eq 8 -and @($script:prompts | Where-Object secure).Count -eq 1 -and $script:prompts[-1].text.StartsWith('MCP Entra client secret')) 'Wizard exposed a credential or re-prompted for API secrets.'
+    Assert ($script:prompts.Count -eq 10 -and @($script:prompts | Where-Object secure).Count -eq 1 -and $script:prompts[-1].text.StartsWith('MCP Entra client secret')) 'Wizard exposed a credential or re-prompted for API secrets.'
     foreach ($name in @('mcp-client','mcp-signing','mcp-encryption')) {
         Assert (-not (Test-Path -LiteralPath (Join-Path $wizard.State "secrets/$name"))) 'Planning persisted MCP secrets before successful validation.'
     }
@@ -476,6 +617,48 @@ try {
     Save-LocalConfiguration $import $imported
     Set-SetupAnswers
     Assert (-not (Read-LocalConfiguration $import $false -Onboard).McpPlan.SecretsChanged) 'Reimporting metadata did not retain saved keys/credential.'
+    $privacyImport=Join-Path $import.Root 'privacy-import.json'
+    $privacyInput=[IO.File]::ReadAllText((Join-Path $repository 'mcp/examples/local-settings.example.json')) | ConvertFrom-Json -AsHashtable
+    $import.McpConfigInput=$privacyImport
+    foreach ($employee in @($false,$true)) {
+        foreach ($champion in @($false,$true)) {
+            $privacyInput.hide_employee_details=$employee
+            $privacyInput.hide_champion_employee=$champion
+            Write-LocalText $privacyImport ($privacyInput | ConvertTo-Json)
+            $privacyPlan=Read-LocalConfiguration $import $false -Onboard
+            Assert ($privacyPlan.McpPlan.Settings.hide_employee_details -ceq $employee -and
+                $privacyPlan.McpPlan.Settings.hide_champion_employee -ceq $champion -and
+                -not $privacyPlan.McpPlan.SecretsChanged -and -not $privacyPlan.IdentityChanged) 'Privacy import changed identity/secrets or lost independent booleans.'
+            Save-LocalConfiguration $import $privacyPlan
+            $privacyInput.Remove('hide_employee_details');$privacyInput.Remove('hide_champion_employee')
+            Write-LocalText $privacyImport ($privacyInput | ConvertTo-Json)
+            $preserved=Read-LocalConfiguration $import $false -Onboard
+            Assert ($preserved.McpPlan.Settings.hide_employee_details -ceq $employee -and
+                $preserved.McpPlan.Settings.hide_champion_employee -ceq $champion -and -not $preserved.SettingsChanged) 'Omitted imported flags reset saved privacy on redeploy.'
+        }
+    }
+    foreach ($key in @('hide_employee_details','hide_champion_employee')) {
+        $privacyInput[$key]='true'
+        Write-LocalText $privacyImport ($privacyInput | ConvertTo-Json)
+        Fails { Read-LocalConfiguration $import $false -Onboard } 'must be a boolean'
+        $privacyInput.Remove($key)
+    }
+    Write-LocalText $privacyImport ($privacyInput | ConvertTo-Json)
+    $import.ConfigureMcp=$true
+    Set-SetupAnswers @('','','','','','TRUE','false','true') @('')
+    $privacyWizard=Read-LocalConfiguration $import $false -Edit
+    Assert ($privacyWizard.McpPlan.Settings.hide_employee_details -ceq $false -and
+        $privacyWizard.McpPlan.Settings.hide_champion_employee -ceq $true -and
+        $privacyWizard.ApplicationSettingsChanged -and -not $privacyWizard.IdentityChanged -and
+        -not $privacyWizard.McpPlan.SecretsChanged) 'Privacy wizard failed to target the API configuration without changing credentials.'
+    Save-LocalConfiguration $import $privacyWizard
+    Set-SetupAnswers @('','','','','') @('')
+    $keptPrivacy=Read-LocalConfiguration $import $false -Edit
+    Assert ($keptPrivacy.McpPlan.Settings.hide_employee_details -ceq $false -and
+        $keptPrivacy.McpPlan.Settings.hide_champion_employee -ceq $true -and
+        -not $keptPrivacy.ApplicationSettingsChanged) 'Enter did not retain explicit privacy settings.'
+    $import.ConfigureMcp=$false
+    $import.McpConfigInput=Join-Path $repository 'mcp/examples/local-settings.example.json'
 
     foreach ($receiptName in @('mcp-storage.json','mcp-deployment.json','mcp-operation.json')) {
         $retained=New-McpSetupFixture ($receiptName -replace '\.','-') @($unbound) 14391

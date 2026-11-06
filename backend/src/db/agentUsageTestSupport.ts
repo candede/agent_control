@@ -31,7 +31,7 @@ export const usageAudit = (scope: AgentUsageScope) => ({
   actor: { tenantId: scope.tenantId, homeAccountId: scope.principalId, username: "fixture@example.invalid", displayName: "Fixture" },
   requestPath: "/fixture/usage-associations",
 });
-export type UsageGroup = { packages: string[]; canonicalId?: string; native?: { nativeId: string; environmentId: string | null; createdBy?: string; createdAt?: string | null;
+export type UsageGroup = { packages: string[]; canonicalId?: string; native?: { nativeId: string; environmentId: string | null; createdBy?: string; createdAt?: string | null; lifecycle?: PowerPlatformResource["lifecycle"];
   ownerId?: string; lastModifiedBy?: string; description?: string; identifiers?: InventoryIdentifier[]; agentKind?: string };
   packageFields?: Partial<Omit<CopilotPackageDetail, "id">> };
 const agentType = "microsoft.copilotstudio/agents" as const;
@@ -49,7 +49,7 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
     sourceSystem: "power_platform" as const, nativeId: value.nativeId, environmentId: value.environmentId, tenantId: scope.tenantId,
     type: agentType, displayName: "Inventory native agent", creatorType: "unknown" as const, agentKind: value.agentKind ?? "agent",
     location: null, createdAt: value.createdAt ?? null, createdBy: value.createdBy ?? null, lastPublishedAt: null, authoringTool: null,
-    lifecycle: "published" as const, identityConfidence: "exact_native" as const, identifiers: value.identifiers ?? [], provenance: {},
+    lifecycle: value.lifecycle ?? "published", identityConfidence: "exact_native" as const, identifiers: value.identifiers ?? [], provenance: {},
     details: { ...value.ownerId ? { ownerId: value.ownerId } : {}, ...value.lastModifiedBy ? { lastModifiedBy: value.lastModifiedBy } : {},
       ...value.description !== undefined ? { description: value.description } : {} }, unknownFieldCount: 0,
   } satisfies PowerPlatformResource));

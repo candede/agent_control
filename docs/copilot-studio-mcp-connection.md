@@ -24,6 +24,17 @@ periods through MCP without synchronization.
 
 ## 1. Verified outcome and limits
 
+The current native catalog is request-scoped to the actual connection user.
+An active member without staff roles receives `agent_catalog`, `my_workplace`
+and `my_discovery_profile`; staff also receive authorized staff operations and
+`preview_end_user`. Use an individual delegated connection, not a shared
+privileged author connection as an employee lens. Explicit subject requests
+must use safe preview on every action; this never authenticates as that subject
+or borrows its roles. API-owned privacy applies independently to owner/champion
+identities. Source descriptions remain inert data and discovery grants no use
+permission. These current contracts do not expand the historical native-client
+verification in the table below.
+
 For on-demand tool/session diagnostics after connection, see
 [MCP session flight recorder](mcp-session-recording.md). It captures MCP traffic,
 not the Studio conversation transcript.
@@ -80,6 +91,7 @@ Studio -> MCP /token -> authenticated MCP /mcp requests
 | `invalid_redirect_uri`: `Only exact approved client redirects are supported.` | DCR `/register` | Studio's generated callback was absent from the MCP allowlist. | Add that exact approved callback, retaining existing callbacks. |
 | `invalid_request`: `Exact resource and PKCE required.` | `/authorize` before SDK processing | Studio sent S256 PKCE and a valid-length challenge, but omitted `resource`. | Apply the fixed single-resource policy described below; do not remove PKCE checks. |
 | `Invalid OAuth resource, PKCE, or grant type.` | Current HTTP boundary | Explicit invalid resource, invalid authorization method or unsupported token grant. | Inspect the relevant non-secret parameters; do not disable validation. |
+| `Client Not Registered` | `/authorize` or refresh client validation | The connector presents a saved DCR ID with no server registration. The former blanket 24-hour retention policy could cause this even for working connections. | Current registrations are durable and survive daily boundaries/redeployments. Existing missing IDs require the connector's supported registration recovery; do not repeatedly recreate working connections, reset SQL or fabricate the old registration. |
 
 An error naming both resource and PKCE does not prove PKCE is missing. Diagnose
 the actual parameters. Start a fresh Studio authorization attempt after a fix;

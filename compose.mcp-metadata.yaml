@@ -2,6 +2,8 @@ services:
   app:
     environment:
       MCP_METADATA_TOKEN_FILE: /run/secrets/mcp-metadata
+      MCP_HIDE_EMPLOYEE_DETAILS: ${MCP_HIDE_EMPLOYEE_DETAILS:-false}
+      MCP_HIDE_CHAMPION_EMPLOYEE: ${MCP_HIDE_CHAMPION_EMPLOYEE:-false}
     volumes:
       - type: bind
         source: ${LOCAL_STATE_DIR}/secrets/mcp-metadata

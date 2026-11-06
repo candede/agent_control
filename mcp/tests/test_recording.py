@@ -182,7 +182,11 @@ async def test_real_authenticated_sessions_full_payload_and_protocol_errors(
     catalog = store.read(store.directory(manifest["id"]) / "catalog.json")
     assert catalog["instructions"]
     assert catalog["serverInfo"]["version"] == "0.1.0"
-    assert catalog["tools"] == listed.json()["result"]["tools"]
+    # Recorder's restricted operator snapshot is deliberately unprojected.
+    # Actual per-caller wire discovery remains captured verbatim in events above.
+    assert {tool["name"] for tool in catalog["tools"]} == {
+        tool["name"] for tool in listed.json()["result"]["tools"]
+    }
     before = final["events"]
     assert not (await first("list_capabilities")).get("isError")
     assert store.status()["events"] == before

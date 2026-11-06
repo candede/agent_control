@@ -1,8 +1,12 @@
 function Assert-LocalMcpSettings {
     param($Mcp,[int]$AppPort)
-    $fields = @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port')
-    if ($Mcp -isnot [Collections.IDictionary] -or $Mcp.Count -ne $fields.Count -or
+    $required = @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port')
+    $fields = $required + @('hide_employee_details','hide_champion_employee')
+    if ($Mcp -isnot [Collections.IDictionary] -or @($required | Where-Object { -not $Mcp.Contains($_) }).Count -or
         @($Mcp.Keys | Where-Object { $_ -cnotin $fields }).Count) { throw 'MCP configuration must contain only tenantId, clientId, apiClientId, publicUrl, redirectUris and port.' }
+    foreach ($name in @('hide_employee_details','hide_champion_employee')) {
+        if ($Mcp.Contains($name) -and $Mcp[$name] -isnot [bool]) { throw "$name must be a boolean." }
+    }
     foreach ($name in @('tenantId','clientId','apiClientId')) {
         if ($Mcp[$name] -isnot [string] -or $Mcp[$name] -cnotmatch '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}\z') { throw 'MCP identities must be exact lowercase GUIDs.' }
     }
@@ -21,6 +25,7 @@ function Assert-LocalMcpSettings {
         $callback = $null
         if ($redirect -isnot [string] -or $redirect.Length -gt 2048 -or -not [Uri]::TryCreate($redirect,[UriKind]::Absolute,[ref]$callback) -or
             $callback.AbsoluteUri -cne $redirect -or $callback.UserInfo -or $callback.Query -or $callback.Fragment -or
+            $callback.AbsolutePath.Contains('//') -or $callback.Port -lt 1 -or
             $redirect -match "[%\\\s'*]" -or
             ($callback.Scheme -cne 'https' -and -not ($callback.Scheme -ceq 'http' -and $callback.Host -cin @('localhost','127.0.0.1','[::1]')))) { throw 'MCP client callbacks must be exact canonical HTTPS or HTTP loopback URLs of at most 2048 characters.' }
     }
@@ -109,10 +114,20 @@ function Read-LocalMcpSettings {
     $redirects = [string](Read-Host "Allowed client callback URLs, comma-separated [$(@($Current.redirectUris) -join ','); Enter to keep]")
     $redirectUris = if ([string]::IsNullOrWhiteSpace($redirects)) { @($Current.redirectUris) } else { @($redirects -split ',' | ForEach-Object { $_.Trim() }) }
     $port = if ($Current.port) { [int]$Current.port } elseif ($Settings.port -eq 8001) { 8002 } else { 8001 }
-    return [ordered]@{
+    $result = [ordered]@{
         tenantId=$profile.tenantId.ToLowerInvariant(); apiClientId=$profile.clientId.ToLowerInvariant(); clientId=$client
         publicUrl=$url.Trim(); redirectUris=@($redirectUris); port=(Read-LocalPort $port -Label 'MCP loopback port')
     }
+    foreach ($name in @('hide_employee_details','hide_champion_employee')) {
+        $currentValue = if ($Current -and $Current.Contains($name)) { $Current[$name] } else { $false }
+        while ($true) {
+            $answer = [string](Read-Host "$name [true/false; $($currentValue.ToString().ToLowerInvariant()); Enter to keep]")
+            if ([string]::IsNullOrWhiteSpace($answer)) { $result[$name]=$currentValue; break }
+            if ($answer -ceq 'true' -or $answer -ceq 'false') { $result[$name]=($answer -ceq 'true'); break }
+            Write-Warning 'Enter exactly true or false.'
+        }
+    }
+    return $result
 }
 
 function Get-LocalMcpPlan {
@@ -124,9 +139,12 @@ function Get-LocalMcpPlan {
         if ((Get-Item -LiteralPath $inputPath -Force).LinkType) { throw 'MCP configuration input must not be a link.' }
         $supplied = [IO.File]::ReadAllText($inputPath) | ConvertFrom-Json -AsHashtable
         if ($supplied -isnot [Collections.IDictionary] -or
-            @($supplied.Keys | Where-Object { $_ -cnotin @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port','clientSecretFile','signingKeyFile','encryptionKeyFile') }).Count) { throw 'Unknown MCP configuration fields.' }
+            @($supplied.Keys | Where-Object { $_ -cnotin @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port','hide_employee_details','hide_champion_employee','clientSecretFile','signingKeyFile','encryptionKeyFile') }).Count) { throw 'Unknown MCP configuration fields.' }
         $mcp = [ordered]@{}
         foreach ($name in @('tenantId','clientId','apiClientId','publicUrl','redirectUris','port')) { $mcp[$name] = $supplied[$name] }
+        foreach ($name in @('hide_employee_details','hide_champion_employee')) {
+            $mcp[$name] = if ($supplied.Contains($name)) { $supplied[$name] } elseif ($Settings.mcp -and $Settings.mcp.Contains($name)) { $Settings.mcp[$name] } else { $false }
+        }
         foreach ($pair in @(@('clientSecretFile','mcp-client'),@('signingKeyFile','mcp-signing'),@('encryptionKeyFile','mcp-encryption'))) {
             if ($supplied.Contains($pair[0])) {
                 if ($supplied[$pair[0]] -isnot [string]) { throw 'MCP secret input paths must be absolute strings.' }
@@ -137,6 +155,7 @@ function Get-LocalMcpPlan {
     if ($Context.ConfigureMcp) { $mcp = Read-LocalMcpSettings $Context $Settings $Profiles $mcp }
     if ($null -eq $mcp) { return $null }
     Assert-LocalMcpSettings $mcp $Settings.port
+    foreach ($name in @('hide_employee_details','hide_champion_employee')) { if (-not $mcp.Contains($name)) { $mcp[$name]=$false } }
     $binding = @($Profiles | Where-Object { $_.tenantId -ieq $mcp.tenantId -and $_.clientId -ieq $mcp.apiClientId })
     if ($binding.Count -ne 1) { throw 'MCP must explicitly match one existing tenant/API integration binding; no implicit tenant selection or registration is performed.' }
     $profile = $binding[0]
@@ -303,13 +322,75 @@ function Get-LocalMcpRunArguments {
     return $arguments
 }
 
+function Get-LocalMcpBuildArguments {
+    param($Context,[string]$SourceRoot,[string]$Target)
+    $installed = [Environment]::GetEnvironmentVariable('AGENT_CONTROL_MCP_DEPENDENCY_IMAGE')
+    if (-not $installed) {
+        $Context.Remove('McpDependencyImage')
+        $Context.Remove('McpDependencyImageId')
+        $Context.Remove('McpDependencyPlatform')
+        return @()
+    }
+    if ($installed -cnotmatch '^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,255}$') { throw 'Installed MCP dependency image reference is invalid.' }
+    $image = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$installed) -Capture
+    if ($image -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Installed MCP dependency image identity is invalid.' }
+    $platform = Invoke-DockerCommand @('image','inspect','--format','{{.Os}}/{{.Architecture}}',$image) -Capture
+    if ($platform -cnotmatch '^linux/(amd64|arm64)$') { throw 'Installed MCP dependency image platform is unsupported.' }
+    $program = @'
+import hashlib, importlib.metadata as metadata, json, subprocess, sys, tomllib
+from pathlib import Path
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+root = Path("/opt/mcp")
+assert sys.version_info[:3] == (3, 14, 6) and sys.prefix == str(root / ".venv"), "MCP Python layout differs"
+assert subprocess.check_output(["/usr/local/bin/uv", "--version"], text=True).split()[1] == "0.12.17", "MCP build tool differs"
+project = tomllib.loads((root / "pyproject.toml").read_text())
+lock = tomllib.loads((root / "uv.lock").read_text())
+locked = {canonicalize_name(p["name"]): p["version"] for p in lock["package"]}
+installed = {canonicalize_name(d.metadata["Name"]): d.version for d in metadata.distributions()}
+assert all(locked.get(name) == version for name, version in installed.items()), "Installed MCP versions differ from lock"
+required = project["project"]["dependencies"]
+if sys.argv[1] != "runtime":
+    required += project["dependency-groups"]["dev"]
+assert all(canonicalize_name(Requirement(r).name) in installed for r in required), "Installed MCP dependencies are missing"
+check = subprocess.run(["/usr/local/bin/uv", "pip", "check", "--python", str(root / ".venv/bin/python")], capture_output=True)
+assert check.returncode == 0, "Installed MCP dependencies are inconsistent"
+print(json.dumps({name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in ("pyproject.toml", "uv.lock")}))
+'@
+    $hashes = Invoke-DockerCommand @('run','--rm','--network','none','--read-only','--user','10001:10001',
+        '--cap-drop','ALL','--security-opt','no-new-privileges','--env','TMPDIR=/opt/mcp/.build-work','--env','UV_NO_CACHE=1',
+        '--tmpfs','/opt/mcp/.build-work:rw,noexec,nosuid,size=16m,uid=10001,gid=10001,mode=0700',
+        '--entrypoint','/opt/mcp/.venv/bin/python',$image,'-c',$program,$Target) -Capture | ConvertFrom-Json -AsHashtable
+    if ($hashes.Count -ne 2) { throw 'Installed MCP dependency manifest inventory differs.' }
+    foreach ($path in @('pyproject.toml','uv.lock')) {
+        if ($hashes[$path] -cne (Get-FileHash -LiteralPath (Join-Path $SourceRoot "mcp/$path") -Algorithm SHA256).Hash.ToLowerInvariant()) {
+            throw 'Installed MCP dependency manifests differ; offline reuse refused. Rebuild dependencies through the approved feed.'
+        }
+    }
+    $Context.McpDependencyImage = $installed
+    $Context.McpDependencyImageId = $image
+    $Context.McpDependencyPlatform = $platform
+    return @('--network','none','--platform',$platform,'--build-arg',"MCP_DEPENDENCY_BASE=$installed",'--build-arg','REUSE_INSTALLED_DEPENDENCIES=1')
+}
+
+function Assert-LocalMcpDependencyImage {
+    param($Context)
+    if ($Context.McpDependencyImage -and
+        (Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$Context.McpDependencyImage) -Capture) -cne $Context.McpDependencyImageId) {
+        throw 'Installed MCP dependency image changed during build; deployment refused.'
+    }
+}
+
 function Build-LocalMcpArtifact {
     param($Context,$Snapshot,[string]$Target='runtime')
     $file = Join-Path $Snapshot.Directory "mcp-$Target.iid"
     $labels = if ($Context.SourceHash) { @('--label',"io.agent-control.source-sha256=$($Context.SourceHash)") } else { @() }
+    $buildArguments = @(Get-LocalMcpBuildArguments $Context $Snapshot.Root $Target)
+    Assert-LocalMcpDependencyImage $Context
     Invoke-DockerCommand (@('build','--provenance=false','-f',(Join-Path $Snapshot.Root 'mcp/Dockerfile'),'--target',$Target,
-        '--iidfile',$file,'-t',"$($Context.McpImage)$(if ($Target -ne 'runtime') {'-test'})") + $labels + @($Snapshot.Root)) |
+        '--iidfile',$file,'-t',"$($Context.McpImage)$(if ($Target -ne 'runtime') {'-test'})") + $buildArguments + $labels + @($Snapshot.Root)) |
         ForEach-Object { Write-Host $_ }
+    Assert-LocalMcpDependencyImage $Context
     $identity = [IO.File]::ReadAllText($file).Trim()
     if ($identity -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'MCP build did not return an immutable image identity.' }
     return $identity
@@ -389,7 +470,7 @@ function Get-LocalMcpVolume {
 }
 
 function Assert-LocalMcpContainer {
-    param($Context,[string]$Id)
+    param($Context,[string]$Id,[switch]$RequireConfiguredPort)
     $details = Invoke-DockerCommand @('inspect','--format',
         '{"mounts":{{json .Mounts}},"ports":{{json .HostConfig.PortBindings}},"networks":{{json .NetworkSettings.Networks}},"user":{{json .Config.User}}}',$Id) -Capture | ConvertFrom-Json -AsHashtable
     $expected = @{
@@ -400,10 +481,12 @@ function Assert-LocalMcpContainer {
     if (@($details.mounts | Where-Object Destination -CEQ '/run/secrets/mcp-metadata').Count) {
         $expected['/run/secrets/mcp-metadata']='secrets/mcp-metadata'
     }
+    $hostPort = 0
     if ($details.mounts.Count -ne $expected.Count -or $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network) -or
         $details.user -notmatch '^[1-9][0-9]*:[0-9]+$' -or $details.ports.Count -ne 1 -or $details.ports['8000/tcp'].Count -ne 1 -or
         $details.ports['8000/tcp'][0].HostIp -cne '127.0.0.1' -or
-        ($Context.Mcp -and $details.ports['8000/tcp'][0].HostPort -cne [string]$Context.Mcp.port)) { throw 'MCP container user/network/loopback identity differs.' }
+        -not [int]::TryParse($details.ports['8000/tcp'][0].HostPort,[ref]$hostPort) -or $hostPort -lt 1024 -or $hostPort -gt 65535 -or
+        ($RequireConfiguredPort -and $details.ports['8000/tcp'][0].HostPort -cne [string]$Context.Mcp.port)) { throw 'MCP container user/network/loopback identity differs.' }
     foreach ($mount in $details.mounts) {
         if ($mount.Destination -cin @('/var/lib/agent-control-mcp/oauth','/var/lib/agent-control-mcp/recordings')) {
             if ($mount.Type -cne 'volume' -or $mount.Name -cne $expected[$mount.Destination] -or -not $mount.RW) { throw 'MCP protected volume identity differs.' }
@@ -439,6 +522,7 @@ function Start-LocalMcp {
     $running = @(Get-OwnedLocalContainers $Context | Where-Object Service -eq 'mcp')
     if ($running.Count -ne 1 -or $running[0].Image -cne $Context.McpImageId -or -not $running[0].State.Running -or
         $running[0].State.Health.Status -cne 'healthy') { throw 'MCP runtime identity/readiness differs.' }
+    Assert-LocalMcpContainer $Context $running[0].Id -RequireConfiguredPort
     Invoke-DockerCommand @('exec',$running[0].Id,'python','-m','agent_control_mcp.healthcheck')
     $receipt = @{version=1;image=$Context.McpImageId;identity=$identity;step='verified'}
     Write-LocalText $receiptPath ($receipt | ConvertTo-Json)

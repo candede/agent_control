@@ -20,6 +20,7 @@ import { clearAdmissionForTest } from "../middleware/admission.js";
 import { loadOperationalState } from "../services/operationalState.js";
 import { bulkJobs, drainBulkJobs } from "../services/bulkJobs.js";
 import { AppError } from "../errors.js";
+import { dataSync } from "../services/dataSync.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -38,6 +39,7 @@ const sql: { text: string; values: unknown[] }[] = [];
 const exchanges: string[] = [];
 const defaultIdentityFetch: typeof fetch = async (url, request) => {
   if (String(url).endsWith("/discovery/v2.0/keys")) return new Response(JSON.stringify({ keys: [jwk] }));
+  if (String(url).startsWith("https://graph.microsoft.com/v1.0/users/")) return Response.json({ id: selected.localAccountId, userType: "Member", accountEnabled: true });
   exchanges.push(String(new URLSearchParams(String(request?.body)).get("scope")));
   return sdkResponse({ oid: selected.localAccountId, uid: selected.homeAccountId.split(".")[0],
     utid: selected.homeAccountId.split(".")[1] }, request);
@@ -197,10 +199,47 @@ describe("registered canonical HTTP authentication", () => {
     expect([...declaredRoutePolicies.keys()].filter(key => key === "POST /agent-inventory/selections")).toHaveLength(1);
   });
 
-  it.each([{ aud: "wrong" }, { azp: tenant.clientId }, { roles: [] }, { scp: "wrong" }, { tid: guestTenant },
+  it.each([{ aud: "wrong" }, { azp: tenant.clientId }, { roles: ["unknown"] }, { scp: "wrong" }, { tid: guestTenant },
     { iat: Math.floor(Date.now() / 1000) + 300 }, { exp: Math.floor(Date.now() / 1000) - 1 }])("denies wrong or invalid bearer authority %j without fallback", async changes => {
     const response = await call("/agent-inventory/health", apiToken(changes));
     expect(response.status).toBe(401); expect(sql).toHaveLength(0);
+  });
+
+  it.each([{ roles: [] }, { roles: undefined }])("provides a minimal profile and no sensitive route authority for roleless members %j", async claims => {
+    const token = apiToken(claims);
+    const response = await call("/mcp/access-profile", token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toMatchObject({ audience: "end_user", staffPreviewAuthorized: false, operations: [
+      { method: "POST", route: "/api/discovery/read", inputChoices: { operation: ["profile", "search", "detail", "workplace"] } },
+      { method: "GET", route: "/api/mcp/access-profile" }, { method: "POST", route: "/api/mcp/authenticated-entry" },
+    ] });
+    const protectedRoutes = [...declaredRoutePolicies].filter(([, policy]) => policy.access === "authenticated" && policy.roles?.length);
+    for (const [key] of protectedRoutes) {
+      const [method, route] = key.split(" ");
+      const path = route.replace(/^\/api/, "").replace(/:[A-Za-z]+/g, "fixture");
+      const denied = await call(path, token, { method });
+      expect(denied.status, key).toBe(403);
+    }
+    expect(sql).toHaveLength(0);
+  });
+
+  it("separates authenticated entry from provider-free profile reads and rejects caller-supplied subjects/options", async () => {
+    const admission = vi.spyOn(dataSync, "authenticatedEntry").mockResolvedValue(true);
+    const token = apiToken({ roles: [] });
+    expect((await call("/mcp/access-profile", token)).status).toBe(200);
+    expect(admission).not.toHaveBeenCalled();
+    const entered = await call("/mcp/authenticated-entry", token, { method: "POST" });
+    expect(await entered.json()).toMatchObject({ admission: "scheduled" });
+    expect(admission).toHaveBeenCalledWith(expect.objectContaining({ homeAccountId: selected.homeAccountId, localAccountId: selected.localAccountId, roles: [] }), expect.any(Number));
+    const forged = await call("/mcp/authenticated-entry", token, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ subject: "admin@example.invalid" }) });
+    expect(forged.status).toBe(400);
+    expect((await call("/mcp/access-profile?hide_employee_details=false", token)).status).toBe(400);
+    expect(admission).toHaveBeenCalledOnce();
+    admission.mockRejectedValue(new AppError(503, "data_sync_shutdown", "Collection is restarting."));
+    const retry = await call("/mcp/authenticated-entry", token, { method: "POST" });
+    expect(retry.status).toBe(202);
+    expect(await retry.json()).toMatchObject({ admission: "retryable", errorCode: "data_sync_shutdown" });
   });
 
   it.each([300, 301, 1800])("admits a saved read with valid Entra timestamps backdated by %i seconds", async age => {

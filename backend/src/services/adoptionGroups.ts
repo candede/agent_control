@@ -6,6 +6,7 @@ import type { AdoptionAgent, AdoptionGroup, AdoptionPage, AdoptionPerson } from 
 import { reportSearchSql, type LargeTenantUsersReports, type ReportReadContext } from "./largeTenantUsersReports.js";
 import { SelectionError } from "./dataSelections.js";
 import { selectedInventorySourcesSql } from "../db/inventorySelections.js";
+import { championOrderSql } from "./championRanking.js";
 
 const maxGroupItems = 16_384;
 function assertGroupItems(rows: unknown[]) {
@@ -84,7 +85,7 @@ export function adoptionDataset(reports: LargeTenantUsersReports, context: Repor
     FROM adoption_users u JOIN matching_groups g ON g.identity=u.group_id
   ), ranked_people AS (
     SELECT *,row_number() OVER(PARTITION BY group_id
-      ORDER BY responses DESC NULLS LAST,agents DESC,lower(name) COLLATE "C",identity) AS rank
+      ORDER BY ${championOrderSql()}) AS rank
     FROM person_metrics
   ), adoption_champions AS (
     SELECT * FROM ranked_people WHERE rank<=3 AND (coalesce(responses,0)>0 OR agents>0)

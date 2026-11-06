@@ -2,11 +2,10 @@ import { constants, closeSync, fstatSync, openSync, readFileSync } from "node:fs
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
-import { Readable } from "node:stream";
 import { config, findTenantConfiguration } from "../config.js";
 import {
   mcpMetadataMaximumBytes, parseBoundedMcpJson, parseMcpRuntimeMetadata,
-  type McpBinding, type McpConfiguredSettings, type McpSettings,
+  type McpAccessProfile, type McpBinding, type McpConfiguredSettings, type McpConnectionSettings,
 } from "../types/mcpSettings.js";
 
 type BindingDecision = { configured: McpConfiguredSettings; binding: McpBinding; origin?: string; code?: string };
@@ -22,7 +21,7 @@ function configuredResourceUrl(raw: string) {
     const resource = new URL(raw);
     if (raw.length > 2048 || resource.href !== raw || resource.protocol !== "https:" || resource.pathname === "/"
       || resource.pathname.endsWith("/") || reserved.includes(resource.pathname) || resource.pathname.startsWith("/.well-known/")
-      || resource.search || resource.hash || resource.username || resource.password || /[%\\\s*]/.test(raw)) return "";
+      || resource.search || resource.hash || resource.username || resource.password || /[?#%\\\s*]/.test(raw)) return "";
     return raw;
   } catch { return ""; }
 }
@@ -75,7 +74,7 @@ function requestMcpMetadata(url: string, options: RequestInit): Promise<Metadata
   const request = target.protocol === "https:" ? httpsRequest : httpRequest;
   return new Promise((resolve, reject) => {
     const outgoing = request(target, {
-      method: "GET", signal: options.signal ?? undefined,
+      method: "POST", signal: options.signal ?? undefined,
       headers: Object.fromEntries(new Headers(options.headers)),
       ...(target.protocol === "https:" ? { servername: isIP(hostname) ? "" : hostname } : {}),
     }, incoming => {
@@ -84,17 +83,34 @@ function requestMcpMetadata(url: string, options: RequestInit): Promise<Metadata
         reject(new Error("MCP metadata HTTP request failed."));
         return;
       }
+      const iterator = incoming[Symbol.asyncIterator]();
+      const cancel = async () => {
+        incoming.destroy();
+        await iterator.return?.();
+      };
       resolve({
-        ok: true, body: Readable.toWeb(incoming),
+        ok: true,
+        body: {
+          cancel,
+          getReader: () => ({
+            async read() {
+              const { done, value } = await iterator.next();
+              if (done) return { done: true, value: undefined };
+              if (!(value instanceof Uint8Array)) throw new Error("Invalid metadata response chunk.");
+              return { done: false, value };
+            },
+            cancel,
+          }),
+        },
         headers: new Headers({ "Content-Type": incoming.headers["content-type"] ?? "" }),
       });
     });
     outgoing.once("error", reject);
-    outgoing.end();
+    outgoing.end(options.body);
   });
 }
 
-export async function readMcpSettings(tenantId: string, signal?: AbortSignal, fetcher = requestMcpMetadata): Promise<McpSettings> {
+export async function readMcpSettings(tenantId: string, projection: McpAccessProfile, signal?: AbortSignal, fetcher = requestMcpMetadata): Promise<McpConnectionSettings> {
   const decision = mcpBindingForTenant(tenantId);
   if (!decision) return { state: "not_configured" };
   const { configured, binding, origin, code } = decision;
@@ -113,9 +129,13 @@ export async function readMcpSettings(tenantId: string, signal?: AbortSignal, fe
   const cancel = () => { void (reader ? reader.cancel() : body?.cancel())?.catch(() => undefined); };
   controller.signal.addEventListener("abort", cancel, { once: true });
   try {
+    const projected = JSON.stringify(projection);
+    if (Buffer.byteLength(projected) > 65536) throw new Error("Metadata projection limit.");
     const response = await fetcher(`${origin}/internal/mcp-metadata`, {
-      method: "GET", redirect: "error", signal: controller.signal,
+      method: "POST", redirect: "error", signal: controller.signal,
+      body: projected,
       headers: { Accept: "application/json", Host: new URL(binding.resourceUrl).host,
+        "Content-Type": "application/json",
         "X-Agent-Control-Mcp-Metadata-Token": credential },
     });
     body = response.body;

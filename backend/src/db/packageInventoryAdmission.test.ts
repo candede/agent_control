@@ -322,18 +322,24 @@ describe("package refresh admission", () => {
     },
   );
 
-  it("cleans up only the unchanged automatic claim after stale admission", async () => {
-    const automatic = { ...job, auto_details: true, status: "failed", error_code: "authorization_expired" };
+  it.each([
+    { automatic: true, attemptedAt: null },
+    { automatic: false, attemptedAt: null },
+    { automatic: false, attemptedAt: new Date("2026-09-21T23:59:00.000Z") },
+  ])("fails only the unchanged waiting admission (automatic=$automatic, attempt=$attemptedAt)", async ({ automatic, attemptedAt }) => {
+    const failed = { ...job, auto_details: automatic, attempted_at: attemptedAt, status: "failed", error_code: "authorization_expired" };
     query.mockResolvedValueOnce({ ...emptyResult, rowCount: 1 })
-      .mockResolvedValueOnce({ ...emptyResult, rows: [automatic] });
+      .mockResolvedValueOnce({ ...emptyResult, rows: [failed] });
 
     await expect(new PackageRefreshJobs().markFailed(scope, job.id, "authorization_expired", "Renew authorization.", job.result_revision))
       .resolves.toMatchObject({ id: job.id, status: "failed", errorCode: "authorization_expired" });
 
     const statement = String(query.mock.calls[0][0]);
     expect(statement).toContain("id=$1 AND tenant_id=$2 AND principal_id=$3");
-    expect(statement).toContain("auto_details AND status='waiting_authorization' AND attempted_at IS NULL");
+    expect(statement).toContain("$6::text IS NULL OR (status='waiting_authorization'");
     expect(statement).toContain("updated_at::text=$6");
+    expect(statement).not.toContain("auto_details AND");
+    expect(statement).not.toContain("attempted_at IS NULL");
     expect(query.mock.calls[0][1]).toEqual([
       job.id, scope.tenantId, scope.principalId, "authorization_expired", "Renew authorization.", job.result_revision,
     ]);
@@ -348,7 +354,7 @@ describe("package refresh admission", () => {
     await expect(new PackageRefreshJobs().markFailed(scope, job.id, "authorization_expired", "Renew authorization.", job.result_revision))
       .resolves.toMatchObject({ id: job.id, status, resultRevision: replacement.result_revision });
     expect(query).toHaveBeenCalledTimes(2);
-    expect(String(query.mock.calls[0][0])).toContain("auto_details AND status='waiting_authorization' AND attempted_at IS NULL");
+    expect(String(query.mock.calls[0][0])).toContain("$6::text IS NULL OR (status='waiting_authorization'");
     expect(String(query.mock.calls[0][0])).toContain("updated_at::text=$6");
     expect(String(query.mock.calls[1][0])).toContain("SELECT job.id");
   });

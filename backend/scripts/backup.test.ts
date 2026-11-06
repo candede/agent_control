@@ -23,6 +23,7 @@ import { packageInventoryRecord } from "../src/services/inventoryRecordProjectio
 import { InventoryQueries } from "../src/db/inventoryQueries.js";
 import { backupTableKeys, fingerprintAlgorithm } from "./backupInventory.js";
 import { seedDisjointReportUnion } from "./officialReportFixtures.js";
+import { DataGenerations } from "../src/db/dataGenerations.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 const directory = join(process.cwd(), "artifacts", "test-scratch", `postgres-backup-${randomUUID()}`);
@@ -198,6 +199,8 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
       count(*) FILTER(WHERE bearer_issued_after<=0)::int AS unfenced FROM data_principal_epochs`)).rows[0];
     expect(restoredFence.principals).toBeGreaterThan(0);
     expect(restoredFence.unfenced).toBe(0);
+    expect((await new DataGenerations(restoredRuntime).bearerAuthority("restored-tenant", "unknown-before-restore")).issuedAfter)
+      .toBe("0");
     expect((await restoredRuntime.query("SELECT status,error_code FROM job_items WHERE job_id=$1",[uncertainJob])).rows[0]).toEqual({status:"inconclusive",error_code:"restored_uncertain_write"});
     expect((await restoredRuntime.query("SELECT status,lease_owner,lease_until FROM jobs WHERE id=$1",[uncertainJob])).rows[0]).toEqual({status:"partial",lease_owner:null,lease_until:null});
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1",

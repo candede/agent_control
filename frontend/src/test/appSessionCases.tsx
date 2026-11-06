@@ -362,7 +362,8 @@ export function sessionAndNavigationCases() {
       const base = transport.fetchMock.getMockImplementation()!;
       transport.fetchMock.mockImplementation((input, init) => input === "/api/mcp/settings"
         ? Promise.resolve(Response.json({ state: "unavailable", configured: { resourceUrl: "https://mcp.example.invalid/mcp" },
-          code: "metadata_unavailable" })) : base(input, init));
+          code: "metadata_unavailable", privacy: { hide_employee_details: false, hide_champion_employee: false },
+          privacyScope: "end_user_and_preview" })) : base(input, init));
       vi.stubGlobal("fetch", transport.fetchMock);
       render(<App />);
       await screen.findByText(agent.displayName);
@@ -388,7 +389,8 @@ export function sessionAndNavigationCases() {
     const base = transport.fetchMock.getMockImplementation()!;
     transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
       ? Promise.resolve(Response.json({ views: workbenchViews.filter(view => view.id !== "mcp-settings"), actions: workbenchActions }))
-      : input === "/api/mcp/settings" ? Promise.resolve(Response.json({ state: "not_configured" })) : base(input, init));
+      : input === "/api/mcp/settings" ? Promise.resolve(Response.json({ state: "not_configured",
+        privacy: { hide_employee_details: false, hide_champion_employee: false }, privacyScope: "end_user_and_preview" })) : base(input, init));
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
     expect(await screen.findByText("No MCP server is configured for this organization.")).toBeVisible();
@@ -595,6 +597,34 @@ export function sessionAndNavigationCases() {
       expect(screen.queryByRole("button", { name: "Audit" })).not.toBeInTheDocument();
       expect(screen.queryByRole("region", { name: "Audit evidence" })).not.toBeInTheDocument();
       expect(transport.fetchMock.mock.calls.some(([input]) => new URL(input, "http://localhost").pathname.startsWith("/api/audit/events"))).toBe(false);
+    },
+  );
+
+  it.each(["denied Audit bookmark", "unadvertised Dashboard bookmark", "denied Audit history"] as const)(
+    "keeps fallback Agents navigation interactive after a %s", async boundary => {
+      const history = boundary === "denied Audit history";
+      window.history.replaceState({}, "", history ? "/agents"
+        : boundary === "denied Audit bookmark" ? "/audit" : "/dashboard");
+      const transport = appTransport({ revalidatedRoles: viewer.roles });
+      const base = transport.fetchMock.getMockImplementation()!;
+      transport.fetchMock.mockImplementation((input, init) => input === "/api/workbench/metadata"
+        ? Promise.resolve(Response.json({
+          views: workbenchViews.filter(view => view.id === "agents" || view.id === "permissions"),
+          actions: workbenchActions,
+        })) : base(input, init));
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
+      if (history) act(() => {
+        window.history.pushState(window.history.state, "", "/audit");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await waitFor(() => expect(window.location.pathname).toBe("/agents"));
+      await userEvent.click(screen.getByRole("button", { name: `View details for ${agent.displayName}` }));
+      expect(await screen.findByRole("dialog", { name: agent.displayName })).toBeVisible();
+      expect(new URLSearchParams(window.location.search).get("detail")).toBe(unifiedPage.value[0].id);
+      expect(transport.fetchMock.mock.calls.some(([input]) =>
+        new URL(input, "http://localhost").pathname.startsWith("/api/audit/events"))).toBe(false);
     },
   );
 
@@ -3321,13 +3351,13 @@ export function sessionAndNavigationCases() {
     await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
     await waitFor(() => expect(sessionReads).toBe(deferredRead + 1));
     await act(async () => abandoned.resolve(Response.json({
-      user: { ...viewer, displayName: "Abandoned account" }, csrfToken: "abandoned-csrf", roleAssignmentRequired: false,
+      user: { ...viewer, displayName: "Abandoned account" }, csrfToken: "abandoned-csrf",
     })));
     expect(screen.queryByText("Abandoned account")).not.toBeInTheDocument();
     expect(screen.getByText("Checking sign-in...")).toBeVisible();
     await act(async () => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
     expect(sessionReads).toBe(deferredRead + 1);
-    await act(async () => replacement.resolve(Response.json({ user: viewer, csrfToken: "replacement-csrf", roleAssignmentRequired: false })));
+    await act(async () => replacement.resolve(Response.json({ user: viewer, csrfToken: "replacement-csrf" })));
     expect(await screen.findByText(agent.displayName)).toBeVisible();
     expect(screen.getByText(viewer.displayName)).toBeVisible();
     expect(screen.queryByText("Abandoned account")).not.toBeInTheDocument();
@@ -3762,7 +3792,7 @@ export function sessionAndNavigationCases() {
     controller.abort();
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     await act(async () => transport.releaseRevalidation());
-    await screen.findByRole("heading", { name: "Permissions" });
+    await screen.findByRole("heading", { name: "Agent discovery" });
   });
 
   it("uses the automatic due check to replace duplicate source rows without a second identity scanner", async () => {
@@ -5882,7 +5912,7 @@ export function savedInventoryCases() {
     expect(screen.queryByText("Sensitive cached agent")).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await act(async () => transport.releaseRevalidation());
-    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Agent discovery" })).toBeInTheDocument();
   });
 
   it("clears saved queries and cached inventory when the same home account revalidates in another tenant", async () => {
@@ -6053,7 +6083,7 @@ export function savedInventoryCases() {
     next.fetchMock.mockImplementation((input, init) => input === "/api/me"
       ? Promise.resolve(Response.json({ user: { ...viewer, roles: ["AgentControl.Admin"],
         homeAccountId: account === "same" ? viewer.homeAccountId : "replacement-viewer" },
-      csrfToken: "new-csrf", roleAssignmentRequired: false })) : base(input, init));
+      csrfToken: "new-csrf" })) : base(input, init));
     vi.stubGlobal("fetch", next.fetchMock);
     render(<App />);
     const selection = await screen.findByRole("checkbox", { name: `Select ${agent.displayName}` });
@@ -6126,7 +6156,7 @@ export function savedInventoryCases() {
       }
       await act(async () => releaseDetail(Response.json(agent)));
 
-      expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: scenario === "navigation" ? "Permissions" : "Agent discovery" })).toBeInTheDocument();
       expect(screen.queryByRole("dialog", { name: agent.displayName })).not.toBeInTheDocument();
       expect(screen.queryByText("Loading agent details...")).not.toBeInTheDocument();
     },
@@ -6602,11 +6632,14 @@ export function savedInventoryCases() {
     vi.stubGlobal("fetch", transport.fetchMock);
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Agent discovery" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Jobs" })).not.toBeInTheDocument();
     expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/agents/package-private"))).toBe(false);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/agents/refresh-jobs/private-job"))).toBe(false);
+    await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/mcp/authenticated-entry")).toHaveLength(1));
+    expect([...new Set(transport.fetchMock.mock.calls.map(([path]) => String(path)))].sort())
+      .toEqual(["/api/auth/status", "/api/me", "/api/mcp/authenticated-entry"].sort());
   });
 
   it("allows Viewer to use read-only bulk-reference filters", async () => {
@@ -8820,7 +8853,7 @@ export function savedInventoryCases() {
     await waitFor(() => expect(transport.meCalls()).toBe(2));
     expect(screen.queryByText("Sensitive cached agent")).not.toBeInTheDocument();
     await act(async () => transport.releaseRevalidation());
-    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Agent discovery" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Jobs" })).not.toBeInTheDocument();
   });
 
@@ -9103,7 +9136,7 @@ export function savedInventoryCases() {
       packageCount: 40, packagesComplete: false, memberCount: 40 };
     let counts = 0;
     transport.fetchMock.mockImplementation((input, init) => {
-      if (input === "/api/me") return Promise.resolve(Response.json({ user: currentUser, csrfToken: "csrf-account", roleAssignmentRequired: false }));
+      if (input === "/api/me") return Promise.resolve(Response.json({ user: currentUser, csrfToken: "csrf-account" }));
       if (new URL(input, "http://localhost").pathname === "/api/agent-inventory") return Promise.resolve(Response.json({
         ...unifiedPage, value: [group], counts: { total: 1, scoped: 1, filtered: 1, packageTargets: 40 },
       }));
@@ -9430,7 +9463,7 @@ export function commandsAndExportsCases() {
     render(<App />);
     await screen.findByRole("button", { name: "Sign out" });
     if (scenario === "unassigned") {
-      expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "Agent discovery" })).toBeInTheDocument();
       expect(agentListRequests(transport.fetchMock)).toHaveLength(0);
     } else {
       await waitFor(() => expect(agentListRequests(transport.fetchMock)).toHaveLength(1));
@@ -12504,7 +12537,7 @@ export function commandsAndExportsCases() {
     await waitFor(() => expect(transport.meCalls()).toBe(2));
     expect(screen.queryByText(agent.displayName)).not.toBeInTheDocument();
     await act(async () => transport.releaseRevalidation());
-    expect(await screen.findByRole("heading", { name: "Permissions" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Agent discovery" })).toBeInTheDocument();
     expect(screen.getByText(/Unable to clear the saved package job/)).toBeInTheDocument();
   });
 
@@ -13432,7 +13465,6 @@ function appTransport({
   const revalidatedResponse = () => Response.json({
     user: { ...revalidatedUser, roles: revalidatedRoles },
     csrfToken: "csrf-2",
-    roleAssignmentRequired: revalidatedRoles.length === 0,
   });
   const transport: {
     failProtectedReadsWith?: 401 | 403;
@@ -13458,10 +13490,11 @@ function appTransport({
       expiresAt: new Date(Date.now() + 600_000).toISOString(), error: null, limit: null, observed: null,
     });
     if (input === "/api/auth/status") return Response.json({ authConfigured: true, callback: "http://localhost/api/auth/callback" });
+    if (input === "/api/mcp/authenticated-entry") return Response.json({ admission: "scheduled", nextCheckAt: new Date(Date.now() + 300_000).toISOString() });
     if (input === "/api/me") {
       currentUserCalls += 1;
       if (!authenticated) return Response.json({ user: null });
-      if (currentUserCalls === 1) return Response.json({ user: { ...viewer, roles: initialRoles }, csrfToken: "csrf-1", roleAssignmentRequired: false });
+      if (currentUserCalls === 1) return Response.json({ user: { ...viewer, roles: initialRoles }, csrfToken: "csrf-1" });
       return deferRevalidation ? revalidation : revalidatedResponse();
     }
     if (input === "/api/capabilities" || input.startsWith("/api/capabilities/check")) {

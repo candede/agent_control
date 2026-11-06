@@ -1,18 +1,20 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { apiToken, account, jwk } from "../auth/authFoundationTestSupport.js";
+import type { AppRole } from "../types/capability.js";
 import type { setupAuditOriginHttp } from "./auditOriginHttpTestSupport.js";
 
 // Names identify canonical operations for SQL/browser parity assertions. The Python
 // test adapter resolves the current public tool/action; no old wire alias is called.
 export type SdkCall = { name: string; request: Record<string, unknown>; expected?: unknown };
 
-export async function sdkJourney(fixture: Awaited<ReturnType<typeof setupAuditOriginHttp>>, calls: SdkCall[]) {
+export async function sdkJourney(fixture: Awaited<ReturnType<typeof setupAuditOriginHttp>>, calls: SdkCall[],
+  actor = { oid: fixture.actor.localAccountId ?? account().localAccountId, roles: fixture.actor.roles as AppRole[] }) {
   const python = process.env.AGENT_CONTROL_MCP_SQL_JOURNEY;
   if (python !== "/opt/mcp/.venv/bin/python" || process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1"
     || process.env.PGHOST !== "127.0.0.1" || process.env.PGDATABASE !== "agentcontrol_test_control") throw new Error("Exact isolated SDK/SQL fixture required.");
-  const payload = { url: fixture.base, client: fixture.integrationClientId, oid: account().localAccountId, jwk: { ...jwk, kid: "sdk-api-fixture" },
-    token: apiToken({ roles: ["AgentControl.Viewer", "AgentControl.Admin"], azp: fixture.integrationClientId }, "sdk-api-fixture"),
+  const payload = { url: fixture.base, client: fixture.integrationClientId, oid: actor.oid, jwk: { ...jwk, kid: "sdk-api-fixture" },
+    token: apiToken({ oid: actor.oid, roles: actor.roles, azp: fixture.integrationClientId }, "sdk-api-fixture"),
     state: `/evidence/mcp-sql-${randomUUID()}`, calls };
   const child = spawn(python, ["/opt/mcp/tests/sql_journey.py"], {
     env: { PATH: process.env.PATH, HOME: "/evidence", TMPDIR: "/evidence", PYTHONDONTWRITEBYTECODE: "1" },

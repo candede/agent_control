@@ -7,6 +7,8 @@ services:
       MCP_API_CLIENT_ID: ${MCP_API_CLIENT_ID}
       MCP_PUBLIC_URL: ${MCP_PUBLIC_URL}
       MCP_LOCAL_HOST_PORT: ${MCP_PORT}
+      MCP_HIDE_EMPLOYEE_DETAILS: ${MCP_HIDE_EMPLOYEE_DETAILS:-false}
+      MCP_HIDE_CHAMPION_EMPLOYEE: ${MCP_HIDE_CHAMPION_EMPLOYEE:-false}
   mcp:
     container_name: "${COMPOSE_PROJECT_NAME:?Compose project name is required}-agent-control-mcp-1"
     image: ${MCP_IMAGE:?MCP image must be explicitly configured}

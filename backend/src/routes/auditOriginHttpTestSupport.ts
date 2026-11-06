@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { AddressInfo } from "node:net";
 import { vi } from "vitest";
 import { createApp } from "../app.js";
@@ -10,6 +11,8 @@ import { replaceMsalClientForTest } from "../auth/msal.js";
 import { apiToken, account, browserAuthenticationResult, browserFixtureCookie, browserSession, jwk, sdkResponse, tenant } from "../auth/authFoundationTestSupport.js";
 import { loadOperationalState } from "../services/operationalState.js";
 import { clearAdmissionForTest } from "../middleware/admission.js";
+import type { AppRole } from "../types/capability.js";
+import { dataSync } from "../services/dataSync.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -23,45 +26,68 @@ const context = Buffer.from(JSON.stringify({ version: 1, client: { id: "syntheti
 let fixture: Awaited<ReturnType<typeof testDatabase>> | undefined, application: ReturnType<typeof createApp> | undefined, server: Server | undefined;
 
 // The same real createApp/RSA/JWKS/MSAL/browser-cookie harness used by phase03A.
-export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected = account(), integrationClientId = tenant.integration!.clientId) {
+export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected = account(), integrationClientId = tenant.integration!.clientId,
+  actorRoles: AppRole[] = roles) {
   fixture = await testDatabase();
   vi.spyOn(pool, "query").mockImplementation(fixture.runtime.query.bind(fixture.runtime));
   vi.spyOn(pool, "connect").mockImplementation(fixture.runtime.connect.bind(fixture.runtime));
   config.tenants = [{ ...tenant, integration: { ...tenant.integration!, clientId: integrationClientId } }];
   clearAccountSessionMutationsForTest(); clearAdmissionForTest();
+  const roles = actorRoles;
+  const identityAccounts = new Map([[selected.localAccountId, { account: selected, roles }]]);
   const authentication = { ...browserAuthenticationResult(), account: selected, uniqueId: selected.localAccountId, scopes: ["openid", "profile"],
     idTokenClaims: { ...browserAuthenticationResult().idTokenClaims, oid: selected.localAccountId, roles } };
   replaceMsalClientForTest(tenant.tenantId, {
     getAuthCodeUrl: async () => { throw new Error("No live browser login"); },
     acquireTokenByCode: async () => { throw new Error("No live browser login"); },
-    acquireTokenByClientCredential: async () => { throw new Error("No application grant"); },
+    acquireTokenByClientCredential: async () => ({ ...browserAuthenticationResult(), account: null, idTokenClaims: {},
+      scopes: ["https://graph.microsoft.com/.default"], accessToken: "synthetic-application-membership-token" }),
     acquireTokenSilent: async request => ({ ...authentication, scopes: Array.isArray(request.scopes) ? request.scopes : [] }),
     getTokenCache: () => ({ getAccountByHomeId: async () => selected, removeAccount: async () => undefined }),
   });
   await activateAccountSession(tenant.tenantId, selected.homeAccountId, async () => undefined);
   await loadOperationalState(fixture.runtime);
-  const providerWork = { requests: 0 };
+  const providerWork = { requests: 0, bootstrapRequests: 0, bootstrapAdmissions: 0 };
+  const bootstrap = new AsyncLocalStorage<boolean>();
+  const authenticatedEntry = dataSync.authenticatedEntry.bind(dataSync);
+  vi.spyOn(dataSync, "authenticatedEntry").mockImplementation((...args) => {
+    providerWork.bootstrapAdmissions++;
+    return bootstrap.run(true, () => authenticatedEntry(...args));
+  });
+  const providerRequest = () => {
+    if (bootstrap.getStore()) providerWork.bootstrapRequests++;
+    else providerWork.requests++;
+  };
   const liveFetch = globalThis.fetch;
   vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
     const target = new URL(String(url));
     if (target.protocol === "http:" && target.hostname === "127.0.0.1") return liveFetch(url, init);
-    providerWork.requests++; throw new Error("Saved HTTP fixtures forbid provider data requests.");
+    providerRequest(); throw new Error("Saved HTTP fixtures forbid provider data requests.");
   });
   const identityFetch: typeof fetch = async (url, request) => {
     const target = new URL(String(url));
+    if (target.hostname === "graph.microsoft.com" && target.pathname.startsWith("/v1.0/users/")) {
+      const member = identityAccounts.get(target.pathname.slice("/v1.0/users/".length));
+      if (member) return Response.json({ id: member.account.localAccountId, userType: "Member", accountEnabled: true });
+    }
     if (target.hostname !== "login.microsoftonline.com" || !target.pathname.startsWith(`/${tenant.tenantId}/`)) {
-      providerWork.requests++; throw new Error("Unexpected identity authority.");
+      providerRequest(); throw new Error("Unexpected identity authority.");
     }
     if (target.pathname.endsWith("/discovery/v2.0/keys")) return Response.json({ keys: [jwk, { ...jwk, kid: "sdk-api-fixture" }] });
-    if (!target.pathname.endsWith("/oauth2/v2.0/token")) { providerWork.requests++; throw new Error("Unexpected identity operation."); }
-    return sdkResponse({ oid: selected.localAccountId, uid: selected.homeAccountId.split(".")[0], utid: selected.homeAccountId.split(".")[1],
-      claims: { roles } }, request);
+    if (!target.pathname.endsWith("/oauth2/v2.0/token")) { providerRequest(); throw new Error("Unexpected identity operation."); }
+    const assertion = new URLSearchParams(String(request?.body ?? "")).get("assertion");
+    const oid = assertion ? JSON.parse(Buffer.from(assertion.split(".")[1], "base64url").toString("utf8")).oid : selected.localAccountId;
+    const identity = identityAccounts.get(oid);
+    if (!identity) throw new Error("Unregistered synthetic same-user identity.");
+    return sdkResponse({ oid: identity.account.localAccountId, uid: identity.account.homeAccountId.split(".")[0], utid: identity.account.homeAccountId.split(".")[1],
+      claims: { roles: identity.roles } }, request);
   };
   application = createApp(fixture.runtime, undefined, identityFetch);
   server = createServer(application.app);
   await new Promise<void>(resolve => server!.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
-  const session = browserSession(selected); session.user!.roles = roles; session.csrfToken = "synthetic-csrf";
+  const session = browserSession(selected); session.user!.roles = roles; session.user!.localAccountId = selected.localAccountId;
+  session.csrfToken = "synthetic-csrf";
   const cookie = await browserFixtureCookie(application.store, config.sessionSecret, session);
   const headers = transport === "mcp"
     ? { authorization: `Bearer ${apiToken({ roles, oid: selected.localAccountId, azp: integrationClientId })}`, "X-Agent-Control-Mcp-Context": context }
@@ -71,7 +97,7 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
     headers: { ...(kind === "mcp"
       ? { authorization: `Bearer ${apiToken({ roles, oid: selected.localAccountId, azp: integrationClientId })}`, "X-Agent-Control-Mcp-Context": context }
       : { cookie, Origin: config.frontendOrigin, "X-CSRF-Token": "synthetic-csrf" }), ...options.headers } });
-  return { base, integrationClientId, database: fixture.runtime, providerWork, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs };
+  return { base, integrationClientId, database: fixture.runtime, providerWork, identityAccounts, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs };
 }
 
 export async function closeAuditOriginHttp() {

@@ -382,13 +382,12 @@ export class PackageRefreshJobs {
     return this.getJob(scope, id);
   }
 
-  async markFailed(scope: PackageDataScope, id: string, code: string, message: string, claimedRevision?: string) {
-    // Stale admission may compensate its never-started claim, but cannot stop a newer owner.
+  async markFailed(scope: PackageDataScope, id: string, code: string, message: string, admissionRevision?: string) {
+    // Admission may fail only the waiting revision it read, never a newer owner.
     await this.database.query(`UPDATE package_refresh_jobs SET status='failed',error_code=$4,message=$5,finished_at=clock_timestamp(),
       updated_at=clock_timestamp() WHERE id=$1 AND tenant_id=$2 AND principal_id=$3 AND status IN ('running','waiting_authorization')
-        AND ($6::text IS NULL OR (auto_details AND status='waiting_authorization' AND attempted_at IS NULL
-          AND updated_at::text=$6))`,
-    [id, scope.tenantId, scope.principalId, safeCode(code), message.slice(0, 1024), claimedRevision ?? null]);
+        AND ($6::text IS NULL OR (status='waiting_authorization' AND updated_at::text=$6))`,
+    [id, scope.tenantId, scope.principalId, safeCode(code), message.slice(0, 1024), admissionRevision ?? null]);
     return this.getJob(scope, id);
   }
 

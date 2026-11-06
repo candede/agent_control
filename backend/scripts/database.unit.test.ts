@@ -1,10 +1,18 @@
 import pg from "pg";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { initializeSchema, preflightSchema } from "./database.js";
 
 vi.mock("../src/db/schema.js", () => ({
   schemaFingerprint: "a".repeat(64), schemaSql: "synthetic-schema", verifySchema: vi.fn(),
 }));
+
+beforeEach(() => {
+  vi.spyOn(pg.Pool.prototype, "query").mockImplementation(async function(this: pg.Pool, statement) {
+    if (this.options.database !== "postgres" || typeof statement !== "string"
+      || !statement.startsWith("SELECT to_regclass")) throw new Error("Unexpected pool query.");
+    return { rows: [{ name: null }], rowCount: 1 };
+  });
+});
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -13,7 +21,6 @@ it.each(["preflight", "initialize"] as const)(
     const database = new pg.Pool();
     const client = Object.assign(new pg.Client(), { release: vi.fn() });
     vi.spyOn(database, "connect").mockImplementation(async () => client);
-    vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected pool query."));
     const query = vi.spyOn(client, "query").mockImplementation(async statement => {
       if (typeof statement !== "string") throw new Error("Unexpected query shape.");
       if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: null }], rowCount: 1 };
@@ -37,7 +44,6 @@ it.each(["preflight", "initialize"] as const)("preserves normal fresh initializa
   const database = new pg.Pool();
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
   vi.spyOn(database, "connect").mockImplementation(async () => client);
-  vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected pool query."));
   const query = vi.spyOn(client, "query").mockImplementation(async statement => {
     if (typeof statement !== "string") throw new Error("Unexpected query shape.");
     if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: null }], rowCount: 1 };
@@ -61,6 +67,71 @@ it.each(["preflight", "initialize"] as const)("preserves normal fresh initializa
   expect(client.release).toHaveBeenCalledOnce();
 });
 
+function initializationFixture(current = false) {
+  const database = new pg.Pool({ database: "agentcontrol_test_review" });
+  const client = Object.assign(new pg.Client(), { release: vi.fn() });
+  const connect = vi.spyOn(database, "connect").mockImplementation(async () => client);
+  const query = vi.spyOn(client, "query").mockImplementation(async statement => {
+    if (typeof statement !== "string") throw new Error("Unexpected query shape.");
+    if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: current ? "app_schema" : null }], rowCount: 1 };
+    if (statement.startsWith("SELECT fingerprint")) return { rows: [{ fingerprint: "a".repeat(64) }], rowCount: 1 };
+    if (statement.includes("AS populated")) return { rows: [{ populated: false }], rowCount: 1 };
+    if (["BEGIN", "COMMIT", "ROLLBACK", "synthetic-schema"].includes(statement)
+      || statement.includes("pg_advisory_xact_lock") || statement.startsWith("INSERT INTO")) return { rows: [], rowCount: 0 };
+    throw new Error("Unexpected initialization query.");
+  });
+  return { database, client, connect, query };
+}
+
+it("reads reset revocations only after acquiring the target initialization transaction", async () => {
+  const { database, client, connect, query } = initializationFixture();
+  let protectedRows = [{ tenant_id: "tenant", principal_id: "principal", epoch: "1", bearer_issued_after: "1000" }];
+  const latest = [{ tenant_id: "tenant", principal_id: "principal", epoch: "9007199254740993", bearer_issued_after: "2000" }];
+  vi.mocked(pg.Pool.prototype.query).mockImplementation(async function(this: pg.Pool, statement) {
+    if (this.options.database !== "postgres" || typeof statement !== "string") throw new Error("Unexpected pool query.");
+    if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: "agentcontrol_principal_revocations" }], rowCount: 1 };
+    if (statement.includes("FROM public.agentcontrol_principal_revocations")) {
+      return { rows: structuredClone(protectedRows), rowCount: protectedRows.length };
+    }
+    throw new Error("Unexpected maintenance query.");
+  });
+  connect.mockImplementation(async () => {
+    // A revoke/reset completed before initialization acquired its target connection.
+    protectedRows = latest;
+    return client;
+  });
+  await initializeSchema(database);
+  const insert = query.mock.calls.find(([statement]) => typeof statement === "string"
+    && statement.startsWith("INSERT INTO data_principal_epochs"));
+  expect(insert?.[1]).toEqual([JSON.stringify(latest)]);
+  expect(pg.Pool.prototype.query).toHaveBeenCalledWith(
+    expect.stringContaining("WHERE database_name=$1"), ["agentcontrol_test_review"],
+  );
+  expect(query).toHaveBeenCalledWith("COMMIT");
+  expect(client.release).toHaveBeenCalledOnce();
+});
+
+it("retries current initialization without depending on the maintenance database", async () => {
+  const { database, client, query } = initializationFixture(true);
+  vi.mocked(pg.Pool.prototype.query).mockRejectedValue(new Error("Maintenance is unavailable."));
+  await expect(initializeSchema(database)).resolves.toBeUndefined();
+  expect(pg.Pool.prototype.query).not.toHaveBeenCalled();
+  expect(query).not.toHaveBeenCalledWith("synthetic-schema");
+  expect(query).toHaveBeenCalledWith("COMMIT");
+  expect(client.release).toHaveBeenCalledOnce();
+});
+
+it("rolls back fresh initialization before DDL if protected revocations cannot be read", async () => {
+  const { database, client, query } = initializationFixture();
+  const failure = new Error("Protected revocations are unavailable.");
+  vi.mocked(pg.Pool.prototype.query).mockRejectedValue(failure);
+  await expect(initializeSchema(database)).rejects.toBe(failure);
+  expect(query).toHaveBeenCalledWith("ROLLBACK");
+  expect(query).not.toHaveBeenCalledWith("synthetic-schema");
+  expect(query).not.toHaveBeenCalledWith("COMMIT");
+  expect(client.release).toHaveBeenCalledOnce();
+});
+
 const preflightGrants = [
   ["data_principal_epochs", ["SELECT", "INSERT", "UPDATE"]],
   ["audit_events", ["SELECT", "INSERT"]],
@@ -76,7 +147,6 @@ it.each([
     const database = new pg.Pool();
     const client = Object.assign(new pg.Client(), { release: vi.fn() });
     vi.spyOn(database, "connect").mockImplementation(async () => client);
-    vi.spyOn(database, "query").mockRejectedValue(new Error("Unexpected pool query."));
     const query = vi.spyOn(client, "query").mockImplementation(async statement => {
       if (typeof statement !== "string") throw new Error("Unexpected query shape.");
       if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: "app_schema" }], rowCount: 1 };

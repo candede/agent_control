@@ -13,6 +13,7 @@ import type pg from "pg";
 import { copilotStudioQuarantineControl } from "../services/copilotStudioQuarantineControl.js";
 import { AppError } from "../errors.js";
 import { sdkJourney } from "./mcpSdkJourneyTestSupport.js";
+import { DataSyncRepository } from "../db/dataSync.js";
 
 const canonical = (n: number) => `10000000-0000-4000-8000-${String(n).padStart(12,"0")}`;
 const environmentId = "40000000-0000-4000-8000-000000000001", botId = "50000000-0000-4000-8000-000000000001";
@@ -42,6 +43,9 @@ function providers(initial: boolean) {
     const url = new URL(String(input));
     if (url.hostname !== "graph.microsoft.com" && url.hostname !== "api.powerplatform.com") return before(input, init);
     const isStudio = url.hostname === "api.powerplatform.com";
+    if (init?.method === "POST" && !/\/(?:block|unblock|SetAsQuarantined|SetAsUnquarantined)$/.test(url.pathname)) {
+      return before(input, init);
+    }
     if (init?.method === "POST") {
       await state.holdWrites;
       writes.push(url.pathname);
@@ -101,8 +105,15 @@ describe.sequential("shared exact agent controls on the actual registered browse
     const results: unknown[] = [];
     for (const transport of ["webapp","mcp"] as const) {
       const f = await setupAuditOriginHttp(transport), provider = providers(action === "unblock");
-      const inventory = await seed(f, action === "unblock");
       const useSdk = process.env.AGENT_CONTROL_MCP_SQL_JOURNEY && transport === "mcp";
+      if (useSdk) {
+        await sdkJourney(f, []);
+        await vi.waitFor(async () => expect(
+          (await new DataSyncRepository(f.database).getLatestRun(f.scope))?.status
+        ).not.toBe("running"), { timeout: 10_000 });
+        expect(f.providerWork.bootstrapAdmissions).toBe(2);
+      }
+      const inventory = await seed(f, action === "unblock");
       const recordIds = [`agent:${canonical(1)}`,`agent:${canonical(2)}`,`agent:${canonical(3)}`, "report:unmanaged"];
       const reviewed = useSdk ? (await sdkJourney(f, [{ name: "preview_agent_control",
         request: { selectionId: inventory.selection.id, action, recordIds } }]))[0] as AgentControlPreview

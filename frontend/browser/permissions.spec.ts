@@ -23,6 +23,36 @@ async function login(page: Page, scenario: string, username?: string) {
   await expect(page.getByRole("button", { name: "Check status", exact: true })).toBeEnabled();
   if (["available", "role-Viewer", "role-Admin"].includes(scenario)) await prepareSavedWorkspace(page);
 }
+for (const [role, scenario] of [["employee", "roleless-employee"], ["viewer", "role-Viewer"], ["admin", "role-Admin"]] as const) {
+  test(`fresh ${role} sign-in starts read-only collection without a permissions visit or manual Sync`,
+    { tag: "@automatic-first-use" }, async ({ page }, info) => {
+    const calls: string[] = [];
+    page.on("request", request => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith("/api/")) calls.push(`${request.method()} ${path}`);
+    });
+    const loginUrl = new URL(fixtureLoginUrl(scenario, `fixture@fresh-${role}-${info.project.name}.example.invalid`));
+    loginUrl.searchParams.set("returnTo", `/agents?fixture=${scenario}`);
+    await page.goto(loginUrl.href);
+    if (role === "employee") {
+      await expect(page.getByRole("heading", { name: "Agent discovery", exact: true })).toBeVisible();
+      await expect.poll(() => calls.filter(call => call === "POST /api/mcp/authenticated-entry").length).toBe(1);
+      await expect(page.getByRole("navigation", { name: "Primary views" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /^Sync/ })).toHaveCount(0);
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      expect(calls).not.toContain("POST /api/capabilities/check");
+      expect(calls.filter(call => !/^GET \/api\/(?:auth\/login|auth\/callback|auth\/status|me)$/.test(call)))
+        .toEqual(["POST /api/mcp/authenticated-entry"]);
+    } else {
+      await expect(page.getByRole("region", { name: "Agent inventory", exact: true })).toBeVisible();
+      await expect.poll(() => calls.filter(call => call === "POST /api/data-sync/auto-refresh").length).toBeGreaterThan(0);
+      await waitForWorkspaceSources(page);
+    }
+    expect(calls).not.toContain("POST /api/data-sync/runs");
+    expect(calls).not.toContain("GET /api/mcp/settings");
+    expect(new URL(page.url()).pathname).toBe("/agents");
+  });
+}
 async function prepareSavedWorkspace(page: Page) {
   if (process.env.AGENT_CONTROL_FIXTURE_MODE !== "browser") throw new Error("Workspace collection requires synthetic providers.");
   const state = await page.request.get("/api/data-sync/state");
@@ -113,7 +143,7 @@ function savedPackagePage(observedAt: string, expiresAt: string) {
   };
 }
 const requestDiagnostics = new WeakMap<Page, string[]>();
-test.beforeEach(async ({ context, page }) => {
+test.beforeEach(async ({ context, page }, testInfo) => {
   // The internal-only fixture network still serves the reachable synthetic API.
   await page.addInitScript(() => Object.defineProperty(navigator, "onLine", { get: () => true }));
   const diagnostics: string[] = [];
@@ -127,7 +157,7 @@ test.beforeEach(async ({ context, page }) => {
   page.on("requestfailed", request => record(`failed ${request.method()} ${new URL(request.url()).pathname}: ${request.failure()?.errorText}`));
   page.on("pageerror", error => record(`pageerror: ${error.message}`));
   await context.route(isExternalFixtureRequest, route => route.abort());
-  await mockAutomaticRefresh(page);
+  if (!testInfo.tags.includes("@automatic-first-use")) await mockAutomaticRefresh(page);
 });
 test.afterEach(async ({ page }, testInfo) => {
   if (testInfo.status !== testInfo.expectedStatus) {
@@ -323,7 +353,7 @@ test("administrator prerequisites replace in-app consent before and after a miss
     if (route.request().method() === "POST" && !isAutomaticRefreshRequest(route.request()) && !isInventorySelectionRequest(route.request())) posts.push(path + url.search);
     if (path === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic administrator", username: "fixture@example.invalid", homeAccountId: "consent-fixture", roles: ["AgentControl.Admin"] },
-      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+      csrfToken: "synthetic-csrf",
     } });
     if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
     if ((path === "/api/capabilities" || path === "/api/capabilities/check") && permissionLayoutRequestKind(route.request().method(), url)) {
@@ -379,7 +409,7 @@ test("compact primary navigation has one Permissions entry and a visible icon-on
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic navigation validation account", username: "fixture@example.invalid", homeAccountId: "navigation-fixture", roles: ["AgentControl.Admin"] },
-      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+      csrfToken: "synthetic-csrf",
     } });
     if (path === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
     if (path === "/api/agents") return route.fulfill({ json: savedPackagePage(new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()) });
@@ -504,7 +534,7 @@ test("timeout recovery retries failed checks without presenting unused operation
     requests.push(url.pathname + url.search);
     if (url.pathname === "/api/me") return route.fulfill({ json: {
       user: { displayName: "Synthetic validation account", username: "fixture@example.invalid", homeAccountId: "fixture", roles: ["AgentControl.Admin"] },
-      csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+      csrfToken: "synthetic-csrf",
     } });
     if (url.pathname === "/api/auth/status") return route.fulfill({ json: { authConfigured: true, callback: `${url.origin}/api/auth/callback` } });
     if (url.pathname === "/api/workbench/metadata") return route.fulfill({ json: { views: workbenchViews, actions: workbenchActions } });
@@ -1292,7 +1322,7 @@ test("Defender hunting is explicit, fixed-template, scoped, partial-aware and co
   await page.route("**/api/me", route => route.fulfill({ json: {
     user: { homeAccountId: "fixture-role-Viewer", tenantId: "fixture-tenant", displayName: "Fixture Viewer",
       username: "viewer@example.invalid", roles: ["AgentControl.Viewer"] },
-    csrfToken: "layout-csrf", roleAssignmentRequired: false,
+    csrfToken: "layout-csrf",
   } }));
   await page.route(url => url.pathname.startsWith("/api/hunting/"), route => {
     const request = route.request();

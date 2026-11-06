@@ -3,21 +3,196 @@ import base64
 import json
 import time
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx2
 import pytest
+from azure.core import MatchConditions
 from azure.core.exceptions import HttpResponseError
 from azure.storage.blob.aio import BlobClient, BlobServiceClient
 from conftest import OTHER, connect, tokens
 from cryptography.fernet import Fernet
 
 from agent_control_mcp.azure_storage import AzureOAuthBlobStore, OAuthAuthorityUnavailable
-from agent_control_mcp.config import AzureBlobSettings
+from agent_control_mcp.config import AzureBlobSettings, ConfigurationError
 from agent_control_mcp.service import ProtocolBoundary, build_service
-from agent_control_mcp.storage import OAuthStore
+from agent_control_mcp.storage import CLIENT_COLLECTION, OAuthStore
 
 SYNTHETIC_KEY = base64.b64encode(b"synthetic-emulator-key-not-a-production-secret").decode()
+
+
+@pytest.fixture
+async def local_blob(settings):
+    configured = replace(
+        settings,
+        azure_blob=AzureBlobSettings(
+            "https://fixtureoauth.blob.core.windows.net",
+            "oauth-local",
+            "oauth-state.v1.fernet",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        ),
+    )
+    state = SimpleNamespace(content=b"", etag="0")
+    lease = SimpleNamespace(renew=AsyncMock(), release=AsyncMock())
+
+    async def download(**kwargs):
+        assert kwargs["lease"] is lease
+        return SimpleNamespace(
+            size=len(state.content),
+            properties=SimpleNamespace(etag=state.etag),
+            readall=AsyncMock(return_value=state.content),
+        )
+
+    async def upload(content, **kwargs):
+        assert kwargs["lease"] is lease
+        assert kwargs["etag"] == state.etag
+        assert kwargs["match_condition"] == MatchConditions.IfNotModified
+        state.content = content
+        state.etag = str(int(state.etag) + 1)
+
+    client = SimpleNamespace(
+        acquire_lease=AsyncMock(return_value=lease),
+        download_blob=AsyncMock(side_effect=download),
+        upload_blob=AsyncMock(side_effect=upload),
+        close=AsyncMock(),
+    )
+    store = AzureOAuthBlobStore(configured, client=client)
+    try:
+        yield store, state, configured
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.parametrize("value", [{}, {"client_id": None}, {"client_id": "different-client"}])
+async def test_local_blob_rejects_invalid_persistent_registration_without_mutation(
+    local_blob, value
+):
+    store, state, _ = local_blob
+    await store.start()
+    before = state.content
+    with pytest.raises(ConfigurationError):
+        await store.put("registered-client", value, collection=CLIENT_COLLECTION)
+    assert state.content == before
+    assert not store.failed
+    await store.put("credential", {"token": "synthetic-expiring-token"}, ttl=60)
+    assert await store.get("credential") == {"token": "synthetic-expiring-token"}
+
+
+async def test_local_blob_rejects_invalid_registration_batch_atomically(local_blob):
+    store, state, _ = local_blob
+    await store.start()
+    before = state.content
+    with pytest.raises(ConfigurationError):
+        await store.put_many(
+            ["valid-client", "invalid-client"],
+            [{"client_id": "valid-client"}, {"client_id": "different-client"}],
+            collection=CLIENT_COLLECTION,
+        )
+    assert state.content == before
+    assert not store.failed
+    assert await store.get("valid-client", collection=CLIENT_COLLECTION) is None
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_local_blob_closes_credential_when_client_close_fails(local_blob, error_type):
+    store, _, _ = local_blob
+    credential = SimpleNamespace(close=AsyncMock())
+    store.credential = credential
+    store.client.close.side_effect = error_type("synthetic-close-failure")
+    try:
+        with pytest.raises(error_type):
+            await store.aclose()
+        credential.close.assert_awaited_once()
+    finally:
+        store.client.close.side_effect = None
+
+
+async def test_local_blob_durable_registration_rotation_and_expiry(local_blob, monkeypatch):
+    store, state, configured = local_blob
+    await store.start()
+    client = {"client_id": "durable-client"}
+    await store.put("durable-client", client, collection=CLIENT_COLLECTION)
+    await store.put_many(["first", "second"], [{"token": "synthetic-token"}, {}], ttl=60)
+    assert await store.ttl("durable-client", collection=CLIENT_COLLECTION) == (client, None)
+    assert b"synthetic-token" not in state.content
+    await store.aclose()
+
+    new_key = Fernet.generate_key()
+    rotated = AzureOAuthBlobStore(
+        replace(configured, encryption_keys=(new_key, *configured.encryption_keys)),
+        client=store.client,
+    )
+    try:
+        await rotated.start()
+        assert await rotated.get_many(["first", "second"]) == [{"token": "synthetic-token"}, {}]
+    finally:
+        await rotated.aclose()
+
+    future = time.time() + 30 * 86400
+    monkeypatch.setattr(
+        "agent_control_mcp.azure_storage.time",
+        SimpleNamespace(time=lambda: future, monotonic=time.monotonic),
+    )
+    restarted = AzureOAuthBlobStore(
+        replace(configured, encryption_keys=(new_key,)), client=store.client
+    )
+    try:
+        await restarted.start()
+        await restarted.cull()
+        assert await restarted.ttl_many(
+            ["durable-client", "missing"], collection=CLIENT_COLLECTION
+        ) == [(client, None), (None, None)]
+        assert await restarted.get_many(["first", "second"]) == [None, None]
+        assert await restarted.delete("durable-client", collection=CLIENT_COLLECTION)
+        assert await restarted.usage() == (0, len(state.content))
+    finally:
+        await restarted.aclose()
+
+
+async def test_local_blob_invalid_saved_persistent_state_is_not_overwritten(local_blob):
+    store, state, configured = local_blob
+    await store.start()
+    await store.aclose()
+    value = json.loads(store.fernet.decrypt(state.content))
+    value["records"][store._key("credential", None)] = {"value": {"token": "test"}, "expires": None}
+    state.content = store.fernet.encrypt(json.dumps(value).encode())
+    before = state.content
+    restarted = AzureOAuthBlobStore(configured, client=store.client)
+    with pytest.raises(OAuthAuthorityUnavailable):
+        await restarted.start()
+    assert state.content == before
+    assert restarted.failed
+
+
+async def test_local_blob_unknown_write_halts_authority_without_replay(local_blob):
+    store, _, configured = local_blob
+    await store.start()
+    upload = store.client.upload_blob.side_effect
+
+    async def ambiguous(*args, **kwargs):
+        await upload(*args, **kwargs)
+        raise TimeoutError("synthetic-unknown-write")
+
+    store.client.upload_blob.side_effect = ambiguous
+    try:
+        with pytest.raises(OAuthAuthorityUnavailable):
+            await store.put("possibly-persisted", {"v": 1})
+        assert store.failed
+        calls = store.client.upload_blob.await_count
+        with pytest.raises(OAuthAuthorityUnavailable):
+            await store.put("not-replayed", {"v": 2})
+        assert store.client.upload_blob.await_count == calls
+    finally:
+        store.client.upload_blob.side_effect = upload
+        await store.aclose()
+    restarted = AzureOAuthBlobStore(configured, client=store.client)
+    try:
+        await restarted.start()
+        assert await restarted.get_many(["possibly-persisted", "not-replayed"]) == [{"v": 1}, None]
+    finally:
+        await restarted.aclose()
 
 
 @pytest.fixture
@@ -155,7 +330,51 @@ async def test_real_sdk_ciphertext_reload_rotation_and_revocation(prepared_blob)
     assert await only_new.get("revoked-token-hash", collection="revoked") == {"revoked": True}
 
 
-@pytest.mark.parametrize("failure", ["binding", "key", "plaintext", "format", "oversize"])
+async def test_real_sdk_durable_registration_survives_month_culling_restart_and_rotation(
+    prepared_blob, monkeypatch
+):
+    settings, factory, bootstrap, _ = prepared_blob
+    first = factory()
+    await first.start()
+    client = {"client_id": "durable-client"}
+    await first.put("durable-client", client, collection=CLIENT_COLLECTION)
+    assert await first.ttl("durable-client", collection=CLIENT_COLLECTION) == (client, None)
+    await first.put("credential", {"token": "synthetic-expiring-token"}, ttl=60)
+    await first.aclose()
+    raw = await (await bootstrap.download_blob()).readall()
+    value = json.loads(first.fernet.decrypt(raw))
+    registration = value["records"][first._key("durable-client", CLIENT_COLLECTION)]
+    registration["expires"] = time.time() + 3600
+    await bootstrap.upload_blob(first.fernet.encrypt(json.dumps(value).encode()), overwrite=True)
+    new_key = Fernet.generate_key()
+    rotated = factory(replace(settings, encryption_keys=(new_key, *settings.encryption_keys)))
+    await rotated.start()
+    assert await rotated.ttl("durable-client", collection=CLIENT_COLLECTION) == (client, None)
+    await rotated.aclose()
+
+    future = time.time() + 30 * 86400
+    monkeypatch.setattr(
+        "agent_control_mcp.azure_storage.time",
+        SimpleNamespace(time=lambda: future, monotonic=time.monotonic),
+    )
+    restarted = factory(replace(settings, encryption_keys=(new_key,)))
+    await restarted.start()
+    await restarted.cull()
+    assert await restarted.get_many(
+        ["durable-client"], collection=CLIENT_COLLECTION
+    ) == [client]
+    assert await restarted.ttl_many(
+        ["durable-client", "missing"], collection=CLIENT_COLLECTION
+    ) == [(client, None), (None, None)]
+    assert await restarted.get("credential") is None
+    assert await restarted.delete("durable-client", collection=CLIENT_COLLECTION)
+    await restarted.cull()
+    assert await restarted.get("durable-client", collection=CLIENT_COLLECTION) is None
+
+
+@pytest.mark.parametrize(
+    "failure", ["binding", "key", "plaintext", "format", "oversize", "persistent-credential"]
+)
 async def test_real_sdk_invalid_state_fails_closed_without_overwrite(prepared_blob, failure):
     settings, factory, bootstrap, _ = prepared_blob
     first = factory()
@@ -179,8 +398,8 @@ async def test_real_sdk_invalid_state_fails_closed_without_overwrite(prepared_bl
                         "binding": first.binding,
                         "records": {
                             "f" * 64: {
-                                "value": {"v": "x" * 262144},
-                                "expires": time.time() + 60,
+                                "value": {"v": "x" * 262144} if failure == "oversize" else {"v": 1},
+                                "expires": time.time() + 60 if failure == "oversize" else None,
                             }
                         },
                     }

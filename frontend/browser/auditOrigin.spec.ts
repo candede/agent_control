@@ -22,7 +22,7 @@ for (const role of ["AgentControl.Viewer", "AgentControl.UsageReportUploader"] a
     await page.route("**/api/me", route => route.fulfill({ json: {
       user: { homeAccountId: "layout-principal", tenantId: "layout-tenant", username: "reader@example.invalid",
         displayName: "Synthetic reader", roles: [role] },
-      csrfToken: "layout-csrf", roleAssignmentRequired: false,
+      csrfToken: "layout-csrf",
     } }));
     const auditRequests: string[] = [];
     page.on("request", request => {

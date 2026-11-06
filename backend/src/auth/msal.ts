@@ -13,7 +13,8 @@ import { types } from "node:util";
 import { authConfigured, config, getTenantConfiguration, loginScopes, normalizeSignInUsername, type TenantConfiguration } from "../config.js";
 import { AppError, isApplicationError } from "../errors.js";
 import { adminManagedPermissionsError, adminManagedPermissionsMessage, assertLoginAuthFlow, assertTenantConfiguration, authenticationScopes, authFlowLifetimeMs, tenantConfigurationFingerprint } from "./flows.js";
-import { getCapabilityDefinition, isAppRole } from "../services/capabilityRegistry.js";
+import { getCapabilityDefinition } from "../services/capabilityRegistry.js";
+import { appRoleClaims } from "./appRoleClaims.js";
 import { normalizeInventoryProviderRoleIds } from "../services/inventoryRoleScope.js";
 import { isApplicationCollectionCapability, type CapabilityId } from "../types/capability.js";
 import type { AuthenticatedUser, AuthFlow } from "../types/session.js";
@@ -290,8 +291,9 @@ export function toAuthenticatedUser(
     displayName: account.name ?? claims?.name ?? account.username,
     username: normalizedPrincipalUsername(claims?.preferred_username ?? account.username),
     homeAccountId: account.homeAccountId,
+    localAccountId: account.localAccountId,
     tenantId: account.tenantId ?? claims?.tid,
-    roles: Array.isArray(claims?.roles) ? [...new Set(claims.roles.filter(isAppRole))].sort() : [],
+    roles: appRoleClaims(claims?.roles),
     providerRoleIds: normalizeInventoryProviderRoleIds(claims?.wids),
   };
 }

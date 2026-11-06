@@ -125,6 +125,8 @@ See [CSV import](official-usage-import.md) and [Office adoption](copilot-license
   at dispatch/publication; cancelled or superseded work cannot publish.
 - Diagnostics may retain safe HTTP/correlation/Retry-After data, never tokens,
   raw bodies or private records.
+- Readiness evidence preserves provider cooldowns, including identity-provider
+  Retry-After seconds, beyond the default five-minute evidence lifetime.
 
 Local fixtures do not establish live consent, licensing, provider rollout,
 coverage or response compatibility.

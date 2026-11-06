@@ -33,8 +33,11 @@ param keyVaultName string
 
 @description('Selected immutable versions for the session and database secrets. Versions are non-secret receipt evidence.')
 param sessionSecretVersion string
-param postgresAdminPasswordSecretVersion string
 param postgresAppPasswordSecretVersion string
+
+@secure()
+@description('Native version-pinned ARM Key Vault reference for the database administrator password; never supply a plaintext value.')
+param postgresAdminPassword string
 
 @description('Exact approved App Service outbound IPv4 addresses. Empty means no database firewall access.')
 param approvedAppOutboundIpv4Addresses array = []
@@ -59,7 +62,6 @@ param mcpMetadata object = {}
 
 var secretNames = {
   sessionSecret: 'agent-control-session-secret'
-  postgresAdminPassword: 'agent-control-postgres-admin-password'
   postgresAppPassword: 'agent-control-postgres-app-password'
 }
 var metadataSecret = !empty(mcpMetadata) ? mcpMetadata.secret : {}
@@ -96,11 +98,6 @@ var runtimeAppSettings = [for secret in runtimeSecrets: {
   value: '@Microsoft.KeyVault(SecretUri=${keyVaultUri}secrets/${secret.name}/${secret.version})'
 }]
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
-  scope: resourceGroup(keyVaultSubscriptionId, keyVaultResourceGroupName)
-  name: keyVaultName
-}
-
 resource appServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
   name: appServicePlanName
   location: location
@@ -122,7 +119,7 @@ module postgres './postgres.bicep' = {
   params: {
     location: location
     serverName: postgresServerName
-    administratorPassword: keyVault.getSecret(secretNames.postgresAdminPassword, postgresAdminPasswordSecretVersion)
+    administratorPassword: postgresAdminPassword
     approvedAppOutboundIpv4Addresses: approvedAppOutboundIpv4Addresses
     tags: commonTags
   }
@@ -214,6 +211,8 @@ resource appService 'Microsoft.Web/sites@2024-11-01' = {
         { name: 'MCP_API_CLIENT_ID', value: mcpMetadata.apiClientId }
         { name: 'MCP_CLIENT_ID', value: mcpMetadata.mcpClientId }
         { name: 'MCP_PUBLIC_URL', value: mcpMetadata.resourceUrl }
+        { name: 'MCP_HIDE_EMPLOYEE_DETAILS', value: (contains(mcpMetadata, 'hide_employee_details') ? mcpMetadata.hide_employee_details : false) ? 'true' : 'false' }
+        { name: 'MCP_HIDE_CHAMPION_EMPLOYEE', value: (contains(mcpMetadata, 'hide_champion_employee') ? mcpMetadata.hide_champion_employee : false) ? 'true' : 'false' }
       ] : [])
     }
   }

@@ -483,7 +483,7 @@ describe("DataSyncService", () => {
     const signedInAt = Date.now();
     await harness.service.automaticRefresh(user, signedInAt);
     expect(harness.repository.submitDue).toHaveBeenCalledWith(
-      { tenantId: user.tenantId, principalId: user.homeAccountId }, signedInAt, expect.any(Function));
+      { tenantId: user.tenantId, principalId: user.homeAccountId }, signedInAt, expect.any(Function), ["users", "graph_packages", "power_platform"]);
     expect(harness.packages.refreshDueDetails).toHaveBeenCalledWith(user, signedInAt, expect.any(AbortSignal));
     await vi.waitFor(() => expect(harness.run.status).toBe("completed"));
     expect(harness.copilotUsage.refreshUsers).toHaveBeenCalledWith(user, expect.any(AbortSignal),

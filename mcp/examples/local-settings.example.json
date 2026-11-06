@@ -4,5 +4,7 @@
   "clientId": "33333333-3333-3333-3333-333333333333",
   "publicUrl": "https://mcp.example.test/mcp",
   "redirectUris": ["https://claude.ai/api/mcp/auth_callback"],
-  "port": 8001
+  "port": 8001,
+  "hide_employee_details": false,
+  "hide_champion_employee": false
 }

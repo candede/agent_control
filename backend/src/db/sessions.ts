@@ -48,7 +48,7 @@ function sessionIdentity(data: Partial<SessionData> | undefined, allowMissingCli
     || typeof data.accountId !== "string" || !data.accountId || data.accountId !== user.homeAccountId
     || data.clientId !== tenant.clientId && !(allowMissingClientId && data.clientId === undefined)
     || typeof user.username !== "string" || !user.username.trim() || typeof user.displayName !== "string"
-    || !Array.isArray(user.roles) || user.roles.some(role => typeof role !== "string")) return undefined;
+    || !Array.isArray(user.roles) || user.roles.length > 64 || user.roles.some(role => !isAppRole(role))) return undefined;
   return { tenantId: tenant.tenantId, clientId: tenant.clientId, accountId: data.accountId, user };
 }
 
@@ -64,6 +64,7 @@ function sanitizedSession(data: SessionData, allowMissingClientId: boolean): Ses
     csrfToken: data.csrfToken, rolesValidatedAt: data.rolesValidatedAt, signedInAt: data.signedInAt,
     user: {
       tenantId: identity.tenantId, homeAccountId: identity.accountId,
+      ...(identity.user.localAccountId ? { localAccountId: identity.user.localAccountId } : {}),
       displayName: identity.user.displayName.slice(0, 256), username: identity.user.username.slice(0, 256),
       roles: [...new Set(identity.user.roles.filter(isAppRole))].sort(),
       providerRoleIds: normalizeInventoryProviderRoleIds(identity.user.providerRoleIds),

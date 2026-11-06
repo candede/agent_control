@@ -318,9 +318,6 @@ function New-Fixture {
         }
     }
     if ($FreshResourcesExist) {
-        Add-DatabaseCommand $fixture resume_verify $Target @('backend/scripts/azure-database.ts', 'preflight',
-            $(if ($Target.installationMode -ceq 'existing' -or $ResumeDatabaseInitialized) { 'existing' } else { 'fresh' }),
-            $Target.expectedDatabaseName)
         Add-Az $fixture resume_verify @('webapp', 'config', 'appsettings', 'list', '--ids', $Target.expectedResourceIds.appService) -Json @(
             @{ name = 'MAINTENANCE_MODE'; value = 'true' }
         )
@@ -344,6 +341,11 @@ function New-Fixture {
     Add-Az $fixture network_reconcile @('postgres', 'flexible-server', 'firewall-rule', 'create', '--subscription',
         $Target.subscriptionId, '--resource-group', $Target.resourceGroup, '--name', $Target.resources.postgresFlexibleServer.name,
         '--rule-name', 'wizard-{{RUN_ID}}', '--start-ip-address', $Target.runnerIpv4Address, '--end-ip-address', $Target.runnerIpv4Address) -Json @{}
+    if ($FreshResourcesExist) {
+        Add-DatabaseCommand $fixture network_reconcile $Target @('backend/scripts/azure-database.ts', 'preflight',
+            $(if ($Target.installationMode -ceq 'existing' -or $ResumeDatabaseInitialized) { 'existing' } else { 'fresh' }),
+            $Target.expectedDatabaseName)
+    }
     if ($Target.installationMode -ne 'fresh') {
         Add-Az $fixture enter_maintenance @('webapp', 'config', 'appsettings', 'set', '--ids', $Target.expectedResourceIds.appService,
             '--settings', 'MAINTENANCE_MODE=true') -Json @{}
@@ -454,6 +456,10 @@ function New-Fixture {
         '--rule-name', 'wizard-{{RUN_ID}}') -Json @{}
     $fixture.commands.cleanup[-1] | Add-Member -NotePropertyName optional -NotePropertyValue $true
     if ($Pitr -and -not $Recovery) {
+        Add-Az $fixture cleanup @('webapp', 'config', 'appsettings', 'list', '--ids', $Target.expectedResourceIds.appService) -Json @(
+            @{ name = 'PGHOST'; value = "$($Target.resources.postgresFlexibleServer.name).postgres.database.azure.com" }
+        )
+        $fixture.commands.cleanup[-1] | Add-Member -NotePropertyName optional -NotePropertyValue $true
         Add-Az $fixture cleanup @('postgres', 'flexible-server', 'delete', '--yes', '--subscription', $Target.subscriptionId,
             '--resource-group', $Target.resourceGroup, '--name', "$($Target.resources.postgresFlexibleServer.name)-restore-{{RUN_ID_8}}") -Json @{}
         $fixture.commands.cleanup[-1] | Add-Member -NotePropertyName optional -NotePropertyValue $true
@@ -741,6 +747,8 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $existingResume.Completed.Add('resource_deploy')
     Set-SyntheticBootstrapSecrets $existingResume
     Assert-True ((Invoke-DeploymentOperation $existingResume resume_verify).exactStateVerified -eq $true) 'Existing-target resume before initialization incorrectly required an empty schema.'
+    Invoke-DeploymentOperation $existingResume network_reconcile | Out-Null
+    Assert-True ($existingResume.CommandOffsets.network_reconcile -eq 3) 'Resume did not validate the current database after restoring runner access.'
     Remove-AzureSensitiveDirectories $existingResume
     foreach ($case in @(
         @{ mutate = { param($t) $t.isApproval = $false }; error = 'isApproval' },
@@ -865,10 +873,13 @@ console.log(JSON.stringify({event:"azure_zip_source_filter",outcome:"passed",cas
     $registration = New-Context $target (New-Fixture $target) 'registration'
     $registrationEvidence = Invoke-DeploymentOperation $registration registration_verify
     Assert-True ($registrationEvidence.roleCount -eq 3 -and $registrationEvidence.administratorAssignmentCount -eq 1) 'Three-role registration with a portal-created Admin ID was rejected.'
+    $employeeSignIn = New-Fixture $target
+    $employeeSignIn.commands.registration_verify[1].json[0].appRoleAssignmentRequired = $false
+    $employeeEvidence = Invoke-DeploymentOperation (New-Context $target $employeeSignIn 'registration-employee-signin') registration_verify
+    Assert-True ($employeeEvidence.assignmentRequired -ceq $false -and $employeeEvidence.directoryWrites -eq 0) 'Employee sign-in became a deployment approval gate.'
     foreach ($case in @(
         @{ name = 'unknown-role'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].value = 'Unrecognized.Role' }; error = 'three-role' },
         @{ name = 'application-members'; mutate = { param($f) $f.commands.registration_verify[0].json.appRoles[0].allowedMemberTypes = @('User','Application') }; error = 'Users/Groups' },
-        @{ name = 'unrestricted-signin'; mutate = { param($f) $f.commands.registration_verify[1].json[0].appRoleAssignmentRequired = $false }; error = 'Assignment required' },
         @{ name = 'no-admin'; mutate = { param($f) $f.commands.registration_verify[2].json.value = @() }; error = 'AgentControl.Admin assignment' }
     )) {
         $fixture = New-Fixture $target

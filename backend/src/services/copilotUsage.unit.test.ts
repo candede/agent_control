@@ -66,7 +66,7 @@ function sourceMetadata(source: UserSourceKind): UserSourceMetadata {
   };
 }
 
-function fixture(denied: UserSourceKind, status: "waiting_authorization" | "permission_required" | "failed", minutes: number) {
+function fixture(denied: UserSourceKind, status: "waiting_authorization" | "permission_required" | "failed" | "cancelled", minutes: number) {
   vi.useFakeTimers();
   vi.setSystemTime(now);
   const sources = {
@@ -1086,6 +1086,19 @@ describe("Users provider HTTP failure boundaries", () => {
 });
 
 describe("automatic Users source cadence", () => {
+  it.each((["directory", "app_activity"] as const).flatMap(source => [
+    { source, errorCode: "interaction_required", fresh: true, retry: true },
+    { source, errorCode: "interaction_required", fresh: false, retry: false },
+    { source, errorCode: "read_job_cancelled", fresh: true, retry: false },
+  ]))("retries cancelled $source only for fresh shutdown authorization ($errorCode, $fresh)", async ({ source, errorCode, fresh, retry }) => {
+    const f = fixture(source, "cancelled", 1);
+    const other = source === "directory" ? "app_activity" : "directory";
+    f.sources[other].observedAt = now.toISOString();
+    f.sources[source].errorCode = errorCode;
+    await f.service.refreshUsers(user, undefined, { publication: f.publication, automatic: true,
+      signedInAt: now.getTime() - (fresh ? 0 : 120_000) });
+    expect(f.refresh.mock.calls.map(([, input]) => input.scope.source)).toEqual(retry ? [source] : []);
+  });
   it.each((["directory", "app_activity"] as const).flatMap(source =>
     [true, false].map(automatic => ({ source, automatic }))))(
     "rechecks stale retained $source evidence without treating collection as complete, automatic: $automatic", async ({ source, automatic }) => {

@@ -1,3 +1,10 @@
+import type { DiscoveryPrivacy } from "./agentDiscovery.js";
+
+export type McpAccessProfile = {
+  audience: "end_user" | "adoption" | "admin";
+  operations: { method: string; route: string; inputChoices?: { capabilityId?: string[]; operation?: string[] } }[];
+  staffPreviewAuthorized: boolean; privacy: DiscoveryPrivacy;
+};
 export const mcpMetadataMaximumBytes = 4 * 1024 * 1024;
 export const mcpSettingsMaximumBytes = mcpMetadataMaximumBytes + 16 * 1024;
 export type McpBinding = { tenantId: string; apiClientId: string; mcpClientId: string; resourceUrl: string };
@@ -13,10 +20,13 @@ export type McpRuntimeMetadata = {
   instructions: string; tools: McpTool[]; storageReady: boolean; transport: "streamable-http";
 };
 export type McpConfiguredSettings = { resourceUrl: string; localHostPort?: number };
-export type McpSettings =
+export type McpConnectionSettings =
   | { state: "not_configured" }
   | { state: "unavailable" | "binding_mismatch"; configured: McpConfiguredSettings; code: string }
   | { state: "available"; configured: McpConfiguredSettings; runtime: McpRuntimeMetadata; observedAt: string };
+export type McpSettings = McpConnectionSettings & {
+  privacy: DiscoveryPrivacy; privacyScope: "end_user_and_preview";
+};
 
 function invalid(): never { throw new SyntaxError("Invalid MCP metadata."); }
 function object(value: unknown): Record<string, unknown> {
@@ -38,7 +48,7 @@ function url(value: unknown, redirect = false) {
   try { parsed = new URL(raw); }
   catch { invalid(); }
   if (parsed.href !== raw || parsed.username || parsed.password || parsed.search || parsed.hash
-    || /[%\\\s*]/.test(raw) || !redirect && parsed.pathname === "/"
+    || /[?#%\\\s*]/.test(raw) || !redirect && parsed.pathname === "/"
     || parsed.protocol !== "https:" && !(redirect && parsed.protocol === "http:"
       && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname))) invalid();
   return raw;
@@ -108,8 +118,11 @@ export function parseMcpRuntimeMetadata(value: unknown): McpRuntimeMetadata {
 export function parseMcpSettingsJson(raw: string): McpSettings {
   // Budget for the settings wrapper without reducing the accepted runtime catalog.
   const data = object(parseBoundedJson(raw, mcpSettingsMaximumBytes, 49, 250_032));
+  const privacy = fields(data.privacy, ["hide_employee_details", "hide_champion_employee"]);
+  if (typeof privacy.hide_employee_details !== "boolean" || typeof privacy.hide_champion_employee !== "boolean"
+    || data.privacyScope !== "end_user_and_preview") invalid();
   if (data.state === "not_configured") {
-    fields(data, ["state"]); return { state: "not_configured" };
+    fields(data, ["state", "privacy", "privacyScope"]); return data as McpSettings;
   }
   const configured = fields(data.configured, ["resourceUrl", "localHostPort"]);
   // Invalid configured intent is never presented as runtime evidence.
@@ -117,13 +130,13 @@ export function parseMcpSettingsJson(raw: string): McpSettings {
   if (configured.localHostPort !== undefined && (!Number.isInteger(configured.localHostPort)
     || Number(configured.localHostPort) < 1 || Number(configured.localHostPort) > 65535)) invalid();
   if (data.state === "available") {
-    fields(data, ["state", "configured", "runtime", "observedAt"]);
+    fields(data, ["state", "configured", "runtime", "observedAt", "privacy", "privacyScope"]);
     parseMcpRuntimeMetadata(data.runtime);
     const observed = text(data.observedAt, 64);
     const instant = new Date(observed);
     if (!Number.isFinite(instant.getTime()) || instant.toISOString() !== observed) invalid();
   } else if (data.state === "unavailable" || data.state === "binding_mismatch") {
-    fields(data, ["state", "configured", "code"]);
+    fields(data, ["state", "configured", "code", "privacy", "privacyScope"]);
     if (!/^[a-z_]{1,64}$/.test(text(data.code, 64))) invalid();
   } else invalid();
   return data as McpSettings;

@@ -37,6 +37,12 @@ tenant-registry secret contract; replace its non-secret placeholders with exact
 target identities and immutable secret version IDs. The deployment script writes
 its own parameters from the target file.
 
+The administrator password enters the secure `postgresAdminPassword` parameter
+through a native ARM Key Vault reference pinned to the selected secret version.
+The generated parameter file contains only the vault ID, secret name and version;
+the example uses the parameter-file `az.getSecret` function to emit that reference.
+No administrator secret value is written to either file or exposed to the runtime.
+
 API log alerts filter the shared workspace by the API App Service resource ID;
 MCP or other applications' events do not contribute to their thresholds.
 The rules are enabled immediately but skip deployment-time query validation
@@ -228,6 +234,12 @@ restore server), not serving data; it does not reopen the app. A containment
 failure requires incident handling—do not assume the app is safely stopped.
 Failed retries and successful temporary-resource cleanup retain the original
 uncertain external-write step; neither establishes that the write can be replayed.
+Before deleting a tracked restore, cleanup reads the app's current `PGHOST` and
+requires it to identify the original source server. A switched, missing, ambiguous
+or unavailable setting retains the restore and its ownership record for
+reconciliation; an uncertain switch is never evidence that deletion is safe.
+Resume verifies application containment before writes and restores the exact
+runner firewall rule before rechecking the database schema.
 
 ## Operate the deployment
 
@@ -251,6 +263,8 @@ pwsh ./deploy-azure.ps1 -Action PointInTimeRestore `
 
 Replace the timestamp placeholder. `PointInTimeRestore` validates a temporary
 isolated server, then deletes it during cleanup; it never repoints the app.
+The restore name keeps up to 46 source-name characters plus the run-specific
+`-restore-<eight-character-run-id>` suffix, within the 63-character server limit.
 Separately authorized `-Action Recover` with that restore point creates/validates
 a restore, switches serving and retains the old server. Verify scope, revoked
 sessions, report selections and uncertain jobs before returning to use.

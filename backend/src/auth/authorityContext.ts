@@ -3,9 +3,23 @@ import { AppError } from "../errors.js";
 import { authorizationFreshnessMs } from "./mcpBearer.js";
 import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 import type { AuthenticatedUser } from "../types/session.js";
+import { isApplicationCollectionCapability, type CapabilityId } from "../types/capability.js";
 
 // Async work inherits the initiating source, never a later request for the same account.
 const authority = new AsyncLocalStorage<DelegatedCredentialSource>();
+const applicationReads = new AsyncLocalStorage<DelegatedCredentialSource>();
+
+export function withAutomaticApplicationReads<T>(operation: () => T): T {
+  const source = requireAuthority();
+  return applicationReads.run(source, operation);
+}
+
+export function automaticApplicationRead(user: Pick<AuthenticatedUser, "tenantId" | "homeAccountId">, capabilityId: CapabilityId): boolean {
+  const source = applicationReads.getStore();
+  if (!source || source !== currentAuthority() || !isApplicationCollectionCapability(capabilityId)) return false;
+  requireAuthority(user.tenantId, user.homeAccountId);
+  return true;
+}
 
 export function currentAuthority() { return authority.getStore(); }
 
@@ -99,6 +113,7 @@ export function authorityUser(source: DelegatedCredentialSource): AuthenticatedU
   source.assertCurrent();
   const principal = source.principal;
   return { tenantId: principal.tenantId, homeAccountId: principal.principalId,
+    localAccountId: principal.localAccountId,
     username: principal.username, displayName: principal.displayName,
     roles: [...principal.roles], providerRoleIds: [...principal.providerRoleIds] };
 }

@@ -221,7 +221,7 @@ export class PowerPlatformInventoryService {
   }
 
   async cancel(user: AuthenticatedUser, id: string, cancellationReason: RefreshCancellationReason = "requested") {
-    requireReader(user);
+    if (cancellationReason === "requested") requireReader(user);
     const scope = dataScope(user);
     const validation = cancellationReason === "requested" ? beginAccountSessionValidation(scope.tenantId, scope.principalId) : undefined;
     const assertCurrent = () => { if (validation) assertAccountSessionValidation(validation); };

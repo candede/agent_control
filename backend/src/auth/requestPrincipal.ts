@@ -44,7 +44,7 @@ export async function browserRequestPrincipal(
   assertAccountSessionValidation(validation);
   return freezePrincipal({
     tenantId: identity.tenantId, principalId: identity.accountId, apiClientId: identity.clientId,
-    localAccountId: account?.localAccountId ?? "", username: identity.user.username, displayName: identity.user.displayName,
+    localAccountId: account?.localAccountId ?? identity.user.localAccountId ?? "", username: identity.user.username, displayName: identity.user.displayName,
     roles: identity.user.roles, providerRoleIds: normalizeInventoryProviderRoleIds(identity.user.providerRoleIds),
     transport: "browser", integrationClientId: identity.clientId,
     rolesValidatedAt: validatedAt, authenticatedAt: signedInAt,

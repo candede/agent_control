@@ -46,7 +46,7 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
       <div className="mcp-heading-copy">
         <p className="mcp-eyebrow">Connections &amp; integrations</p>
         <h2 id="mcp-settings-title" ref={heading} tabIndex={-1}>MCP settings</h2>
-        <p>Inspect the server connection, client instructions, and advertised tools.</p>
+        <p>Inspect your current caller's server connection, client instructions, and advertised tools.</p>
       </div>
       {allowed ? <button type="button" className="secondary mcp-refresh" onClick={refresh} disabled={!current}>
         <RefreshCw size={16} aria-hidden="true" className={!current ? "mcp-spinner" : undefined} />Refresh metadata
@@ -55,6 +55,15 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
     {!allowed ? <div className="mcp-notice" role="alert"><AlertCircle size={20} aria-hidden="true" /><p>Viewer access is required.</p></div> : <>
       {!current ? <div className="mcp-loading" role="status"><LoaderCircle className="mcp-spinner" size={22} aria-hidden="true" /><p>Loading MCP metadata…</p></div> : null}
       {current?.error ? <MetadataError message={current.error} onRetry={refresh} /> : null}
+      {settings ? <section className="mcp-card" aria-labelledby="mcp-privacy-title">
+        <header className="mcp-card-heading"><h3 id="mcp-privacy-title">Employee discovery privacy</h3><span className="mcp-badge">View only</span></header>
+        <p>Effective API-owned deployment policy for EndUser discovery and staff EndUser previews.
+          These independent values remain available when MCP metadata is unreachable. Ordinary authorized staff reads are unchanged.</p>
+        <dl className="mcp-status-list">
+          <div><dt>hide_employee_details</dt><dd>{String(settings.privacy.hide_employee_details)}</dd></div>
+          <div><dt>hide_champion_employee</dt><dd>{String(settings.privacy.hide_champion_employee)}</dd></div>
+        </dl>
+      </section> : null}
       {settings?.state === "not_configured" ? <div className="mcp-empty">
         <Network size={28} aria-hidden="true" /><h3>No server configured</h3>
         <p>No MCP server is configured for this organization.</p>

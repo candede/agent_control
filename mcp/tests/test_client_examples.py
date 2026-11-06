@@ -89,7 +89,7 @@ def test_every_template_is_a_native_document_and_linked_from_the_guide():
 )
 def test_each_client_has_an_explicit_first_read(heading):
     section = DOC.read_text().split(f"\n## {heading}\n", 1)[1].split("\n## ", 1)[0]
-    assert "capabilities" in section
+    assert "agent_catalog" in section or "capabilities" in section
 
 
 def test_messages_api_recipe_has_the_documented_transport_toolset_and_token_boundary():
@@ -269,7 +269,7 @@ async def test_cloud_example_filters_to_real_read_only_tools_with_typed_inputs(b
         json={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
     )
     catalog = {tool["name"]: tool for tool in result.json()["result"]["tools"]}
-    assert len(catalog) == len(PUBLIC_TOOLS) == 50
+    assert len(catalog) == len(PUBLIC_TOOLS) == 54
     for name in examples["github-cloud"]["mcpServers"]["agentControl"]["tools"]:
         tool = catalog[name]
         assert tool["annotations"]["readOnlyHint"] is True

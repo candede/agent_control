@@ -959,7 +959,7 @@ describe("inventory HTTP selected-read boundary", () => {
       await withAuthority(authority, () => runtime.enqueue(owner, false));
       await runtime.pass();
       await runtime.drain();
-      expect(authorize).toHaveBeenCalledWith(owner, expect.any(AbortSignal));
+      expect(authorize).toHaveBeenCalledWith(owner, expect.any(AbortSignal), "canonical");
       const identity = await reportIdentity(fixture.runtime, user), queries = new InventoryQueries(fixture.runtime, config.sessionSecret);
       const selection = await queries.capture(identity, canonical);
       expect((await queries.page(selection.id, identity, { limit: 1 })).counts.total).toBeGreaterThan(0);

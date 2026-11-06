@@ -153,7 +153,7 @@ export class LargeTenantUsersReports {
     return { key: found[0].page_key, id: found[0].identity, nullRank: found[0].page_key === null ? 1 : 0 };
   }
 
-  private async prepareHistoryCapture(tenantId: string) {
+  async prepareHistoryCapture(tenantId: string) {
     await this.history.ensure(tenantId);
     await this.history.connections.run(client => this.history.reconcileHead(client, tenantId));
     while (await this.history.expire(tenantId) > 0) { /* bounded maintenance transactions */ }
@@ -247,6 +247,7 @@ export class LargeTenantUsersReports {
       if (setId) throw new AppError(404, "usage_report_unavailable", "This published report is no longer available.");
       throw new SelectionError("selection_invalidated");
     }
+
     const age = (date: number | null) => date === null ? null : Math.max(0, Math.floor((now.getTime() - date) / 86400000));
     const periodAgeDays = age(set?.reporting_end ? Date.parse(`${set.reporting_end}T23:59:59.999Z`) : null);
     const acceptedAgeDays = age(set?.accepted_at?.getTime() ?? null);
@@ -262,6 +263,20 @@ export class LargeTenantUsersReports {
       lineages: versions.map(row => ({ kind: row.kind, versionId: row.id, contentHash: row.content_hash, rowCount: row.row_count,
         sourceAsOf: row.source_as_of?.toISOString() ?? null, sourceAsOfProvenance: row.source_as_of_provenance,
         sourceFreshness: row.source_freshness, periodProvenance: row.period_provenance })) };
+  }
+
+  async latestDiscoveryReport(client: pg.PoolClient, tenant: string, now: Date) {
+    const latest = (await client.query<{ id: string }>(`SELECT s.id FROM official_usage_sets s
+      JOIN official_usage_history_memberships h ON h.set_id=s.id AND h.tenant_id=s.tenant_id
+      WHERE s.tenant_id=$1 AND s.complete AND s.deleted_at IS NULL AND h.valid_to_revision IS NULL
+        AND h.visibility='retained'
+        AND (s.expires_at IS NULL OR s.expires_at>GREATEST($2::timestamptz,clock_timestamp()))
+      ORDER BY s.reporting_end DESC NULLS LAST,s.reporting_start DESC NULLS LAST,s.accepted_at DESC,s.id DESC LIMIT 1`, [tenant, now])).rows[0];
+    return this.metadata(client, tenant, latest?.id, now, !latest);
+  }
+
+  discoveryReport(client: pg.PoolClient, tenant: string, setId: string | null, now: Date) {
+    return this.metadata(client, tenant, setId ?? undefined, now, setId === null);
   }
 
   async contextInRead(client: pg.PoolClient, identity: SelectionIdentity, selectionId: string): Promise<ReportReadContext> {

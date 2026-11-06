@@ -37,9 +37,11 @@ In [Microsoft Entra admin center](https://entra.microsoft.com/), open
    - **Who can consent:** Admins only
    - Fill the required consent display name/description; leave **State: Enabled**.
 3. In **Manifest**, set `api.requestedAccessTokenVersion` to `2`.
-4. Keep existing provider permissions and app roles. Assign MCP users a
+4. Keep existing provider permissions and app roles. Assign staff MCP users a
    [Viewer, Uploader or Admin role](user-roles-and-permissions.md#app-defined-roles)
-   on the **Agent Control** enterprise application.
+   on the **Agent Control** enterprise application. After hardened deployment,
+   set **Assignment required?** to **No** for employee admission; verified active
+   members without roles receive discovery only.
 
 Use the existing registration's application/client GUID for `<API_CLIENT_ID>`,
 not its object ID. Do not create a replacement API registration.
@@ -80,8 +82,9 @@ On **Agent Control MCP > API permissions**:
 4. Select **Grant admin consent** for the tenant.
 
 Do not copy Graph data or Power Platform permissions from the API registration.
-If the MCP enterprise application requires assignment, assign its users/groups
-there too; this does not replace their Agent Control app roles.
+Set **Assignment required?** to **No** on the existing MCP enterprise application
+after hardened deployment. Retain existing assignments and consent; this does not
+replace explicit Agent Control staff roles or grant employees staff authority.
 
 <details>
 <summary>If the MCP app's own scope is missing from My APIs</summary>
@@ -137,8 +140,9 @@ Enter:
 The public MCP URL is required on first setup; the example is not a default.
 On later edits, the wizard shows the saved URL and Enter keeps it.
 Public resource and callback URLs must be canonical, contain no wildcards, and
-be at most 2,048 characters. Callback paths are case-sensitive; paths differing
-only by case are separate allowlist entries.
+be at most 2,048 characters. Callback paths cannot contain repeated `/` separators,
+and explicit ports must be from 1 to 65535. Callback paths are case-sensitive;
+paths differing only by case are separate allowlist entries.
 
 For VS Code, paste these callbacks as one line:
 
@@ -156,6 +160,9 @@ Changing client callbacks does not change the MCP server's Entra `/auth/callback
 
 Point your HTTPS proxy/tunnel at the selected loopback port.
 MCP calls the API internally at `http://app:3001`, not through the web/API tunnel.
+Changing the saved MCP port replaces the existing owned container on the next
+start; readiness is verified against the new port. Update your proxy/tunnel target
+to match.
 
 The wizard saves the API binding, generates protected signing/encryption keys
 on first setup, and starts the MCP container. It does not create Entra apps or
@@ -172,10 +179,30 @@ After setup, normal startup includes MCP:
 pwsh ./deploy-local.ps1 start
 ```
 
+For an offline source-only MCP rebuild, set
+`AGENT_CONTROL_MCP_DEPENDENCY_IMAGE` to an existing cached MCP dependency/test
+image. The local build owner verifies its immutable identity before/after
+building, byte-matching `pyproject.toml`/`uv.lock`, Python 3.14.6/uv 0.12.17
+layout and installed locked dependencies. Test/fixture builds additionally
+require the declared development packages. Mismatches fail without installing
+packages. The build runs with no network and rebuilds only the application wheel,
+replacing its previous installed files; it does not reinstall third-party
+dependencies. Without this input, dependency installation uses only the approved
+feed and is cached separately from application source. Runtime packaging removes
+development-only packages offline, including when reusing a test-image baseline.
+
+An independent MCP-only update uses `Start-LocalMcp` and its
+`mcp-operation.json` / `mcp-deployment.json` receipts as current MCP authority.
+`deployment.json` remains the historical last coordinated application release;
+do not describe its embedded MCP candidate as current after an independent
+update. Preserve that application/reset provenance, the existing OAuth volume
+and keys. Do not restart the API or reset data merely to update release bookkeeping.
+
 Startup automatically persists a separate metadata-only key and shares it
 read-only with the web API; no additional wizard question or consent is required.
 Viewer-capable users can then open **MCP settings** (`/mcp-settings`) to see exact
-runtime instructions, complete advertised tools/schemas, callbacks and the known
+runtime instructions, that caller's projected tools/schemas, independent
+read-only API privacy values, callbacks and the known
 host port. A stopped service or metadata-key problem remains an explicit settings
 error, not a sign-in or business-admission failure. “Reachable” means API-to-MCP
 only: the page does not certify the public tunnel or a native client's OAuth.
@@ -196,9 +223,14 @@ In VS Code, run **MCP: Add Server > HTTP** and enter
 }
 ```
 
-Start the server connection, complete Entra sign-in and optionally read saved
-`capabilities` with `{"request":{"action":"list","input":{}}}`.
-Then request a saved agents/users list. Never put the server secret into client
+Start the server connection and complete Entra sign-in as the actual user.
+Read `my_discovery_profile` with `{"request":{"action":"read","input":{}}}`,
+then search `agent_catalog` or read `my_workplace`. Roleless active members get
+only these safe discovery tools; staff additionally get their authorized saved
+reads and `preview_end_user`. Staff may optionally read saved `capabilities`;
+it is never a prerequisite. Initialize/list automatically reaches the API-owned
+due read bootstrap, while business discovery itself remains provider-free.
+Never put the server secret into client
 settings. Health/readiness alone does not verify OAuth or data access.
 
 ## Troubleshooting
@@ -206,7 +238,7 @@ settings. Health/readiness alone does not verify OAuth or data access.
 | Problem | Check |
 | --- | --- |
 | Redirect mismatch | Entra uses `/auth/callback`; client callbacks belong in the wizard allowlist |
-| Consent or API access denied | Both custom scopes have admin consent; user has an Agent Control app role |
+| Consent or API access denied | Both custom scopes have admin consent; employee is an active tenant member or staff has its explicit Agent Control role |
 | Discovery/login page unreachable | HTTPS ingress forwards MCP discovery/OAuth paths as well as `/mcp` |
 | Missing signing/encryption keys | Restore the original protected keys/state; do not start with replacement keys |
 

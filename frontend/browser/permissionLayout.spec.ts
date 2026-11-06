@@ -246,7 +246,7 @@ test("unchecked, stale, disabled, unregistered and app-role decisions are not is
   }));
   await page.route("**/api/me", route => route.fulfill({ json: {
     user: { displayName: "Synthetic viewer", username: "viewer@example.invalid", homeAccountId: "viewer-fixture", roles: ["AgentControl.Viewer"] },
-    csrfToken: "synthetic-csrf", roleAssignmentRequired: false,
+    csrfToken: "synthetic-csrf",
   } }));
   await page.goto("/permissions");
   await expectQuietPermissions(page);

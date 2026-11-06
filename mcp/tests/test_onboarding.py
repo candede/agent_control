@@ -76,7 +76,7 @@ async def test_profile_discovery_exact_dcr_pkce_catalog_refresh_and_revocation(
         },
     )
     tools = result.json()["result"]["tools"]
-    assert len(tools) == len(PUBLIC_TOOLS) == 50
+    assert len(tools) == len(PUBLIC_TOOLS) == 54
     for tool in tools:
         assert tool["inputSchema"]["required"] == ["request"]
         assert set(tool["inputSchema"]["properties"]) == {"request"}

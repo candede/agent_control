@@ -6,6 +6,7 @@ import { pool } from "../db/pool.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, errorTelemetry, isTimeoutError } from "../errors.js";
 import { hasAppRole } from "../types/capability.js";
+import { automaticApplicationRead } from "../auth/authorityContext.js";
 import { isDirectoryObjectId } from "../types/copilotPackage.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { capabilities } from "./capabilities.js";
@@ -229,7 +230,7 @@ async function awaitResolution<T>(signal: AbortSignal, operation: () => Promise<
 }
 
 function userScope(user: AuthenticatedUser): DataSyncScope {
-  if (!user.tenantId || !user.homeAccountId || !hasAppRole(user.roles, "AgentControl.Viewer")) {
+  if (!user.tenantId || !user.homeAccountId || !hasAppRole(user.roles, "AgentControl.Viewer") && !automaticApplicationRead(user, "graph.users.read")) {
     throw new AppError(403, "missing_internal_role", "Agent people require a tenant-scoped Viewer session.");
   }
   return { tenantId: user.tenantId, principalId: user.homeAccountId };

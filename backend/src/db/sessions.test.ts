@@ -36,7 +36,7 @@ describe("PostgreSQL sessions", () => {
 
   it("persists across store recreation, excludes tokens and isolates tenant reads", async () => {
     const store = createSessionStore(fixture.runtime);
-    const data = { cookie: new session.Cookie({maxAge:60000}), tenantId: tenant.tenantId, accountId:"principal", authFlowHandle:"a".repeat(43), csrfToken:"fixture-csrf", rolesValidatedAt:1234, user:{tenantId:tenant.tenantId,homeAccountId:"principal",username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Viewer","untrusted-role"],providerRoleIds:[inventoryProviderRoleIds.aiReader,"00000000-0000-0000-0000-000000000000","must-not-persist-role-name"]}, authFlow:{state:"must-not-persist-state",nonce:"must-not-persist-nonce",codeVerifier:"must-not-persist-verifier"}, accessToken:"must-not-persist-token", refreshToken:"must-not-persist-refresh", tokenCache:"must-not-persist-cache", code:"must-not-persist-code", clientSecret:"must-not-persist-secret" };
+    const data = { cookie: new session.Cookie({maxAge:60000}), tenantId: tenant.tenantId, accountId:"principal", authFlowHandle:"a".repeat(43), csrfToken:"fixture-csrf", rolesValidatedAt:1234, user:{tenantId:tenant.tenantId,homeAccountId:"principal",username:"fixture@example.invalid",displayName:"Fixture",roles:["AgentControl.Viewer"],providerRoleIds:[inventoryProviderRoleIds.aiReader,"00000000-0000-0000-0000-000000000000","must-not-persist-role-name"]}, authFlow:{state:"must-not-persist-state",nonce:"must-not-persist-nonce",codeVerifier:"must-not-persist-verifier"}, accessToken:"must-not-persist-token", refreshToken:"must-not-persist-refresh", tokenCache:"must-not-persist-cache", code:"must-not-persist-code", clientSecret:"must-not-persist-secret" };
     await new Promise<void>((resolve,reject) => store.set("fixture-session", { ...data, signedInAt: 1000 }, error => error ? reject(error) : resolve()));
     store.close();
     const recreated = createSessionStore(fixture.runtime);
@@ -54,6 +54,19 @@ describe("PostgreSQL sessions", () => {
       await recreated.pruneSessions();
       expect((await fixture.runtime.query("SELECT 1 FROM sessions")).rowCount).toBe(0);
     } finally { recreated.close(); }
+  });
+
+  it("never sanitizes an unknown app role into default employee authority", async () => {
+    const store = createSessionStore(fixture.runtime);
+    const data = { cookie: new session.Cookie({ maxAge: 60_000 }), tenantId: tenant.tenantId,
+      clientId: tenant.clientId, accountId: "malformed-principal",
+      user: { tenantId: tenant.tenantId, homeAccountId: "malformed-principal", username: "fixture@example.invalid",
+        displayName: "Malformed", roles: ["AgentControl.Viewer", "untrusted-role"] } };
+    try {
+      await expect(new Promise<void>((resolve, reject) => store.set("malformed-roles", data, error => error ? reject(error) : resolve())))
+        .rejects.toThrow("Session tenant/principal/client mismatch");
+      expect((await fixture.runtime.query("SELECT 1 FROM sessions WHERE sid='malformed-roles'")).rowCount).toBe(0);
+    } finally { store.close(); }
   });
 
   it("deletes a legacy session without a role-bearing user shape but preserves another tenant", async () => {

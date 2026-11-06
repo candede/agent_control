@@ -91,6 +91,13 @@ function Get-TargetResourceId {
     return "/subscriptions/$($Target.subscriptionId)/resourceGroups/$($Target.resourceGroup)/providers/$ProviderType/$Name"
 }
 
+function Get-AzureRestoreServerName {
+    param($Context)
+    $source = [string]$Context.Target.resources.postgresFlexibleServer.name
+    $suffix = "-restore-$($Context.RunId.Substring(0, 8))"
+    return $source.Substring(0, [Math]::Min($source.Length, 63 - $suffix.Length)) + $suffix
+}
+
 function Assert-AzureMcpObject {
     param($Value, [string[]]$Keys, [string]$Label)
     if ($null -eq $Value -or $Value -isnot [Collections.IDictionary] -and $Value -isnot [PSCustomObject]) {
@@ -110,10 +117,21 @@ function Get-AzureMcpTarget {
         return $null
     }
     $m = $Target.mcp
+    if ($null -eq $m -or ($m -isnot [Collections.IDictionary] -and $m -isnot [pscustomobject])) {
+        throw 'mcp must be an explicit object.'
+    }
+    foreach ($name in @('hide_employee_details','hide_champion_employee')) {
+        $present = if ($m -is [Collections.IDictionary]) { $m.Contains($name) } else { $name -cin @($m.PSObject.Properties.Name) }
+        if ($present -and $m.$name -isnot [bool]) { throw "$name must be a boolean." }
+        if (-not $present) {
+            if ($m -is [Collections.IDictionary]) { $m[$name]=$false }
+            else { $m | Add-Member -NotePropertyName $name -NotePropertyValue $false }
+        }
+    }
     Assert-AzureMcpObject $m @('contractVersion','installationMode','appServiceName','planName','planSku',
         'appServiceResourceId','planResourceId','identityResourceId','identityClientId','registryResourceId','registryLoginServer',
         'repository','imageDigest','existingImageDigest','tenantId','clientId','apiClientId','apiOrigin','publicUrl',
-        'callbackUri','redirectUris','storage','secrets','network','operationsOwner','registrationApprovalReference','cost') 'mcp'
+        'callbackUri','redirectUris','storage','secrets','network','operationsOwner','registrationApprovalReference','cost','hide_employee_details','hide_champion_employee') 'mcp'
     if ($m.contractVersion -ne 1 -or $m.installationMode -cnotin @('fresh','existing') -or $m.planSku -cne 'S1') {
         throw 'MCP requires contract 1, fresh/existing, and a separate single-instance Linux S1 plan.'
     }
@@ -697,7 +715,7 @@ function Import-AzureDeploymentReceipt {
     $Context.RunId = [string]$receipt.runId
     foreach ($step in @($receipt.completedSteps | Select-Object -Unique)) { $Context.Completed.Add([string]$step) }
     $expectedFirewall = "postgres-firewall:wizard-$($Context.RunId)"
-    $expectedRestore = "postgres-restore:$($Context.Target.resources.postgresFlexibleServer.name)-restore-$($Context.RunId.Substring(0, 8))"
+    $expectedRestore = "postgres-restore:$(Get-AzureRestoreServerName $Context)"
     if (@($receipt.ownedResourcesRemaining).Count -ne @($receipt.ownedResourcesRemaining | Select-Object -Unique).Count) {
         throw 'Resume receipt contains duplicate ownership records.'
     }
@@ -714,7 +732,7 @@ function Import-AzureDeploymentReceipt {
     $Context.Resuming = $true
     if ($Context.Completed.Contains('recovery_switch')) {
         $restored = [string]$Context.ResumeEvidence.recovery_switch.newPostgresServerName
-        $expectedRestored = "$($Context.Target.resources.postgresFlexibleServer.name)-restore-$($Context.RunId.Substring(0, 8))"
+        $expectedRestored = Get-AzureRestoreServerName $Context
         if ($restored -cne $expectedRestored) {
             throw 'Resume receipt recovery server identity is invalid.'
         }
@@ -831,7 +849,6 @@ function Invoke-RealAzureOperation {
             }
             $servicePrincipals = Get-AzJson @('ad', 'sp', 'list', '--filter', "appId eq '$($target.entraApplicationId)'")
             if (@($servicePrincipals).Count -ne 1) { throw 'The exact application service principal is missing or ambiguous.' }
-            if ($servicePrincipals[0].appRoleAssignmentRequired -ne $true) { throw 'Set Assignment required to Yes on the enterprise application before deployment.' }
             $administratorRole = @($enabledRoles | Where-Object value -CEQ 'AgentControl.Admin')
             Assert-GuidValue $administratorRole[0].id 'Admin app role ID'
             $assignments = Get-AzJson @('rest', '--method', 'get', '--url',
@@ -839,6 +856,7 @@ function Invoke-RealAzureOperation {
             if (@($assignments.value).Count -lt 1) { throw 'At least one approved AgentControl.Admin assignment is required.' }
             return @{
                 roleCount = $actualRoles.Count; callbackVerified = $true; directoryWrites = 0
+                assignmentRequired = $servicePrincipals[0].appRoleAssignmentRequired
                 administratorAssignmentCount = @($assignments.value).Count
                 primaryRegistrationVerified = $true
                 additionalRegistrationsVerified = $false
@@ -904,6 +922,11 @@ function Invoke-RealAzureOperation {
                 '--resource-group', $target.resourceGroup, '--name', $target.resources.postgresFlexibleServer.name,
                 '--rule-name', $rule, '--start-ip-address', $target.runnerIpv4Address, '--end-ip-address', $target.runnerIpv4Address) | Out-Null
             $Context.Owned.Add("postgres-firewall:$rule")
+            if ($Context.Resuming -and $Context.Completed.Contains('resource_deploy')) {
+                $mode = if ($target.installationMode -ceq 'existing' -or $Context.Completed.Contains('database_initialize')) { 'existing' } else { 'fresh' }
+                Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $mode, $target.expectedDatabaseName) `
+                    -ServerName $Context.ServingServerName | Out-Null
+            }
             return @{ appOutboundAddresses = $actual; temporaryRunnerRule = $rule }
         }
         'release_inspection' {
@@ -1163,7 +1186,7 @@ function Invoke-RealAzureOperation {
             return Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'reopen') -ServerName $Context.ServingServerName
         }
         'pitr_restore' {
-            $restoreName = "$($target.resources.postgresFlexibleServer.name)-restore-$($Context.RunId.Substring(0, 8))"
+            $restoreName = Get-AzureRestoreServerName $Context
             Get-AzJson @('postgres', 'flexible-server', 'restore', '--subscription', $target.subscriptionId,
                 '--resource-group', $target.resourceGroup, '--name', $restoreName, '--source-server',
                 $target.resources.postgresFlexibleServer.name, '--restore-time', $OperationInput.RestorePoint) | Out-Null
@@ -1183,7 +1206,7 @@ function Invoke-RealAzureOperation {
             Get-AzJson @('webapp', 'config', 'appsettings', 'set', '--ids', $target.expectedResourceIds.appService,
                 '--settings', "PGHOST=$($Context.RestoredServerName).postgres.database.azure.com", 'MAINTENANCE_MODE=true') | Out-Null
             $owned = "postgres-restore:$($Context.RestoredServerName)"
-            $Context.Owned.Remove($owned)
+            [void]$Context.Owned.Remove($owned)
             $Context.ServingServerName = $Context.RestoredServerName
             return @{ newPostgresServerName = $Context.RestoredServerName; oldServerRetained = $true; servingDatabaseChanged = $true }
         }
@@ -1204,11 +1227,6 @@ function Invoke-RealAzureOperation {
             if (-not $Context.Resuming) { throw 'Resume verification requires an imported receipt.' }
             if ($Context.PreviousFailedStep -in $script:UncertainAzureWriteSteps) {
                 throw "Receipt stopped during '$($Context.PreviousFailedStep)', whose external outcome is uncertain; reconcile it explicitly before any replay."
-            }
-            if ($Context.Completed.Contains('resource_deploy')) {
-                $mode = if ($Context.Target.installationMode -ceq 'existing' -or $Context.Completed.Contains('database_initialize')) { 'existing' } else { 'fresh' }
-                Invoke-AzureDatabaseContainer $Context @('backend/scripts/azure-database.ts', 'preflight', $mode, $target.expectedDatabaseName) `
-                    -ServerName $Context.ServingServerName | Out-Null
             }
             $firewall = "postgres-firewall:wizard-$($Context.RunId)"
             if ($Context.Owned.Contains($firewall)) {
@@ -1240,6 +1258,12 @@ function Invoke-RealAzureOperation {
                     [void]$Context.Owned.Remove($owned)
                 } elseif ($owned -like 'postgres-restore:*') {
                     $server = $owned.Substring('postgres-restore:'.Length)
+                    $settings = @(Get-AzJson @('webapp', 'config', 'appsettings', 'list',
+                        '--ids', $target.expectedResourceIds.appService) -SensitiveOutput)
+                    $hosts = @($settings | Where-Object { $_.name -ceq 'PGHOST' })
+                    if ($hosts.Count -ne 1 -or $hosts[0].value -ine "$($target.resources.postgresFlexibleServer.name).postgres.database.azure.com") {
+                        throw 'Cleanup could not prove the restore server is unswitched; serving data and ownership were retained.'
+                    }
                     Get-AzJson @('postgres', 'flexible-server', 'delete', '--yes', '--subscription', $target.subscriptionId,
                         '--resource-group', $target.resourceGroup, '--name', $server) | Out-Null
                     [void]$Context.Owned.Remove($owned)
@@ -1365,7 +1389,11 @@ function New-AzureParameterFile {
         keyVaultResourceGroupName = @{ value = $vaultParts[4] }
         keyVaultName = @{ value = $vaultParts[8] }
         sessionSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-session-secret' }
-        postgresAdminPasswordSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-postgres-admin-password' }
+        postgresAdminPassword = @{ reference = @{
+            keyVault = @{ id = $target.existingVaultResourceId }
+            secretName = 'agent-control-postgres-admin-password'
+            secretVersion = Get-SelectedSecretVersion $target 'agent-control-postgres-admin-password'
+        } }
         postgresAppPasswordSecretVersion = @{ value = Get-SelectedSecretVersion $target 'agent-control-postgres-app-password' }
         approvedAppOutboundIpv4Addresses = @{ value = @($target.resources.approvedAppOutboundIpv4Addresses) }
         actionGroupResourceId = @{ value = $target.resources.monitoring.actionGroupResourceId }
@@ -1383,6 +1411,7 @@ function New-AzureParameterFile {
         $parameters.mcpMetadata = @{value=@{
             origin=([Uri]$mcp.publicUrl).GetLeftPart([UriPartial]::Authority)
             tenantId=$mcp.tenantId;apiClientId=$mcp.apiClientId;mcpClientId=$mcp.clientId;resourceUrl=$mcp.publicUrl
+            hide_employee_details=$mcp.hide_employee_details;hide_champion_employee=$mcp.hide_champion_employee
             secret=(Get-AzureMcpMetadataReference $mcp)
         }}
     }

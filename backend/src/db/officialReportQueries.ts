@@ -110,8 +110,10 @@ export function selectedDirectoryReportRelationsSql(candidate: string, unresolve
   const keys = `SELECT k.identity_key,counted.match_count,k.identity FROM (
       SELECT identity_key,min(identity) AS identity FROM directory_keys GROUP BY identity_key
     ) k CROSS JOIN LATERAL (
-      SELECT count(*) AS match_count FROM directory_user_rows d WHERE d.generation_id=$1
-        AND (d.identity=k.identity_key OR d.upn_key=k.identity_key)
+      SELECT count(*) AS match_count FROM (
+        SELECT d.identity FROM directory_user_rows d WHERE d.generation_id=$1 AND d.identity=k.identity_key
+        UNION SELECT d.identity FROM directory_user_rows d WHERE d.generation_id=$1 AND d.upn_key=k.identity_key
+      ) matched
     ) counted`;
   return relations(userSourceFactsSql(true), reports, keys, unresolvedParameter === null ? null : `${unresolvedParameter}::boolean`,
     `${prefix}selected_directory AS MATERIALIZED (${candidate}),`);

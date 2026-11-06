@@ -42,9 +42,9 @@ function Invoke-DockerCommand {
 function Test-LocalBindSource {
     param([string]$Source,[string]$Expected)
     if ($Source -ceq $Expected) { return $true }
-    if (-not $IsMacOS -or -not $Expected.StartsWith('/Users/',[StringComparison]::Ordinal) -or
+    if ($IsWindows -or -not $Expected.StartsWith('/Users/',[StringComparison]::Ordinal) -or
         $Source -cne "/host_mnt$Expected") { return $false }
-    # Docker Desktop may expose its exact host-file mapping instead of the macOS source.
+    # Docker Desktop can expose its host mapping to macOS or a socket-mounted Linux helper.
     return ((Invoke-DockerCommand @('context','show') -Capture) -ceq 'desktop-linux' -and
         (Invoke-DockerCommand @('context','inspect','--format','{{.Endpoints.docker.Host}}') -Capture) -ceq "unix://$HOME/.docker/run/docker.sock" -and
         -not [Environment]::GetEnvironmentVariable('DOCKER_HOST') -and -not [Environment]::GetEnvironmentVariable('DOCKER_CONTEXT'))
@@ -214,7 +214,10 @@ App roles (separate from API permissions):
   Users/Groups for Allowed member types. origin: Application describes where
   a role is defined, not who receives it.
   In Enterprise applications > your app > Properties, set Assignment required
-  to Yes. Under Users and groups, assign one role to each approved user/group:
+  to No after hardened API/MCP deployment. Retain explicit staff assignments.
+  Active roleless tenant members receive only conversational discovery and the
+  browser handoff; no EndUser role exists. Under Users and groups, assign one
+  role to each approved staff user/group:
     AgentControl.Viewer               Observe tenant data and request read synchronization.
     AgentControl.UsageReportUploader  Viewer access plus upload, validation and
                                      publication of new official CSV report sets.
@@ -439,10 +442,15 @@ function Read-LocalConfiguration {
     if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
     $settings.port = $port
     if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
+    $previousEmployeePrivacy = if ($settings.mcp -and $settings.mcp.Contains('hide_employee_details')) { $settings.mcp.hide_employee_details } else { $false }
+    $previousChampionPrivacy = if ($settings.mcp -and $settings.mcp.Contains('hide_champion_employee')) { $settings.mcp.hide_champion_employee } else { $false }
     $mcpPlan = Get-LocalMcpPlan $Context $settings $profiles
     if ($mcpPlan) {
         $settings.mcp = $mcpPlan.Settings
         Assert-DeploymentTenantProfiles $profiles
+        $applicationSettingsChanged = $applicationSettingsChanged -or
+            $previousEmployeePrivacy -cne $settings.mcp.hide_employee_details -or
+            $previousChampionPrivacy -cne $settings.mcp.hide_champion_employee
     }
     $metadata = Get-LocalTenantMetadata $profiles
     $registryChanged = $complete -and (-not $hasRegistry -or (ConvertTo-Json -InputObject $profiles -Depth 20 -Compress) -cne $previousProfiles)
@@ -539,6 +547,10 @@ function Write-LocalComposeEnvironment {
         $lines += @("MCP_IMAGE=$mcpImage","MCP_PORT=$($Context.Mcp.port)","MCP_TENANT_ID=$($Context.Mcp.tenantId)",
             "MCP_CLIENT_ID=$($Context.Mcp.clientId)","MCP_API_CLIENT_ID=$($Context.Mcp.apiClientId)","MCP_PUBLIC_URL=$($Context.Mcp.publicUrl)",
             "MCP_ALLOWED_CLIENT_REDIRECT_URIS='$(ConvertTo-Json -InputObject @($Context.Mcp.redirectUris) -Compress)'")
+        foreach ($pair in @(@('hide_employee_details','MCP_HIDE_EMPLOYEE_DETAILS'),@('hide_champion_employee','MCP_HIDE_CHAMPION_EMPLOYEE'))) {
+            $value = if ($Context.Mcp.Contains($pair[0])) { $Context.Mcp[$pair[0]] } else { $false }
+            $lines += "$($pair[1])=$($value.ToString().ToLowerInvariant())"
+        }
     }
     Write-LocalText (Join-Path $Context.State 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }

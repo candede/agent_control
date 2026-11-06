@@ -112,9 +112,13 @@ const savedAutomaticSourcesSql = `
 export class DataSyncRepository {
   constructor(private readonly database: pg.Pool = pool) {}
 
-  async submitDue(scope: DataSyncScope, signedInAt?: number, beforeCommit?: () => void): Promise<{ run: DataSyncRun | null; created: boolean }> {
+  async submitDue(scope: DataSyncScope, signedInAt?: number, beforeCommit?: () => void,
+    allowedSources: readonly DataSyncSourceId[] = automaticDataSyncSourceIds): Promise<{ run: DataSyncRun | null; created: boolean }> {
     validateScope(scope);
+    if (!allowedSources.length || allowedSources.some(source => !automaticDataSyncSourceIds.some(id => id === source))
+      || new Set(allowedSources).size !== allowedSources.length) throw new AppError(400, "invalid_data_sync_source", "Automatic reads require a finite supported source set.");
     return transaction(this.database, async client => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [`automatic-data-sync:${scope.tenantId}`]);
       await lockScope(client, scope);
       await expireActiveRuns(client, scope);
       const active = await client.query<{ id: string }>(`SELECT id FROM data_sync_runs
@@ -149,7 +153,7 @@ export class DataSyncRepository {
             CASE WHEN attempt.status='succeeded' THEN $6::double precision*interval '1 millisecond'
               ELSE $7::double precision*interval '1 millisecond' END))
           OR (attempt.status='waiting_authorization' AND attempt.attempt_started_at<$4::timestamptz))
-        ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, automaticDataSyncSourceIds,
+        ORDER BY requested.source_id`, [scope.tenantId, scope.principalId, allowedSources,
         signedInAt === undefined ? null : new Date(signedInAt), reportChanged,
         automaticDataSyncIntervalMs, automaticDataSyncRetryIntervalMs]);
       if (!due.rows.length) return { run: (await readLatestRun(client, scope)) ?? null, created: false };

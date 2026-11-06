@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
 import os
 import stat
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, SupportsFloat
@@ -27,6 +29,14 @@ MAX_FILES = 4096
 MAX_DISK_BYTES = 64 * 1024 * 1024
 MAX_RETENTION_SECONDS = 86400
 MAX_RECORD_BYTES = 262144
+CLIENT_COLLECTION = "mcp-oauth-proxy-clients"
+
+
+def oauth_ttl(collection: str | None, ttl: SupportsFloat | None) -> float | None:
+    seconds = MAX_RETENTION_SECONDS if ttl is None else float(ttl)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ConfigurationError("OAuth state requires finite positive retention.")
+    return None if collection == CLIENT_COLLECTION else min(seconds, MAX_RETENTION_SECONDS)
 
 
 class PrivateLookupKeys(FileTreeV1KeySanitizationStrategy):
@@ -130,9 +140,10 @@ class OAuthStore(BaseWrapper):
             data_directory=self.root,
             key_sanitization_strategy=PrivateLookupKeys(self.root),
         )
+        self.fernet = MultiFernet([Fernet(key) for key in settings.encryption_keys])
         self.key_value = FernetEncryptionWrapper(
             EncryptedEnvelopeStore(self.files),
-            fernet=MultiFernet([Fernet(key) for key in settings.encryption_keys]),
+            fernet=self.fernet,
             raise_on_decryption_error=True,
         )
         self.lock = asyncio.Lock()
@@ -145,9 +156,7 @@ class OAuthStore(BaseWrapper):
         collection: str | None = None,
         ttl: SupportsFloat | None = None,
     ) -> None:
-        seconds = MAX_RETENTION_SECONDS if ttl is None else float(ttl)
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ConfigurationError("OAuth state requires finite positive retention.")
+        seconds = oauth_ttl(collection, ttl)
         record_bytes = len(json.dumps(dict(value), allow_nan=False).encode("utf-8"))
         if record_bytes > MAX_RECORD_BYTES:
             raise ConfigurationError("OAuth state record exceeds its bounded storage limit.")
@@ -159,7 +168,7 @@ class OAuthStore(BaseWrapper):
                         "OAuth storage capacity exceeded; prune expired state."
                     )
             await self.key_value.put(
-                key, value, collection=collection, ttl=min(seconds, MAX_RETENTION_SECONDS)
+                key, value, collection=collection, ttl=seconds
             )
 
     async def put_many(
@@ -188,7 +197,11 @@ class OAuthStore(BaseWrapper):
                     raise ConfigurationError(
                         "OAuth state belongs to another resource; reconnect required."
                     )
-                await self.put("binding", self.binding, collection="service", ttl=86400)
+                # Durable registrations must not outlive their tenant/resource binding.
+                async with self.lock:
+                    await self.key_value.put(
+                        "binding", self.binding, collection="service", ttl=None
+                    )
                 probe = uuid4().hex
                 await self.put(probe, {"version": 1}, collection="health", ttl=30)
                 if await self.get(probe, collection="health") != {"version": 1}:
@@ -207,9 +220,47 @@ class OAuthStore(BaseWrapper):
             await asyncio.to_thread(inspect_storage, self.root)
 
     async def start(self) -> None:
-        if self.blob is not None:
-            await self.blob.start()
-        await self.check()
+        ready = False
+        try:
+            if self.blob is not None:
+                await self.blob.start()
+            await self.check()
+            if self.blob is None:
+                await asyncio.to_thread(self._refresh_local_records)
+            ready = True
+        finally:
+            self._ready = ready
+
+    def _refresh_local_records(self) -> None:
+        # The pinned FileTree v1 envelope owns expiry; its encrypted value stays opaque.
+        inspect_storage(self.root)
+        for path in self.root.glob("*/*.json"):
+            record = json.loads(path.read_text())
+            if (
+                not isinstance(record, dict)
+                or not {"version", "value"}.issubset(record)
+                or set(record) - {"version", "created_at", "expires_at", "value"}
+                or record["version"] != 1
+            ):
+                raise ConfigurationError("OAuth file record is incompatible.")
+            expires = record.get("expires_at")
+            if expires is not None and datetime.fromisoformat(expires) <= datetime.now(UTC):
+                continue
+            envelope = EncryptedEnvelopeStore.checked(record["value"])
+            if envelope is None:
+                raise ConfigurationError("OAuth file record has no encrypted value.")
+            if path.parent.name == CLIENT_COLLECTION:
+                record.pop("expires_at", None)
+            envelope["__encrypted_data__"] = base64.b64encode(
+                self.fernet.rotate(base64.b64decode(envelope["__encrypted_data__"], validate=True))
+            ).decode("ascii")
+            temporary = path.with_name(f".{uuid4().hex}.tmp")
+            try:
+                with temporary.open("x", encoding="utf-8") as output:
+                    output.write(json.dumps(record, allow_nan=False, separators=(",", ":")))
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     async def assert_authority(self) -> None:
         if self.blob is not None:

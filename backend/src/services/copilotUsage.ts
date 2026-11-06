@@ -11,6 +11,7 @@ import type { AuthenticatedUser } from "../types/session.js";
 import { hasIncompleteUserSourceCollection, type UserSourceKind, type UserSourceMetadata } from "../types/userSources.js";
 import { automaticDataSyncIntervalMs, automaticDataSyncRetryIntervalMs } from "../types/dataSync.js";
 import { hasAppRole } from "../types/capability.js";
+import { automaticApplicationRead } from "../auth/authorityContext.js";
 import { capabilities } from "./capabilities.js";
 import { UserSourceProvider } from "./userSourceProvider.js";
 import { LargeTenantUsersReports } from "./largeTenantUsersReports.js";
@@ -68,7 +69,9 @@ export class CopilotUsageService {
       const sourceIncomplete = hasIncompleteUserSourceCollection(source);
       if (!options.automatic) return sourceIncomplete || source.source === "directory" && reportChanged
         || !options.incompleteOnly || source.generationId === null || source.attemptStatus !== "available";
-      if (source.attemptStatus === "waiting_authorization" && source.attemptedAt && options.signedInAt !== undefined
+      const awaitingSignIn = source.attemptStatus === "waiting_authorization"
+        || source.attemptStatus === "cancelled" && source.errorCode === "interaction_required";
+      if (awaitingSignIn && source.attemptedAt && options.signedInAt !== undefined
         && Date.parse(source.attemptedAt) < options.signedInAt) return true;
       if (source.attemptedAt && source.attemptStatus !== "available")
         return Date.now() - Date.parse(source.attemptedAt) >= automaticDataSyncRetryIntervalMs;
@@ -88,7 +91,7 @@ export class CopilotUsageService {
         return commitAccountSessionValidation(validation, async () => {
           sourceFence(); providerSignal.throwIfAborted();
           if (fresh.tenantId !== scope.tenantId || fresh.homeAccountId !== scope.principalId
-            || !hasAppRole(fresh.roles, "AgentControl.Viewer")) throw AppError.unauthorized();
+            || !hasAppRole(fresh.roles, "AgentControl.Viewer") && !automaticApplicationRead(fresh, capability)) throw AppError.unauthorized();
           await this.dependencies.requireAvailable(capability, fresh);
           sourceFence(); providerSignal.throwIfAborted();
           const token = await this.dependencies.applicationToken(scope.tenantId, capability);

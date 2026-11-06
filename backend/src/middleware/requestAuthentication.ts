@@ -1,6 +1,7 @@
 import type { Request, RequestHandler } from "express";
 import type pg from "pg";
 import { AppError } from "../errors.js";
+import { assertAuthSignal } from "../auth/boundedAuth.js";
 import { McpBearerVerifier } from "../auth/mcpBearer.js";
 import { createBearerCredentials, createBrowserCredentials } from "../auth/delegatedCredentials.js";
 import { browserRequestPrincipal, principalEpochAuthority } from "../auth/requestPrincipal.js";
@@ -10,6 +11,7 @@ import { getValidatedSessionIdentity } from "../db/sessions.js";
 import type { DelegatedCredentialSource } from "../types/requestPrincipal.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { deriveActionOrigin, mcpContextHeader, withActionOrigin } from "../services/actionOrigin.js";
+import { EmployeeProfileService } from "../services/employeeProfile.js";
 
 declare global {
   namespace Express {
@@ -23,6 +25,7 @@ declare global {
 export function requestAuthentication(database: pg.Pool, fetcher: typeof fetch = fetch): RequestHandler {
   const verifier = new McpBearerVerifier(fetcher);
   const epochs = principalEpochAuthority(database);
+  const employees = new EmployeeProfileService(fetcher);
   return async (request, response, next) => {
     try {
       const header = request.get("authorization");
@@ -30,7 +33,7 @@ export function requestAuthentication(database: pg.Pool, fetcher: typeof fetch =
         throw new AppError(400, "ambiguous_authentication", "Cookie and bearer authentication cannot be combined.");
       }
       if (header !== undefined) {
-        if (!/^Bearer [^\s,]+$/i.test(header) || request.rawHeaders.filter(value => value.toLowerCase() === "authorization").length !== 1) {
+        if (!/^Bearer [^\s,]+$/i.test(header) || request.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === "authorization").length !== 1) {
           throw AppError.unauthorized("Use one delegated bearer credential.");
         }
         const controller = new AbortController();
@@ -38,9 +41,11 @@ export function requestAuthentication(database: pg.Pool, fetcher: typeof fetch =
         const disconnected = () => { if (!response.writableEnded) controller.abort(); };
         request.once("aborted", aborted);
         response.once("close", disconnected);
+        if (request.aborted || response.destroyed) controller.abort();
         try {
           request.authentication = await createBearerCredentials(await verifier.verify(header.slice(7), controller.signal),
             epochs, { signal: controller.signal, fetcher });
+          await employees.verify(request.authentication, controller.signal);
         } finally {
           request.removeListener("aborted", aborted);
           response.removeListener("close", disconnected);
@@ -50,15 +55,29 @@ export function requestAuthentication(database: pg.Pool, fetcher: typeof fetch =
         return;
       }
       request.bindBrowserAuthority = async (browserRequest, browserResponse, browserNext) => {
+        const controller = new AbortController();
+        const aborted = () => controller.abort();
+        const disconnected = () => { if (!browserResponse.writableEnded) controller.abort(); };
+        browserRequest.once("aborted", aborted);
+        browserResponse.once("close", disconnected);
+        if (browserRequest.aborted || browserResponse.destroyed) controller.abort();
         try {
+          assertAuthSignal(controller.signal);
           const identity = getValidatedSessionIdentity(browserRequest.session);
           if (!identity) throw AppError.unauthorized();
           const account = await getMsalClient(identity.tenantId).getTokenCache().getAccountByHomeId(identity.accountId);
+          assertAuthSignal(controller.signal);
           const principal = await browserRequestPrincipal(browserRequest.session, account, epochs);
+          assertAuthSignal(controller.signal);
           browserRequest.authentication = createBrowserCredentials(principal, epochs);
+          await employees.verify(browserRequest.authentication, controller.signal);
           const origin = deriveActionOrigin(principal, browserResponse.locals.requestId, contextHeader(browserRequest));
           withAuthority(browserRequest.authentication, () => withActionOrigin(origin, browserNext));
         } catch (error) { browserNext(error); }
+        finally {
+          browserRequest.removeListener("aborted", aborted);
+          browserResponse.removeListener("close", disconnected);
+        }
       };
       next();
     } catch (error) { next(error); }
@@ -75,7 +94,7 @@ export const bindRequestAuthority: RequestHandler = (request, response, next) =>
 };
 
 function contextHeader(request: Request) {
-  const matches = request.rawHeaders.filter(value => value.toLowerCase() === mcpContextHeader.toLowerCase()).length;
+  const matches = request.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === mcpContextHeader.toLowerCase()).length;
   if (matches > 1) throw new AppError(400, "invalid_action_origin", "Use one bounded action attribution header.");
   return request.get(mcpContextHeader);
 }

@@ -18,7 +18,7 @@ import { operationalLog } from "./telemetry.js";
 import { AgentPeopleService } from "./agentPeople.js";
 import { config } from "../config.js";
 import { temporaryAgentSharingDiagnostic, type AgentSharingDiagnosticContext } from "./temporaryAgentSharingDiagnostic.js";
-import { withReadAuthorityRefresh } from "../auth/authorityContext.js";
+import { requireAuthority, withAutomaticApplicationReads, withReadAuthorityRefresh } from "../auth/authorityContext.js";
 import { OfficeAppAdoptionRepository } from "../db/officeAppAdoption.js";
 
 type PackageJob = Awaited<ReturnType<PackageInventoryService["get"]>>;
@@ -114,6 +114,23 @@ export class DataSyncService {
 
   async automaticRefresh(user: AuthenticatedUser, signedInAt?: number): Promise<AutomaticRefreshResult> {
     requireViewer(user);
+    return this.refreshDue(user, signedInAt, automaticDataSyncSourceIds);
+  }
+
+  async authenticatedEntry(user: AuthenticatedUser, signedInAt?: number): Promise<boolean> {
+    const source = requireAuthority(user.tenantId, user.homeAccountId);
+    if (source.principal.roles.join("\0") !== user.roles.join("\0")) throw AppError.unauthorized();
+    if (hasAppRole(user.roles, "AgentControl.Viewer")) {
+      const result = await this.automaticRefresh(user, signedInAt);
+      return Boolean(result.run?.status === "running" || result.detailJob?.status === "running");
+    }
+    return withAutomaticApplicationReads(async () => {
+      const result = await this.refreshDue(user, signedInAt, ["graph_packages", "users"]);
+      return Boolean(result.run?.status === "running" || result.detailJob?.status === "running");
+    });
+  }
+
+  private async refreshDue(user: AuthenticatedUser, signedInAt: number | undefined, sources: readonly DataSyncSourceId[]): Promise<AutomaticRefreshResult> {
     return this.admit(user, undefined, async (owner, authorization) => {
       const previous = await this.dependencies.repository.getLatestRun(owner);
       assertCurrentSync(authorization);
@@ -123,7 +140,7 @@ export class DataSyncService {
         await commitSync(authorization, () => this.dependencies.repository.finishRun(owner, previous.id));
       }
       const submitted = await commitSync(authorization, () => this.dependencies.repository.submitDue(owner, signedInAt,
-        () => assertCurrentSync(authorization)));
+        () => assertCurrentSync(authorization), sources));
       if (submitted.created && submitted.run) authorization.admittedRunId = submitted.run.id;
       assertCurrentSync(authorization);
       if (submitted.created && submitted.run) {

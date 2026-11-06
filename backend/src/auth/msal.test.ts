@@ -707,7 +707,7 @@ describe("authentication scopes", () => {
     const user = toAuthenticatedUser({
       account,
       idTokenClaims: {
-        roles: ["AgentControl.Viewer", "AgentControl.Admin", "AgentControl.Reader", "AgentControl.Operator", "AgentControl.SecurityReader", "AgentControl.Administrator"],
+        roles: ["AgentControl.Viewer", "AgentControl.Admin"],
         wids: [inventoryProviderRoleIds.aiReader, inventoryProviderRoleIds.aiReader, "00000000-0000-0000-0000-000000000000", "secret-role-name", 42],
       },
     } as never);
@@ -715,6 +715,14 @@ describe("authentication scopes", () => {
     expect(user.roles).toEqual(["AgentControl.Admin", "AgentControl.Viewer"]);
     const excessive = toAuthenticatedUser({ account, idTokenClaims: { wids: Array.from({ length: 65 }, () => inventoryProviderRoleIds.globalReader) } } as never);
     expect(excessive.providerRoleIds).toEqual([]);
+  });
+
+  it.each([null, "AgentControl.Viewer", ["AgentControl.Reader"], ["AgentControl.Viewer", "unknown"], [1]])("rejects malformed or unknown browser roles %j", roles => {
+    expect(() => toAuthenticatedUser({ account, idTokenClaims: { roles } } as never)).toThrow(expect.objectContaining({ status: 401 }));
+  });
+
+  it.each([undefined, []])("preserves valid roleless browser claims %j", roles => {
+    expect(toAuthenticatedUser({ account, idTokenClaims: { roles } } as never).roles).toEqual([]);
   });
 
   it("requests application .default and requires the exact app role", async () => {

@@ -25,6 +25,9 @@ $implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
 $implemented += @('production-frontend','auth-recovery','audit-origin','mcp-read-contracts','shared-agent-controls','webapp-regressions','webapp-qualification')
 $implemented += @('deployment-current','fresh-installation-current','mcp-container','mcp-end-to-end')
 $implemented += @('office-app-adoption')
+$implemented += @('mcp-roleless-authority')
+$implemented += @('mcp-agent-discovery')
+$implemented += @('mcp-agent-discovery-capacity')
 if ($Suite -notin ($implemented + @('inventory-acceptance-repair','inventory-acceptance-recovery','inventory-controller-contract','report-source-scale','backend-shard-1','backend-shard-2','inventory-app-exports','inventory-http-contract','inventory-route-contract','inventory-integration','inventory-expiry','inventory-parity','inventory-verification','inventory-identity-proof','inventory-cleanup','inventory-identity','inventory-facets','inventory','inventory-cutover','inventory-usage-authority','inventory-native-evidence','inventory-staging','inventory-jobs','inventory-route','inventory-protocol','inventory-core','inventory-reconciliation','inventory-native-ui','inventory-groups','inventory-foundation')) -and -not $profile -and $Suite -ne 'cutover-compiled-restart') { throw "Suite '$Suite' is not yet implemented; no qualification claimed." }
 if ($Suite -in @('cutover-browser-contract','browser')) {
     if ($Suite -eq 'browser' -and -not $PSBoundParameters.ContainsKey('BrowserFiles')) { $BrowserFiles = 'largeTenantData.spec.ts' }

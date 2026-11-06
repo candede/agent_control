@@ -1,16 +1,32 @@
-FROM python:3.14.6-slim-bookworm@sha256:4c92ffcde4dd6f1ff72a24518f49fd4990b27134987dfa31a733badde66df9f8 AS dependencies
+ARG MCP_DEPENDENCY_BASE=python:3.14.6-slim-bookworm@sha256:4c92ffcde4dd6f1ff72a24518f49fd4990b27134987dfa31a733badde66df9f8
+FROM ${MCP_DEPENDENCY_BASE} AS dependencies
+ARG REUSE_INSTALLED_DEPENDENCIES=0
 ENV PIP_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple \
     PIP_EXTRA_INDEX_URL= \
     UV_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple \
     UV_PYTHON_DOWNLOADS=never \
     UV_NO_CACHE=1 \
+    TMPDIR=/opt/mcp/.build-work \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+USER root
 WORKDIR /opt/mcp
-RUN python -m pip install --no-cache-dir --index-url https://packagefeedproxy.microsoft.io/pypi/simple uv==0.12.17
+RUN mkdir -p .build-work && if [ "$REUSE_INSTALLED_DEPENDENCIES" = 1 ]; then \
+      test -x /usr/local/bin/uv && test -x .venv/bin/python; \
+    else python -m pip install --no-cache-dir --index-url https://packagefeedproxy.microsoft.io/pypi/simple uv==0.12.17; fi
 COPY mcp/pyproject.toml mcp/uv.lock ./
+RUN if [ "$REUSE_INSTALLED_DEPENDENCIES" != 1 ]; then \
+      uv sync --frozen --no-dev --no-editable --no-install-project --index-url https://packagefeedproxy.microsoft.io/pypi/simple; fi
+
+FROM dependencies AS application
+RUN rm -rf src
 COPY mcp/src src
-RUN uv sync --frozen --no-dev --no-editable --index-url https://packagefeedproxy.microsoft.io/pypi/simple
+RUN uv build --wheel --offline --out-dir .wheels \
+    && uv pip install --offline --no-deps --reinstall-package agent-control-mcp --python .venv/bin/python .wheels/*.whl \
+    && rm -rf .wheels .build-work
+
+FROM application AS runtime-dependencies
+RUN mkdir -p .build-work && uv sync --frozen --no-dev --no-editable --offline
 
 FROM python:3.14.6-slim-bookworm@sha256:4c92ffcde4dd6f1ff72a24518f49fd4990b27134987dfa31a733badde66df9f8 AS runtime
 ENV PATH=/opt/mcp/.venv/bin:$PATH \
@@ -21,7 +37,7 @@ ENV PATH=/opt/mcp/.venv/bin:$PATH \
     PIP_INDEX_URL=https://packagefeedproxy.microsoft.io/pypi/simple \
     PIP_EXTRA_INDEX_URL=
 WORKDIR /opt/mcp
-COPY --from=dependencies /opt/mcp/.venv .venv
+COPY --from=runtime-dependencies /opt/mcp/.venv .venv
 RUN mkdir -p /var/lib/agent-control-mcp/oauth && chown -R 10001:10001 /var/lib/agent-control-mcp && chmod 700 /var/lib/agent-control-mcp/oauth
 USER 10001:10001
 EXPOSE 8000
@@ -29,8 +45,10 @@ STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=5s --timeout=5s --start-period=15s --retries=6 CMD ["python", "-m", "agent_control_mcp.healthcheck"]
 ENTRYPOINT ["agent-control-mcp"]
 
-FROM dependencies AS test
-RUN uv sync --frozen --no-editable --index-url https://packagefeedproxy.microsoft.io/pypi/simple
+FROM application AS test
+RUN mkdir -p .build-work && if [ "$REUSE_INSTALLED_DEPENDENCIES" = 1 ]; then \
+      uv sync --frozen --no-editable --offline; \
+    else uv sync --frozen --no-editable --index-url https://packagefeedproxy.microsoft.io/pypi/simple; fi
 COPY mcp/tests tests
 COPY docs/mcp-integration.md /opt/docs/mcp-integration.md
 COPY docs/mcp-reference.md /opt/docs/mcp-reference.md

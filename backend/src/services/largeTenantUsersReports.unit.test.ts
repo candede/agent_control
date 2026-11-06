@@ -186,6 +186,63 @@ describe("history selection status", () => {
   });
 });
 
+describe("discovery report metadata", () => {
+  const setId = "22222222-2222-4222-8222-222222222222";
+  const state = { history_revision: "3", invalidation_epoch: "1", active_set_id: setId,
+    active_revision: "2", retained: 1, incomplete: 0 };
+  const set = { id: setId, reporting_start: "2025-12-01", reporting_end: "2025-12-31",
+    period_provenance: "activity_range", accepted_at: new Date("2026-01-01T00:00:00Z"), expires_at: null };
+  const versions = (["agents", "users", "userAgents"] as const).map(kind => ({
+    id: `version-${kind}`, kind, content_hash: "a".repeat(64), row_count: 0, source_as_of: null,
+    source_as_of_provenance: "absent", source_freshness: "unknown", period_provenance: "activity_range",
+    expires_at: null, artifact_expiry: null, alive: true, complete: true,
+  }));
+
+  it("uses only retained content periods for Latest without reviving superseded corrections", async () => {
+    const saved = context("official_agents"), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const query = mockQuery(client);
+    query.mockResolvedValueOnce(result([{ id: setId }])).mockResolvedValueOnce(result([state]))
+      .mockResolvedValueOnce(result([set])).mockResolvedValueOnce(result(versions));
+    const report = await reports.latestDiscoveryReport(client, identity.tenantId, saved.evaluatedAt);
+    expect(report).toMatchObject({ setId, availability: "active", reportingPeriod: { endDate: "2025-12-31" } });
+    const [sql, values] = query.mock.calls[0];
+    expect(sql).toContain("h.valid_to_revision IS NULL");
+    expect(sql).toContain("h.visibility='retained'");
+    expect(sql).toContain("s.complete AND s.deleted_at IS NULL");
+    expect(sql).toContain("s.expires_at>GREATEST($2::timestamptz,clock_timestamp())");
+    expect(sql).toContain("ORDER BY s.reporting_end DESC NULLS LAST,s.reporting_start DESC NULLS LAST,s.accepted_at DESC,s.id DESC LIMIT 1");
+    expect(values).toEqual([identity.tenantId, saved.evaluatedAt]);
+  });
+
+  it("keeps explicitly pinned superseded reports readable", async () => {
+    const saved = context("official_agents"), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const query = mockQuery(client);
+    query.mockResolvedValueOnce(result([state])).mockResolvedValueOnce(result([set])).mockResolvedValueOnce(result(versions));
+    await expect(reports.discoveryReport(client, identity.tenantId, setId, saved.evaluatedAt))
+      .resolves.toMatchObject({ setId, availability: "active", lineages: versions.map(version => ({ versionId: version.id })) });
+    expect(query.mock.calls[1][0]).toContain("m.valid_to_revision IS NULL");
+    expect(query.mock.calls[1][0]).not.toContain("m.visibility='retained'");
+    expect(query.mock.calls[1][1]).toEqual([setId, identity.tenantId, saved.evaluatedAt]);
+  });
+
+  it("allows catalog-only first use without an imported report", async () => {
+    const saved = context("official_agents"), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const query = mockQuery(client).mockResolvedValue(result([]));
+    await expect(reports.latestDiscoveryReport(client, identity.tenantId, saved.evaluatedAt))
+      .resolves.toMatchObject({ setId: null, availability: "never_imported", lineages: [] });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(database.connect).not.toHaveBeenCalled();
+  });
+
+  it("does not replace a pinned absent report with a newly imported head", async () => {
+    const saved = context("official_agents"), client = Object.assign(new pg.Client(), { release: vi.fn() });
+    const query = mockQuery(client).mockResolvedValue(result([state]));
+    await expect(reports.discoveryReport(client, identity.tenantId, null, saved.evaluatedAt))
+      .resolves.toMatchObject({ setId: null, activeSetId: setId, availability: "not_selected", lineages: [] });
+    expect(query).toHaveBeenCalledOnce();
+  });
+});
+
 describe.each(["history", "directory_report_inputs"] as const)("%s selection expiry maintenance", endpoint => {
   const captureSelection = () => endpoint === "history" ? reports.capture(identity, endpoint) : reports.captureReportIdentities(identity);
 

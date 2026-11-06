@@ -2,7 +2,7 @@ import pg from "pg";
 import { pathToFileURL } from "node:url";
 import { databaseSettings, secretValue, transaction } from "../src/db/pool.js";
 import { schemaFingerprint, schemaSql, verifySchema } from "../src/db/schema.js";
-import { DatabaseResetError, preflightDatabaseReset, resetDatabase } from "./databaseReset.js";
+import { DatabaseResetError, preflightDatabaseReset, resetDatabase, type ProtectedPrincipalRevocation } from "./databaseReset.js";
 import { OfficialReportHistory } from "../src/db/officialReportHistory.js";
 import { retainRecordData } from "../src/db/dataRetention.js";
 import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
@@ -100,7 +100,21 @@ export async function initializeSchema(database: pg.Pool) {
   await transaction(database, async (client) => {
     await client.query("SELECT pg_advisory_xact_lock(3650101)");
     if ((await inspectSchema(client)).state === "fresh") {
+      const maintenance = new pg.Pool({ ...database.options, password: database.options.password, database: "postgres" });
+      let revocations: ProtectedPrincipalRevocation[] = [];
+      try {
+        const exists = (await maintenance.query("SELECT to_regclass('public.agentcontrol_principal_revocations') AS name")).rows[0]?.name;
+        if (exists) revocations = (await maintenance.query<ProtectedPrincipalRevocation>(`SELECT tenant_id,principal_id,
+          epoch::text,bearer_issued_after::text FROM public.agentcontrol_principal_revocations WHERE database_name=$1`,
+        [database.options.database])).rows;
+      } finally { await maintenance.end(); }
       await client.query(schemaSql);
+      for (let offset = 0; offset < revocations.length; offset += 1000) {
+        await client.query(`INSERT INTO data_principal_epochs(tenant_id,principal_id,epoch,bearer_issued_after)
+          SELECT tenant_id,principal_id,epoch,bearer_issued_after FROM jsonb_to_recordset($1::jsonb)
+            AS records(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint)`,
+        [JSON.stringify(revocations.slice(offset, offset + 1000))]);
+      }
       await client.query("INSERT INTO app_schema(singleton,fingerprint) VALUES (true,$1)", [schemaFingerprint]);
     }
   });
@@ -140,6 +154,7 @@ export async function grantRuntime(database: pg.Pool) {
     REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
     REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM agentcontrol_app;
     GRANT SELECT ON app_schema TO agentcontrol_app;
+    GRANT EXECUTE ON FUNCTION discovery_safe_text(text,jsonb,boolean,boolean) TO agentcontrol_app;
     GRANT SELECT, INSERT, UPDATE, DELETE ON sessions, jobs, job_items, job_attempts, source_identifiers, capability_configuration, capability_evidence TO agentcontrol_app;
     GRANT SELECT, INSERT, UPDATE ON power_platform_refresh_jobs TO agentcontrol_app;
     GRANT SELECT, INSERT, UPDATE ON package_refresh_jobs, package_inventory_snapshots TO agentcontrol_app;

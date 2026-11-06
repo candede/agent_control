@@ -27,6 +27,62 @@ Delegated authority uses verified `(tenantId, MSAL homeAccountId)`, never report
 usernames, guest resource IDs or names. Tenant sharing excludes tokens, sessions
 and mutation authority.
 
+## Restricted agent discovery
+
+`POST /api/discovery/read` serves authenticated employees and staff through one
+positive-allowlist API. Its finite operations are `profile`, `search`, `detail`
+and `workplace`. `POST /api/discovery/preview` accepts the same operations plus
+an exact saved member identifier/UPN, and requires the actual actor's Viewer
+hierarchy. Preview never changes the actor, borrows a target token or inherits
+the target's roles. Both routes return neutral self/preview labels.
+
+Search covers current organization-created canonical records: authoritative
+Power Platform evidence or package type `lob`/`custom`, not presence, sharing,
+deployment or usage alone. Full saved About chunks participate; snippets disclose
+clipping and detail continuations return safe 4,096-character portions. Goals
+are at most 512 characters; expanded terms at most eight of 128 characters each;
+card pages default to five and allow at most twenty. Unknown options, personal
+filters and workplace/privacy overrides fail explicitly. Matches are candidates,
+not proof of capability or provider access; missing coverage is reported.
+Complete approved descriptions identify canonical candidates before people
+rendering; final matching, ordering and excerpts use only permitted rendered text.
+Unfiltered reads bound candidates before rendering. Discovery disables parallel
+hashing within its read transaction so bounded PostgreSQL shared memory cannot
+be exhausted before ordinary hashes spill; other readers keep their settings.
+
+Workplace comes only from the canonical saved account. Department means company
+**and** department; company spans its own departments.
+Workplace `scope` accepts only the strings `department`, `company`, or `both`
+(the default). Latest reports are selected by their content period and pinned
+to one immutable set, without changing a
+personal selected-period preference. Distinct-user popularity remains internal.
+Champion ordering is shared with staff adoption; own status is suggested,
+not-suggested or unavailable, never a negative inference from missing linkage.
+Unlicensed employees without a saved profile remain catalog-only.
+
+Discovery reuses canonical inventory publications, directory generations,
+official report membership and `data_read_selections`; there is no second
+catalog/profile store. Automatic canonical reconciliation revalidates the
+initiating account without requiring an employee to hold a staff role; control
+publication retains its staff-role check. Selection query bindings include real
+actor authority, self/preview mode, canonical subject, saved profile digest,
+directory generation, report set and association revision. Current-clock
+inventory fences apply again before returning, including complete-description
+continuation.
+
+The API reapplies deployment-owned `hide_employee_details` and
+`hide_champion_employee` independently on every response, including ordinary
+staff reads and previews. Structured contacts follow their category. Saved
+identity evidence is removed from source prose before search, excerpts and
+chunking; unsafe or insufficiently evidenced fields are explicitly withheld
+without dropping the agent. Hidden identities cannot supply a task match.
+Saved workplace labels and nonidentifying affiliations are rendered too.
+Unredacted saved values remain the query authority: hiding identity-bearing
+display labels cannot change scope, popularity or the champion set.
+There are no metrics, raw configurations, report rows, control fields, personal
+IDs or administrative links in these DTOs. Current saved source contracts supply
+no verified agent-use URL, so `useLink` is honestly absent.
+
 ## Current schema
 
 [Current DDL](../backend/src/db/currentSchema.ts) and
@@ -74,6 +130,8 @@ limits.
 Provider waits hold no database transaction. Recheck authority after pending work
 and before publication; pre-commit cancellation rolls back. Confirmed commit
 survives separately reported cleanup failure. Leases cannot outlive deadlines.
+Package admission failures update only the waiting-job revision originally read;
+a delayed permission denial cannot fail a refresh started by another worker.
 
 Collection is due every six hours; ordinary failure retries normally wait an hour,
 subject to provider backoff. Missing sources, initial collection, newer-sign-in

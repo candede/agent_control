@@ -9,6 +9,7 @@ const appRoleRequirements: readonly {
     role: "AgentControl.Viewer", title: "Viewer", summary: "Read and refresh adoption data.",
     permissions: [
       "View shared agents, users, saved reports and sync results.",
+      "Choose saved reports for your own view.",
       "Use automatic Graph read-only sync through the application identity.",
       "Sync Power Platform when your Microsoft account has the required access.",
     ],
@@ -21,7 +22,7 @@ const appRoleRequirements: readonly {
       "Upload, validate and publish new CSV report sets.",
       "Discard your own unaccepted drafts.",
     ],
-    note: "No Graph permission is needed to upload. Published-report corrections, selection and deletion require Admin.",
+    note: "No Graph permission is needed to upload. Published-report corrections and deletion require Admin.",
   },
   {
     role: "AgentControl.Admin", title: "Admin", summary: "Manage the app and administrative changes.",
@@ -43,7 +44,7 @@ export function SignedInUserRoles({ user }: { user?: SessionUser }) {
         Assign app roles<ExternalLink size={14} aria-hidden="true" />
       </a>
     </header>
-    <p className="permission-section-intro">Assign these roles in Enterprise applications &gt; this app &gt; Users and groups. App roles control Agent Control access, not Microsoft provider permissions.</p>
+    <p className="permission-section-intro">Assign staff roles in Enterprise applications &gt; this app &gt; Users and groups. App roles control Agent Control access, not Microsoft provider permissions. Verified active employees without app roles receive discovery-only access; no EndUser role is required.</p>
     <div className="permission-role-list">
       {appRoleRequirements.map(requirement => {
         const assigned = user?.roles.includes(requirement.role) ?? false;

@@ -274,7 +274,7 @@ it.each(["logout", "role removal", "unmount"] as const)("does not admit a retain
 it.each(["reload", "hidden initial check"] as const)("does not admit a %s into a replacement request session before account props update", async trigger => {
   const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue(trigger === "reload" ? "visible" : "hidden");
   const fetchMock = vi.fn(async (url: string) => url === "/api/me"
-    ? Response.json({ user, csrfToken: "fixture-csrf", roleAssignmentRequired: false })
+    ? Response.json({ user, csrfToken: "fixture-csrf" })
     : Response.json({ value: [available()] }));
   vi.stubGlobal("fetch", fetchMock);
   const { result, rerender } = renderHook(({ epoch }) => useCapabilities(user, epoch), { initialProps: { epoch: 0 } });
@@ -321,7 +321,7 @@ it.each([
     }
   });
   const fetchMock = vi.fn(async (url: string) => url === "/api/me"
-    ? Response.json({ user, csrfToken: "fixture-csrf", roleAssignmentRequired: false })
+    ? Response.json({ user, csrfToken: "fixture-csrf" })
     : fail ? Response.json({ code: "request_throttled" }, { status: 429 })
       : Response.json({ value: [available()] }));
   vi.stubGlobal("fetch", fetchMock);
@@ -643,7 +643,7 @@ it.each(["catalog", "check"] as const)("does not replay a delayed %s retry into 
   let attempts = 0;
   const fetchMock = vi.fn(async (url: string) => {
     if (url === "/api/me") return Response.json({
-      user: { ...user, homeAccountId: "fixture-b" }, csrfToken: "fixture-csrf", roleAssignmentRequired: false,
+      user: { ...user, homeAccountId: "fixture-b" }, csrfToken: "fixture-csrf",
     });
     if (url === path && ++attempts === 1) return Response.json({ code: "temporarily_unavailable" }, { status: 503 });
     return Response.json({ value: [available()] });

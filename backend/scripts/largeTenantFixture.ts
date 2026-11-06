@@ -5,6 +5,33 @@ import { browserFixtureTestFiles } from "./fixtureSupport.js";
 const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
 
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "mcp-agent-discovery-capacity") return [
+    ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts", "--silent=false"],
+  ];
+  if (suite === "mcp-agent-discovery") return [
+    ["run", "test", "--workspace", "backend", "--", "src/services/agentDiscovery.unit.test.ts",
+      "src/routes/agentDiscovery.unit.test.ts", "src/services/adoptionGroups.unit.test.ts", "src/db/inventoryAuthority.unit.test.ts",
+      "src/routes/agentDiscovery.test.ts", "src/routes/policy.test.ts", "src/services/mcpAccess.unit.test.ts",
+      "src/db/schema.test.ts", "scripts/databaseReset.test.ts", "scripts/database.test.ts",
+      "scripts/backup.test.ts", "scripts/largeTenantRestore.test.ts", "scripts/largeTenantFixture.test.ts", "src/services/dataSelections.test.ts",
+      "src/services/largeTenantUsersReports.test.ts", "src/db/inventoryGenerations.test.ts",
+      "src/services/automaticRefreshIntegration.test.ts", "src/auth/mcpBearer.test.ts", "src/auth/requestPrincipal.test.ts",
+      "src/auth/msal.test.ts", "src/middleware/auth.test.ts", "src/services/employeeProfile.unit.test.ts",
+      "src/routes/mcpApiAuth.test.ts", "src/services/dataSync.test.ts", "src/db/dataSync.test.ts", "src/db/sessions.test.ts",
+      "src/app.test.ts", "scripts/dataSyncPersistence.test.ts", "src/services/copilotUsage.unit.test.ts",
+      "src/services/mcpSettings.test.ts", "src/services/mcpSettings.unit.test.ts", "src/routes/mcpSettings.unit.test.ts",
+      "src/routes/mcpContractFeasibility.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "mcp-roleless-authority") return [
+    ["run", "test", "--workspace", "backend", "--",
+      "src/auth/mcpBearer.test.ts", "src/auth/requestPrincipal.test.ts", "src/auth/msal.test.ts", "src/middleware/auth.test.ts",
+      "src/routes/policy.test.ts", "src/services/mcpAccess.unit.test.ts", "src/services/employeeProfile.unit.test.ts",
+      "src/routes/mcpApiAuth.test.ts", "src/services/dataSync.test.ts", "src/services/automaticRefreshIntegration.test.ts",
+      "src/db/dataSync.test.ts", "src/db/sessions.test.ts", "src/db/schema.test.ts", "src/app.test.ts",
+      "scripts/dataSyncPersistence.test.ts", "scripts/databaseReset.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
   if (suite === "office-app-adoption") return [
     ["run", "test", "--workspace", "backend", "--", "src/db/officeAppAdoption.test.ts", "src/routes/officeAppAdoption.test.ts",
       "src/db/officeAppAdoption.unit.test.ts", "src/services/officeAppAdoption.unit.test.ts", "src/routes/officeAppAdoption.unit.test.ts",
@@ -19,7 +46,8 @@ export function fixtureCommands(suite: string): string[][] {
   if (suite === "mcp-end-to-end") return [
     ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
       "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
-      "src/routes/sharedAgentControls.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
+      "src/routes/sharedAgentControls.test.ts", "src/routes/agentDiscovery.test.ts",
+      "src/services/mcpSettings.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "deployment-current") return [
@@ -644,7 +672,8 @@ export function runFixtureCommand(args: string[], environment: NodeJS.ProcessEnv
   execute: FixtureExecutor = spawnSync, kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill) {
   const result = execute("npm", args, {
     env: environment, stdio: "inherit",
-    timeout: args.join(" ") === "run test --workspace frontend" ? 300_000 : 600_000, cwd: "/app", detached: true,
+    timeout: args.includes("scripts/agentDiscoveryCapacity.test.ts") ? 1_740_000
+      : args.join(" ") === "run test --workspace frontend" ? 300_000 : 600_000, cwd: "/app", detached: true,
   });
   if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
     if (!Number.isSafeInteger(result.pid) || result.pid <= 0) throw new Error("fixture_timeout_process_group_missing", { cause: result.error });

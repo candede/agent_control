@@ -1,0 +1,1649 @@
+{
+  "end_user": {
+    "audience": "end_user",
+    "operations": [
+      {
+        "method": "POST",
+        "route": "/api/discovery/read",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "GET",
+        "route": "/api/mcp/access-profile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/mcp/authenticated-entry"
+      }
+    ],
+    "staffPreviewAuthorized": false,
+    "privacy": {
+      "hide_employee_details": false,
+      "hide_champion_employee": false
+    }
+  },
+  "adoption": {
+    "audience": "adoption",
+    "operations": [
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/about"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/children"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/detail"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/members"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/sections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-associations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/health"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/purview"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/investigations/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/people/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/selections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-responsibility"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/:id/detail"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/:id/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id/items"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id/targets"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-selection"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/selections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/cancel"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id/records"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities"
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/:id/probe",
+        "inputChoices": {
+          "capabilityId": [
+            "graph.package.read.application",
+            "graph.directory.read",
+            "graph.users.read",
+            "graph.agentIdentity.read",
+            "graph.licenses.read",
+            "powerPlatform.inventory.read",
+            "powerPlatform.quarantine.read",
+            "purview.audit.search.delegated",
+            "purview.audit.search.application",
+            "defender.hunting.delegated",
+            "defender.hunting.application",
+            "reports.copilotUsage.read"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/check"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities/check-progress"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/champions"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agent-relationships"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/resolve"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/unresolved-identities"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/package-details"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/start"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/runs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/retry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/state"
+      },
+      {
+        "method": "GET",
+        "route": "/api/directory/principals"
+      },
+      {
+        "method": "POST",
+        "route": "/api/directory/principals/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/preview",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/read",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id/rows"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/quarantine-selection"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/resources/:nativeId/related"
+      },
+      {
+        "method": "GET",
+        "route": "/api/mcp/access-profile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/mcp/authenticated-entry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/comparison"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups/:groupId/people"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agent-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/:setId/observations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/options"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/overview"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/directory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/audit"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/status"
+      },
+      {
+        "method": "GET",
+        "route": "/api/workbench/jobs"
+      }
+    ],
+    "staffPreviewAuthorized": true,
+    "privacy": {
+      "hide_employee_details": false,
+      "hide_champion_employee": false
+    }
+  },
+  "uploader": {
+    "audience": "adoption",
+    "operations": [
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/about"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/children"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/detail"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/members"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/sections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-associations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/health"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/purview"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/investigations/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/people/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/selections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-responsibility"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/:id/detail"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/:id/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id/items"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id/targets"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-selection"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/selections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/cancel"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id/records"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities"
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/:id/probe",
+        "inputChoices": {
+          "capabilityId": [
+            "graph.package.read.application",
+            "graph.directory.read",
+            "graph.users.read",
+            "graph.agentIdentity.read",
+            "graph.licenses.read",
+            "powerPlatform.inventory.read",
+            "powerPlatform.quarantine.read",
+            "purview.audit.search.delegated",
+            "purview.audit.search.application",
+            "defender.hunting.delegated",
+            "defender.hunting.application",
+            "reports.copilotUsage.read",
+            "reports.official.import"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/check"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities/check-progress"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/champions"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agent-relationships"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/resolve"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/unresolved-identities"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/package-details"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/start"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/runs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/retry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/state"
+      },
+      {
+        "method": "GET",
+        "route": "/api/directory/principals"
+      },
+      {
+        "method": "POST",
+        "route": "/api/directory/principals/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/preview",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/read",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id/rows"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/quarantine-selection"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/resources/:nativeId/related"
+      },
+      {
+        "method": "GET",
+        "route": "/api/mcp/access-profile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/mcp/authenticated-entry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/comparison"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups/:groupId/people"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agent-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/:setId/observations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/options"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/overview"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/directory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/audit"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/status"
+      },
+      {
+        "method": "GET",
+        "route": "/api/workbench/jobs"
+      }
+    ],
+    "staffPreviewAuthorized": true,
+    "privacy": {
+      "hide_employee_details": false,
+      "hide_champion_employee": false
+    }
+  },
+  "admin": {
+    "audience": "admin",
+    "operations": [
+      {
+        "method": "GET",
+        "route": "/api/agent-controls/:receiptId"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-controls/execute"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-controls/preview"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/about"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/children"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/detail"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/members"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/sections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-associations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-candidates"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/:recordId/usage-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/health"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/investigations/purview"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/investigations/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/people/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agent-inventory/selections"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-inventory/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agent-responsibility"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents"
+      },
+      {
+        "method": "PATCH",
+        "route": "/api/agents/:id/access"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/:id/block"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/:id/detail"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/:id/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/:id/unblock"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/access"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/block"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/block-all"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/bulk-jobs/:id/cancel"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/bulk-jobs/:id/items"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/bulk-jobs/:id/reconcile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/bulk-jobs/:id/resume"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/mutation-preview"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/mutation-selection"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/agents/refresh-jobs/:id/targets"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/refresh-selection"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/selections"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/unblock"
+      },
+      {
+        "method": "POST",
+        "route": "/api/agents/unblock-all"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/cancel"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit-search/jobs/:id/records"
+      },
+      {
+        "method": "POST",
+        "route": "/api/audit-search/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/audit/events"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities"
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/:id/probe",
+        "inputChoices": {
+          "capabilityId": [
+            "graph.package.read.delegated",
+            "graph.package.read.application",
+            "graph.package.access.manage",
+            "graph.package.block.manage",
+            "graph.package.reassign.manage",
+            "graph.directory.read",
+            "graph.users.read",
+            "graph.agentIdentity.read",
+            "graph.licenses.read",
+            "powerPlatform.inventory.read",
+            "powerPlatform.quarantine.read",
+            "powerPlatform.quarantine.manage",
+            "purview.audit.search.delegated",
+            "purview.audit.search.application",
+            "defender.hunting.delegated",
+            "defender.hunting.application",
+            "reports.copilotUsage.read",
+            "reports.official.import"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/capabilities/check"
+      },
+      {
+        "method": "GET",
+        "route": "/api/capabilities/check-progress"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/champions"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agent-relationships"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/:objectId/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/resolve"
+      },
+      {
+        "method": "GET",
+        "route": "/api/copilot-usage/users/unresolved-identities"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/package-details"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/package-details/start"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/runs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/data-sync/runs/:id/retry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/data-sync/state"
+      },
+      {
+        "method": "GET",
+        "route": "/api/directory/principals"
+      },
+      {
+        "method": "POST",
+        "route": "/api/directory/principals/resolve"
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/preview",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "POST",
+        "route": "/api/discovery/read",
+        "inputChoices": {
+          "operation": [
+            "profile",
+            "search",
+            "detail",
+            "workplace"
+          ]
+        }
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/catalog"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs"
+      },
+      {
+        "method": "DELETE",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/hunting/jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/hunting/jobs/:id/rows"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/quarantine-selection"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/refresh-jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/inventory/refresh-jobs/:id/resume"
+      },
+      {
+        "method": "GET",
+        "route": "/api/inventory/resources/:nativeId/related"
+      },
+      {
+        "method": "GET",
+        "route": "/api/mcp/access-profile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/mcp/authenticated-entry"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/comparison"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/context"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/departments"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/groups/:groupId/people"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/office-app-adoption/summary"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agent-users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/agents/:agentId/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/aggregate/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/:setId/observations"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/adoption"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/history/options"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/overview"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/agents"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/directory"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/:username/service-plans"
+      },
+      {
+        "method": "GET",
+        "route": "/api/official-usage/users/facets"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/audit"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs"
+      },
+      {
+        "method": "POST",
+        "route": "/api/quarantine/jobs"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/jobs/:id"
+      },
+      {
+        "method": "POST",
+        "route": "/api/quarantine/jobs/:id/cancel"
+      },
+      {
+        "method": "POST",
+        "route": "/api/quarantine/jobs/:id/reconcile"
+      },
+      {
+        "method": "POST",
+        "route": "/api/quarantine/jobs/:id/resume"
+      },
+      {
+        "method": "POST",
+        "route": "/api/quarantine/preview"
+      },
+      {
+        "method": "GET",
+        "route": "/api/quarantine/status"
+      },
+      {
+        "method": "GET",
+        "route": "/api/workbench/jobs"
+      }
+    ],
+    "staffPreviewAuthorized": true,
+    "privacy": {
+      "hide_employee_details": false,
+      "hide_champion_employee": false
+    }
+  }
+}

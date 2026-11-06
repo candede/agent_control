@@ -29,14 +29,10 @@ class PublicTool:
     request: type[BaseModel]
     response: type[BaseModel]
     description: str
-
-    @property
-    def grouped(self) -> bool:
-        return len(self.branches) > 1
+    grouped: bool = False
 
 
-def _family(name: str, **actions: str) -> PublicTool:
-    branches = tuple(Branch(action, operation_named(op)) for action, op in actions.items())
+def family(name: str, branches: tuple[Branch, ...]) -> PublicTool:
     requests: list[type[BaseModel]] = []
     responses: list[type[BaseModel]] = []
     for branch in branches:
@@ -60,8 +56,16 @@ def _family(name: str, **actions: str) -> PublicTool:
         )
     # Concrete Pydantic classes retain every nested DTO and its validators. The
     # SDK receives the actual discriminated union, not an optional-field bag.
-    request_union: object = Annotated[reduce(or_, requests), Field(discriminator="action")]
-    response_union: object = Annotated[reduce(or_, responses), Field(discriminator="action")]
+    request_union: object = (
+        requests[0]
+        if len(requests) == 1
+        else Annotated[reduce(or_, requests), Field(discriminator="action")]
+    )
+    response_union: object = (
+        responses[0]
+        if len(responses) == 1
+        else Annotated[reduce(or_, responses), Field(discriminator="action")]
+    )
     title = "".join(word.title() for word in name.split("_"))
     request_model = create_model(
         title + "Request",
@@ -77,10 +81,27 @@ def _family(name: str, **actions: str) -> PublicTool:
         request_model,
         response_model,
         " ".join(f"{branch.action}: {branch.operation.description}" for branch in branches),
+        True,
+    )
+
+
+def _family(name: str, **actions: str) -> PublicTool:
+    return family(
+        name, tuple(Branch(action, operation_named(op)) for action, op in actions.items())
     )
 
 
 _FAMILIES = (
+    _family("agent_catalog", search="search_agent_catalog", detail="read_discovery_detail"),
+    _family("my_workplace", read="read_my_workplace"),
+    _family("my_discovery_profile", read="read_my_discovery_profile"),
+    _family(
+        "preview_end_user",
+        profile="preview_discovery_profile",
+        search="preview_discovery_search",
+        detail="preview_discovery_detail",
+        workplace="preview_discovery_workplace",
+    ),
     _family("capabilities", list="list_capabilities", progress="get_capability_check_progress"),
     _family(
         "inventory",

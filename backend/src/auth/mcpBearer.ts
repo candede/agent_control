@@ -86,11 +86,11 @@ export class McpBearerVerifier {
       || typeof payload.scp !== "string" || payload.scp.length > 4096
       || !/^[A-Za-z0-9_.-]+(?: [A-Za-z0-9_.-]+)*$/.test(payload.scp)
       || !payload.scp.split(" ").includes(tenant.integration.scope)
-      || !Array.isArray(payload.roles) || !payload.roles.length || payload.roles.length > 64
-      || payload.roles.some(role => !isAppRole(role))
+      || payload.roles !== undefined && (!Array.isArray(payload.roles) || payload.roles.length > 64
+        || payload.roles.some(role => !isAppRole(role)))
       || payload.wids !== undefined && (!Array.isArray(payload.wids) || payload.wids.length > 64
         || payload.wids.some(role => typeof role !== "string" || !guid.test(role)))) throw invalidBearer();
-    const roles = payload.roles.filter(isAppRole);
+    const roles = Array.isArray(payload.roles) ? payload.roles.filter(isAppRole) : [];
     const result: VerifiedBearer = Object.freeze({
       tenantId: tenant.tenantId, apiClientId: tenant.clientId, integrationClientId: tenant.integration.clientId,
       localAccountId: payload.oid, roles: Object.freeze([...new Set(roles)].sort()),

@@ -64,8 +64,11 @@ not workload/application assignments.
 | `AgentControl.Admin` | Viewer/Uploader access; provider changes, published-report corrections/selection/deletion, configuration and local Audit read/export. |
 
 Open **Enterprise applications > Agent Control > Properties** and set
-**Assignment required?** to **Yes**. Under **Users and groups**, assign each
-approved user/group one role. Uploader includes Viewer; Admin includes both.
+**Assignment required?** to **No** after the hardened API/MCP deployment.
+Under **Users and groups**, retain and assign explicit staff roles to approved
+adoption/admin users. Verified active tenant members with no roles receive only
+employee discovery; no EndUser role exists. Guests, disabled users and malformed
+roles do not receive that default. Uploader includes Viewer; Admin includes both.
 Sign out/in after assignment changes. Group assignment requires the applicable
 Entra licensing; nested group assignments do not cascade.
 
@@ -176,8 +179,56 @@ For manual configuration and token-validation rules, use the
 | `https://<mcp-origin>/auth/callback` | MCP registration, Web redirect. |
 | Actual consumer OAuth callback | MCP downstream redirect allowlist, not the Entra registration. |
 
-Provider permissions remain on the API registration. MCP users still need their
-Agent Control role; an MCP registration or consent grant does not assign that role.
+Provider permissions remain on the API registration. Set **Assignment required?**
+to **No** on the existing MCP enterprise application as well when admitting
+employee OAuth. Keep both registrations tenant-only, existing explicit staff
+assignments, admin consent and callbacks. Do not recreate registrations or add
+Entra write permission to MCP. Only the approved rollout owner changes the exact
+two existing service principals' `appRoleAssignmentRequired` properties; application
+roles still protect every staff API. Consent does not grant an app role.
+
+Roleless eligibility uses a bounded exact application Graph lookup of the actual
+tenant-local `oid` with `User.Read.All`; it is not a license check or workplace writer.
+An unlicensed employee absent from saved directory/report sources remains catalog-only.
+Normal authenticated entry automatically admits due application Graph reads without
+manual Sync permission. Power Platform remains delegated-only and genuine usage
+report imports remain staff-owned.
+
+### Bounded rollout on existing enterprise applications
+
+Phase 04 first reconciles the current seha installation and reads its existing
+tenant, API client ID and MCP client ID from protected saved deployment settings.
+Do not substitute example IDs or create applications. From an already authorized
+administrator's tenant session, the bounded assignment-required change is:
+
+```powershell
+# These two IDs come from the reconciled existing installation.
+$currentTenant = az account show --query tenantId -o tsv
+if ($LASTEXITCODE -or $currentTenant -ine $deploymentTenantId) {
+    throw 'Administrator session does not match the existing installation tenant.'
+}
+foreach ($clientId in @($apiClientId, $mcpClientId)) {
+    $principals = @(az ad sp list --filter "appId eq '$clientId'" --query '[].{id:id,appId:appId}' -o json | ConvertFrom-Json)
+    if ($LASTEXITCODE -or $principals.Count -ne 1 -or $principals[0].appId -ine $clientId) {
+        throw 'Exact existing service principal could not be resolved.'
+    }
+    $uri = "https://graph.microsoft.com/v1.0/servicePrincipals/$($principals[0].id)"
+    az rest --method patch --url $uri --body '{"appRoleAssignmentRequired":false}' --only-show-errors
+    if ($LASTEXITCODE) { throw 'Existing service-principal assignment setting was not updated.' }
+    $saved = az rest --method get --url "$uri`?`$select=id,appId,appRoleAssignmentRequired" --only-show-errors -o json | ConvertFrom-Json
+    if ($LASTEXITCODE -or $saved.appId -ine $clientId -or $saved.appRoleAssignmentRequired -cne $false) {
+        throw 'Existing service-principal setting did not converge.'
+    }
+}
+```
+
+Use service-principal **object IDs** returned by the exact lookup, not application
+client IDs or application-object IDs in PATCH URLs. This updates two properties
+only, preserving role assignments, app roles, grants/consent, credentials and
+redirects. Administrative control-plane permission stays with the operator;
+neither API nor MCP receives Entra write permission. Phase 01 makes no live change.
+The Azure setup owner reports the existing property without requiring its former
+`true` value before deployment.
 
 ## Verify the affected journeys
 
@@ -188,7 +239,9 @@ Agent Control role; an MCP registration or consent grant does not assign that ro
 - Confirm Uploader can import new reports but cannot change published reports.
 - For optional MCP, confirm the same user sees equivalent authorized saved data
   without first warming a browser session. Test refresh/reconnect and rejection
-  of wrong audience, tenant, scope, calling client and absent app-role assignment.
+  of wrong audience, tenant, scope, calling client, malformed/unknown roles,
+  guests and disabled roleless accounts. Verify absent/empty roles for an active
+  employee, automatic application reads and a catalog-only unlicensed employee.
 - Provider changes require current Admin and Microsoft authority plus exact
   target confirmation. Never test destructive controls on ordinary user targets
   merely to prove sign-in.

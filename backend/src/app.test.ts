@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { request as httpRequest, type ClientRequest, type Server } from "node:http";
@@ -47,6 +47,11 @@ import { generationInput } from "../scripts/largeTenantFixtures.js";
 import type { OfficialReportAccepted, OfficialReportBundlePreview, OfficialReportExportStatus, OfficialReportPreview } from "./types/officialReportApi.js";
 import type { ReportAgent, ReportHistorySet, ReportPage, ReportRelationship, ReportUser } from "./types/officialReportData.js";
 
+function localId(principalId: string) {
+  const value = createHash("sha256").update(principalId).digest("hex");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
+}
+
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
   process.env.TENANTS_JSON=JSON.stringify([
@@ -77,13 +82,13 @@ vi.mock("./auth/msal.js", async original => {
     return { ...user, roles: [...user.roles] };
   });
   const account = (tenantId: string, principalId: string) => ({
-    tenantId, homeAccountId: principalId, localAccountId: principalId,
+    tenantId, homeAccountId: principalId, localAccountId: localId(principalId),
     environment: "login.microsoftonline.com", username: `${principalId}@example.invalid`,
-    idTokenClaims: { tid: tenantId, oid: principalId },
+    idTokenClaims: { tid: tenantId, oid: localId(principalId) },
   });
   const result = (user: typeof authFixture.user, scopes: string[], accessToken = "fixture-token") => ({
-    authority: `https://login.microsoftonline.com/${user.tenantId}`, uniqueId: user.homeAccountId, tenantId: user.tenantId,
-    account: account(user.tenantId, user.homeAccountId), idToken: "synthetic-identity", idTokenClaims: { tid: user.tenantId, oid: user.homeAccountId },
+    authority: `https://login.microsoftonline.com/${user.tenantId}`, uniqueId: localId(user.homeAccountId), tenantId: user.tenantId,
+    account: account(user.tenantId, user.homeAccountId), idToken: "synthetic-identity", idTokenClaims: { tid: user.tenantId, oid: localId(user.homeAccountId) },
     scopes, accessToken, expiresOn: new Date(Date.now() + 3_600_000), fromCache: false, tokenType: "Bearer", correlationId: "",
     syntheticUser: user,
   });
@@ -153,7 +158,11 @@ beforeAll(async () => {
   pool.options.database = fixture.name; pool.options.user="agentcontrol_app"; pool.options.password=fixturePassword;
   mkdirSync(join(directory,"assets"), { recursive: true }); writeFileSync(join(directory,"index.html"),"<!doctype html><html><body><div id='root'>Fixture shell</div></body></html>");
   writeFileSync(join(directory,"assets/app.js"),"console.log('fixture')");
-  application = createApp(fixture.runtime,directory);
+  application = createApp(fixture.runtime,directory, async url => {
+    const target = new URL(String(url));
+    if (target.origin !== "https://graph.microsoft.com" || !target.pathname.startsWith("/v1.0/users/")) throw new Error("Unexpected identity fixture request");
+    return Response.json({ id: target.pathname.split("/").at(-1), accountEnabled: true, userType: "Member" });
+  });
   await new Promise<void>(resolve => { server=application.app.listen(0,"127.0.0.1",resolve); });
   base=`http://127.0.0.1:${(server.address() as {port:number}).port}`;
   vi.spyOn(GraphPackagesClient.prototype,"collectCatalog").mockImplementation(async (_token, options) => {
@@ -522,7 +531,7 @@ describe.sequential("packaged API/session contracts", () => {
       cookie=callback.headers.get("set-cookie")!.split(";")[0];
       const me=await request("/api/me");
       expect(me.status).toBe(200);
-      expect(await me.json()).toMatchObject({user:{roles:[]},roleAssignmentRequired:true});
+      expect(await me.json()).toMatchObject({user:{roles:[]}});
     } finally {
       authFixture.user.roles=["AgentControl.Admin"];
       cookie=originalCookie;
@@ -1085,7 +1094,7 @@ describe.sequential("packaged API/session contracts", () => {
     const noRoleCookie=await roleCookie("unassigned",[]);
     const me=await request("/api/me",{headers:{Cookie:noRoleCookie}});
     expect(me.status).toBe(200);
-    expect((await me.json()).roleAssignmentRequired).toBe(true);
+    expect(await me.json()).toMatchObject({user:{roles:[]}});
     expect((await request("/api/capabilities",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
     expect((await request("/api/capabilities/check-progress",{headers:{Cookie:noRoleCookie}})).status).toBe(403);
     expect((await request("/api/capabilities/check",{method:"POST",headers:{Cookie:noRoleCookie}})).status).toBe(403);
@@ -1112,8 +1121,7 @@ describe.sequential("packaged API/session contracts", () => {
       { retryFailed: false, signal: expect.any(AbortSignal) });
     expect((await request("/api/agents/package-1/block", { method: "POST", headers: { Cookie: viewerCookie, "Content-Type": "application/json" }, body: "{}" })).status).toBe(403);
     expect((await request("/api/official-usage/staging/not-owned", { method: "DELETE", headers: { Cookie: viewerCookie } })).status).toBe(403);
-    const legacyCookie = await roleCookie("legacy-role-only", ["AgentControl.Reader" as AppRole]);
-    expect((await request("/api/agents", { headers: { Cookie: legacyCookie } })).status).toBe(403);
+    await expect(roleCookie("unknown-role", ["AgentControl.Reader" as AppRole])).rejects.toThrow("Session tenant/principal/client mismatch");
   });
   it("allows Viewer and inherited Admin package reads including exact targets", async () => {
     const readerCookie=await roleCookie("reader",["AgentControl.Viewer"]);

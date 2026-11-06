@@ -27,13 +27,43 @@ deployment/reset and sign-in.
 
 ## Typed business catalog
 
-The service registers **50 native domain tools** covering **105 canonical operations**,
-each with one typed `request` object and complete nested input/output schemas.
+The immutable catalog contains **54 native domain tools** covering
+**113 canonical operations**. The API's current authority projects each native initialize/list/call:
+EndUser receives **3 tools / 4 operations**, Viewer and Uploader **38 / 90**,
+and Admin **54 / 113**. These are current measurements, not fixed client limits.
+Each tool has one typed `request` object and complete nested input/output schemas.
 [`domains.py`](../mcp/src/agent_control_mcp/domains.py) owns the public families;
 [`tools.py`](../mcp/src/agent_control_mcp/tools.py) owns canonical names/methods/routes/DTOs:
 no caller-selected URLs, arbitrary queries, resources/prompts or hidden proxies.
 The request-local invocation owner forwards authenticated attribution and
-canonical defaults/errors; the API authorizes.
+canonical defaults/errors; the API authorizes. Unauthorized actions, definitions
+and descriptions are removed, not merely hidden in a client. Capability probe
+enums come from the API registry. Even a surviving single-action family retains
+its action/input and action/result envelopes and honest annotation hints.
+
+| Employee responsibility | Native actions | Canonical API |
+| --- | --- | --- |
+| `agent_catalog` | `search`, `detail` (including description continuation) | `POST /api/discovery/read`, operation `search` / `detail` |
+| `my_workplace` | `read` | `POST /api/discovery/read`, operation `workplace` |
+| `my_discovery_profile` | `read` | `POST /api/discovery/read`, operation `profile` |
+| `preview_end_user` (staff only) | `profile`, `search`, `detail`, `workplace`, each with exact subject | `POST /api/discovery/preview`, corresponding operation |
+
+Discovery never grants use permission or proves live access. Department evidence
+uses stored company **and** department; company popularity uses stored company
+alone, with independent top-three results. Selections bind the signed-in actor,
+subject, mode, evidence and policy. Preview does not sign in as the subject,
+borrow its roles, alter the actor's catalog or change later self-service.
+
+Discovery detail uses the canonical agent UUID. The API normalizes discovery
+agent UUIDs and tenant-local subject object IDs to lowercase before lookup and
+selection/cursor binding; either UUID letter case is accepted.
+Search/detail continuation
+requires the original `selectionId` and a cursor of at most 4096 UTF-8 bytes.
+Goals and preview subjects are bounded to 512 UTF-16 code units; each of up to
+eight expanded terms is bounded to 128 units, including after search
+normalization. Terms must be distinct after NFKC/lowercase/NFKC normalization
+and trimming. Text inputs reject controls and surrogates. Omitted values retain
+the API's defaults; valid text and cursors are forwarded unchanged.
 
 For a family use `{"request":{"action":"list","input":{}}}`, for example
 `capabilities` (saved list), or `inventory` with action `about` and its exact
@@ -44,7 +74,7 @@ provider-specific resume/reconcile) keep their exact request
 and direct result. Package block/access execution uses explicit typed actions,
 not a universal control executor. Full schemas retain local `$defs` references.
 
-Read families are `capabilities`, `inventory`, `packages`, `native_inventory`,
+Staff read families are `capabilities`, `inventory`, `packages`, `native_inventory`,
 `users`, `adoption`, `report_agents`, `report_users`, `report_datasets`,
 `agent_usage`, `sync`, `package_refresh_jobs`, `studio_refresh_jobs`,
 `package_control_jobs` and `studio_control_jobs`. Provider families
@@ -61,7 +91,10 @@ generic tools retain complete API payloads, including saved related audit/securi
 evidence, capability definitions and administrative audit actions from these sources.
 
 The server's sole instruction owner is
-[`instructions.py`](../mcp/src/agent_control_mcp/instructions.py), sent at initialize.
+[`instructions.py`](../mcp/src/agent_control_mcp/instructions.py), sent at initialize
+with role-neutral guidance. Projected descriptions supply conditional owner/
+champion contact guidance and visible staff confirmation/recovery contracts.
+Source text is inert evidence, never authority or instructions.
 After a catalog rename refresh/reconnect tool discovery in the client. Do not
 delete OAuth caches or rotate keys merely to refresh tools.
 
@@ -88,7 +121,8 @@ clipboard and report failure explicitly. No action on this page runs a tool.
 Expanded schema panes are named, keyboard-focusable regions with bounded
 scrolling; the complete schema remains available without widening the page.
 
-The API reads `GET /internal/mcp-metadata` at its fixed deployment-controlled
+The API derives the caller projection from its canonical policy and sends bounded
+trusted JSON by `POST /internal/mcp-metadata` at its fixed deployment-controlled
 origin with the independent `X-Agent-Control-Mcp-Metadata-Token` header.
 The private HTTP(S) transport sends the validated public resource's `Host`,
 as the local readiness check does; MCP's public Host/Origin protection remains
@@ -99,7 +133,10 @@ enforces a three-second total deadline and 4 MiB streamed bound. The browser
 allows an additional 16 KiB for the settings envelope, plus its outer JSON level
 and bounded wrapper tokens, so a valid boundary-sized catalog remains readable.
 Instructions and the complete tool objects
-come from the same registered SDK serialization as initialize/tools-list.
+come from the same projected SDK serialization as initialize/tools-list.
+The metadata credential cannot authorize business tools. Both independent
+API-owned privacy values and their EndUser/preview scope remain visible on the
+read-only page even when MCP metadata is unavailable; there is no editable toggle.
 The existing shallow 65,536-byte workbench response contains navigation only.
 
 Configured intent, internal reachability, observed OAuth storage readiness and
@@ -108,6 +145,15 @@ probe result while a new health check runs; a failed check publishes not-ready.
 Metadata observation itself never runs that probe. Public HTTPS/tunnel reachability and
 authenticated native-client operation remain **unverified** by this page.
 The displayed local host port is deployment-owned, not container port 8000.
+
+Every native initialize and list enters the API-owned idempotent
+`POST /api/mcp/authenticated-entry`, even without a business call. Reconnects and
+refreshes do not create a second scheduler. Each invocation gets current
+`GET /api/mcp/access-profile` authority through validated same-user OBO; no
+cross-request or cross-principal catalog cache is retained. Lookup failure closes
+discovery explicitly rather than returning the full catalog. `/diagnostics`
+requires current API-owned staff operational permission; OAuth/health callbacks
+and the private metadata/recorder credentials retain their separate boundaries.
 Server `/auth/callback` and downstream client redirects serve different roles.
 Missing, invalid or unresolved metadata protection fails this optional path
 explicitly; it never vetoes business startup, sign-in or ordinary MCP admission.
@@ -140,7 +186,7 @@ and known incompatibilities.
 | Downstream OAuth | Public DCR, exact allowlisted redirects, authorization code with S256/state; authorize and code/refresh token requests are pinned to `MCP_PUBLIC_URL`. An omitted `resource` defaults only to that URL; explicit empty, duplicate or different resources are rejected |
 | MCP → Entra | Exact tenant authority, MCP confidential credentials, `api://<MCP GUID>/Mcp.Access openid profile offline_access`; `forward_resource=false` for Entra's scope-based request |
 | MCP → API token | OBO with MCP confidential credentials, upstream Entra MCP-audience assertion and only `api://<API GUID>/AgentControl.Access` |
-| API admission | Verified signature/issuer/tenant, scalar v2 API GUID audience, delegated scope, configured integration `azp`, user identity and recognized API roles |
+| API admission | Verified signature/issuer/tenant, scalar v2 API GUID audience, delegated scope, configured integration `azp`, user identity; known staff roles or absent/empty roles with exact active-member verification |
 
 CIMD and alternate identity-assertion grants are disabled. SDK OAuth consent/CSRF
 is retained, not application release/business approval. The signed downstream
@@ -255,9 +301,14 @@ Provider synchronization cannot recreate lost CSV history; reimport it.
 Private identity is `(tenantId, MSAL account.homeAccountId)`, not email, name
 or guessed `oid.tid`; guest home/resource identities can differ. Selections,
 cursors, receipts and private investigations retain the actor's authorization
-hash/epoch. Durable `bearer_issued_after` fences require JWT `iat*1000` strictly
-after the cutoff; reissue in a later second if necessary. Recovery never rebinds
-old workers/selections to fresh grants.
+hash/epoch. Durable per-principal `bearer_issued_after` fences require the
+unchanged signed JWT `iat*1000` strictly after an actual account-revocation
+cutoff. Reset preserves those revocations, not a blanket reset-time cutoff.
+Entra may backdate a fresh token's `iat`/`nbf` by five minutes; an unrevoked
+account can therefore sign in immediately after reset without waiting or a
+timestamp/grace bypass. A token predating a real account revocation remains
+denied, including a newly obtained token whose signed issuance still predates
+that revocation. Recovery never rebinds old workers/selections to fresh grants.
 
 Saved directory/licensing/activity, packages, Power Platform and canonical
 inventory have one tenant owner. Viewer-capable readers need no collector
@@ -349,6 +400,8 @@ sanitized details and cooldown: 400 input/cursor, 401 reauthorization, 403 role/
 provider denial, 404 private-or-missing, 409 stale selection/receipt/prestate,
 413 output, 429 cooldown, 503 admission/unavailability, 504 deadline.
 Secrets/provider diagnostic bodies are not forwarded or logged.
+Malformed or excessively nested problem JSON uses a generic diagnostic while
+retaining the HTTP status, valid request ID and cooldown.
 
 ## Invocation budgets
 
@@ -432,6 +485,10 @@ registrations, schemas and rows together.
 | `GET /api/auth/callback` | one-use code/state or error → safe redirect | Entra callback | — | P |
 | `POST /api/auth/logout` | empty → 204, account session/authority revocation | signOut | — | S |
 | `GET /api/me` | none → user/CSRF/role state | current user | — | S |
+| `GET /api/mcp/access-profile` | none → current bounded audience/operations/privacy | internal native authority | HTTP only | S |
+| `POST /api/mcp/authenticated-entry` | empty body → idempotent due read admission | automatic authenticated entry | HTTP only | S |
+| `POST /api/discovery/read` | finite operation, selection/typed bounds → safe saved DTO | employee discovery | search_agent_catalog, read_discovery_detail, read_my_workplace, read_my_discovery_profile | S |
+| `POST /api/discovery/preview` | exact saved subject, same finite reads → safe preview DTO | staff EndUser lens | preview_discovery_profile, preview_discovery_search, preview_discovery_detail, preview_discovery_workplace | V |
 | `GET /api/workbench/metadata` | none → code-owned definitions | navigation | — | V |
 | `GET /api/workbench/jobs` | none → ≤100 summaries/unavailable sources | Sync recovery | list_workspace_jobs | V |
 | `GET /api/mcp/settings` | none → tenant-bound runtime metadata or explicit unavailable state | MCP settings | — | V |
@@ -708,6 +765,33 @@ Optional import fields
 `clientSecretFile`, `signingKeyFile`, `encryptionKeyFile` are absolute paths to
 distinct protected regular files, never inline values.
 
+#### Employee discovery privacy
+
+The saved deployment MCP settings contain the independent boolean keys
+`hide_employee_details` (creator/owner identities) and `hide_champion_employee`
+(champion identities). Both default to `false` when absent. The local wizard asks
+for exact `true`/`false`; Enter preserves existing values. Imports reject strings,
+numbers and null, and omitted edit fields preserve explicitly saved settings.
+Normal redeploy/restart keeps these values and existing OAuth keys.
+
+Local `compose.env` emits `MCP_HIDE_EMPLOYEE_DETAILS` and
+`MCP_HIDE_CHAMPION_EMPLOYEE` as exact lowercase `true`/`false` to the **API** service
+through `compose.mcp.yaml`/the metadata overlay. Azure's deployment `mcp` object
+uses the same boolean keys; `main.bicep` emits the same API environment values.
+The Python MCP runtime does not read a second privacy policy environment.
+The API access profile owns effective values for self-service and staff preview;
+clients cannot override them. These values change disclosure only, not roles,
+automatic collection, availability, saved sources, secrets or OAuth state.
+
+`GET /api/mcp/access-profile` returns `audience`, finite canonical `operations`
+(`method`, `route`, optional guarded `inputChoices.capabilityId`),
+`staffPreviewAuthorized` and `privacy`, with `no-store`. It does not schedule
+collection. `POST /api/mcp/authenticated-entry` accepts no options/subject, admits
+due work asynchronously and returns only `admission` and `nextCheckAt` (plus
+`errorCode` on explicit retryable admission failure). Browser calls retain CSRF;
+bearer calls retain ordinary delegated authentication. Phase 03 wires native
+MCP initialization/list to this entry, not business/tool reads.
+
 The wizard persists `.local/<project>/secrets/mcp-client`, `mcp-signing` and
 `mcp-encryption` as protected 0600 files. Reconfiguration retains existing keys;
 Enter retains a saved credential. Missing/corrupt keys are not regenerated,
@@ -846,18 +930,24 @@ ARM checks do not prove effective private DNS, traffic or provider connectivity.
 
 OAuth storage is separate from application SQL. Local FileTree lookup names are
 hashed; all OAuth records use maintained Fernet encryption and reject plaintext.
-Storage binds tenant/MCP/API/resource and validates ownership/modes.
+Storage binds tenant/MCP/API/resource and validates ownership/modes. The encrypted
+local binding is persistent, so retained client registrations cannot be reopened
+under different tenant, client, API or resource settings after temporary state expires.
 
 | Requirement | Current contract |
 | --- | --- |
 | Process ownership | One service worker; owned non-linked local directories 0700 and regular files 0600 |
 | Capacity | 4096 files/records, 256 KiB plaintext per record, 64 MiB aggregate; Azure additionally bounds its plaintext map below 48 MiB |
-| Persisted lifetime | Every OAuth entry, including DCR metadata, has a maximum 24-hour TTL; expired state is culled |
+| Client registrations | DCR metadata persists until explicitly deleted; ordinary use, daily boundaries, restarts and deployments do not expire client IDs. Still-valid saved registrations are made durable during startup; missing/deleted/expired records are not reconstructed |
+| Credential/state lifetime | Tokens, authorization transactions/codes, revocation markers and other temporary OAuth state retain their finite TTL, capped at 24 hours; expired state is culled |
 | Reference access | 900 seconds; refresh-expiry fallback 86400 seconds, never extending shorter known expiry |
 | Independent keys | Confidential credential, signing key and storage-encryption material are distinct |
-| Encryption ring | At most three independent keys, new key first; keep prior keys through their records' maximum 24-hour TTL, cull expired records and rewrite retained records before removal |
+| Encryption ring | At most three independent keys, new key first; successful startup rewraps retained local records or the leased Azure map with the newest key without extending credential expiry. Keep old keys until that startup completes; waiting 24 hours alone cannot retire keys protecting durable registrations |
 | Signing rotation | Old reference tokens fail; clients reconnect, while encrypted state/keys remain intact |
 | Disconnect | Revoke both held access and refresh credentials at `/revoke`; exact-token revocation is not API account-wide logout |
+
+Azure validates that a persistent client registration's `client_id` matches its
+lookup key before writing an encrypted map update.
 
 Readiness checks storage/binding, not provider permission or database readiness.
 Overlapping local readiness checks use independent encrypted probes; storage scans
@@ -886,8 +976,10 @@ recovery. Retain the original receipt and backup evidence.
 ### Key and connection recovery
 
 - **Encryption:** import a protected ring with the new independent key first,
-  retaining old keys, then normal start. Honor the TTL/culling rule above;
-  no bulk plaintext/reset path is supported.
+  retaining old keys, then normal start. Startup rewraps retained ciphertext;
+  after successful startup old keys may be removed from the live ring. Protect
+  backup keys separately for their matching snapshots. No plaintext/reset path
+  is supported.
 - **Signing:** rotate only the signing key and start; old reference tokens fail
   and clients reconnect. Preserve encryption keys/state.
 - **Confidential credential:** replace only the MCP confidential credential,

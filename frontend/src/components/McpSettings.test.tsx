@@ -10,6 +10,7 @@ const user: SessionUser = { tenantId: "tenant", homeAccountId: "reader", roles: 
   displayName: "Reader", username: "reader@example.invalid" };
 const description = "  Long exact\n<script>alert('inert')</script>  ";
 const settings: Settings = { state: "available", configured: { resourceUrl: "https://mcp.example.invalid/mcp", localHostPort: 3003 },
+  privacy: { hide_employee_details: false, hide_champion_employee: false }, privacyScope: "end_user_and_preview",
   observedAt: "2026-11-04T10:00:00.000Z", runtime: {
     binding: { tenantId: "tenant", apiClientId: "api", mcpClientId: "mcp", resourceUrl: "https://mcp.example.invalid/mcp" },
     serverInfo: { name: "Agent Control", version: "0.1.0" }, instructions: description, transport: "streamable-http",
@@ -18,6 +19,15 @@ const settings: Settings = { state: "available", configured: { resourceUrl: "htt
       outputSchema: { type: "object" }, annotations: { readOnlyHint: name === "saved_read" } })),
   } };
 afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); });
+it.each([[false, false], [true, false], [false, true], [true, true]])("shows independent API privacy values during metadata outage (%s,%s)", async (employee, champion) => {
+  vi.mocked(getMcpSettings).mockResolvedValue({ state: "unavailable", configured: settings.configured, code: "metadata_unavailable",
+    privacy: { hide_employee_details: employee, hide_champion_employee: champion }, privacyScope: "end_user_and_preview" });
+  render(<McpSettings user={user} />);
+  await screen.findByRole("heading", { name: "Employee discovery privacy" });
+  expect(screen.getByText("hide_employee_details").closest("div")).toHaveTextContent(String(employee));
+  expect(screen.getByText("hide_champion_employee").closest("div")).toHaveTextContent(String(champion));
+  expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+});
 it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)("shows exact inert metadata to %s", async role => {
   vi.mocked(getMcpSettings).mockResolvedValue(settings);
   const { container } = render(<McpSettings user={{ ...user, roles: [role] }} />);
@@ -36,8 +46,8 @@ it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentContro
   expect(screen.getByText(/<img onerror/)).toBeVisible();
 });
 it.each(["not_configured", "unavailable", "binding_mismatch"] as const)("shows explicit %s state", async state => {
-  vi.mocked(getMcpSettings).mockResolvedValue(state === "not_configured" ? { state } :
-    { state, configured: { resourceUrl: "https://configured.invalid/mcp" }, code: "metadata_unavailable" });
+  vi.mocked(getMcpSettings).mockResolvedValue(state === "not_configured" ? { state, privacy: settings.privacy, privacyScope: settings.privacyScope } :
+    { state, configured: { resourceUrl: "https://configured.invalid/mcp" }, code: "metadata_unavailable", privacy: settings.privacy, privacyScope: settings.privacyScope });
   render(<McpSettings user={user} />);
   if (state === "not_configured") expect(await screen.findByText(/No MCP server is configured/)).toBeVisible();
   else expect(await screen.findByRole("button", { name: "Retry metadata" })).toBeVisible();

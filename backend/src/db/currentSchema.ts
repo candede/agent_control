@@ -4,6 +4,7 @@ import { agentControlReceiptsSql } from "./agentControlReceiptsSchema.js";
 import { unknownOrigin } from "../types/actionOrigin.js";
 import { readableReportVersionSql } from "./reportCapacitySchema.js";
 import { officeAppAdoptionSchemaSql } from "./officeAppAdoptionSchema.js";
+import { agentDiscoverySchemaSql } from "./agentDiscoverySchema.js";
 
 const schemaBaseSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
@@ -6697,5 +6698,5 @@ VALUES ('records')
      , ('report_payloads')
      , ('report_staging');
 `;
-export const currentSchemaSql: string = auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql
+export const currentSchemaSql: string = agentDiscoverySchemaSql + auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql
   + officeAppAdoptionSchemaSql;

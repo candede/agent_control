@@ -5,6 +5,7 @@ import { PackageRefreshJobs, type PackageDataScope, type PackageRefreshInput } f
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { AppError, isTimeoutError } from "../errors.js";
 import { hasAppRole, type CapabilityId } from "../types/capability.js";
+import { automaticApplicationRead } from "../auth/authorityContext.js";
 import type { AuthenticatedUser } from "../types/session.js";
 import { dataSyncFailureStatus } from "../types/dataSync.js";
 import type { PackageDetailSyncState } from "../types/dataSync.js";
@@ -380,7 +381,7 @@ export class PackageInventoryService {
           await this.repository.markWaitingAuthorization(scope, id);
         }
       } else if (ownedWaitingJob && failure instanceof AppError && dataSyncFailureStatus(failure.code, failure.status) === "permission_required") {
-        await this.repository.markFailed(scope, id, syncFailureCode(failure), safeFailureMessage(failure));
+        await this.repository.markFailed(scope, id, syncFailureCode(failure), safeFailureMessage(failure), current!.resultRevision);
       }
       assertCurrent();
       throw failure;
@@ -421,7 +422,7 @@ export class PackageInventoryService {
   }
 
   async cancel(user: AuthenticatedUser, id: string, tokenMode: RefreshInput["tokenMode"], cancellationReason: RefreshCancellationReason = "requested") {
-    requireRefreshRole(user);
+    if (cancellationReason === "requested") requireRefreshRole(user);
     const actor = actorScope(user);
     const validation = cancellationReason === "requested" ? beginAccountSessionValidation(actor.tenantId, actor.principalId) : undefined;
     const assertCurrent = () => { if (validation) assertAccountSessionValidation(validation); };
@@ -704,7 +705,7 @@ function actorScope(user: AuthenticatedUser): PackageDataScope {
 }
 
 function requireRefreshRole(user: AuthenticatedUser) {
-  if (!hasAppRole(user.roles, "AgentControl.Viewer")) throw new AppError(403, "missing_internal_role", "Package refresh requires Viewer.");
+  if (!hasAppRole(user.roles, "AgentControl.Viewer") && !automaticApplicationRead(user, "graph.package.read.application")) throw new AppError(403, "missing_internal_role", "Package refresh requires Viewer.");
 }
 
 function requireSamePrincipal(scope: PackageDataScope, user: AuthenticatedUser) {

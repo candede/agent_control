@@ -165,14 +165,22 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
             "MCP_API_CLIENT_ID": "${MCP_API_CLIENT_ID}",
             "MCP_PUBLIC_URL": "${MCP_PUBLIC_URL}",
             "MCP_LOCAL_HOST_PORT": "${MCP_PORT}",
+            "MCP_HIDE_EMPLOYEE_DETAILS": "${MCP_HIDE_EMPLOYEE_DETAILS:-false}",
+            "MCP_HIDE_CHAMPION_EMPLOYEE": "${MCP_HIDE_CHAMPION_EMPLOYEE:-false}",
         }
     }
     metadata = yaml.safe_load((ROOT / "compose.mcp-metadata.yaml").read_text())
     assert set(metadata) == {"services"}
     assert set(metadata["services"]) == {"app", "mcp"}
-    for service in metadata["services"].values():
+    for name, service in metadata["services"].items():
+        environment = {"MCP_METADATA_TOKEN_FILE": "/run/secrets/mcp-metadata"}
+        if name == "app":
+            environment |= {
+                "MCP_HIDE_EMPLOYEE_DETAILS": "${MCP_HIDE_EMPLOYEE_DETAILS:-false}",
+                "MCP_HIDE_CHAMPION_EMPLOYEE": "${MCP_HIDE_CHAMPION_EMPLOYEE:-false}",
+            }
         assert service == {
-            "environment": {"MCP_METADATA_TOKEN_FILE": "/run/secrets/mcp-metadata"},
+            "environment": environment,
             "volumes": [
                 {
                     "type": "bind",
@@ -184,6 +192,8 @@ def test_optional_compose_keeps_api_independent_and_authority_separate():
             ],
         }
     mcp = overlay["services"]["mcp"]
+    assert "MCP_HIDE_EMPLOYEE_DETAILS" not in mcp["environment"]
+    assert "MCP_HIDE_CHAMPION_EMPLOYEE" not in mcp["environment"]
     assert "depends_on" not in mcp
     assert mcp["environment"]["MCP_API_ORIGIN"] == "http://app:3001"
     assert mcp["environment"]["MCP_RECORDING_STORAGE_PATH"] == (
@@ -235,11 +245,25 @@ def test_image_is_pinned_nonroot_locked_and_uses_only_approved_python_feed():
     assert "UV_PYTHON_DOWNLOADS=never" in dockerfile
     assert "USER 10001:10001" in runtime
     assert "mcp/tests" not in runtime and "container_service" not in runtime
-    assert "COPY --from=dependencies /opt/mcp/.venv .venv" in runtime
+    assert "COPY --from=runtime-dependencies /opt/mcp/.venv .venv" in runtime
     assert 'ENTRYPOINT ["agent-control-mcp"]' in runtime
     assert "secrets/" not in dockerfile
     assert "STOPSIGNAL SIGTERM" in runtime
     assert "TMPDIR=/work" in dockerfile and "TMPDIR=" not in runtime
+
+
+def test_image_reuses_locked_dependencies_and_replaces_only_the_application_offline():
+    dockerfile = (ROOT / "mcp/Dockerfile").read_text()
+    dependencies = dockerfile.split(" AS dependencies\n", 1)[1].split("\nFROM ", 1)[0]
+    application = dockerfile.split(" AS application\n", 1)[1].split("\nFROM ", 1)[0]
+    assert "ARG MCP_DEPENDENCY_BASE=python:3.14.6-slim-bookworm@sha256:" in dockerfile
+    assert 'if [ "$REUSE_INSTALLED_DEPENDENCIES" != 1 ]' in dependencies
+    assert "--no-install-project" in dependencies and "COPY mcp/src" not in dependencies
+    assert application.index("rm -rf src") < application.index("COPY mcp/src src")
+    assert "uv build --wheel --offline" in application
+    assert "uv pip install --offline --no-deps --reinstall-package agent-control-mcp" in application
+    assert "uv sync" not in application and "pip install" not in dependencies.split("COPY mcp/")[1]
+    assert "uv sync --frozen --no-dev --no-editable --offline" in dockerfile
 
 
 @pytest.mark.parametrize(

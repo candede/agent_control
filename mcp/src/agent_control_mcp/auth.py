@@ -68,18 +68,17 @@ def valid_claims(
             and isinstance(claims.get("scp"), str)
             and ("AgentControl.Access" if api else "Mcp.Access") in claims["scp"].split()
             and not any(key in claims for key in ("nonce", "appid", "fastmcp_grant"))
-            and claims.get("idtyp") != "app"
+            and ("idtyp" not in claims or claims["idtyp"] == "user")
             and nbf <= now
             and iat <= now < exp
             and nbf <= exp
             and 0 < exp - iat <= 86400
             and (expected_oid is None or oid == expected_oid)
             and (
-                not api
-                or isinstance(roles, list)
-                and any(
-                    role
-                    in {
+                isinstance(roles, list)
+                and len(roles) <= 64
+                and all(
+                    isinstance(role, str) and role in {
                         "AgentControl.Viewer",
                         "AgentControl.UsageReportUploader",
                         "AgentControl.Admin",

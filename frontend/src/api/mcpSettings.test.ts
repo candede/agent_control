@@ -25,6 +25,7 @@ function settings(runtime = metadata()): Extract<McpSettings, { state: "availabl
   return {
     state: "available", configured: { resourceUrl: runtime.binding.resourceUrl, localHostPort: 3003 },
     runtime, observedAt: "2026-11-04T10:00:00.000Z",
+    privacy: { hide_employee_details: false, hide_champion_employee: false }, privacyScope: "end_user_and_preview",
   };
 }
 
@@ -122,8 +123,9 @@ describe("MCP settings wire contract", () => {
   });
 
   it.each(["not_configured", "unavailable", "binding_mismatch"] as const)("preserves the explicit %s state", async state => {
-    const value: McpSettings = state === "not_configured" ? { state } :
-      { state, configured: { resourceUrl: "" }, code: "metadata_unavailable" };
+    const privacy = { hide_employee_details: false, hide_champion_employee: false }, privacyScope = "end_user_and_preview" as const;
+    const value: McpSettings = state === "not_configured" ? { state, privacy, privacyScope } :
+      { state, configured: { resourceUrl: "" }, code: "metadata_unavailable", privacy, privacyScope };
     const fetcher = respond(JSON.stringify(value));
     await expect(getMcpSettings()).resolves.toEqual(value);
     expect(fetcher).toHaveBeenCalledExactlyOnceWith("/api/mcp/settings", expect.objectContaining({ credentials: "include" }));

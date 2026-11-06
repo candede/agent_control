@@ -1,6 +1,7 @@
 import asyncio
 import json
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from cryptography.fernet import Fernet
 from key_value.aio.errors import DecryptionError
 
 from agent_control_mcp.config import ConfigurationError, Settings
-from agent_control_mcp.storage import OAuthStore, inspect_storage
+from agent_control_mcp.storage import CLIENT_COLLECTION, OAuthStore, inspect_storage
 
 
 @pytest.mark.parametrize(
@@ -158,6 +159,48 @@ async def test_retention_health_corruption_and_no_durable_api_credentials(settin
         await store.check()
 
 
+async def test_client_registration_survives_month_restart_and_encryption_key_retirement(
+    settings, monkeypatch
+):
+    store = OAuthStore(settings)
+    client = {"client_id": "durable-client", "redirect_uris": ["https://client.example.test/callback"]}
+    await store.put("durable-client", client, collection=CLIENT_COLLECTION)
+    assert await store.ttl("durable-client", collection=CLIENT_COLLECTION) == (client, None)
+    await store.key_value.put("retained-client", {"client_id": "retained-client"},
+                              collection=CLIENT_COLLECTION, ttl=3600)
+    await store.put("credential", {"token": "synthetic-expiring-token"}, ttl=60)
+    await store.start()
+    assert (await store.ttl("retained-client", collection=CLIENT_COLLECTION))[1] is None
+
+    new_key = Fernet.generate_key()
+    rotated = OAuthStore(replace(settings, encryption_keys=(new_key, *settings.encryption_keys)))
+    await rotated.start()
+    future = datetime.now(UTC) + timedelta(days=30)
+    monkeypatch.setattr("key_value.aio._utils.managed_entry.now", lambda: future)
+    monkeypatch.setattr("key_value.aio._utils.time_to_live.now", lambda: future)
+    restarted = OAuthStore(replace(settings, encryption_keys=(new_key,)))
+    await restarted.start()
+    assert await restarted.get("durable-client", collection=CLIENT_COLLECTION) == client
+    assert await restarted.get("retained-client", collection=CLIENT_COLLECTION) == {
+        "client_id": "retained-client"
+    }
+    assert await restarted.get("credential") is None
+    assert await restarted.delete("durable-client", collection=CLIENT_COLLECTION)
+    assert await restarted.get("durable-client", collection=CLIENT_COLLECTION) is None
+
+
+async def test_start_does_not_restore_expired_or_deleted_client_registration(settings):
+    store = OAuthStore(settings)
+    await store.key_value.put("expired", {"client_id": "expired"},
+                              collection=CLIENT_COLLECTION, ttl=0.01)
+    await store.put("deleted", {"client_id": "deleted"}, collection=CLIENT_COLLECTION)
+    await store.delete("deleted", collection=CLIENT_COLLECTION)
+    await asyncio.sleep(0.03)
+    await store.start()
+    assert await store.get("expired", collection=CLIENT_COLLECTION) is None
+    assert await store.get("deleted", collection=CLIENT_COLLECTION) is None
+
+
 async def test_overlapping_storage_checks_keep_independent_probes(settings, monkeypatch):
     store = OAuthStore(settings)
     await store.check()
@@ -235,6 +278,51 @@ async def test_storage_binding_wrong_keys_capacity_and_record_bounds(settings, m
     monkeypatch.setattr("agent_control_mcp.storage.MAX_DISK_BYTES", 1)
     with pytest.raises(ConfigurationError):
         await store.put("capacity", {"a": 1})
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tenant_id": "55555555-5555-5555-5555-555555555555"},
+        {"client_id": "66666666-6666-6666-6666-666666666666"},
+        {"api_client_id": "77777777-7777-7777-7777-777777777777"},
+        {"public_url": "https://other.example.test/mcp"},
+    ],
+)
+async def test_storage_binding_rejects_resource_changes_after_month_restart(
+    settings, monkeypatch, change
+):
+    store = OAuthStore(settings)
+    await store.start()
+    await store.put("client", {"client_id": "client"}, collection=CLIENT_COLLECTION)
+    future = datetime.now(UTC) + timedelta(days=30)
+    monkeypatch.setattr("key_value.aio._utils.managed_entry.now", lambda: future)
+    monkeypatch.setattr("key_value.aio._utils.time_to_live.now", lambda: future)
+
+    restarted = OAuthStore(replace(settings, **change))
+    with pytest.raises(ConfigurationError, match="another resource"):
+        await restarted.start()
+    with pytest.raises(ConfigurationError, match="readiness is unavailable"):
+        await restarted.observe_readiness()
+
+
+async def test_storage_binding_is_persistent_and_rotates_with_retained_records(
+    settings, monkeypatch
+):
+    store = OAuthStore(settings)
+    await store.start()
+    assert await store.ttl("binding", collection="service") == (store.binding, None)
+
+    new_key = Fernet.generate_key()
+    rotated = OAuthStore(replace(settings, encryption_keys=(new_key, *settings.encryption_keys)))
+    await rotated.start()
+    future = datetime.now(UTC) + timedelta(days=30)
+    monkeypatch.setattr("key_value.aio._utils.managed_entry.now", lambda: future)
+    monkeypatch.setattr("key_value.aio._utils.time_to_live.now", lambda: future)
+    restarted = OAuthStore(replace(settings, encryption_keys=(new_key,)))
+    await restarted.start()
+    assert await restarted.ttl("binding", collection="service") == (store.binding, None)
+    await restarted.observe_readiness()
 
 
 def test_supported_private_transport_exact_loopback_and_sdk_configuration(settings_env):

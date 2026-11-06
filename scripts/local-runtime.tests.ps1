@@ -436,7 +436,7 @@ exit $ExitCode
         Assert (-not (Read-LocalSettings $context.State).Contains('mcp') -and
             -not [IO.File]::ReadAllText((Join-Path $context.State 'compose.env')).Contains('MCP_')) 'First MCP setup regression requires an existing project without MCP settings.'
         $context.ConfigureMcp = $true
-        foreach ($answer in @('','33333333-3333-4333-8333-333333333333','https://mcp.runtime.example.invalid/mcp','https://client.example.invalid/callback','14400','synthetic-mcp-runtime-test-secret')) {
+        foreach ($answer in @('','33333333-3333-4333-8333-333333333333','https://mcp.runtime.example.invalid/mcp','https://client.example.invalid/callback','14400','','','synthetic-mcp-runtime-test-secret')) {
             $script:answers.Enqueue($answer)
         }
         $script:validateDatabaseCompose = $true
@@ -775,7 +775,7 @@ exit $ExitCode
     $operation=Get-Content -LiteralPath (Join-Path $context.State 'deployment-operation.json') -Raw|ConvertFrom-Json
     Assert ($operation.resetStatus -eq 'completed' -and (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance'))) 'Completed reset with initialization failure lost honest maintenance recovery evidence.'
     $script:failure=''
-    $messages=Run-Deploy -DbReset
+    $messages=Run-Deploy
     Assert (-not (($script:calls -join "`n") -match 'database\.ts\|reset\||backup.ts') -and
         ($script:calls -join "`n") -match 'database\.ts\|resume') 'Reset resume repeated destruction or failed to return to normal operation.'
     $messages=Run-Deploy -DbReset
@@ -794,6 +794,23 @@ exit $ExitCode
     $script:failure=''
     Fails { Run-Deploy -DbReset } 'Reset outcome is unknown'
     Assert (-not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Unknown reset failure automatically repeated destructive work.'
+    $pendingPath=Join-Path $context.State 'deployment-operation.json'
+    $pendingHash=(Get-FileHash -LiteralPath $pendingPath).Hash
+    foreach ($phase in @('drop','create','unknown')) {
+        Fails { Resolve-LocalDeniedReset $context (@{event='database_operator_command';outcome='failed';code='database_reset_failed';phase=$phase}|ConvertTo-Json -Compress) } 'Only the original typed pre-DROP'
+        Assert ((Get-FileHash -LiteralPath $pendingPath).Hash -ceq $pendingHash) 'Uncertain reset recovery changed its pending receipt.'
+    }
+    $denial=@{event='database_operator_command';outcome='failed';code='database_reset_denied';phase='validation'}|ConvertTo-Json -Compress
+    $script:currentFingerprint='9'*64
+    Fails { Resolve-LocalDeniedReset $context $denial } 'target changed: schema'
+    $script:currentFingerprint='0'*64
+    $recovery=Resolve-LocalDeniedReset $context $denial
+    Assert ($recovery.outcome -ceq 'validation-denial-verified' -and -not $recovery.databaseReset -and
+        $recovery.maintenanceRetained -and
+        ([IO.File]::ReadAllText($pendingPath)|ConvertFrom-Json).resetStatus -ceq 'denied' -and
+        (Get-FileHash -LiteralPath $recovery.archive).Hash -ceq $pendingHash -and
+        (Test-Path -LiteralPath "$($recovery.archive).failure.json") -and
+        (Test-Path -LiteralPath (Join-Path $context.State 'control/maintenance'))) 'Typed pre-DROP denial recovery lost its immutable evidence or reopened the application.'
     Write-LocalText (Join-Path $frozen.Root 'backend/input.ts') 'changed-frozen-source'
     Fails { Run-Deploy } 'Candidate source changed'
     Assert (-not (($script:calls -join "`n") -match '\|stop\||backend/scripts/database\.ts\|')) 'Tampered candidate reached production operations.'

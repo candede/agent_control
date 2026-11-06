@@ -56,22 +56,33 @@ await vi.hoisted(async () => {
     { tenantId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", domains: ["office-mobile.example.invalid"] },
     { tenantId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", domains: ["first-sync-desktop.example.invalid"] },
     { tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", domains: ["first-sync-mobile.example.invalid"] },
+    ...["employee", "viewer", "admin"].flatMap((role, roleIndex) => ["desktop", "mobile"].map((project, projectIndex) => ({
+      tenantId: `ddddddd${roleIndex * 2 + projectIndex}-dddd-4ddd-8ddd-dddddddddddd`,
+      domains: [`fresh-${role}-${project}.example.invalid`],
+    }))),
   ].map(profile => ({ ...tenant, ...profile })));
-  // Provider clients capture fetch during module initialization.
-  vi.stubGlobal("fetch", createBrowserFixtureFetch(globalThis.fetch));
+  const loopbackFetch = createBrowserFixtureFetch(globalThis.fetch);
+  vi.stubGlobal("fetch", (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.href === "https://graph.microsoft.com/v1.0/users/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee?$select=id,accountEnabled,userType") {
+      return Promise.resolve(Response.json({ id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", accountEnabled: true, userType: "Member" }));
+    }
+    return loopbackFetch(input, init);
+  });
 });
 const identity = vi.hoisted(() => ({ scenarios: new Map<string, { scenario: string; tenantId: string; username: string }>() }));
 vi.mock("../src/auth/msal.js", async original => {
   const actual = await original<typeof import("../src/auth/msal.js")>();
   const fixtureResult = (tenantId: string, accountId: string): AuthenticationResult => {
     const scenario = accountId.replace(/^fixture-/, "");
-    const roles = scenario === "missing_internal_role" ? [] : scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${scenario.slice(5)}`)) : [...appRoles];
+    const roles = ["missing_internal_role", "roleless-employee"].includes(scenario) ? [] : scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${scenario.slice(5)}`)) : [...appRoles];
     const username = `fixture@${config.tenants.find(profile => profile.tenantId === tenantId)!.domains[0]}`;
-    const claims = { tid: tenantId, oid: accountId, preferred_username: username, roles,
+    const localAccountId = scenario === "roleless-employee" ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : accountId;
+    const claims = { tid: tenantId, oid: localAccountId, preferred_username: username, roles,
       wids: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
     return {
       authority: `https://login.microsoftonline.com/${tenantId}`, uniqueId: accountId, tenantId,
-      scopes: ["openid", "profile"], account: { homeAccountId: accountId, localAccountId: accountId, tenantId,
+      scopes: ["openid", "profile"], account: { homeAccountId: accountId, localAccountId, tenantId,
         environment: "login.microsoftonline.com", username, name: "Synthetic account", idTokenClaims: claims },
       idToken: "synthetic-browser-identity", idTokenClaims: claims, accessToken: accountId,
       fromCache: false, expiresOn: new Date(Date.now() + 3600_000), tokenType: "Bearer", correlationId: "",
@@ -87,8 +98,9 @@ vi.mock("../src/auth/msal.js", async original => {
     redeemAuthorizationCode: async (code: string) => identity.scenarios.get(code),
     toAuthenticatedUser: (result: AuthenticationResult | { scenario: string; tenantId: string; username: string }) => {
       if (!("scenario" in result)) return actual.toAuthenticatedUser(result);
-      const roles = result.scenario === "missing_internal_role" ? [] : result.scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${result.scenario.slice(5)}`)) : [...appRoles];
+      const roles = ["missing_internal_role", "roleless-employee"].includes(result.scenario) ? [] : result.scenario.startsWith("role-") ? appRoles.filter(role => role.endsWith(`.${result.scenario.slice(5)}`)) : [...appRoles];
       return { tenantId: result.tenantId, homeAccountId: `fixture-${result.scenario}`, displayName: "Synthetic account", username: result.username, roles,
+        localAccountId: result.scenario === "roleless-employee" ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : `fixture-${result.scenario}`,
         providerRoleIds: ["d2562ede-74db-457e-a7b6-544e236ebb61"] };
     },
     acquireDelegatedTokenResult: async (tenantId: string, accountId: string) => {
@@ -214,6 +226,9 @@ beforeAll(async () => {
   const repository = new CapabilityRepository(fixture.runtime);
   const applicationDefinition = capabilityDefinitions.find(definition => definition.id === "graph.package.read.application")!;
   await repository.setApplicationConfiguration(config.tenants[0].tenantId!, applicationDefinition.id, true, true, "fixture-administrator", () => undefined);
+  for (const tenant of config.tenants.filter(tenant => tenant.domains.some(domain => domain.startsWith("fresh-")))) {
+    await repository.setApplicationConfiguration(tenant.tenantId!, applicationDefinition.id, true, true, "fixture-administrator", () => undefined);
+  }
   const invalidatePrincipal = capabilities.invalidatePrincipal.bind(capabilities);
   vi.spyOn(capabilities, "invalidatePrincipal").mockImplementation(async (user: AuthenticatedUser) => {
     await invalidatePrincipal(user);
@@ -228,6 +243,7 @@ beforeAll(async () => {
     const tokenValue = "synthetic-browser-catalog";
     await options.visit(tokenValue);
     const records = [{ id: "synthetic-package", displayName: "Synthetic package", isBlocked: false,
+      type: "lob", shortDescription: "Review business requirements documents.",
       sourceSystem: "graph_packages" as const, authoringTool: null, creatorType: "unknown" as const,
       agentKind: "copilot_package" as const, lifecycle: "unknown" as const, identityConfidence: "exact_native" as const, provenance: {} }];
     await options.onRecords(records);
@@ -255,7 +271,8 @@ beforeAll(async () => {
     options.signal?.throwIfAborted();
     const value = "synthetic-browser-power-platform";
     await options.visit(value);
-    const records = token === "fixture-role-Admin" && types.includes("microsoft.copilotstudio/agents")
+    const records = token === "fixture-role-Admin" && options.expectedTenantId === config.tenants[0].tenantId
+      && types.includes("microsoft.copilotstudio/agents")
       && (!options.environmentId || options.environmentId === quarantineEnvironmentId) ? quarantineResources() : [];
     yield { token: value, nextToken: null, records, rawCount: records.length, expectedCount: records.length, page: 1 };
   });
@@ -359,6 +376,21 @@ for (const run of browserRuns) it(`qualifies packaged ${run.name} through Chromi
   }
   expect(exitCode).toBe(0);
   expect((await fixture.operator.query("SELECT count(*)::int AS count FROM jobs")).rows[0].count).toBe(0);
+  if (selectedBrowserFiles.includes("permissions.spec.ts")) {
+    for (const tenant of config.tenants.filter(tenant => tenant.domains.some(domain => domain.startsWith("fresh-")))) {
+      const employee = tenant.domains[0].startsWith("fresh-employee-");
+      const principal = employee ? "fixture-roleless-employee" : tenant.domains[0].startsWith("fresh-viewer-") ? "fixture-role-Viewer" : "fixture-role-Admin";
+      await expect.poll(async () => (await fixture.operator.query(`SELECT source_id,status FROM data_sync_run_sources
+        WHERE tenant_id=$1 AND principal_id=$2 ORDER BY source_id`, [tenant.tenantId, principal])).rows,
+      { timeout: 15_000 }).toEqual((employee ? ["graph_packages", "users"] : ["graph_packages", "power_platform", "users"])
+        .map(source_id => ({ source_id, status: "succeeded" })));
+      const runs = (await fixture.operator.query(`SELECT principal_id,automatic FROM data_sync_runs WHERE tenant_id=$1`, [tenant.tenantId])).rows;
+      expect(runs).toEqual([{ principal_id: principal, automatic: true }]);
+      console.log(JSON.stringify({ event: "fresh_browser_automatic_sources", tenantId: tenant.tenantId, principal,
+        sources: employee ? ["graph_packages", "users"] : ["graph_packages", "power_platform", "users"],
+        manualSync: false, permissionsVisit: false }));
+    }
+  }
 });
 if (!selectedBrowserFiles.length) it("verifies full-browser persistence and exact native provider counts", async () => {
   // The report restart and quarantine mutation postconditions belong to the full browser campaign.

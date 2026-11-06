@@ -80,10 +80,13 @@ export class InventoryRuntime {
   private requested = false;
   private after = "";
   private readonly authorities = new Map<string, DelegatedCredentialSource>();
-  constructor(readonly database: pg.Pool, private readonly authorize = async (scope: Scope, signal: AbortSignal) => {
+  constructor(readonly database: pg.Pool, private readonly authorize = async (
+    scope: Scope, signal: AbortSignal, publication: "canonical" | "control",
+  ) => {
     signal.throwIfAborted();
     const user = await revalidateAuthorizedUser(scope.tenantId, scope.principalId);
-    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId || !hasAppRole(user.roles, "AgentControl.Viewer")) {
+    if (user.tenantId !== scope.tenantId || user.homeAccountId !== scope.principalId
+      || publication === "control" && !hasAppRole(user.roles, "AgentControl.Viewer")) {
       throw AppError.unauthorized();
     }
     signal.throwIfAborted();
@@ -112,9 +115,9 @@ export class InventoryRuntime {
     }
     this.assertCurrent();
   }
-  private async authorizeCurrent(scope: Scope, signal: AbortSignal) {
+  private async authorizeCurrent(scope: Scope, signal: AbortSignal, publication: "canonical" | "control" = "control") {
     this.assertCurrent();
-    await interruptibleAuthorization(() => this.authorize(scope, signal), signal);
+    await interruptibleAuthorization(() => this.authorize(scope, signal, publication), signal);
     this.assertCurrent();
   }
   private async input(scope: Scope): Promise<BeginGeneration> {
@@ -284,7 +287,7 @@ export class InventoryRuntime {
     if (await this.enqueue(scope, false, signal)) {
       await this.requireAdmissions(signal);
       await this.reconciliation.runNext(await this.input(scope), authorizationSignal =>
-        this.authorizeCurrent(scope, authorizationSignal), signal, this.assertCurrent);
+        this.authorizeCurrent(scope, authorizationSignal, "canonical"), signal, this.assertCurrent);
     }
     this.assertCurrent();
   }

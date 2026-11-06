@@ -16,6 +16,15 @@ type GraphEndpoint = "directory" | "catalog" | "report";
 export type DirectoryFilter = { kind: "products"; skuIds: readonly string[] } | { kind: "reported"; identities: readonly string[] };
 export type CopilotReportUser = { normalizedUserPrincipalName: string; activity: CopilotAppActivity };
 
+export function parseActiveMember(value: unknown, expectedId: string) {
+  const user = object(value, "Employee membership");
+  if (requiredUuid(user.id, "Employee object ID") !== expectedId.toLowerCase()
+    || typeof user.accountEnabled !== "boolean" || user.userType !== "Member" && user.userType !== "Guest") {
+    throw providerSchema("Employee membership did not return the exact account and required fields.");
+  }
+  return user.accountEnabled && user.userType === "Member";
+}
+
 export function buildSubscribedSkusUrl() { return `${graphV1}/subscribedSkus?$select=skuId,appliesTo,servicePlans`; }
 export function buildCopilotUsersUrl(skuIds: readonly string[]) {
   if (!skuIds.length || skuIds.length > 20) throw providerSchema("Directory SKU filter has an invalid size.");

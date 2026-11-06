@@ -305,6 +305,58 @@ function Get-LocalReleaseObservations {
         proposedBudgets=@{appMemory=1610612736;appCpus=1.5;postgresMemory=1073741824;postgresCpus=0.5;appConnections=4;nodeHeapMiB=768}}
 }
 
+function Resolve-LocalDeniedReset {
+    param($Context,[string]$FailureJson)
+    $failure = $FailureJson | ConvertFrom-Json
+    if ($failure.event -cne 'database_operator_command' -or $failure.outcome -cne 'failed' -or
+        $failure.code -cne 'database_reset_denied' -or $failure.phase -cne 'validation') {
+        throw 'Only the original typed pre-DROP validation denial can resolve a reset attempt. Unknown/drop/create outcomes remain in maintenance.'
+    }
+    $lock = [IO.File]::Open((Join-Path $Context.Root "artifacts/local-operations/$($Context.Project).lock"),'OpenOrCreate','ReadWrite','None')
+    try {
+        $path = Join-Path $Context.State 'deployment-operation.json'
+        $original = [IO.File]::ReadAllText($path)
+        $progress = $original | ConvertFrom-Json -AsHashtable
+        if ($progress.version -ne 2 -or $progress.databaseAction -cne 'reset' -or
+            $progress.step -cne 'prepared' -or $progress.resetStatus -cne 'attempted' -or
+            $progress.candidate -cne $Context.CandidateSha256 -or $progress.preflight -cne $Context.ExpectedPreflight) {
+            throw 'Reset denial recovery requires the exact pending action/content identity.'
+        }
+        $Context.DatabaseAction = 'reset'
+        $target = Get-LocalReleaseTarget $Context
+        $before = $progress.target
+        foreach ($key in @('project','root','state','dockerContext','engine','endpoint','origin','port','tenantRegistryHash','secretBinding','mcpSecretBinding')) {
+            if ($before[$key] -cne $target[$key]) { throw "Reset denial recovery target changed: $key." }
+        }
+        foreach ($key in @('resources','composeInputs','schema')) {
+            if (($before[$key] | ConvertTo-Json -Depth 20 -Compress) -cne ($target[$key] | ConvertTo-Json -Depth 20 -Compress)) {
+                throw "Reset denial recovery target changed: $key."
+            }
+        }
+        if ($target.configuration['settings.json'] -cne $before.configuration['settings.json'] -or
+            $target.configuration['compose.env'] -cnotin @($before.configuration['compose.env'],$progress.composeEnvironmentHash)) {
+            throw 'Reset denial recovery configuration changed.'
+        }
+        $postgres = @($target.containers | Where-Object service -eq 'postgres')
+        $previous = @($before.containers | Where-Object service -eq 'postgres')
+        if ($postgres.Count -ne 1 -or $previous.Count -ne 1 -or $postgres[0].id -cne $previous[0].id -or
+            $postgres[0].image -cne $previous[0].image -or -not $target.schema.fingerprint -or
+            @(Get-OwnedLocalContainers $Context | Where-Object { $_.Service -eq 'app' -and $_.State.Running }).Count -or
+            -not (Test-Path -LiteralPath (Join-Path $Context.State 'control/maintenance'))) {
+            throw 'Reset denial recovery requires the unchanged initialized database, retained PostgreSQL and drained maintenance state.'
+        }
+        $archive = Join-Path $Context.State "deployment-operation-denied-$([Guid]::NewGuid().ToString('N')).json"
+        Write-LocalText $archive $original
+        Write-LocalText "$archive.failure.json" $FailureJson
+        $progress.resetStatus = 'denied'
+        $progress.step = 'denied'
+        $progress.denialArchive = $archive
+        Write-LocalText $path ($progress | ConvertTo-Json -Depth 30)
+        return @{outcome='validation-denial-verified';archive=$archive
+            archiveSha256=(Get-FileHash -LiteralPath $archive).Hash.ToLowerInvariant();databaseReset=$false;maintenanceRetained=$true}
+    } finally { $lock.Dispose() }
+}
+
 function Get-OwnedLocalContainers {
     param($Context)
     $ids = Invoke-DockerCommand @('ps','-aq','--no-trunc','--filter',"label=com.docker.compose.project=$($Context.Project)") -Capture
@@ -435,8 +487,16 @@ function Invoke-LocalApplication {
             if ($Context.ExpectedPreflight -cnotmatch '^[a-f0-9]{64}$') { throw 'Pinned deployment requires the approved exact read-only preflight digest.' }
             if (Test-Path -LiteralPath $progressPath) {
                 $progress = [IO.File]::ReadAllText($progressPath) | ConvertFrom-Json -AsHashtable
+                if ($progress.step -ceq 'denied' -and $progress.resetStatus -ceq 'denied') { $progress = $null }
                 if ($progress.step -eq 'verified' -and ($progress.candidate -cne $Context.CandidateSha256 -or
                     $progress.preflight -cne $Context.ExpectedPreflight)) { $progress = $null }
+            }
+            if ($progress -and -not $DbReset -and $progress.step -ne 'verified' -and
+                $progress.databaseAction -ceq 'reset' -and $progress.resetStatus -ceq 'completed' -and
+                $progress.candidate -ceq $Context.CandidateSha256 -and $progress.preflight -ceq $Context.ExpectedPreflight) {
+                $DbReset = $true
+                $Context.DatabaseAction = 'reset'
+                $target.databaseAction = 'reset'
             }
             if ($progress) {
                 if ($progress.version -ne 2 -or $progress.databaseAction -cne $Context.DatabaseAction -or
@@ -510,7 +570,10 @@ function Invoke-LocalApplication {
         $marker = Join-Path $Context.State 'control/maintenance'
         $reauthenticate = Join-Path $Context.State 'control/reauthenticate'
         $initializing = Join-Path $Context.State 'control/database-initializing'
-        if ($DbReset) { Write-Warning "Explicit database reset requested for project '$($Context.Project)'. All saved application data will be deleted; settings, secrets and backup files are retained." }
+        if ($DbReset) {
+            if ($progress.resetStatus -eq 'completed') { Write-Host '[DATABASE] Resuming the completed reset without repeating deletion.' }
+            else { Write-Warning "Explicit database reset requested for project '$($Context.Project)'. All saved application data will be deleted; settings, secrets and backup files are retained." }
+        }
         Write-Host '[DATABASE PREFLIGHT] Checking the current schema before runtime compilation, maintenance or app shutdown.'
         try {
             if (-not $candidate) {

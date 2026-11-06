@@ -222,6 +222,16 @@ Success returns to normal operation without another enable step. Verify served
 revision, health/readiness, sign-in/out, authorized saved views, automatic sync
 and affected controls; tests/health alone do not prove these journeys.
 
+If the original operator output explicitly reports `database_reset_denied` in
+phase `validation`, no DROP occurred. After inspecting the exact unchanged
+database, load the pending candidate/preflight identities into `$context` and
+call `Resolve-LocalDeniedReset $context $originalFailureJson`. It preserves the
+original operation and denial in protected adjacent files, verifies retained
+PostgreSQL/schema/configuration and drained maintenance, and permits a fresh
+guarded preflight. It rejects unknown/drop/create outcomes; never fabricate the
+failure JSON or edit receipts. Pool-derived operator connections explicitly
+retain their nonenumerable protected password, rather than ambient credentials.
+
 ## Reset application data
 
 **Destructive:** authorize exact project/database `agentcontrol` and data loss.
@@ -238,10 +248,33 @@ pwsh ./deploy-local.ps1 start -Project agent-control -DbReset
 - Each invocation after completed deployment requests a new reset.
 - If reset succeeded but initialization failed, correct the failure and retry
   **without** `-DbReset`. For an unknown outcome, retain maintenance.
+- The protected operator preserves actual per-principal revocation epochs and
+  signed-token cutoffs in the PostgreSQL maintenance database before deletion.
+  It locks the canonical principal owner through DROP; a missing owner in an
+  initialized database, a failed security publication, or an observed loss of
+  the principal-lock connection before DROP prevents deletion. Reset targets
+  must fit PostgreSQL's 63-byte identifier limit; truncated names are rejected.
+  Fresh initialization transactionally restores that minimum authority to the
+  current principal owner, including after an interrupted reset. It reads the
+  saved revocations only after acquiring the target initialization transaction;
+  retries against an already current schema need no maintenance-database read.
+  Genuinely revoked bearer credentials remain denied. Reset does not invent a global
+  issuance cutoff: an otherwise valid fresh Entra OAuth/OBO login works
+  immediately even when Entra backdates `iat`/`nbf` by five minutes. Never clear
+  actual revocation records or rewrite signed timestamps to recover access.
+- Initialization is transactional. A failure during DDL leaves an empty target;
+  ordinary initialization/resume retries it, verifies the exact current
+  fingerprint and least-privilege grants, and does not reset again. Failure
+  before a validated reset leaves existing application data unchanged.
 
 After success, sign in: read-only sync starts automatically. Re-enter stored sharing
 settings and [reimport CSVs](official-usage-import.md). Provider sync cannot rebuild
 deleted report, Office, audit or job history.
+Discovery search becomes useful as automatic inventory collection publishes;
+workplace requires saved directory fields, and champions/popularity require a
+genuine report import. Missing report evidence does not block sign-in or catalog
+use. Preserve the separate encrypted MCP OAuth volume and keys: application
+database reset neither rotates nor restores that external state.
 
 ## Credential recovery
 
@@ -286,6 +319,8 @@ Unrun journeys are not passed; test receipts never authorize application use.
 
 The MCP-only image suite no longer needs a Node baseline:
 `pwsh ./scripts/large-tenant-tests.ps1 -Suite mcp-container`.
+Its synthetic key generation and rotations use the same immutable locked
+container Python as the journeys, not a host virtual environment.
 For the real browser/API/Python metadata fixture, run
 `-Suite cutover-browser-contract -BrowserFiles "mcpSettings.spec.ts,signIn.spec.ts,permissions.spec.ts"`
 with explicit `-BaselineImage`/`-BaselineImageId` and

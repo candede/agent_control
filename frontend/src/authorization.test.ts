@@ -28,7 +28,7 @@ describe("role-aware views", () => {
   });
 
   it("denies protected views to unassigned and legacy-role sessions", () => {
-    expect(allowedViews({ ...user("AgentControl.Viewer"), roles: [] })).toEqual(["permissions"]);
+    expect(allowedViews({ ...user("AgentControl.Viewer"), roles: [] })).toEqual([]);
     const legacy = { ...user("AgentControl.Viewer"), roles: ["AgentControl.Reader"] } as unknown as SessionUser;
     expect(allowedViews(legacy)).toEqual(["permissions"]);
     expect(hasRole(legacy, "AgentControl.Viewer")).toBe(false);
@@ -51,7 +51,7 @@ describe("role-aware views", () => {
     expect(allowedViews(principal)).toEqual(observationalViews);
     principal.roles = [];
     expect(hasRole(principal, "AgentControl.Viewer")).toBe(false);
-    expect(allowedViews(principal)).toEqual(["permissions"]);
+    expect(allowedViews(principal)).toEqual([]);
   });
 
   it("returns independent observational views for equivalent role sets", () => {

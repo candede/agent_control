@@ -8,7 +8,8 @@ import { GraphPackagesClient } from "./graphPackages.js";
 import { PowerPlatformResourceQueryClient } from "./powerPlatformResourceQuery.js";
 import { capabilityDefinitions } from "./capabilityRegistry.js";
 import { activateAccountSession, revokeAccountSessionMutations } from "../db/sessions.js";
-import { withAuthority } from "../auth/authorityContext.js";
+import { withAuthority, withAutomaticApplicationReads } from "../auth/authorityContext.js";
+import { normalizeTokenError } from "../auth/msal.js";
 import type { DelegatedCredentialSource, RequestPrincipal } from "../types/requestPrincipal.js";
 
 vi.hoisted(() => {
@@ -830,6 +831,32 @@ describe("bounded safe-readiness retries", () => {
     expect(packageProbe).toHaveBeenCalledOnce();
   });
 
+  it.each(["graph.package.read.application", "powerPlatform.inventory.read"] as const)(
+    "retains the identity provider's seconds-based cooldown for %s", async id => {
+      const error = normalizeTokenError(Object.assign(new Error("Synthetic identity throttle"), {
+        errorCode: "temporarily_unavailable", status: 429, retryAfterSeconds: 600,
+      }));
+      const token = vi.fn().mockRejectedValue(error);
+      const { value, repository, probes } = service(new MemoryRepository(),
+        id === "graph.package.read.application" ? { applicationToken: token } : { delegatedToken: token });
+      const result = await value.refresh(id, reader);
+      expect(result).toMatchObject({
+        status: "provider_error", evidence: { category: "provider_throttled", phase: "token_acquisition", httpStatus: 429 },
+      });
+      expect(Date.parse(result.expiresAt!) - Date.parse(result.checkedAt!)).toBe(600_000);
+      expect(repository.recordEvidence.mock.calls[0][2]).toMatchObject({ retryAfterMs: 600_000 });
+      const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse(result.checkedAt!) + 300_001);
+      try {
+        await expect(value.refresh(id, reader)).resolves.toMatchObject({ status: "provider_error", fresh: true });
+        await expect(value.requireAvailable(id, reader, { retryFailed: true }))
+          .rejects.toMatchObject({ code: "provider_throttled" });
+        expect(token).toHaveBeenCalledOnce();
+        expect(probes.packageProbe).not.toHaveBeenCalled();
+        expect(probes.inventoryProbe).not.toHaveBeenCalled();
+      } finally { now.mockRestore(); }
+    },
+  );
+
   it.each(["cancellation", "session-revocation"] as const)("does not retry or publish after %s during backoff", async change => {
     const user = { ...reader, homeAccountId: `readiness-${change}` };
     const controller = new AbortController();
@@ -870,6 +897,39 @@ describe("capability decisions", () => {
         tenantId: user.tenantId, principalId: "22222222-2222-2222-2222-222222222222",
         authorizationPrincipalId: user.homeAccountId, tokenMode: "application", configurationRevision: 1,
       });
+    },
+  );
+
+  it.each(["graph.package.read.application", "graph.users.read", "graph.licenses.read", "reports.copilotUsage.read"] as const)(
+    "keeps automatic employee collection for %s inside its initiating authority", async id => {
+      const { value, repository, probes } = service();
+      const employee = { ...reader, homeAccountId: `employee-${id}`, roles: [] };
+      const source = requestAuthority(employee);
+      await withAuthority(source, async () => {
+        await expect(value.requireAvailable(id, employee)).rejects.toMatchObject({
+          code: "capability_unavailable", details: { status: "missing_internal_role" },
+        });
+        await withAutomaticApplicationReads(async () => {
+          await expect(value.requireApplicationDataScope(id, employee))
+            .resolves.toMatchObject({ enabled: true, sharedDataScope: true });
+          await expect(value.refresh(id, employee)).resolves.toMatchObject({ authorized: true });
+          await expect(value.requireAvailable(id, employee)).resolves.toMatchObject({ authorized: true });
+          for (const other of ["graph.directory.read", "graph.package.block.manage", "purview.audit.search.application"] as const) {
+            await expect(value.requireAvailable(other, employee)).rejects.toMatchObject({
+              code: "capability_unavailable", details: { status: "missing_internal_role" },
+            });
+          }
+        });
+        await expect(value.requireAvailable(id, employee)).rejects.toMatchObject({
+          code: "capability_unavailable", details: { status: "missing_internal_role" },
+        });
+        await expect(value.requireApplicationDataScope(id, employee)).rejects.toMatchObject({ code: "missing_internal_role" });
+      });
+      expect(probes.applicationToken).toHaveBeenCalledExactlyOnceWith(employee.tenantId, id);
+      expect(probes.delegatedToken).not.toHaveBeenCalled();
+      expect(probes.inventoryProbe).not.toHaveBeenCalled();
+      expect(repository.configuration).not.toHaveBeenCalled();
+      expect(repository.setApplicationConfiguration).not.toHaveBeenCalled();
     },
   );
 

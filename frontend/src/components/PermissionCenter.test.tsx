@@ -73,7 +73,7 @@ describe("Permissions setup and issues", () => {
     expect(guide.getByText(/App roles control Agent Control access/)).toBeVisible();
     expect(guide.getByText(/Usage Summary Reports Reader does not include user details/)).toBeVisible();
     expect(screen.getByRole("button", { name: "Check status" })).toBeDisabled();
-    expect(screen.getByRole("region", { name: "Issues" })).toHaveTextContent("Ask an administrator to assign");
+    expect(screen.getByRole("region", { name: "Issues" })).toHaveTextContent("Verified employees without app roles use conversational agent discovery");
   });
 
   it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)(
@@ -107,6 +107,14 @@ describe("Permissions setup and issues", () => {
     const signedOutGuide = within(screen.getByRole("region", { name: "App-defined roles" }));
     for (const card of signedOutGuide.getAllByRole("article")) expect(card).not.toHaveClass("is-assigned");
     expect(signedOutGuide.queryByText("Assigned to you")).not.toBeInTheDocument();
+  });
+
+  it("describes personal saved-report selection as Viewer access rather than an Admin-only change", () => {
+    render(<Page value={{ ...context([]), user: { ...user, roles: ["AgentControl.Viewer"] } }} />);
+    const guide = within(screen.getByRole("region", { name: "App-defined roles" }));
+    expect(guide.getByRole("article", { name: "Viewer" })).toHaveTextContent("Choose saved reports for your own view.");
+    expect(guide.getByRole("article", { name: "Usage Report Uploader" }))
+      .toHaveTextContent("Published-report corrections and deletion require Admin.");
   });
 
   it("maps each required permission to its app use, independently of live check results", () => {

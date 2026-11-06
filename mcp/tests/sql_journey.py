@@ -4,14 +4,19 @@ import asyncio
 import json
 import shutil
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import conftest
 import httpx2
-from conftest import Entra, protocol_client, tokens
+from conftest import Entra, tokens
 from cryptography.fernet import Fernet
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import CallToolResult, Implementation
+from public_contract import canonical_result, public_request
 
 from agent_control_mcp.config import Settings
 from agent_control_mcp.service import build_service
@@ -33,6 +38,7 @@ async def main(payload):
     network = httpx2.AsyncClient(trust_env=False, follow_redirects=False)
     original = httpx2.AsyncClient.__init__
     runtime = None
+    authority_entries = 0
     try:
         values = {
             "MCP_TENANT_ID": "11111111-1111-1111-1111-111111111111",
@@ -47,6 +53,7 @@ async def main(payload):
             ("CLIENT_SECRET", "synthetic-confidential-client-secret"),
             ("JWT_SIGNING_KEY", Fernet.generate_key().decode()),
             ("OAUTH_ENCRYPTION_KEY", json.dumps([Fernet.generate_key().decode()])),
+            ("METADATA_TOKEN", Fernet.generate_key().decode()),
         ):
             path = root / name
             path.write_text(content)
@@ -57,6 +64,7 @@ async def main(payload):
         entra.oid = payload["oid"]
 
         async def route(request):
+            nonlocal authority_entries
             if request.url.host == "login.microsoftonline.com":
                 if request.url.path.endswith("/keys"):
                     return httpx2.Response(
@@ -75,6 +83,7 @@ async def main(payload):
                     )
                 return await entra.route(request)
             assert request.url.host == "api.example.test"
+            authority_entries += int(request.url.path == "/api/mcp/authenticated-entry")
             headers = {
                 key: value for key, value in request.headers.items() if key.lower() != "host"
             }
@@ -98,31 +107,99 @@ async def main(payload):
                 base_url="https://mcp.example.test", transport=httpx2.ASGITransport(app=runtime.app)
             ) as browser:
                 _, issued = await tokens(browser)
-                rpc = await protocol_client(
-                    browser, issued["access_token"], client_name="SQL SDK client"
-                )
-                results = []
-                for call in payload["calls"]:
-                    result = await rpc(call["name"], call["request"])
-                    assert not result.get("isError"), result
-                    document = result["structuredContent"]
-                    if "expected" in call:
-                        for field in ("selection", "inventorySelection"):
-                            if field in document and "validatedAt" in document[field]:
-                                actual = datetime.fromisoformat(document[field]["validatedAt"])
-                                prior = datetime.fromisoformat(
-                                    call["expected"][field]["validatedAt"]
-                                )
-                                assert actual.tzinfo and prior <= actual <= datetime.now(UTC)
-                                call["expected"][field]["validatedAt"] = document[field][
-                                    "validatedAt"
-                                ]
-                        assert document == call["expected"], call["name"]
-                    results.append(document)
-                assert sum(call["bytes"] for call in rpc.trace) <= 4 * 1024 * 1024
-                assert sum(call["seconds"] for call in rpc.trace) <= 180
-                assert all(call["seconds"] <= 60 for call in rpc.trace)
-                print(json.dumps({"results": results, "trace": rpc.trace}, ensure_ascii=False))
+                browser.headers["Authorization"] = "Bearer " + issued["access_token"]
+                async with streamable_http_client(
+                    "https://mcp.example.test/mcp", http_client=browser
+                ) as (read, write):
+                    async with ClientSession(
+                        read, write, client_info=Implementation(name="SQL SDK client", version="1")
+                    ) as session:
+                        initialized = await session.initialize()
+                        listed = await session.list_tools()
+                        schemas = [
+                            tool.model_dump(mode="json", by_alias=True, exclude_none=True)
+                            for tool in listed.tools
+                        ]
+                        profile = await network.get(
+                            f"http://127.0.0.1:{target.port}/api/mcp/access-profile",
+                            headers={"Authorization": "Bearer " + payload["token"]},
+                        )
+                        assert profile.status_code == 200
+                        async with httpx2.AsyncClient(
+                            base_url="https://mcp.example.test",
+                            transport=httpx2.ASGITransport(app=runtime.app),
+                        ) as private:
+                            metadata = await private.post(
+                                "/internal/mcp-metadata",
+                                headers={
+                                    "X-Agent-Control-Mcp-Metadata-Token": (
+                                        settings.metadata_key.decode()
+                                    )
+                                },
+                                json=profile.json(),
+                            )
+                        assert metadata.status_code == 200
+                        assert metadata.json()["tools"] == schemas
+                        assert metadata.json()["instructions"] == initialized.instructions
+                        results, trace = [], []
+                        for call in payload["calls"]:
+                            name, request = public_request(call["name"], call["request"])
+                            started = time.perf_counter()
+                            result = await session.call_tool(
+                                name,
+                                {"request": request},
+                                meta={
+                                    "com.agentcontrol/origin": {
+                                        "callingAgent": {"id": "synthetic-agent"}
+                                    }
+                                },
+                            )
+                            assert isinstance(result, CallToolResult) and not result.is_error, (
+                                result
+                            )
+                            wire = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+                            document = canonical_result(call["name"], wire)["structuredContent"]
+                            trace.append(
+                                {
+                                    "tool": name,
+                                    "status": 200,
+                                    "bytes": len(json.dumps(wire).encode()),
+                                    "seconds": time.perf_counter() - started,
+                                }
+                            )
+                            if "expected" in call:
+                                for field in ("selection", "inventorySelection"):
+                                    if field in document and "validatedAt" in document[field]:
+                                        actual = datetime.fromisoformat(
+                                            document[field]["validatedAt"]
+                                        )
+                                        prior = datetime.fromisoformat(
+                                            call["expected"][field]["validatedAt"]
+                                        )
+                                        assert actual.tzinfo and prior <= actual <= datetime.now(
+                                            UTC
+                                        )
+                                        call["expected"][field]["validatedAt"] = document[field][
+                                            "validatedAt"
+                                        ]
+                                assert document == call["expected"], call["name"]
+                            results.append(document)
+                        assert sum(call["bytes"] for call in trace) <= 4 * 1024 * 1024
+                        assert sum(call["seconds"] for call in trace) <= 180
+                        assert all(call["seconds"] <= 60 for call in trace)
+                        assert authority_entries == 2
+                        print(
+                            json.dumps(
+                                {
+                                    "results": results,
+                                    "trace": trace,
+                                    "authorityEntries": authority_entries,
+                                    "tools": len(schemas),
+                                    "metadataEquality": True,
+                                },
+                                ensure_ascii=False,
+                            )
+                        )
     finally:
         httpx2.AsyncClient.__init__ = original
         if runtime:

@@ -16,7 +16,14 @@ from azure.storage.blob.aio import BlobClient, BlobLeaseClient
 from cryptography.fernet import Fernet, MultiFernet
 
 from .config import ConfigurationError, Settings
-from .storage import MAX_DISK_BYTES, MAX_FILES, MAX_RECORD_BYTES, MAX_RETENTION_SECONDS
+from .storage import (
+    CLIENT_COLLECTION,
+    MAX_DISK_BYTES,
+    MAX_FILES,
+    MAX_RECORD_BYTES,
+    MAX_RETENTION_SECONDS,
+    oauth_ttl,
+)
 
 logger = logging.getLogger(__name__)
 LEASE_SECONDS = 15
@@ -161,9 +168,11 @@ class AzureOAuthBlobStore:
             logger.error("OAuth Blob lease release unconfirmed; wait for finite lease expiry.")
         finally:
             self.lease = None
-            await self.client.close()
-            if self.credential is not None:
-                await self.credential.close()
+            try:
+                await self.client.close()
+            finally:
+                if self.credential is not None:
+                    await self.credential.close()
 
     @staticmethod
     def _key(key: str, collection: str | None) -> str:
@@ -200,14 +209,31 @@ class AzureOAuthBlobStore:
                 or not isinstance(entry, dict)
                 or set(entry) != {"value", "expires"}
                 or not isinstance(entry["value"], dict)
-                or type(entry["expires"]) not in (int, float)
-                or not math.isfinite(entry["expires"])
-                or entry["expires"] > now + MAX_RETENTION_SECONDS
                 or len(json.dumps(entry["value"], allow_nan=False).encode()) > MAX_RECORD_BYTES
             ):
                 raise ConfigurationError("OAuth Blob record is incompatible.")
+            client_id = entry["value"].get("client_id")
+            registration = (
+                isinstance(client_id, str)
+                and key == self._key(client_id, CLIENT_COLLECTION)
+            )
+            expires = entry["expires"]
+            if expires is None:
+                if not registration:
+                    raise ConfigurationError("Only OAuth client registrations may be persistent.")
+            elif (
+                type(expires) not in (int, float)
+                or not math.isfinite(expires)
+                or expires > now + MAX_RETENTION_SECONDS
+            ):
+                raise ConfigurationError("OAuth Blob record is incompatible.")
+            elif registration and expires > now:
+                entry["expires"] = None
         return (
-            {key: entry for key, entry in records.items() if entry["expires"] > now},
+            {
+                key: entry for key, entry in records.items()
+                if entry["expires"] is None or entry["expires"] > now
+            },
             str(download.properties.etag),
             download.size,
         )
@@ -245,7 +271,10 @@ class AzureOAuthBlobStore:
             records, _, _ = await self._read()
             entry = records.get(lookup)
             return (
-                (entry["value"], max(0, entry["expires"] - time.time())) if entry else (None, None)
+                (
+                    entry["value"],
+                    None if entry["expires"] is None else max(0, entry["expires"] - time.time()),
+                ) if entry else (None, None)
             )
 
     async def get_many(
@@ -262,7 +291,11 @@ class AzureOAuthBlobStore:
         async with self._operation():
             records, _, _ = await self._read()
             return [
-                (records[key]["value"], max(0, records[key]["expires"] - time.time()))
+                (
+                    records[key]["value"],
+                    None if records[key]["expires"] is None
+                    else max(0, records[key]["expires"] - time.time()),
+                )
                 if key in records
                 else (None, None)
                 for key in lookups
@@ -288,16 +321,18 @@ class AzureOAuthBlobStore:
     ) -> None:
         if len(keys) != len(values) or len(keys) > MAX_FILES:
             raise ConfigurationError("OAuth state batch exceeds its bound.")
-        seconds = MAX_RETENTION_SECONDS if ttl is None else float(ttl)
-        if not math.isfinite(seconds) or seconds <= 0:
-            raise ConfigurationError("OAuth state requires finite positive retention.")
+        seconds = oauth_ttl(collection, ttl)
         additions = {}
         for key, value in zip(keys, values, strict=True):
-            if len(json.dumps(dict(value), allow_nan=False).encode()) > MAX_RECORD_BYTES:
+            record = dict(value)
+            client_id = record.get("client_id")
+            if seconds is None and (not isinstance(client_id, str) or client_id != key):
+                raise ConfigurationError("OAuth client registration must match its lookup key.")
+            if len(json.dumps(record, allow_nan=False).encode()) > MAX_RECORD_BYTES:
                 raise ConfigurationError("OAuth state record exceeds its bound.")
             additions[self._key(key, collection)] = {
-                "value": dict(value),
-                "expires": time.time() + min(seconds, MAX_RETENTION_SECONDS),
+                "value": record,
+                "expires": None if seconds is None else time.time() + seconds,
             }
         async with self._operation():
             records, etag, _ = await self._read()

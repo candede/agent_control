@@ -8,7 +8,13 @@ import { config } from "../config.js";
 import { tenant } from "../auth/authFoundationTestSupport.js";
 import { mcpMetadataMaximumBytes, parseBoundedMcpJson, parseMcpRuntimeMetadata } from "../types/mcpSettings.js";
 import { getWorkbenchMetadata } from "./workbenchMetadata.js";
-import { mcpBindingForTenant, readMcpSettings } from "./mcpSettings.js";
+import { mcpBindingForTenant, readMcpSettings as readProjectedMcpSettings } from "./mcpSettings.js";
+import type { McpAccessProfile } from "../types/mcpSettings.js";
+
+const projection: McpAccessProfile = { audience: "adoption", operations: [], staffPreviewAuthorized: true,
+  privacy: { hide_employee_details: false, hide_champion_employee: false } };
+const readMcpSettings = (tenantId: string, signal?: AbortSignal, fetcher?: typeof fetch) =>
+  readProjectedMcpSettings(tenantId, projection, signal, fetcher);
 
 const original = config.tenants;
 const key = Buffer.alloc(32, 217).toString("base64url") + "=";
@@ -41,7 +47,7 @@ describe("bounded fixed-origin metadata reader", () => {
         if (request.headers.host !== new URL(binding.resourceUrl).host) {
           response.writeHead(421); response.end("Misdirected Request"); return;
         }
-        expect(request.method).toBe("GET");
+        expect(request.method).toBe("POST");
         expect(request.url).toBe("/internal/mcp-metadata");
         expect(request.headers["x-agent-control-mcp-metadata-token"]).toBe(key);
         expect(request.headers.origin).toBeUndefined();
@@ -64,7 +70,8 @@ describe("bounded fixed-origin metadata reader", () => {
       runtime: metadata(), observedAt: expect.any(String) });
     expect(fetcher).toHaveBeenCalledOnce();
     expect(fetcher).toHaveBeenCalledWith("http://mcp:8000/internal/mcp-metadata", expect.objectContaining({
-      redirect: "error", method: "GET", headers: { Accept: "application/json", Host: "mcp.example.invalid",
+      redirect: "error", method: "POST", body: JSON.stringify(projection),
+      headers: { Accept: "application/json", "Content-Type": "application/json", Host: "mcp.example.invalid",
         "X-Agent-Control-Mcp-Metadata-Token": key },
     }));
     expect(JSON.stringify(value)).not.toContain(key);

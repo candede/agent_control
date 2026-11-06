@@ -23,8 +23,13 @@ import type { InventoryMutationStages } from "../../backend/src/db/inventoryMuta
 import type { NativeInventory } from "../../backend/src/db/nativeInventory.js";
 import type { JobRepository } from "../../backend/src/db/jobs.js";
 import type { reconcileBulkJob } from "../../backend/src/services/bulkJobs.js";
+import type { DiscoveryPage, DiscoveryProfile, DiscoveryDetail, DiscoveryWorkplace } from "../../backend/src/types/agentDiscovery.js";
 
 export type Contracts = {
+  discoveryPage: DiscoveryPage;
+  discoveryProfile: DiscoveryProfile;
+  discoveryDetail: DiscoveryDetail;
+  discoveryWorkplace: DiscoveryWorkplace;
   selection: PublishedSelectedRead;
   capabilities: { value: CapabilityView[] };
   capability: CapabilityView;

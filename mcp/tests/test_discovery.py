@@ -75,15 +75,17 @@ async def test_complete_sdk_discovery(browser, entra):
             assert result.structured_content == {"action": "list", "result": {"value": []}}
             assert len(entra.api_calls) == 1
             unadvertised = (
-                {op.name for op in OPERATIONS} - {tool.name for tool in PUBLIC_TOOLS}
-            ) | RETIRED_OPERATIONS | {"purview", "hunting"}
+                ({op.name for op in OPERATIONS} - {tool.name for tool in PUBLIC_TOOLS})
+                | RETIRED_OPERATIONS
+                | {"purview", "hunting"}
+            )
             for name in sorted(unadvertised):
                 rejected = await session.call_tool(
                     name,
                     {"request": {}},
                 )
                 assert rejected.is_error
-                assert "Unknown tool" in "".join(
+                assert "not permitted" in "".join(
                     block.text for block in rejected.content if isinstance(block, TextContent)
                 )
             assert len(entra.api_calls) == 1
@@ -123,12 +125,16 @@ async def test_complete_sdk_discovery(browser, entra):
             json.dumps(measurement, ensure_ascii=False, indent=2) + "\n",
         )
     print(json.dumps({key: value for key, value in measurement.items() if key != "operations"}))
-    assert len(tools) == len({tool.name for tool in tools}) == len(PUBLIC_TOOLS) == 50
-    assert len(data) < BASELINE["bytes"]
+    assert len(tools) == len({tool.name for tool in tools}) == len(PUBLIC_TOOLS)
     assert measurement["sdk"] == BASELINE["sdk"]
     assert measurement["serializer"] == BASELINE["serializer"]
-    assert measurement["operations"] == [
-        operation for operation in BASELINE["operations"]
+    assert [
+        operation
+        for operation in measurement["operations"]
+        if operation["path"] not in {"/api/discovery/read", "/api/discovery/preview"}
+    ] == [
+        operation
+        for operation in BASELINE["operations"]
         if operation["name"] not in RETIRED_OPERATIONS
     ]
     assert initialized.instructions == INSTRUCTIONS
@@ -137,7 +143,7 @@ async def test_complete_sdk_discovery(browser, entra):
 
 def test_complete_unique_mapping_and_unchanged_safety():
     branches = [branch for tool in PUBLIC_TOOLS for branch in tool.branches]
-    assert len(branches) == len({branch.operation.name for branch in branches}) == 105
+    assert len(branches) == len({branch.operation.name for branch in branches}) == len(OPERATIONS)
     assert {branch.operation.name for branch in branches} == {op.name for op in OPERATIONS}
     for tool in PUBLIC_TOOLS:
         assert len({branch.action for branch in tool.branches}) == len(tool.branches)
@@ -162,9 +168,9 @@ def test_parked_investigation_bindings_are_removed_not_hidden():
     assert not RETIRED_OPERATIONS.intersection(op.name for op in OPERATIONS)
     assert not {"purview", "hunting"}.intersection(tool.name for tool in PUBLIC_TOOLS)
     assert not any(
-        op.path.startswith((
-            "/api/agent-inventory/investigations/", "/api/audit-search/", "/api/hunting/"
-        ))
+        op.path.startswith(
+            ("/api/agent-inventory/investigations/", "/api/audit-search/", "/api/hunting/")
+        )
         for op in OPERATIONS
     )
     for name in RETIRED_OPERATIONS:

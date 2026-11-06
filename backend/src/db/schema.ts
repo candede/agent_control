@@ -10,6 +10,7 @@ import { verifyPrincipalBearerFenceSchema } from "./principalBearerFenceSchema.j
 import { verifyAuditOriginSchema } from "./auditOriginSchema.js";
 import { verifyAgentControlReceiptsSchema } from "./agentControlReceiptsSchema.js";
 import { verifyOfficeAppAdoptionSchema } from "./officeAppAdoptionSchema.js";
+import { verifyAgentDiscoverySchema } from "./agentDiscoverySchema.js";
 
 export const schemaSql: string = currentSchemaSql;
 export const schemaFingerprint: string = createHash("sha256").update(schemaSql).digest("hex");
@@ -112,6 +113,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyAuditOriginSchema(database);
   await verifyAgentControlReceiptsSchema(database);
   await verifyOfficeAppAdoptionSchema(database);
+  await verifyAgentDiscoverySchema(database);
 }
 
 async function verifyDataSyncCleanupSchema(database: Pick<pg.Pool, "query">) {

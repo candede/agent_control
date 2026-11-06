@@ -17,7 +17,7 @@ Assign access:
 1. Create the roles from the [manifest](../infra/entra-app-manifest.json) under
    **App registrations > Agent Control > App roles**, enabled for **Users/Groups**.
 2. Open **Enterprise applications > Agent Control > Properties** and set
-   **Assignment required?** to **Yes**.
+   **Assignment required?** to **No** after hardened API/MCP deployment.
 3. Under **Users and groups > Add user/group**, select the user/group, select
    one role, then **Assign**. Uploader includes Viewer; Admin includes both.
 4. Sign out and sign in after assignment changes.
@@ -26,8 +26,33 @@ App roles do not grant Microsoft API access. All three roles can read
 tenant-shared saved data without permission to collect it.
 Group assignment requires applicable Entra licensing; nested groups do not inherit assignments.
 
+No EndUser role exists. Valid roleless active tenant members receive discovery-only
+access and a browser conversational handoff; they cannot read adoption, enumerate
+people, inspect jobs or run manual sync/controls. Exact member verification uses
+the actual tenant-local `oid`, not licensing, email affiliation or guessed workplace
+fields. Application-only reads bootstrap automatically at authenticated entry.
+Viewer/Uploader/Admin remain the actual authorization actors for read-only employee
+preview; a selected subject never supplies roles, tokens or permissions.
+
+Discovery's safe profile, organization-wide goal search/detail and workplace
+reads use saved data without collecting from providers on each question.
+Company/department come only from the saved account; an unlicensed employee
+absent from that source can still search the catalog. Champions are dated
+report-based suggestions, not appointments; popularity never exposes counts.
+Missing or anonymized report linkage means unavailable, not not-a-champion.
+Viewer/Uploader/Admin preview the exact saved active member through these same
+reads; normal self-service returns to their own account on the next request.
+The deployment's independent employee/champion privacy settings apply to both
+routes, including Admin previews and ordinary staff discovery. They do not
+remove authorized existing adoption/admin reads or change collection/ranking.
+Identity-bearing saved workplace labels are redacted for display without changing
+the saved company/department scope used for these answers.
+
 Read-only sync starts automatically after sign-in while the app is visible and
 online, including on first use. No **Permissions** visit or **Check status** is required.
+Fresh same-user sign-in resumes application reads cancelled for shutdown
+authorization without the ordinary failed-source retry delay; provider failures
+and explicit user cancellations retain their existing backoff.
 
 ## App registration permissions
 

@@ -101,6 +101,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     })),
     { name: "agent control receipts", rows: [{ valid: true }] },
     { name: "Office evidence", rows: [{ valid: true }] },
+    { name: "discovery and reset authority", rows: [{ valid: true }] },
   ];
 }
 
@@ -156,7 +157,7 @@ describe("current schema source contracts", () => {
   });
 
   it("constructs the exact current objects once", () => {
-    for (const [kind, count] of [["TABLE", 107], ["VIEW", 3], ["FUNCTION", 80], ["TRIGGER", 111], ["COLLATION", 2]] as const) {
+    for (const [kind, count] of [["TABLE", 107], ["VIEW", 3], ["FUNCTION", 81], ["TRIGGER", 111], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
@@ -338,7 +339,7 @@ describe("schema verification without a database", () => {
   it("requires the Office-owned rows in the collection guard", async () => {
     const database = databaseWithResults(...schemaResults().map(result => result.rows));
     await expect(verifySchema(database)).resolves.toBeUndefined();
-    const statement = database.query.mock.calls.at(-1)?.[0];
+    const statement = database.query.mock.calls[schemaResults().findIndex(result => result.name === "Office evidence")]?.[0];
     for (const table of ["office_observations", "office_person_facts", "office_group_facts"]) {
       expect(statement).toContain(`EXISTS(SELECT 1 FROM ${table} WHERE generation_id=NEW.id)`);
     }

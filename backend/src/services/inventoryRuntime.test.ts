@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import session from "express-session";
 import { config } from "../config.js";
-import { currentAuthority, withAuthority } from "../auth/authorityContext.js";
+import { authorityUser, currentAuthority, withAuthority, withAutomaticApplicationReads } from "../auth/authorityContext.js";
 import { browserRequestPrincipal } from "../auth/requestPrincipal.js";
 import { createBrowserCredentials } from "../auth/delegatedCredentials.js";
+import * as msal from "../auth/msal.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { InventoryGenerations } from "../db/inventoryGenerations.js";
@@ -13,6 +14,7 @@ import * as operationalState from "./operationalState.js";
 import { InventoryRuntime } from "./inventoryRuntime.js";
 import { StreamedInventory } from "./streamedInventory.js";
 import { AppError } from "../errors.js";
+import type { AppRole } from "../types/capability.js";
 
 const tenants = config.tenants;
 afterEach(() => { config.tenants = tenants; vi.restoreAllMocks(); });
@@ -79,13 +81,13 @@ describe("inventory sweep cancellation and retention", () => {
     return { database, runtime, query, scopeId, root, progress, roots, content, metadata };
   }
 
-  async function credential(f: ReturnType<typeof fixture>, principalId: string) {
+  async function credential(f: ReturnType<typeof fixture>, principalId: string, roles: AppRole[] = ["AgentControl.Viewer"]) {
     const tenant = { tenantId: f.root.tenantId, clientId: "synthetic-api", clientSecret: "synthetic", domains: ["example.invalid"] };
     config.tenants = [tenant];
     const epochs = { sessionEpoch: async () => "0" };
     const principal = await browserRequestPrincipal({ tenantId: tenant.tenantId, clientId: tenant.clientId, accountId: principalId,
       user: { tenantId: tenant.tenantId, homeAccountId: principalId, username: "operator@example.invalid",
-        displayName: "Synthetic operator", roles: ["AgentControl.Viewer"] },
+        displayName: "Synthetic operator", roles },
       signedInAt: Date.now(), rolesValidatedAt: Date.now(), cookie: new session.Cookie({ expires: new Date(Date.now() + 60_000) }) }, null, epochs);
     return createBrowserCredentials(principal, epochs);
   }
@@ -96,6 +98,56 @@ describe("inventory sweep cancellation and retention", () => {
     await withAuthority(source, () => f.runtime.enqueue({ tenantId: f.root.tenantId, principalId }, false));
     return source;
   }
+
+  it.each(["current", "other-tenant", "other-account", "revoked"] as const)(
+    "reconciles an employee's automatic inventory using only %s authority after its initiating context ends", async authorization => {
+    const f = fixture();
+    const source = await credential(f, "employee", []);
+    await withAuthority(source, () => withAutomaticApplicationReads(() => retain(f, "employee", source)));
+    const user = authorityUser(source);
+    vi.spyOn(msal, "revalidateAuthorizedUser").mockImplementation(async () => {
+      if (authorization === "revoked") source.revoke();
+      return { ...user, tenantId: authorization === "other-tenant" ? "another-tenant" : user.tenantId,
+        homeAccountId: authorization === "other-account" ? "another-employee" : user.homeAccountId };
+    });
+    vi.mocked(f.database.query).mockResolvedValue({ command: "SELECT", rows: [
+      { tenant_id: f.root.tenantId, principal_id: "employee", id: "1" },
+    ], rowCount: 1, fields: [], oid: 0 });
+    vi.spyOn(f.runtime, "publishControls").mockResolvedValue(0);
+    vi.spyOn(f.runtime, "publishNativeControls").mockResolvedValue(0);
+    vi.spyOn(f.runtime, "enqueue").mockResolvedValue(true);
+    vi.spyOn(f.runtime, "collect").mockResolvedValue(false);
+    vi.spyOn(DataGenerations.prototype, "sessionEpoch").mockResolvedValue("0");
+    const published = vi.fn();
+    vi.spyOn(f.runtime.reconciliation, "runNext").mockImplementation(async (_input, authorize, signal) => {
+      await authorize(signal ?? new AbortController().signal);
+      published();
+      return null;
+    });
+
+    expect(currentAuthority()).toBeUndefined();
+    await expect(f.runtime.pass()).resolves.toBe(true);
+    expect(published).toHaveBeenCalledTimes(authorization === "current" ? 1 : 0);
+    expect(msal.revalidateAuthorizedUser).toHaveBeenCalledExactlyOnceWith(f.root.tenantId, "employee");
+    },
+  );
+
+  it("keeps employee authority insufficient for control publication even inside automatic application reads", async () => {
+    const f = fixture();
+    const source = await credential(f, "employee", []);
+    vi.spyOn(msal, "revalidateAuthorizedUser").mockResolvedValue(authorityUser(source));
+    vi.mocked(f.database.query).mockResolvedValue({ command: "SELECT", rows: [
+      { target_id: "package", observation_id: randomUUID(), updated_at: new Date() },
+    ], rowCount: 1, fields: [], oid: 0 });
+    vi.spyOn(DataGenerations.prototype, "sessionEpoch").mockResolvedValue("0");
+    const execute = vi.spyOn(InventoryGenerations.prototype, "execute")
+      .mockRejectedValue(new Error("Unexpected control publication."));
+
+    await expect(withAuthority(source, () => withAutomaticApplicationReads(
+      () => f.runtime.publishControls({ tenantId: f.root.tenantId, principalId: "employee" }),
+    ))).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+    expect(execute).not.toHaveBeenCalled();
+  });
 
   it.each(["inventory_control_pending", "inventory_native_control_pending"] as const)(
     "defers canonical discovery for another actor's pending %s, but not another tenant's", async table => {

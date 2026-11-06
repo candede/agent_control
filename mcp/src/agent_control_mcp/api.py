@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import TypeVar
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -32,10 +34,14 @@ from .models import AgentAboutPage, Capabilities, CheckProgress
 from .origin import HEADER, origin_header
 from .storage import OAuthStore
 
+if TYPE_CHECKING:
+    from .projection import AccessProfile, Admission
+
 MAX_OUTPUT = 524288
 MAX_REQUESTS = 8
 MAX_EXCHANGES = 2
 T = TypeVar("T", bound=BaseModel)
+_invocation: ContextVar[ApiInvocation | None] = ContextVar("mcp_api_invocation", default=None)
 
 
 def safe_json(value: JsonValue, depth: int = 0, secrets: tuple[str, ...] = ()) -> JsonValue:
@@ -91,7 +97,7 @@ def problem(
                 sanitized_details = safe_json(value.get("details"), secrets=secrets)
                 if isinstance(sanitized_details, dict):
                     details = sanitized_details
-        except ValueError, TypeError:
+        except ValueError, TypeError, RecursionError:
             pass
     return AdapterError(
         response.status_code,
@@ -117,9 +123,25 @@ class CanonicalApi:
         self.store = store
 
     @asynccontextmanager
-    async def invocation(self, ctx: Context) -> AsyncIterator[ApiInvocation]:
-        upstream = verified_upstream(self.settings)
-        invocation = ApiInvocation(self, upstream, origin_header(ctx))
+    async def invocation(
+        self, ctx: Context | None, *, upstream: AccessToken | None = None
+    ) -> AsyncIterator[ApiInvocation]:
+        existing = _invocation.get()
+        if existing is not None and existing.api is self:
+            await existing.assert_current()
+            yield existing
+            return
+        upstream = upstream or verified_upstream(self.settings)
+        if not valid_claims(upstream.claims, self.settings):
+            raise AdapterError(401, "reauthorization_required", "Reconnect this signed-in account.")
+        invocation = ApiInvocation(
+            self,
+            upstream,
+            origin_header(ctx)
+            if ctx
+            else base64.urlsafe_b64encode(b'{"version":1}').decode().rstrip("="),
+        )
+        marker = _invocation.set(invocation)
         try:
             async with asyncio.timeout(60):
                 yield invocation
@@ -130,6 +152,7 @@ class CanonicalApi:
         finally:
             invocation.closed = True
             invocation.api_token = None
+            _invocation.reset(marker)
 
 
 class ApiInvocation:
@@ -147,6 +170,8 @@ class ApiInvocation:
         self.api_token: AccessToken | None = None
         self.semaphore = asyncio.Semaphore(4)
         self.exchange_lock = asyncio.Lock()
+        self.profile_lock = asyncio.Lock()
+        self.profile: AccessProfile | None = None
 
     def account_output(self, size: int) -> None:
         self.output_bytes += size
@@ -215,6 +240,17 @@ class ApiInvocation:
         if not isinstance(request, operation.request):
             raise AdapterError(400, "invalid_request", "Use the operation's exact typed input.")
         values = request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+        profile = await self.access_profile()
+        permission = profile.permission(operation)
+        if permission is None:
+            raise AdapterError(403, "operation_forbidden", "This operation is not permitted.")
+        for field, choices in permission.inputChoices.items():
+            if field == "capabilityId" and values.get("id") not in choices:
+                raise AdapterError(
+                    403, "operation_forbidden", "This input choice is not permitted."
+                )
+        if operation.body_operation:
+            values["operation"] = operation.body_operation
         path = operation.path
         for field in operation.path_fields:
             value = values.pop(field)
@@ -258,6 +294,24 @@ class ApiInvocation:
             headers=headers,
         )
 
+    async def access_profile(self) -> AccessProfile:
+        from .projection import AccessProfile
+
+        await self.assert_current()
+        async with self.profile_lock:
+            if self.profile is None:
+                self.profile = await self._request(
+                    "GET", "/api/mcp/access-profile", AccessProfile, account=False
+                )
+            return self.profile
+
+    async def authenticated_entry(self) -> Admission:
+        from .projection import Admission
+
+        return await self._request(
+            "POST", "/api/mcp/authenticated-entry", Admission, body={}, account=False
+        )
+
     async def _request(
         self,
         method: str,
@@ -267,6 +321,7 @@ class ApiInvocation:
         params: dict[str, str | list[str]] | None = None,
         body: dict[str, JsonValue] | None = None,
         headers: dict[str, str] | None = None,
+        account: bool = True,
     ) -> T:
         async with self.semaphore:
             await self.assert_current()
@@ -332,13 +387,14 @@ class ApiInvocation:
                                     502, "invalid_api_response", "Expected API JSON."
                                 )
                             parsed = result.model_validate_json(response_body)
-                            self.account_output(
-                                len(
-                                    parsed.model_dump_json(
-                                        exclude_unset=True, by_alias=True
-                                    ).encode()
+                            if account:
+                                self.account_output(
+                                    len(
+                                        parsed.model_dump_json(
+                                            exclude_unset=True, by_alias=True
+                                        ).encode()
+                                    )
                                 )
-                            )
                             return parsed
                 except TimeoutError, httpx2.TimeoutException:
                     raise AdapterError(

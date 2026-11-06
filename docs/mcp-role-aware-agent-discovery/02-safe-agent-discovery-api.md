@@ -93,8 +93,11 @@ not a separate design framework. No data migration or old-schema runtime.
    semantics; expose any necessary provider-free capture as a typed operation,
    not a new context database. Record exact methods/routes/inputs/outputs for
    phase 03 in this phase's completion record.
-3. Default to current saved inventory and the API-owned Latest report by content
-   period. Pin complete identities/revisions across each answer and continuation.
+3. Default to current saved inventory and the API-owned Latest retained complete
+   report by content period; superseded correction originals are not Latest
+   candidates. Run existing report-history retention preparation automatically
+   before capturing new discovery selections, including catalog-only reads.
+   Pin complete identities/revisions across each answer and continuation.
    Do not sum overlapping report periods, change anyone's personal report
    preference, write a tenant selected-period setting or require an employee
    to choose a report before asking a question.

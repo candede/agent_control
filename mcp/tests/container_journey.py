@@ -65,7 +65,7 @@ async def rpc(browser, token, *, drain=False):
         json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
     )
     assert catalog.status_code == 200, catalog.text
-    assert len(catalog.json()["result"]["tools"]) == len(PUBLIC_TOOLS) == 50
+    assert len(catalog.json()["result"]["tools"]) == len(PUBLIC_TOOLS)
     if drain:
         await asyncio.to_thread(Path("/work/drain-started.json").write_text, '{"started":true}')
     name, request = public_request(

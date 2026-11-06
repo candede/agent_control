@@ -141,6 +141,7 @@ import { SavedQueryProvider } from "./components/SavedQueryProvider";
 import { createSavedQueryClient, readSavedQuery } from "./savedQueries";
 import { trapDialogFocus } from "./dialogFocus";
 import { SignInForm } from "./components/SignInForm";
+import { EmployeeDiscoveryHandoff } from "./components/EmployeeDiscoveryHandoff";
 import { McpSettings } from "./components/McpSettings";
 import "./components/agentWorkspace.css";
 
@@ -676,7 +677,7 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
   }, [principalKey]);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user || !hasRole(user, "AgentControl.Viewer")) return;
     const controller = new AbortController();
     readSavedQuery(savedQueries, ["workbench-metadata", principalKey], signal => getWorkbenchMetadata({ signal }), controller.signal)
       .then(value => { if (!controller.signal.aborted) setLoadedWorkbenchMetadata({ principalKey, value }); })
@@ -1432,7 +1433,13 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
 
   useEffect(() => {
     if (!user || visibleActiveView === activeView) return;
-    replaceRoute(visibleActiveView, workbenchUrl(visibleActiveView));
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (!active) return;
+      setActiveView(visibleActiveView);
+      replaceRoute(visibleActiveView, workbenchUrl(visibleActiveView));
+    });
+    return () => { active = false; };
   }, [activeView, replaceRoute, user, visibleActiveView]);
 
   function navigateToView(view: WorkbenchViewId) {
@@ -2139,36 +2146,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         }
         setError(errorMessage(requestError));
       }
-    } finally {
-      if (packageRefreshAbortController.current === controller) packageRefreshAbortController.current = undefined;
-      if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
-    }
-  }
-
-  async function handleRefreshExactPackage(id: string) {
-    if (!isCurrentAgentScope() || packageRefreshAbortController.current && !packageRefreshAbortController.current.signal.aborted) return;
-    const requestId = ++packageRefreshRequestId.current;
-    packageRefreshAbortController.current?.abort();
-    const controller = new AbortController();
-    packageRefreshAbortController.current = controller;
-    const owner = principalKey;
-    setRefreshingAgents(true);
-    setError(undefined);
-    setAgentDetailError(undefined);
-    try {
-      let job = await startExactPackageRefresh(id, "application", { signal: controller.signal });
-      if (!ownsPackageRefreshRequest(requestId, owner)) return;
-      while (job.status === "running") {
-        await wait(packageRefreshPollIntervalMs);
-        if (!ownsPackageRefreshRequest(requestId, owner)) return;
-        job = await getPackageRefreshJob(job.id, job.tokenMode, { signal: controller.signal });
-        if (!ownsPackageRefreshRequest(requestId, owner)) return;
-      }
-      if (job.status !== "succeeded") throw new Error(job.message ?? "Exact package refresh requires current Microsoft Graph application authorization. Open Permissions to review the application's permissions and credentials, then retry.");
-      setRequestedAgentDetailId(id);
-      if (claimPackageRefreshPublication(job)) automaticRefresh.checkNow();
-    } catch (requestError) {
-      if (ownsPackageRefreshRequest(requestId, owner)) setAgentDetailError(errorMessage(requestError));
     } finally {
       if (packageRefreshAbortController.current === controller) packageRefreshAbortController.current = undefined;
       if (ownsPackageRefreshRequest(requestId, owner)) setRefreshingAgents(false);
@@ -3406,6 +3383,11 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
     );
   }
 
+  if (user.roles.length === 0) {
+    return <EmployeeDiscoveryHandoff key={principalKey} user={user} onSignOut={() => void handleSignOut()} signingOut={signingOut}
+      error={[error, bulkJobStorageError].filter(Boolean).join(" ") || undefined} />;
+  }
+
   return (
     <CapabilityContext key={principalKey} value={{ ...capabilityState, openPermissions: () => navigateToView("permissions") }}>
     <PublicationContext value={{ admit: automaticRefresh.admitPublication, revisions: automaticRefresh.publicationRevisions,
@@ -3614,23 +3596,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
           onCompanyChange={company => handleDashboardRouteChange({ ...dashboardRoute, company })} />
         : visibleActiveView === "mcp-settings" && user ? <McpSettings key={principalKey} user={user} />
         : visibleActiveView === "permissions" ? <PermissionCenter /> : visibleActiveView === "agents" ? (
-        !hasRole(user, "AgentControl.Viewer") ? (
-          <>
-            <LinkedAgentJobStatus refreshJob={visibleLinkedPackageRefreshJob} owner={principalKey} controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={linkedPackageRefreshError ?? linkedJobError}
-              loadingRefreshStatus={linkedPackageRefreshLoading}
-              waitingForRefreshStatus={waitingForLinkedPackageStatus}
-              onRefreshStatus={requestedPackageRefreshJobId ? handleRefreshLinkedPackageStatus : undefined} />
-            <ExactPackageLookup
-              loading={Boolean(loadingAgentDetailId)}
-              error={agentDetailError}
-              onLookup={(id) => {
-                setAgentDetailError(undefined);
-                setRequestedAgentDetailId(id);
-              }}
-              onRefresh={(id) => void handleRefreshExactPackage(id)}
-            />
-          </>
-        ) : (
         <section className="agent-workspace" aria-label="Agent inventory">
           {linkedPackageRefreshError ? <div className="error-banner" role="alert">{linkedPackageRefreshError}</div> : null}
           {!canOperate ? <LinkedAgentJobStatus controlJob={requestedPackageControlJobId ? trackedJob : undefined} error={requestedPackageControlJobId ? linkedJobError : undefined} /> : null}
@@ -3855,7 +3820,6 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
               </nav> : null}
             </div>
         </section>
-        )
       ) : visibleActiveView === "users" ? (
         <CopilotUsersView
           key={`users:${principalKey}`}
@@ -4124,33 +4088,6 @@ function formatRefreshTime(date: Date) {
     hour: "numeric",
     minute: "2-digit",
   });
-}
-
-function ExactPackageLookup({ loading, error, onLookup, onRefresh }: {
-  loading: boolean;
-  error?: string;
-  onLookup: (id: string) => void;
-  onRefresh: (id: string) => void;
-}) {
-  const [nativeId, setNativeId] = useState("");
-  return <section className="screen-state exact-package-lookup" aria-labelledby="exact-package-heading">
-    <h2 id="exact-package-heading">Exact package targeting</h2>
-    <p>Enter one known Microsoft Graph package native ID to inspect that exact target.</p>
-    <form onSubmit={event => {
-      event.preventDefault();
-      const id = nativeId.trim();
-      if (id && id.length <= 512 && !/[\r\n\0]/.test(id)) onLookup(id);
-    }}>
-      <label><span>Graph package native ID</span><input value={nativeId} maxLength={512} onChange={event => setNativeId(event.target.value)} /></label>
-      <button type="submit" disabled={loading || !nativeId.trim()}>Inspect exact package</button>
-      <WorkbenchActionGate actionId="packages.refresh.exact"><button type="button" className="secondary" disabled={loading || !nativeId.trim()} onClick={() => {
-        const id = nativeId.trim();
-        if (id && id.length <= 512 && !/[\r\n\0]/.test(id)) onRefresh(id);
-      }}>Refresh exact package</button></WorkbenchActionGate>
-    </form>
-    {loading ? <p role="status">Loading exact package…</p> : null}
-    {error ? <p role="alert">{error}</p> : null}
-  </section>;
 }
 
 function ExportIcon() {

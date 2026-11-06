@@ -343,7 +343,7 @@ it.each(["initial delay", "poll interval", "transport retry", "admission cooldow
       if (url === "/api/me") return Response.json({ user: {
         displayName: "Replacement", username: "replacement@example.invalid", homeAccountId: "replacement",
         tenantId: "tenant", roles: ["AgentControl.Viewer"],
-      }, csrfToken: "synthetic", roleAssignmentRequired: false });
+      }, csrfToken: "synthetic" });
       if (phase === "transport retry") throw new TypeError("Network");
       if (phase === "admission cooldown") return Response.json({ code: "request_admission_limit" }, { status: 429, headers: { "Retry-After": "5" } });
       if (phase === "pending read") return pending;

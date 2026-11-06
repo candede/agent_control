@@ -15,7 +15,8 @@ param keyVaultSubscriptionId = '00000000-0000-0000-0000-000000000000'
 param keyVaultResourceGroupName = 'approved-security-resource-group'
 param keyVaultName = 'approved-vault-name'
 param sessionSecretVersion = 'approved-version'
-param postgresAdminPasswordSecretVersion = 'approved-version'
+// This parameter-file function emits a native ARM reference, not a secret value.
+param postgresAdminPassword = az.getSecret('00000000-0000-0000-0000-000000000000', 'approved-security-resource-group', 'approved-vault-name', 'agent-control-postgres-admin-password', 'approved-version')
 param postgresAppPasswordSecretVersion = 'approved-version'
 param approvedAppOutboundIpv4Addresses = []
 param actionGroupResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/approved-monitoring-resource-group/providers/Microsoft.Insights/actionGroups/approved-operator-action-group'

@@ -11,6 +11,7 @@ from mcp.types import PaginatedRequestParams
 from starlette.types import Receive, Scope, Send
 
 from agent_control_mcp.config import ConfigurationError, Settings, checked_url
+from agent_control_mcp.domains import PUBLIC_TOOLS
 from agent_control_mcp.service import build_service
 
 HEADER = "X-Agent-Control-Mcp-Metadata-Token"
@@ -33,8 +34,11 @@ async def test_same_instance_complete_wire_metadata(browser, service, entra, rec
                 cursor = page.next_cursor
                 if cursor is None:
                     break
-    response = await browser.get(
-        "/internal/mcp-metadata", headers={HEADER: service.api.settings.metadata_key.decode()}
+    browser.headers.pop("Authorization", None)
+    response = await browser.post(
+        "/internal/mcp-metadata",
+        headers={HEADER: service.api.settings.metadata_key.decode()},
+        json=entra.profiles["admin"],
     )
     assert response.status_code == 200
     metadata = response.json()
@@ -45,16 +49,22 @@ async def test_same_instance_complete_wire_metadata(browser, service, entra, rec
     assert metadata["tools"] == [
         tool.model_dump(mode="json", by_alias=True, exclude_none=True) for tool in tools
     ]
-    discovery = {"initialize": initialized.model_dump(
-        mode="json", by_alias=True, exclude_none=True
-    ), "tools": metadata["tools"]}
+    discovery = {
+        "initialize": initialized.model_dump(mode="json", by_alias=True, exclude_none=True),
+        "tools": metadata["tools"],
+    }
     record_property("metadata_utf8_bytes", len(response.content))
-    record_property("discovery_utf8_bytes", len(json.dumps(
-        discovery, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")))
+    record_property(
+        "discovery_utf8_bytes",
+        len(
+            json.dumps(
+                discovery, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        ),
+    )
     record_property("public_tools", len(tools))
     record_property("instructions_words", len(metadata["instructions"].split()))
-    assert len(metadata["tools"]) == 50
+    assert len(metadata["tools"]) == len(PUBLIC_TOOLS)
     assert len(response.content) < 4 * 1024 * 1024
     assert metadata["storageReady"] is True
     assert response.headers["cache-control"] == "no-store"
@@ -64,9 +74,14 @@ async def test_same_instance_complete_wire_metadata(browser, service, entra, rec
 async def test_metadata_authority_is_independent(browser, service, entra):
     key = service.api.settings.metadata_key.decode()
     for headers in (
-        {}, {HEADER: "wrong"}, {HEADER: entra.token()}, {"Authorization": f"Bearer {key}"}
+        {},
+        {HEADER: "wrong"},
+        {HEADER: entra.token()},
+        {"Authorization": f"Bearer {key}"},
     ):
-        response = await browser.get("/internal/mcp-metadata", headers=headers)
+        response = await browser.post(
+            "/internal/mcp-metadata", headers=headers, json=entra.profiles["admin"]
+        )
         assert response.status_code == 401
         assert key not in response.text
     response = await browser.post("/mcp", headers={"Authorization": f"Bearer {key}"}, json={})
@@ -75,9 +90,7 @@ async def test_metadata_authority_is_independent(browser, service, entra):
 
 
 @pytest.mark.parametrize("path", ["/internal/mcp-metadata", "/mcp"])
-async def test_private_transport_preserves_public_host_and_origin_protection(
-    service, entra, path
-):
+async def test_private_transport_preserves_public_host_and_origin_protection(service, entra, path):
     async def bound_server(scope: Scope, receive: Receive, send: Send) -> None:
         # ASGITransport otherwise infers the server bind address from the request Host.
         scope["server"] = ("0.0.0.0", 8000)
@@ -85,21 +98,25 @@ async def test_private_transport_preserves_public_host_and_origin_protection(
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=bound_server)) as client:
         headers = {HEADER: service.api.settings.metadata_key.decode()}
-        method = "GET" if path == "/internal/mcp-metadata" else "POST"
+        method = "POST"
         url = f"http://mcp:8000{path}"
-        assert (await client.request(method, url, headers=headers)).status_code == 421
+        assert (
+            await client.request(method, url, headers=headers, json=entra.profiles["admin"])
+        ).status_code == 421
         headers["Host"] = "mcp.example.test"
-        response = await client.request(method, url, headers=headers)
-        assert response.status_code == (200 if method == "GET" else 401)
-        if method == "GET":
-            assert len(response.json()["tools"]) == 50
+        response = await client.request(method, url, headers=headers, json=entra.profiles["admin"])
+        assert response.status_code == (200 if path == "/internal/mcp-metadata" else 401)
+        if path == "/internal/mcp-metadata":
+            assert len(response.json()["tools"]) == len(PUBLIC_TOOLS)
         headers["Origin"] = "https://untrusted.example.invalid"
-        assert (await client.request(method, url, headers=headers)).status_code == 403
+        assert (
+            await client.request(method, url, headers=headers, json=entra.profiles["admin"])
+        ).status_code == 403
     assert not entra.api_calls
 
 
 async def test_metadata_observes_readiness_without_oauth_record_reads_or_writes(
-    browser, service, monkeypatch
+    browser, service, monkeypatch, entra
 ):
     async def forbidden(*args, **kwargs):
         raise AssertionError("Metadata must not read or write OAuth records.")
@@ -107,16 +124,20 @@ async def test_metadata_observes_readiness_without_oauth_record_reads_or_writes(
     for name in ("get", "put", "delete", "check"):
         monkeypatch.setattr(service.store, name, forbidden)
     headers = {HEADER: service.api.settings.metadata_key.decode()}
-    response = await browser.get("/internal/mcp-metadata", headers=headers)
+    response = await browser.post(
+        "/internal/mcp-metadata", headers=headers, json=entra.profiles["admin"]
+    )
     assert response.status_code == 200 and response.json()["storageReady"] is True
     service.store._ready = False
-    response = await browser.get("/internal/mcp-metadata", headers=headers)
+    response = await browser.post(
+        "/internal/mcp-metadata", headers=headers, json=entra.profiles["admin"]
+    )
     assert response.status_code == 200 and response.json()["storageReady"] is False
 
 
 @pytest.mark.parametrize("fails", [False, True])
 async def test_pending_probe_preserves_last_completed_readiness(
-    browser, service, monkeypatch, fails
+    browser, service, monkeypatch, fails, entra
 ):
     entered, release = asyncio.Event(), asyncio.Event()
     cull = service.store.files.cull
@@ -133,7 +154,9 @@ async def test_pending_probe_preserves_last_completed_readiness(
     headers = {HEADER: service.api.settings.metadata_key.decode()}
     try:
         await asyncio.wait_for(entered.wait(), timeout=1)
-        response = await browser.get("/internal/mcp-metadata", headers=headers)
+        response = await browser.post(
+            "/internal/mcp-metadata", headers=headers, json=entra.profiles["admin"]
+        )
         assert response.status_code == 200 and response.json()["storageReady"] is True
     finally:
         release.set()
@@ -142,7 +165,9 @@ async def test_pending_probe_preserves_last_completed_readiness(
                 await probe
         else:
             await probe
-    response = await browser.get("/internal/mcp-metadata", headers=headers)
+    response = await browser.post(
+        "/internal/mcp-metadata", headers=headers, json=entra.profiles["admin"]
+    )
     assert response.status_code == 200
     assert response.json()["storageReady"] is not fails
 
@@ -158,7 +183,9 @@ async def test_metadata_configuration_failure_is_scoped(settings_env, tmp_path, 
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=service.app), base_url="https://mcp.example.test"
         ) as client:
-            response = await client.get("/internal/mcp-metadata", headers={HEADER: "unusable"})
+            response = await client.post(
+                "/internal/mcp-metadata", headers={HEADER: "unusable"}, json={}
+            )
             assert response.status_code == 503
             assert response.json() == {"error": "metadata_configuration_unavailable"}
             assert (await client.get("/ready")).status_code == 200

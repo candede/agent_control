@@ -4,6 +4,7 @@ export type AuthenticatedUser = {
   displayName: string;
   username: string;
   homeAccountId: string;
+  localAccountId?: string;
   tenantId?: string;
   roles: AppRole[];
   providerRoleIds?: string[];

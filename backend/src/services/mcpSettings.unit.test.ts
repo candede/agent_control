@@ -4,7 +4,13 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config, type TenantConfiguration } from "../config.js";
 import { mcpMetadataMaximumBytes, type McpRuntimeMetadata } from "../types/mcpSettings.js";
-import { readMcpSettings } from "./mcpSettings.js";
+import { readMcpSettings as readProjectedMcpSettings } from "./mcpSettings.js";
+import type { McpAccessProfile } from "../types/mcpSettings.js";
+
+const projection: McpAccessProfile = { audience: "adoption", operations: [], staffPreviewAuthorized: true,
+  privacy: { hide_employee_details: false, hide_champion_employee: false } };
+const readMcpSettings = (tenantId: string, signal?: AbortSignal) =>
+  readProjectedMcpSettings(tenantId, projection, signal);
 
 const mocks = vi.hoisted(() => ({ http: vi.fn(), https: vi.fn() }));
 vi.mock("node:http", () => ({ request: mocks.http }));
@@ -76,18 +82,37 @@ function nativeResponse(options: { status?: number; contentType?: string; body?:
 }
 
 describe("native MCP metadata transport without sockets", () => {
-  it("uses the private destination and public Host with an independently authenticated GET", async () => {
+  it("uses the private destination and public Host with an independently authenticated POST", async () => {
     const { transport, outgoing, incoming } = nativeResponse();
     const result = await readMcpSettings(tenant.tenantId);
     expect(result).toMatchObject({ state: "available", runtime: metadata });
     expect(JSON.stringify(result)).not.toContain(key);
     expect(transport).toHaveBeenCalledExactlyOnceWith(new URL("http://mcp:8000/internal/mcp-metadata"), {
-      method: "GET", signal: expect.any(AbortSignal),
-      headers: { accept: "application/json", host: "public-mcp.example.invalid",
+      method: "POST", signal: expect.any(AbortSignal),
+      headers: { accept: "application/json", "content-type": "application/json", host: "public-mcp.example.invalid",
         "x-agent-control-mcp-metadata-token": key },
     }, expect.any(Function));
     expect(mocks.https).not.toHaveBeenCalled();
-    expect(outgoing.end).toHaveBeenCalledOnce();
+    expect(outgoing.end).toHaveBeenCalledExactlyOnceWith(JSON.stringify(projection));
+    expect(incoming.destroyed).toBe(true);
+  });
+
+  it.each(["?", "#"])("rejects a configured resource with an empty %s delimiter before requesting metadata", async delimiter => {
+    vi.stubEnv("MCP_PUBLIC_URL", `${metadata.binding.resourceUrl}${delimiter}`);
+    expect(await readMcpSettings(tenant.tenantId)).toMatchObject({
+      state: "unavailable", configured: { resourceUrl: "" }, code: "metadata_configuration_unavailable",
+    });
+    expect(mocks.http).not.toHaveBeenCalled();
+    expect(mocks.https).not.toHaveBeenCalled();
+  });
+
+  it.each(["?", "#"])("rejects runtime callbacks with an empty %s delimiter", async delimiter => {
+    const { incoming } = nativeResponse({
+      body: JSON.stringify({ ...metadata, redirectUris: [`${metadata.redirectUris[0]}${delimiter}`] }),
+    });
+    expect(await readMcpSettings(tenant.tenantId)).toMatchObject({
+      state: "unavailable", code: "metadata_unavailable",
+    });
     expect(incoming.destroyed).toBe(true);
   });
 

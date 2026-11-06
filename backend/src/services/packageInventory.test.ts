@@ -49,7 +49,8 @@ function fixture(options: { autoDetails?: boolean; exact?: boolean } = {}) {
     submit: vi.fn(async () => job), getJob: vi.fn(async (_scope?: unknown, id = job.id): Promise<typeof job | undefined> => ({ ...job, id })),
     claimDueDetails: vi.fn(async () => null as typeof job | null), latestAutomaticDetailsJob: vi.fn(async () => null as typeof job | null),
     markRunning: vi.fn(async () => true), recordProgress: vi.fn(async () => undefined), complete: vi.fn(async () => undefined),
-    markWaitingAuthorization: vi.fn(async () => undefined), markFailed: vi.fn(async () => job),
+    markWaitingAuthorization: vi.fn(async () => undefined),
+    markFailed: vi.fn(async (_scope: unknown, _id: string, _code: string, _message: string, _admissionRevision?: string) => job),
     cancel: vi.fn(async (): Promise<typeof job | undefined> => ({ ...job, status: "cancelled" })), recoverInterrupted: vi.fn(async () => 0),
   };
   const collection = vi.fn(async (_token: string, _options: Options) => {});
@@ -695,11 +696,37 @@ describe("streamed package refresh service", () => {
       f.dependencies[stage].mockRejectedValueOnce(new AppError(403, "missing_permission", "Consent."));
       await expect(f.start()).rejects.toMatchObject({ code: "missing_permission" });
       expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "missing_permission",
-        expect.stringContaining("signing in again does not grant permissions"));
+        expect.stringContaining("signing in again does not grant permissions"), f.job.resultRevision);
       expect(f.repository.markRunning).not.toHaveBeenCalled();
       expect(f.collection).not.toHaveBeenCalled();
     },
   );
+
+  it.each([false, true])("does not fail a newer running job after stale admission is denied (automatic=%s)", async autoDetails => {
+    const f = fixture({ autoDetails }), readiness = deferred<void>();
+    const revision = f.job.resultRevision;
+    f.dependencies.requireAvailable.mockReturnValueOnce(readiness.promise);
+    f.repository.markFailed.mockImplementation(async (_scope, _id, _code, _message, admissionRevision) => {
+      if (admissionRevision === undefined
+        || f.job.status === "waiting_authorization" && f.job.resultRevision === admissionRevision) {
+        f.job.status = "failed";
+      }
+      return { ...f.job };
+    });
+    const starting = expect(f.start()).rejects.toMatchObject({ code: "missing_permission" });
+    await vi.waitFor(() => expect(f.dependencies.requireAvailable).toHaveBeenCalledOnce());
+    f.job.status = "running";
+    f.job.resultRevision = "2026-09-09 00:01:00+00";
+    readiness.reject(new AppError(403, "missing_permission", "This admission was denied."));
+    await starting;
+    await expect(f.service.get(f.owner, f.job.id, "application")).resolves.toMatchObject({
+      status: "running", resultRevision: f.job.resultRevision,
+    });
+    expect(f.repository.markFailed).toHaveBeenCalledWith(expect.anything(), f.job.id, "missing_permission",
+      expect.any(String), revision);
+    expect(f.repository.markRunning).not.toHaveBeenCalled();
+    expect(f.collection).not.toHaveBeenCalled();
+  });
 
   it.each(["missing_permission", "capability_unavailable", "provider_error"])("does not relabel provider 403 %s as an expired sign-in", async code => {
     const f = fixture();

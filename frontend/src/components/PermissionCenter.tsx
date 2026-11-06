@@ -77,7 +77,7 @@ function PermissionCenterContent() {
         {canCheckPermissions && (loading || pending) ? <PermissionCheckProgress loading={loading} activeCheck={activeCheck} views={views} /> : null}
         {!canCheckPermissions ? <div className="permission-role-required">
           <AlertCircle size={20} aria-hidden="true" />
-          <p>Ask an administrator to assign <code>AgentControl.Viewer</code>, <code>AgentControl.UsageReportUploader</code> or <code>AgentControl.Admin</code>.</p>
+          <p>Verified employees without app roles use conversational agent discovery. Adoption and administration require an explicit staff app role.</p>
         </div> : issues.length ? <ul className="permission-issue-list">{issues.map(issue => <li key={issue.view.definition.id}>
           <article className="permission-issue" aria-labelledby={`issue-${issue.view.definition.id}`}>
             <header className="permission-issue-heading">

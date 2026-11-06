@@ -156,8 +156,9 @@ export class DataGenerations {
     return this.connections.run(async client => {
       await client.query("INSERT INTO data_principal_epochs(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING", [tenant, principal]);
       const row = (await client.query<{ epoch: string; issuedAfter: string }>(`
-        SELECT epoch,bearer_issued_after AS "issuedAfter" FROM data_principal_epochs
-        WHERE tenant_id=$1 AND principal_id=$2 FOR SHARE`, [tenant, principal])).rows[0];
+        SELECT p.epoch,p.bearer_issued_after AS "issuedAfter"
+        FROM data_principal_epochs p
+        WHERE p.tenant_id=$1 AND p.principal_id=$2 FOR SHARE OF p`, [tenant, principal])).rows[0];
       if (!row) throw new Error("data_principal_missing");
       return row;
     });

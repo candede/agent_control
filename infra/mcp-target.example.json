@@ -13,6 +13,8 @@
   "repository": "agent-control/mcp",
   "imageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "existingImageDigest": "",
+  "hide_employee_details": false,
+  "hide_champion_employee": false,
   "tenantId": "00000000-0000-0000-0000-000000000000",
   "clientId": "00000000-0000-0000-0000-000000000000",
   "apiClientId": "00000000-0000-0000-0000-000000000000",

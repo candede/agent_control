@@ -68,6 +68,10 @@ def sample(schema, root=None, name=""):
 
 
 SOURCE_TYPES = {
+    "Page": "discoveryPage",
+    "Profile": "discoveryProfile",
+    "Detail": "discoveryDetail",
+    "Workplace": "discoveryWorkplace",
     "WorkspaceJobs": "workspace",
     "Capabilities": "capabilities",
     "CapabilityView": "capability",
@@ -377,9 +381,7 @@ async def test_every_registered_tool_is_callable_over_real_sdk(
 
 
 @pytest.mark.parametrize("age", [300, 301, 1800])
-async def test_department_adoption_accepts_backdated_entra_tokens(
-    age, rpc, entra, source_fixtures
-):
+async def test_department_adoption_accepts_backdated_entra_tokens(age, rpc, entra, source_fixtures):
     now = int(time.time())
     entra.response_claims = {"iat": now - age, "nbf": now - age}
     expected = source_fixtures["adoption"]
@@ -401,15 +403,17 @@ async def test_department_adoption_accepts_backdated_entra_tokens(
     }
 
 
-async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rpc):
+async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rpc, entra):
+    from agent_control_mcp.projection import AccessProfile, projected_catalog
+
     response = await browser.post(
         "/mcp",
         headers=rpc.headers,
         json={"jsonrpc": "2.0", "id": 500, "method": "tools/list"},
     )
     tools = {tool["name"]: tool for tool in response.json()["result"]["tools"]}
-    assert len(tools) == len(PUBLIC_TOOLS) == len(set(tools)) == 50
-    for domain in PUBLIC_TOOLS:
+    assert len(tools) == len(PUBLIC_TOOLS) == len(set(tools))
+    for domain in projected_catalog(AccessProfile.model_validate(entra.profiles["admin"])):
         tool = tools[domain.name]
         operation = domain.branches[0].operation
         assert tool["inputSchema"]["properties"]["request"]
@@ -418,18 +422,20 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
             **domain.response.model_json_schema(by_alias=True),
             "type": "object",
         }
-        if domain.grouped:
+        if domain.grouped and len(domain.branches) > 1:
             assert tool["outputSchema"]["discriminator"]["propertyName"] == "action"
             assert set(tool["outputSchema"]["discriminator"]["mapping"]) == {
                 branch.action for branch in domain.branches
             }
         assert tool["description"] == domain.description
         assert tool["annotations"]["readOnlyHint"] == (
-            operation.method == "GET" and not operation.provider
+            operation.saved_read or operation.method == "GET" and not operation.provider
         )
         assert tool["annotations"]["destructiveHint"] == operation.destructive
         assert tool["annotations"]["idempotentHint"] == (
-            operation.idempotent or (operation.method == "GET" and not operation.provider)
+            operation.idempotent
+            or operation.saved_read
+            or (operation.method == "GET" and not operation.provider)
         )
         assert tool["annotations"]["openWorldHint"] == operation.provider
         assert "Any" not in json.dumps(tool["outputSchema"])
@@ -459,7 +465,12 @@ async def test_uploader_assignment_does_not_add_browser_only_import_tools(browse
         json={"jsonrpc": "2.0", "id": 501, "method": "tools/list"},
     )
     tools = response.json()["result"]["tools"]
-    assert {tool["name"] for tool in tools} == {tool.name for tool in PUBLIC_TOOLS}
+    from agent_control_mcp.projection import AccessProfile, projected_catalog
+
+    assert {tool["name"] for tool in tools} == {
+        tool.name
+        for tool in projected_catalog(AccessProfile.model_validate(entra.profiles["uploader"]))
+    }
     assert not any(
         operation.path.startswith("/api/official-usage/") and operation.method in {"POST", "DELETE"}
         for operation in OPERATIONS

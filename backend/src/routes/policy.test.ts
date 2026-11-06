@@ -11,7 +11,8 @@ describe("route policy declarations", () => {
       "GET /api/health", "GET /api/ready", "GET /api/auth/status", "GET /api/diagnostics", "GET /{*path}",
       "GET /auth/login", "POST /auth/login", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
-      "GET /workbench/metadata", "GET /workbench/jobs", "GET /mcp/settings", "POST /audit/events/export.csv",
+      "GET /workbench/metadata", "GET /workbench/jobs", "GET /mcp/settings", "GET /mcp/access-profile", "POST /mcp/authenticated-entry", "POST /audit/events/export.csv",
+      "POST /discovery/read", "POST /discovery/preview",
       "GET /agent-inventory", "GET /agent-inventory/summary", "GET /agent-inventory/facets", "POST /agent-inventory/selections",
       "GET /agent-inventory/health",
       "GET /agent-inventory/:recordId/about",
@@ -68,6 +69,11 @@ describe("route policy declarations", () => {
       if (policy.access === "authenticated" && !key.startsWith("GET ")) expect(policy.csrf).toBe(true);
       if (policy.access === "authenticated") expect(policy.dataClass.length).toBeGreaterThan(0);
     }
+  });
+
+  it("requires explicit staff roles on every sensitive authenticated route", () => {
+    expect([...declaredRoutePolicies].filter(([, policy]) => policy.access === "authenticated" && !policy.roles?.length).map(([key]) => key).sort())
+      .toEqual(["GET /mcp/access-profile", "GET /me", "POST /auth/logout", "POST /discovery/read", "POST /mcp/authenticated-entry"]);
   });
 
   it("requires directory-read authorization, Viewer access and CSRF for persisted people resolution", () => {

@@ -386,10 +386,23 @@ export async function getCurrentUser(options: { signal?: AbortSignal } = {}) {
   assertCurrentRequest(sessionGeneration, options.signal);
   const generation = ++sessionGeneration;
   csrfToken = undefined;
-  const result = await request<{ user: SessionUser; csrfToken: string; roleAssignmentRequired: boolean }>("/api/me", { signal: options.signal });
+  const result = await request<{ user: SessionUser; csrfToken: string }>("/api/me", { signal: options.signal });
   assertCurrentRequest(generation, options.signal);
   csrfToken = result.csrfToken;
   return result;
+}
+
+export async function enterDiscovery(options: { signal?: AbortSignal } = {}) {
+  const value = await request<{ admission: string; nextCheckAt: string; errorCode?: string }>("/api/mcp/authenticated-entry", {
+    method: "POST", signal: options.signal,
+  });
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !["scheduled", "current", "retryable"].includes(value.admission)
+    || typeof value.nextCheckAt !== "string" || !Number.isFinite(Date.parse(value.nextCheckAt))
+    || value.errorCode !== undefined && typeof value.errorCode !== "string") {
+    throw new ApiError(200, "invalid_response", "The server returned an invalid automatic collection admission.");
+  }
+  return value;
 }
 
 export function getCapabilities(options: { signal?: AbortSignal } = {}) {

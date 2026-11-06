@@ -834,8 +834,19 @@ def test_control_inputs_reject_guessed_identity_unbound_receipts_and_unsupported
 
 def test_catalog_has_one_owner_and_no_control_gate_or_parallel_recovery_framework():
     added = {operation.name for operation in OPERATIONS} - {row[0] for row in CASES}
-    assert len(added) == 75
-    assert len(OPERATIONS) == 105
+    discovery = {
+        "search_agent_catalog",
+        "read_discovery_detail",
+        "read_my_workplace",
+        "read_my_discovery_profile",
+        "preview_discovery_profile",
+        "preview_discovery_search",
+        "preview_discovery_detail",
+        "preview_discovery_workplace",
+    }
+    assert discovery <= added
+    assert len(added - discovery) == 75
+    assert len(OPERATIONS) == 113
     assert {operation.method for operation in OPERATIONS if operation.method == "PATCH"} == {
         "PATCH"
     }

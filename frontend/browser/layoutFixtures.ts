@@ -295,7 +295,7 @@ export async function mockLayoutApi(page: Page, options: { metadataAfterPermissi
   }
   const responses: Record<string, unknown> = {
     "/api/auth/status": { authConfigured: true, callback: new URL("/api/auth/callback", process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3001").href },
-    "/api/me": { user: actor, csrfToken: "layout-csrf", roleAssignmentRequired: false },
+    "/api/me": { user: actor, csrfToken: "layout-csrf" },
     "/api/workbench/metadata": { views: workbenchViews, actions: workbenchActions },
     "/api/capabilities": { value: capabilityViews }, "/api/capabilities/check": { value: capabilityViews },
     "/api/capabilities/check-progress": { progress: null },

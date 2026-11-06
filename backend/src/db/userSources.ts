@@ -501,10 +501,10 @@ const sortKeys = {
   department: 'lower(normalize(department,NFKC) COLLATE "default")', service: "service_state", activity: "last_activity_date::text",
 } as const;
 
-export function userSourceSearch(value: string) {
-  if (typeof value !== "string" || value.length > 256 || /[\p{Cc}\p{Cs}]/u.test(value)) throw new SelectionError("invalid_cursor");
+export function userSourceSearch(value: string, maximum = 256) {
+  if (typeof value !== "string" || value.length > maximum || /[\p{Cc}\p{Cs}]/u.test(value)) throw new SelectionError("invalid_cursor");
   const search = value.normalize("NFKC").toLowerCase().normalize("NFKC").trim();
-  if (search.length > 256) throw new SelectionError("invalid_cursor");
+  if (search.length > maximum) throw new SelectionError("invalid_cursor");
   return search;
 }
 export function userSourceSearchSql(expression: string) {

@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+from functools import cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -24,6 +25,11 @@ CLIENT = "33333333-3333-3333-3333-333333333333"
 API = "22222222-2222-2222-2222-222222222222"
 USER = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+@cache
+def canonical_profiles():
+    return json.loads((Path(__file__).parent / "fixtures/access_profiles.json").read_text())
 
 
 def pytest_addoption(parser):
@@ -66,6 +72,13 @@ class Entra:
         self.oid = USER
         self.calls = []
         self.api_calls = []
+        self.authority_calls = []
+        self.profiles = canonical_profiles()
+        self.profile_overrides = {}
+        self.privacy = {"hide_employee_details": False, "hide_champion_employee": False}
+        self.access_error = None
+        self.roles_by_oid = {}
+        self.profiles_by_oid = {}
         self.api_responses = []
         self.exchange_error = None
         self.refresh_error = False
@@ -94,7 +107,7 @@ class Entra:
             "nbf": now - 300,
             "exp": now + 3600,
             "scp": "AgentControl.Access" if api else "Mcp.Access",
-            **({"roles": ["AgentControl.Viewer"]} if api else {}),
+            **({"roles": ["AgentControl.Admin"]} if api else {}),
             **extra,
         }
 
@@ -135,7 +148,15 @@ class Entra:
                     json={
                         "access_token": self.token(
                             api=True,
-                            **{"oid": assertion["oid"], **self.response_claims},
+                            **{
+                                "oid": assertion["oid"],
+                                **self.response_claims,
+                                **(
+                                    {"roles": self.roles_by_oid[assertion["oid"]]}
+                                    if assertion["oid"] in self.roles_by_oid
+                                    else {}
+                                ),
+                            },
                         ),
                         "token_type": "Bearer",
                         "expires_in": 3600,
@@ -160,6 +181,31 @@ class Entra:
                 },
             )
         assert request.url.host == "api.example.test", str(request.url)
+        if request.url.path in {"/api/mcp/access-profile", "/api/mcp/authenticated-entry"}:
+            self.authority_calls.append(request)
+            claims = jwt.decode(
+                request.headers["Authorization"].removeprefix("Bearer "), self.key
+            ).claims
+            roles = claims.get("roles", [])
+            if self.access_error:
+                return self.access_error
+            profile = self.profiles[
+                "admin"
+                if "AgentControl.Admin" in roles
+                else "uploader"
+                if "AgentControl.UsageReportUploader" in roles
+                else "adoption"
+                if roles
+                else "end_user"
+            ]
+            profile = self.profiles_by_oid.get(claims["oid"], profile)
+            if request.url.path.endswith("authenticated-entry"):
+                return httpx2.Response(
+                    202, json={"admission": "current", "nextCheckAt": "2026-11-06T10:00:00Z"}
+                )
+            return httpx2.Response(
+                200, json={**profile, "privacy": self.privacy, **self.profile_overrides}
+            )
         self.api_calls.append(request)
         self.api_started.set()
         assert "cookie" not in request.headers

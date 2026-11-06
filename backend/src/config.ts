@@ -34,11 +34,22 @@ export const config = {
   frontendOrigin,
   redirectUri,
   officialUsageStaleDays,
+  employeePrivacy: parseEmployeePrivacy(process.env),
   agentSharingDiagnostics: process.env.AGENT_SHARING_DIAGNOSTICS === "1",
   sessionSecret: secretValue("SESSION_SECRET") ?? "",
   trustProxy: deploymentTarget === "azure" || process.env.TRUST_PROXY === "1",
 };
 export const authConfigured = config.tenants.length > 0;
+
+export function parseEmployeePrivacy(environment: NodeJS.ProcessEnv) {
+  const boolean = (name: string) => {
+    const value = environment[name];
+    if (value === undefined) return false;
+    if (value !== "false" && value !== "true") throw new Error(`${name} must be exactly true or false.`);
+    return value === "true";
+  };
+  return { hide_employee_details: boolean("MCP_HIDE_EMPLOYEE_DETAILS"), hide_champion_employee: boolean("MCP_HIDE_CHAMPION_EMPLOYEE") };
+}
 
 export function findTenantConfiguration(tenantId: string | undefined) {
   return typeof tenantId === "string" ? config.tenants.find(tenant => tenant.tenantId === tenantId.toLowerCase()) : undefined;

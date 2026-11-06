@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 
 import httpx2
 import uvicorn
-from conftest import API, CLIENT, OTHER, TENANT, USER, Entra
+from conftest import API, CLIENT, OTHER, TENANT, USER, Entra, canonical_profiles
 from joserfc import jwt
 from joserfc.jwk import RSAKey
 from starlette.applications import Starlette
@@ -36,6 +36,12 @@ def api_app():
             assert claims["scp"] == "AgentControl.Access"
         except Exception:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if request.url.path == "/api/mcp/access-profile":
+            return JSONResponse(canonical_profiles()["admin"])
+        if request.url.path == "/api/mcp/authenticated-entry":
+            return JSONResponse(
+                {"admission": "current", "nextCheckAt": "2026-11-06T10:00:00Z"}, status_code=202
+            )
         if request.url.path == "/api/capabilities":
             return JSONResponse({"value": []})
         if request.url.path == "/api/capabilities/check-progress":
@@ -64,7 +70,7 @@ def api_app():
             return JSONResponse({"progress": None})
         return JSONResponse({"error": "not_found"}, status_code=404)
 
-    return Starlette(routes=[Route("/{path:path}", respond)])
+    return Starlette(routes=[Route("/{path:path}", respond, methods=["GET", "POST"])])
 
 
 def mcp_app():

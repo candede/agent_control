@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 import httpx2
 import pytest
 from conftest import OTHER, tokens
-from fastmcp import Context
+from public_contract import public_request
 from pydantic import ValidationError
 
 import agent_control_mcp.auth as auth
@@ -61,7 +61,7 @@ async def test_real_sdk_obo_audience_and_typed_canonical_progress(invocation, en
     assert invocation.api_token.claims["aud"] == invocation.api.settings.api_client_id
     assert invocation.authenticated_client_id == invocation.upstream.client_id
     assert invocation.exchanges == 1
-    assert invocation.requests == 1
+    assert invocation.requests == 2  # Current access projection plus the business read.
     assert invocation.request_ids == ["12345678-1234-4234-8234-123456789abc"]
     assert invocation.api_token.token != invocation.upstream.token
     contents = b"".join(
@@ -101,6 +101,34 @@ async def test_uploader_only_api_role_and_typed_import_capability(invocation, en
     await invocation.get_capabilities()
     assert invocation.api_token.claims["roles"] == ["AgentControl.UsageReportUploader"]
     assert len(entra.api_calls) == 1
+
+
+@pytest.mark.parametrize("role_claim", ["absent", "empty"])
+async def test_signed_roleless_oauth_identity_can_exchange_without_staff_role(
+    browser, service, entra, monkeypatch, role_claim
+):
+    claims = entra.claims
+
+    def roleless_claims(*, api=False, oid=None, **extra):
+        value = claims(api=api, oid=oid, **extra)
+        if role_claim == "absent":
+            value.pop("roles", None)
+        else:
+            value["roles"] = []
+        return value
+
+    monkeypatch.setattr(entra, "claims", roleless_claims)
+    _, issued = await tokens(browser)
+    upstream = await service.provider.load_access_token(issued["access_token"])
+    assert upstream is not None
+    assert upstream.claims.get("roles", []) == []
+    invocation = ApiInvocation(service.api, upstream, origin_header(context()))
+    token = await invocation.token()
+    assert token.claims.get("roles", []) == []
+    assert token.claims["oid"] == invocation.upstream.claims["oid"]
+    assert token.claims["aud"] == invocation.api.settings.api_client_id
+    assert invocation.exchanges == 1
+    assert entra.api_calls == []
 
 
 async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence(invocation, entra):
@@ -157,8 +185,14 @@ async def test_nonempty_typed_capability_preserves_unknown_and_provider_evidence
         {"oid": OTHER},
         {"tid": OTHER},
         {"nonce": "id-token"},
+        {"idtyp": "app"},
+        {"idtyp": None},
+        {"idtyp": True},
         {"scp": "Mcp.Access"},
-        {"roles": []},
+        {"roles": None},
+        {"roles": "AgentControl.Viewer"},
+        {"roles": ["AgentControl.Viewer", "unknown"]},
+        {"roles": [1]},
         {"roles": ["GlobalAdministrator"]},
         {"iat": 120},
         {"nbf": 120},
@@ -332,6 +366,38 @@ async def test_problem_status_code_safe_details_and_no_false_empty_success(
     assert len(entra.api_calls) == 1
 
 
+async def test_deep_problem_json_preserves_the_structured_error_boundary(invocation, entra):
+    body = (
+        b'{"status":403,"code":"forbidden","details":{"nested":'
+        + b"[" * 100000
+        + b"0"
+        + b"]" * 100000
+        + b"}}"
+    )
+    entra.api_responses.append(
+        httpx2.Response(
+            403,
+            content=body,
+            headers={
+                "content-type": "application/problem+json",
+                "Retry-After": "60",
+                "X-Request-ID": "12345678-1234-4234-8234-123456789abc",
+            },
+        )
+    )
+    with pytest.raises(AdapterError) as error:
+        await invocation.get_capabilities()
+    assert error.value.as_dict() == {
+        "status": 403,
+        "code": "api_error",
+        "message": "The canonical API rejected the request.",
+        "requestId": "12345678-1234-4234-8234-123456789abc",
+        "retryAfterSeconds": 60,
+        "details": None,
+    }
+    assert len(entra.api_calls) == 1
+
+
 async def test_allowlist_malformed_output_bounds_and_safe_read_retry(invocation, entra):
     with pytest.raises(AdapterError, match="unsupported_operation"):
         await invocation.call("https://attacker.example.test", Empty())
@@ -345,7 +411,7 @@ async def test_allowlist_malformed_output_bounds_and_safe_read_retry(invocation,
         ]
     )
     assert (await invocation.get_check_progress()).progress is None
-    assert invocation.requests == 2
+    assert invocation.requests == 3
     entra.api_responses.append(httpx2.Response(200, json={"not_the_contract": []}))
     with pytest.raises(AdapterError, match="invalid_api_response"):
         await invocation.get_capabilities()
@@ -421,7 +487,7 @@ async def test_bounded_concurrency_coalesced_exchange_request_budget_and_cancell
     entra,
 ):
     entra.block_api = asyncio.Event()
-    tasks = [asyncio.create_task(invocation.get_check_progress()) for _ in range(8)]
+    tasks = [asyncio.create_task(invocation.get_check_progress()) for _ in range(7)]
     for _ in range(200):
         if len(entra.api_calls) == 4:
             break
@@ -610,12 +676,6 @@ async def test_real_sdk_context_concurrent_principal_client_and_agent_attributio
     service,
     entra,
 ):
-    @service.mcp.tool(name="synthetic_phase05_probe")
-    async def probe(ctx: Context) -> dict:
-        async with service.api.invocation(ctx) as invocation:
-            await invocation.get_check_progress()
-            return {"authenticatedClient": invocation.authenticated_client_id}
-
     first_client, first = await tokens(browser)
     entra.oid = OTHER
     second_client, second = await tokens(browser)
@@ -649,6 +709,7 @@ async def test_real_sdk_context_concurrent_principal_client_and_agent_attributio
                 "method": "notifications/initialized",
             },
         )
+        name, request = public_request("get_capability_check_progress", {})
         response = await browser.post(
             "/mcp",
             headers=headers,
@@ -657,8 +718,8 @@ async def test_real_sdk_context_concurrent_principal_client_and_agent_attributio
                 "id": agent,
                 "method": "tools/call",
                 "params": {
-                    "name": "synthetic_phase05_probe",
-                    "arguments": {},
+                    "name": name,
+                    "arguments": {"request": request},
                     "_meta": {"com.agentcontrol/origin": {"callingAgent": {"id": agent}}},
                 },
             },
@@ -668,8 +729,15 @@ async def test_real_sdk_context_concurrent_principal_client_and_agent_attributio
         return response.json()["result"]
 
     a, b = await asyncio.gather(call(first, "first", "agent-a"), call(second, "second", "agent-b"))
-    assert a["structuredContent"]["authenticatedClient"] == first_client
-    assert b["structuredContent"]["authenticatedClient"] == second_client
+    assert (
+        a["structuredContent"]["result"] == b["structuredContent"]["result"] == {"progress": None}
+    )
+    assert (
+        await service.provider.load_access_token(first["access_token"])
+    ).client_id == first_client
+    assert (
+        await service.provider.load_access_token(second["access_token"])
+    ).client_id == second_client
     descriptors = [
         json.loads(base64.urlsafe_b64decode(request.headers[HEADER] + "=="))
         for request in entra.api_calls
@@ -731,4 +799,9 @@ def test_allowlist_is_a_subset_of_the_canonical_operation_table():
     for operation in OPERATIONS:
         path = re.sub(r"\{(\w+)\}", r":\1", operation.path)
         assert f"| `{operation.method} {path}` |" in document
-        assert f"| {operation.name} |" in document
+        row = next(
+            line
+            for line in document.splitlines()
+            if line.startswith(f"| `{operation.method} {path}` |")
+        )
+        assert operation.name in row.split("|")[4].strip().split(", ")

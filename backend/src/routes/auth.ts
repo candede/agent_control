@@ -152,7 +152,7 @@ async function revokePrincipalAuthorization(tenantId: string, accountId: string,
 }
 
 policyRoute(authRouter, "get", "/me", { access: "authenticated", browserOnly: true, dataClass: "identity" }, (request, response) => {
-  response.json({ user: request.session.user, csrfToken: request.session.csrfToken, roleAssignmentRequired: request.session.user!.roles.length === 0 });
+  response.json({ user: request.session.user, csrfToken: request.session.csrfToken });
 });
 
 function regenerateSession(request: Request) {
