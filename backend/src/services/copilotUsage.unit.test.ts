@@ -443,6 +443,104 @@ describe("Users provider HTTP failure boundaries", () => {
     return { provider, stages, lease, wait };
   }
 
+  it.each(["directory", "report", "signed-download"] as const)(
+    "rejects overdue %s headers before the deadline timer gets a turn", async source => {
+      vi.useFakeTimers();
+      const response = source === "directory" ? Response.json({ value: [] }) : new Response(`${reportHeaders.join(",")}\n`);
+      const cancel = vi.spyOn(response.body!, "cancel");
+      const fetcher = vi.fn<FetchLike>(async target => {
+        if (source === "signed-download" && new URL(String(target)).origin === "https://graph.microsoft.com") {
+          return new Response(null, { status: 302, headers: { location: "https://reports.office.com/data/download/synthetic" } });
+        }
+        vi.setSystemTime(Date.now() + 15_000);
+        return response;
+      });
+      const f = providerFixture(fetcher);
+      const page = vi.spyOn(f.stages, "page").mockResolvedValue(undefined);
+      vi.spyOn(f.stages, "finishQuery").mockResolvedValue(undefined);
+      vi.spyOn(f.stages, "skuBatch").mockResolvedValue([]);
+      vi.spyOn(f.stages, "verificationBatch").mockResolvedValue([]);
+      vi.spyOn(f.stages, "progress").mockResolvedValue(0);
+      const signal = new AbortController().signal;
+      const pending = source === "directory" ? f.provider.directory(f.stages, f.lease, "synthetic-token", signal)
+        : f.provider.activity(f.stages, f.lease, "synthetic-token", signal);
+
+      await expect(pending).rejects.toMatchObject({ status: 504, code: "provider_timeout" });
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(page).not.toHaveBeenCalled();
+      expect(fetcher).toHaveBeenCalledTimes(source === "signed-download" ? 2 : 1);
+      expect(f.wait).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["directory", "report", "signed-download"] as const)(
+    "classifies a rejected %s fetch as a provider network failure", async source => {
+      const failure = new TypeError("Synthetic private transport detail.");
+      const fetcher = vi.fn<FetchLike>(async target => {
+        if (source === "signed-download" && new URL(String(target)).origin === "https://graph.microsoft.com") {
+          return new Response(null, { status: 302, headers: { location: "https://reports.office.com/data/download/synthetic" } });
+        }
+        throw failure;
+      });
+      const f = providerFixture(fetcher);
+      const page = vi.spyOn(f.stages, "page").mockResolvedValue(undefined);
+      const signal = new AbortController().signal;
+      const pending = source === "directory" ? f.provider.directory(f.stages, f.lease, "synthetic-token", signal)
+        : f.provider.activity(f.stages, f.lease, "synthetic-token", signal);
+
+      await expect(pending).rejects.toMatchObject({
+        status: 502, code: "provider_network_error", message: "Microsoft Graph or report download could not be reached.",
+      });
+      expect(page).not.toHaveBeenCalled();
+      expect(fetcher).toHaveBeenCalledTimes(source === "signed-download" ? 2 : 1);
+      expect(f.wait).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["cancelled", "authority", "application"] as const)(
+    "preserves %s errors when a provider fetch rejects", async boundary => {
+      const controller = new AbortController();
+      const reason = new AppError(boundary === "cancelled" ? 409 : boundary === "authority" ? 401 : 503,
+        boundary === "cancelled" ? "read_job_cancelled" : boundary === "authority" ? "authorization_expired" : "provider_unavailable",
+        "Synthetic source failure.");
+      let current = true;
+      const fetcher = vi.fn<FetchLike>(async () => {
+        if (boundary === "cancelled") controller.abort(reason);
+        if (boundary === "authority") current = false;
+        throw boundary === "application" ? reason : new TypeError("Synthetic transport failure.");
+      });
+      const f = providerFixture(fetcher);
+
+      await expect(f.provider.directory(f.stages, f.lease, "synthetic-token", controller.signal,
+        undefined, () => { if (!current) throw reason; })).rejects.toBe(reason);
+      expect(fetcher).toHaveBeenCalledOnce();
+      expect(f.wait).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not inspect borrowed fetch failure diagnostics", async () => {
+    const trap = vi.fn(() => { throw new Error("Borrowed diagnostics must not execute."); });
+    const failure = new Proxy(new Error("Synthetic transport failure."), {
+      get: trap, getPrototypeOf: trap, getOwnPropertyDescriptor: trap,
+    });
+    const f = providerFixture(vi.fn<FetchLike>(async () => { throw failure; }));
+
+    await expect(f.provider.directory(f.stages, f.lease, "synthetic-token", new AbortController().signal))
+      .rejects.toMatchObject({ status: 502, code: "provider_network_error" });
+    expect(trap).not.toHaveBeenCalled();
+  });
+
+  it("does not reclassify a retry-wait failure as a transport failure", async () => {
+    const fetcher = vi.fn<FetchLike>(async () => new Response(null, { status: 429 }));
+    const f = providerFixture(fetcher);
+    const failure = new TypeError("Synthetic wait failure.");
+    f.wait.mockRejectedValue(failure);
+
+    await expect(f.provider.directory(f.stages, f.lease, "synthetic-token", new AbortController().signal)).rejects.toBe(failure);
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(f.wait).toHaveBeenCalledOnce();
+  });
+
   it.each((["directory", "report", "signed-download"] as const).flatMap(source =>
     (["cancelled", "timeout"] as const).map(boundary => ({ source, boundary })),
   ))("settles $source $boundary without cooperative fetch and disposes a late redirect", async ({ source, boundary }) => {

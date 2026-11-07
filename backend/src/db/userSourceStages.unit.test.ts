@@ -101,6 +101,28 @@ describe("guarded user-source failures", () => {
 
     expect(abort).toHaveBeenCalledExactlyOnceWith(lease);
   });
+
+  it.each([false, true])("preserves an invalid provider count error when abort fails=%s", async abortFails => {
+    const database = new pg.Pool({ max: 4 });
+    vi.spyOn(database, "connect").mockRejectedValue(new Error("Unit tests must not connect to a database."));
+    const stages = new UserSourceStages(database);
+    const abortFailure = new Error("Synthetic generation abort failure.");
+    const abort = vi.spyOn(stages.generations, "abort").mockResolvedValue(undefined);
+    if (abortFails) abort.mockRejectedValue(abortFailure);
+    const observePage = vi.spyOn(stages.generations, "observePage").mockRejectedValue(new Error("Invalid page must not be recorded."));
+
+    const pending = stages.page(lease, "synthetic-query", "synthetic:page", 1, -1);
+    if (abortFails) {
+      await expect(pending).rejects.toMatchObject({
+        name: "AggregateError", message: "data_poison_fence_failed",
+        errors: [expect.objectContaining({ code: "provider_count_mismatch", status: 502 }), abortFailure],
+      });
+    } else {
+      await expect(pending).rejects.toMatchObject({ code: "provider_count_mismatch", status: 502 });
+    }
+    expect(abort).toHaveBeenCalledExactlyOnceWith(lease);
+    expect(observePage).not.toHaveBeenCalled();
+  });
 });
 
 describe("saved directory identity verification inputs", () => {
@@ -245,6 +267,16 @@ describe("unverified directory retention", () => {
   it("keeps the original provenance when already-retained evidence is copied again", async () => {
     const previous = directory("retained-before", sharedAlias);
     previous.residual = { retainedObservedAt: "2026-09-01T00:00:00.000Z", retainedCollectorPrincipalId: "first-collector" };
+    const { stages, incoming } = fixture([previous]);
+
+    await expect(stages.preserveUnseen(lease, () => undefined)).resolves.toBe(1);
+
+    expect(incoming[0].residual).toEqual(previous.residual);
+  });
+
+  it("keeps an explicitly unattributed original collector when retaining evidence again", async () => {
+    const previous = directory("retained-before", sharedAlias);
+    previous.residual = { retainedObservedAt: "2026-09-01T00:00:00.000Z", retainedCollectorPrincipalId: null };
     const { stages, incoming } = fixture([previous]);
 
     await expect(stages.preserveUnseen(lease, () => undefined)).resolves.toBe(1);

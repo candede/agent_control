@@ -48,6 +48,11 @@ Open **Sync** for progress, errors or an explicit refresh. Directory/license and
 Office sources collect independently; failures preserve the last successful data.
 Office collection does not require agent CSVs or inventory.
 
+Provider headers must arrive within 15 seconds, even if the deadline timer is
+delayed. Idle network reads also time out after 15 seconds; deliberate storage
+backpressure does not count as network inactivity. Unreachable Graph or report
+downloads fail with `provider_network_error`, without exposing transport details.
+
 Saved data is tenant-shared. Viewing, filtering and exporting do not call Microsoft
 Graph. A changed usable default agent report automatically makes directory
 verification due; newly reported identities remain license-unknown until it succeeds.
@@ -56,12 +61,17 @@ object IDs, even when they no longer have a Copilot license or appear in the lat
 agent reports. Changed licenses replace the saved evidence; users confirmed absent
 by a complete exact-ID query leave the current snapshot. A failed or incomplete
 query preserves the preceding snapshot rather than treating missing users as removed.
+Exact-ID queries can omit Graph's `@odata.count` metadata. They complete only after
+all pages are read and each returned user matches the requested identities.
+Counts are reconciled when provided; product discovery still requires its count.
 Saved license evidence containing users not yet rechecked is automatically
 reverified on the next eligible check, without waiting for the normal six-hour
 refresh or requiring **Sync users**. Failed attempts retain the normal retry backoff.
 Until that recheck completes, Users sync remains partial and its checked count
 excludes retained users that were not rechecked. Stale source metadata does not
-hide incomplete collection. A fully collected Office report does not require
+hide incomplete collection. Retained users keep their original observation time
+and collector attribution, including an explicitly unattributed collector; later
+refreshes do not rewrite that provenance. A fully collected Office report does not require
 recollection solely because some identities cannot be matched.
 
 ## 1. Review users

@@ -55,8 +55,8 @@ describe("record-backed Graph provider protocol", () => {
     };
   }
 
-  it.each(["discovery", "identity"] as const)("rejects missing, invalid and excessive %s counts without publication", async source => {
-    for (const count of [undefined, null, -1, 1.5, "1", 100001]) {
+  it.each(["discovery", "identity"] as const)("rejects invalid and excessive %s counts without publication", async source => {
+    for (const count of [...(source === "discovery" ? [undefined] : []), null, -1, 1.5, "1", 100001]) {
       const fetcher = vi.fn(requested(source, () => Response.json({ value: [], "@odata.count": count })));
       const run = setup(fetcher);
       await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
@@ -64,6 +64,50 @@ describe("record-backed Graph provider protocol", () => {
       await noHead(run.input.scope);
       expect(fetcher).toHaveBeenCalledTimes(source === "discovery" ? 2 : 3);
     }
+  });
+
+  it.each([[], [objectId], [objectId, upn]].map(ids => ({ ids })))("publishes complete exact-ID results without count metadata: $ids", async ({ ids }) => {
+    const run = setup(requested("identity", () => Response.json({ value: ids.length ? [user()] : [] })));
+    const result = await run.collect({ identities: lease => run.stages.identities(lease, ids.length ? ids : [objectId]) });
+    expect(result.rows).toBe(ids.length ? 1 : 0);
+    expect((await fixture.runtime.query("SELECT status FROM user_source_attempts WHERE generation_id=$1",
+      [result.generationId])).rows).toEqual([{ status: "available" }]);
+    expect((await fixture.runtime.query("SELECT expected_count,complete FROM user_source_queries WHERE generation_id=$1 AND kind='identity'",
+      [result.generationId])).rows).toEqual([{ expected_count: null, complete: true }]);
+  });
+
+  it("follows countless exact-ID pages before publishing", async () => {
+    const secondId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let pages = 0;
+    const run = setup(requested("identity", url => {
+      pages++;
+      const next = new URL(url); next.searchParams.set("$skiptoken", "next");
+      return Response.json(pages === 1 ? { value: [user()], "@odata.nextLink": next.toString() }
+        : { value: [user(secondId, "second@example.invalid")] });
+    }));
+    expect((await run.collect({ identities: lease => run.stages.identities(lease, [objectId, secondId]) })).rows).toBe(2);
+    expect(pages).toBe(2);
+  });
+
+  it("rejects countless exact results exceeding the requested identity batch", async () => {
+    const run = setup(requested("identity", () => Response.json({
+      value: [user(), user("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")],
+    })));
+    await expect(run.collect({ identities: lease => run.stages.identities(lease, [upn]) }))
+      .rejects.toMatchObject({ code: "provider_count_mismatch" });
+    await noHead(run.input.scope);
+  });
+
+  it("does not publish an interrupted countless exact-ID collection", async () => {
+    let pages = 0;
+    const run = setup(requested("identity", url => {
+      if (++pages > 1) return new Response(null, { status: 403 });
+      const next = new URL(url); next.searchParams.set("$skiptoken", "next");
+      return Response.json({ value: [user()], "@odata.nextLink": next.toString() });
+    }));
+    await expect(run.collect({ identities: lease => run.stages.identities(lease, [objectId]) }))
+      .rejects.toMatchObject({ status: 403 });
+    await noHead(run.input.scope);
   });
 
   it.each(["discovery", "identity"] as const)("reconciles unique %s members rather than raw duplicates or reported identities", async source => {

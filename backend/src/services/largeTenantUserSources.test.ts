@@ -141,7 +141,7 @@ describe("dormant user-source foundation", () => {
     expect(() => userSourceObjectIds(["someone@example.invalid"])).toThrow("exact");
   });
 
-  it.each([false, true])("rechecks saved users outside current license discovery, including previously retained=%s", async retained => {
+  it.each([false, true])("rechecks saved users without exact-ID count metadata, including previously retained=%s", async retained => {
     const stages = new UserSourceStages(fixture.runtime);
     const removedId = "00000000-0000-0000-0000-000000000003";
     const input = generationInput({ actorPrincipalId: "saved-user-verification" });
@@ -155,7 +155,7 @@ describe("dormant user-source foundation", () => {
       const value = filter.includes("assignedLicenses/any")
         ? users.filter(user => user.assignedLicenses.length)
         : users.filter(user => filter.includes(user.id));
-      return Response.json({ value, "@odata.count": value.length });
+      return Response.json({ value, ...(filter.includes("assignedLicenses/any") ? { "@odata.count": value.length } : {}) });
     });
     const provider = new UserSourceProvider(fetcher);
     const refresh = () => provider.refresh(stages, { ...input, jobId: randomUUID(), observedAt: new Date() },

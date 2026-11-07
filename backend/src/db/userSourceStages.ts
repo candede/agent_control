@@ -150,7 +150,8 @@ export class UserSourceStages {
       const records = rows.map(({ value, identity }) => ({ ...value,
         identity,
         residual: { ...value.residual, retainedObservedAt: value.residual.retainedObservedAt ?? previous.observed_at.toISOString(),
-          retainedCollectorPrincipalId: value.residual.retainedCollectorPrincipalId ?? previous.actor_principal_id } }));
+          retainedCollectorPrincipalId: Object.hasOwn(value.residual, "retainedCollectorPrincipalId")
+            ? value.residual.retainedCollectorPrincipalId : previous.actor_principal_id } }));
       await this.append(lease, "directory", records as RecordKinds["directory"][]);
       let planAfter = "";
       for (;;) {
@@ -209,15 +210,18 @@ export class UserSourceStages {
 
   async page(lease: GenerationLease, key: string, url: string, wireRows: number, reportedCount?: number) {
     if (reportedCount !== undefined && (!Number.isSafeInteger(reportedCount) || reportedCount < 0)) {
-      await this.generations.abort(lease);
-      throw new AppError(502, "provider_count_mismatch", "Invalid provider count.");
+      const error = new AppError(502, "provider_count_mismatch", "Invalid provider count.");
+      try { await this.generations.abort(lease); }
+      catch (failure) { throw new AggregateError([error, failure], "data_poison_fence_failed"); }
+      throw error;
     }
     await this.generations.observePage(lease, url, wireRows);
     await this.guarded(lease, async client => {
       const query = (await client.query<{ kind: UserSourceQueryKind; complete: boolean; expected_count: number | null; page_count: number }>(
         "SELECT kind,complete,expected_count,page_count FROM user_source_queries WHERE generation_id=$1 AND query_key=$2", [lease.id, key])).rows[0];
+      // Exact object-ID filters can return complete Graph results without @odata.count.
       if (!query || query.complete || query.expected_count !== null && reportedCount !== undefined && query.expected_count !== reportedCount
-        || query.page_count === 0 && ["discovery", "identity"].includes(query.kind) && reportedCount === undefined) {
+        || query.page_count === 0 && query.kind === "discovery" && reportedCount === undefined) {
         throw new AppError(502, "provider_count_mismatch", "Inconsistent or missing provider count.");
       }
       await client.query(`UPDATE user_source_queries SET page_count=page_count+1,wire_count=wire_count+$3,
@@ -465,6 +469,8 @@ function userSourceFailureMessage(error: AppError | undefined) {
     reason = "The configured application could not be authorized. An administrator must verify its registration, credentials and consent, then retry Users sync.";
   } else if (code === "identity_provider_error") {
     reason = "Microsoft Entra ID could not renew authorization. Retry Users sync; if this persists, review the Entra sign-in logs and application configuration.";
+  } else if (code === "provider_count_mismatch") {
+    reason = "Microsoft Graph directory counts were missing, invalid, or inconsistent with the returned user records.";
   }
   return `${reason} Any preceding complete source remains retained.`;
 }

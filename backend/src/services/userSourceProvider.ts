@@ -136,6 +136,7 @@ export class UserSourceProvider {
     assertCurrent();
     const key = await stages.query(lease, filter.kind === "products" ? "discovery" : "identity", initialUrl);
     assertCurrent();
+    const exactMembers = new Set<string>();
     let url: string | undefined = initialUrl;
     while (url) {
       assertCurrent();
@@ -156,6 +157,12 @@ export class UserSourceProvider {
         assertCurrent();
         const user = parseDirectoryUser(value, evidence, filter);
         if (!user) throw new AppError(502, "provider_schema", "Directory returned an identity outside the requested filter.");
+        if (filter.kind === "reported") {
+          exactMembers.add(user.identity.objectId);
+          if (exactMembers.size > filter.identities.length) {
+            throw new AppError(502, "provider_count_mismatch", "Exact identity results exceed their requested batch.");
+          }
+        }
         try { encodeBatch([...batch, user], [lease.id, lease.scopeId, lease.tenantId]); }
         catch (error) {
           if (!isApplicationError(error) || Object.getOwnPropertyDescriptor(error, "code")?.value !== "data_batch_bytes" || !batch.length) throw error;
@@ -256,7 +263,9 @@ export class UserSourceProvider {
     for (let attempt = 0; ; attempt++) {
       assertCurrent();
       const headerDeadline = new AbortController();
-      const timer = setTimeout(() => headerDeadline.abort(new DOMException("Provider headers exceeded 15 seconds.","TimeoutError")),15_000);
+      const headerExpiresAt = Date.now() + 15_000;
+      const expireHeaders = () => headerDeadline.abort(new DOMException("Provider headers exceeded 15 seconds.", "TimeoutError"));
+      const timer = setTimeout(expireHeaders, 15_000);
       timer?.unref();
       const requestSignal = AbortSignal.any([signal, headerDeadline.signal]);
       let removeAbort = () => {};
@@ -277,8 +286,16 @@ export class UserSourceProvider {
       void fetching.then(response => {
         if (requestSignal.aborted) void response.body?.cancel().catch(() => {});
       }, () => {});
-      const response = await Promise.race([fetching, aborted]);
-      try { assertCurrent(); requestSignal.throwIfAborted(); }
+      const response = await Promise.race([fetching, aborted]).catch(error => {
+        assertCurrent();
+        if (requestSignal.aborted || isApplicationError(error)) throw error;
+        throw new AppError(502, "provider_network_error", "Microsoft Graph or report download could not be reached.");
+      });
+      try {
+        assertCurrent();
+        if (Date.now() >= headerExpiresAt) expireHeaders();
+        requestSignal.throwIfAborted();
+      }
       catch (error) {
         void response.body?.cancel().catch(() => {});
         throw error;
