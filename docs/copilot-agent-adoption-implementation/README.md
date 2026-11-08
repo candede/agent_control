@@ -24,6 +24,13 @@ The user confirmed this folder and the following operating boundaries:
   it within the object-level policy in [CONTRACT](./CONTRACT.md). Admins manage
   all tenant adoption content. EndUsers see only explicitly shared,
   privacy-safe learning cards through the existing discovery boundary.
+- During this review, the user selected **tenant-wide explicit employee sharing**.
+  Cards default to staff-only. Company/department labels help discovery; they
+  are not departmental access controls. Briefs and actions remain staff-only.
+- During this review, the user selected **group-level follow-up measurement**.
+  Keep compact aggregate baselines and source references, disclose membership,
+  licensing and window changes, and do not create a permanent participant
+  registry or promise same-original-people measurement after source expiry.
 - Prefer the simplest complete, robust current implementation. No compatibility
   routes, aliases, duplicate data owners, migration chains, or speculative
   workflow/analytics platform.
@@ -42,35 +49,69 @@ The user confirmed this folder and the following operating boundaries:
 
 ## Approach verdict and target flow
 
-**Verdict: keep the consumer-led approach, with selective backend/MCP extensions.**
+**Verdict: simplify the consumer-led approach, with selective backend/MCP
+extensions and one delivered-guidance owner.**
 
-The current app already owns evidence, joins, metrics, source publication, and
-authorization. Rewriting those in MCP or an AI client would add competing truth.
-A prompt-only solution is also insufficient: Office tool coverage, safe
-descriptions, cross-source cohorts, and durable adoption content need application
-contracts.
+Current flow: provider collection or genuine CSV import -> validated saved
+sources -> API-owned selected reads -> browser analytics and partial MCP
+coverage -> ad hoc AI advice. The employee catalog filters sources before
+description assembly, so a linked package's useful About can be excluded along
+with its eligibility. There is no current durable adoption-content owner.
+
+Would we choose this approach without the existing plan? Yes, but not a second
+analytics service, prompt-only reconstruction, or separate server/customer
+recipe campaigns. Existing APIs already own evidence, joins, source publication
+and authorization. The simpler prompt-only alternative cannot supply missing
+Office tools, repair safe discovery or persist transferable business knowledge.
 
 The chosen runtime flow is:
 
-1. Normal sign-in or authenticated MCP entry automatically admits initial
-   read-only synchronization. Missing sources remain explicit.
-2. The API selects saved report/Office/inventory contexts and calculates exact
-   department opportunities.
-3. Thin, typed MCP actions expose that evidence and complete permitted agent
-   descriptions.
-4. A customer-configured AI consumer uses focused instructions/skill guidance
-   to produce a brief, draft exercises, and peer-learning suggestions.
-5. On an explicit save request, MCP calls the same adoption-content API used by
-   the browser. The app displays saved briefs, actions, and learning cards.
-6. Authors can share suitable learning cards with employees. The discovery API
-   applies current privacy and source rules on every read.
-7. Teams capture real successful workflows and compare suitable follow-up
-   evidence, without treating response counts as expertise or ROI.
+1. Normal browser sign-in or authenticated MCP entry automatically admits
+   applicable initial read-only synchronization. Staff retain eligible delegated
+   collection; roleless entry bootstraps application-owned Graph/package/user
+   reads and derived Office evidence, not privileged native-provider collection.
+   Missing permissions/sources remain explicit; no staff bootstrap or manual
+   start is required for the supported roleless flow.
+2. The API pins independent saved report, Office and inventory contexts and
+   calculates exact company/department opportunities on the frozen Office
+   audience. Optional enrichment does not disable unrelated evidence.
+3. Thin typed MCP actions expose compact facts and separately paged permitted
+   people, relationships and complete descriptions. Canonical eligibility and
+   permission to use linked descriptive evidence are separate decisions.
+4. A customer-configured AI consumer uses the delivered instructions/skill and
+   tested recipes to draft a brief, exercises and peer-learning suggestions.
+   Model interpretation never becomes metric, origin or access authority.
+5. An explicit save uses the same adoption-content API as normal browser forms.
+   The backend validates evidence bindings, owns record identity/revisions and
+   persists bounded business content, not a second telemetry snapshot.
+6. An author can explicitly share a suitable card with all active employees in
+   the tenant. Discovery reapplies current privacy and source rules; department
+   labels filter relevance, not authorization.
+7. Teams capture contributor-provided learning and compare appropriate group
+   baselines/follow-up evidence. Changed cohorts and overlapping windows remain
+   visible; response counts never establish expertise, causal impact or ROI.
+
+Failures stay owned at their existing boundary: provider/source recovery uses
+current automatic retry/backoff; expired selections require an explicit new
+capture without silently changing the requested period; save conflicts preserve
+unsaved edits; unsafe employee fields are withheld; unavailable source references
+do not resurrect old authority or erase unrelated authored learning.
 
 No hosted LLM service, autonomous outreach scheduler, second catalog, champion
-registry, generic SQL/HTTP tool, or sixteen use-case-specific tools are needed.
-The tradeoff is deliberate: users configure their AI consumer; the web app does
-not pretend it can generate AI output without one.
+registry, participant registry, departmental card ACL framework, generic SQL/HTTP
+tool, or sixteen use-case-specific tools are needed. Server instructions,
+customer assets and their recipes now have one phase owner instead of repeating
+the same contract work across two phases.
+
+Necessary complexity remains: independent evidence pins prevent false joins;
+source eligibility/privacy rendering protects employee reads; revision-safe
+content writes prevent lost edits and duplicate saves; current-schema reset and
+isolated recovery proof protect installation integrity; real-client and live
+journeys prove usefulness beyond schemas or health checks.
+
+The tradeoffs are explicit: customers configure an authorized AI consumer;
+employee-shared cards are tenant-wide, not department-private; and group
+measurement is not a permanent original-participant study.
 
 ## Ordered executable manifest
 
@@ -80,12 +121,17 @@ README and CONTRACT are support documents, not executable phases.
 | Order | Prompt and implementation owner | Prerequisites | Exact completion record |
 | --- | --- | --- | --- |
 | 01 | [Evidence APIs and MCP reads](./01-evidence-apis-and-mcp-reads.md): canonical evidence, exact opportunity cohorts, read bindings and shared fixtures | None | `completions/01-evidence-apis-and-mcp-reads.md` |
-| 02 | [Safe discovery and agent descriptions](./02-safe-discovery-and-agent-descriptions.md): linked descriptions, first-party coverage, staff/EndUser parity | 01 contexts and representative fixtures | `completions/02-safe-discovery-and-agent-descriptions.md` |
-| 03 | [Adoption workspace and learning cards](./03-adoption-workspace-and-learning-cards.md): current schema, object authorization, API/MCP persistence, UI and employee-safe sharing | 01, 02 | `completions/03-adoption-workspace-and-learning-cards.md` |
-| 04 | [MCP instructions and tool descriptions](./04-mcp-instructions-and-tool-descriptions.md): actual connection instructions, descriptions and executable recipes | 01, 02, 03 | `completions/04-mcp-instructions-and-tool-descriptions.md` |
-| 05 | [Customer agent starter kit](./05-customer-agent-starter-kit.md): general/adoption instructions, skill package, Studio setup and sample prompts | 04 and its implemented contracts | `completions/05-customer-agent-starter-kit.md` |
-| 06 | [End-to-end and capacity verification](./06-end-to-end-and-capacity-verification.md): integrated journeys, model/client evidence, scale, privacy and reset proof | 01-05 | `completions/06-end-to-end-and-capacity-verification.md` |
-| 07 | [Deploy SEHA and observe](./07-deploy-seha-and-observe.md): exact local rollout, justified reset, live journeys, fix-forward and cleanup | 06 evidence and residuals | `completions/07-deploy-seha-and-observe.md` |
+| 02 | [Safe discovery and agent descriptions](./02-safe-discovery-and-agent-descriptions.md): canonical eligibility, linked descriptions, first-party coverage and staff/EndUser consumers | 01 contexts and representative fixtures | `completions/02-safe-discovery-and-agent-descriptions.md` |
+| 03 | [Adoption workspace and learning cards](./03-adoption-workspace-and-learning-cards.md): current schema, object authorization, API/MCP persistence, UI and tenant-wide employee sharing | 01, 02 | `completions/03-adoption-workspace-and-learning-cards.md` |
+| 04 | [AI guidance and customer starter kit](./04-ai-guidance-and-customer-starter-kit.md): delivered server/tool guidance, canonical recipes/assets, Studio setup and copy/download UX | 01, 02, 03 | `completions/04-ai-guidance-and-customer-starter-kit.md` |
+| 05 | [End-to-end and capacity verification](./05-end-to-end-and-capacity-verification.md): integrated journeys, model/client evidence, scale, privacy and reset proof | 01-04 | `completions/05-end-to-end-and-capacity-verification.md` |
+| 06 | [Deploy SEHA and observe](./06-deploy-seha-and-observe.md): exact local rollout, justified reset, live journeys, fix-forward and cleanup | 05 attempted checks, repair evidence and residuals | `completions/06-deploy-seha-and-observe.md` |
+
+These six boundaries have independently useful proof: evidence calculations,
+employee-safe discovery, durable content/schema, delivered customer guidance,
+integrated qualification, then actual production convergence. The first four
+own implementation; phase 05 integrates their proof and repairs defects at the
+original owner rather than adding a parallel implementation.
 
 ## Running a prompt in a fresh session
 
@@ -109,8 +155,11 @@ completed work, true validation results, residuals, and the exact next action.
 Do not create speculative phase-completion records before implementation.
 Changed contracts invalidate only the affected prior proof.
 
-Follow the installed `implement-folder` and step-worker contracts where
-available. Every delegated worker uses `gpt-6.1-sol` with `xhigh` reasoning;
+Read the installed `implement-folder/SKILL.md` and
+`implement-folder/references/step-worker.md` under the active skill installation.
+This README's approved current-only/reset and local-target boundaries override
+generic migration or environment examples. Every delegated worker uses
+`gpt-6.1-sol` with `xhigh` reasoning;
 record actual launch settings rather than claiming prompt wording selects them.
 Use direct execution when delegation is inappropriate. Do not nest workers or
 create a reviewer pool. These are implementation settings, not a required
@@ -184,7 +233,9 @@ This is the single binding campaign deployment policy. Every phase must obey it.
 3. Non-passing evidence alone is not an invented release veto. Each residual
    needs affected scope, a concrete existing containment mechanism, signal or
    canary, numeric alert threshold, implementation owner, and exact fix-forward
-   trigger. Unimplemented promised behavior is not a completed phase.
+   trigger. Completed implementation may advance as `complete_with_risk` after
+   practical repair/rerun attempts; unimplemented promised behavior is not a
+   completed phase.
 4. Unsafe disclosure or mutation remains denied by real existing authorization,
    privacy and integrity controls while safe/unaffected code and recovery
    deploy. Do not create feature-enable, approval, certification, canary-token,
@@ -207,7 +258,7 @@ implementation and justified reset; do not invent another routine approval.
 ## Completion and handoff
 
 Each phase uses the factual record requirements in CONTRACT. Final completion
-requires the useful whole flow, aligned current contracts, all seven records,
+requires the useful whole flow, aligned current contracts, all six records,
 the deployed release identity, actual live observations, and owned residuals.
 Builds, a successful MCP handshake, or green health endpoints alone do not
 establish adoption usefulness or successful agent execution.

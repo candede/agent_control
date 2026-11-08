@@ -14,6 +14,8 @@ record `completions/01-evidence-apis-and-mcp-reads.md`, campaign state,
 ## Read first
 
 - [Current discovery query](../../backend/src/db/agentDiscoveryQueries.ts),
+  [service](../../backend/src/services/agentDiscovery.ts),
+  [source privacy renderer](../../backend/src/db/agentDiscoverySchema.ts),
   [source authority](../../backend/src/db/inventoryAuthority.ts),
   [discovery DTOs](../../backend/src/types/agentDiscovery.ts).
 - [Saved-data discovery contract](../data-architecture.md#restricted-agent-discovery),
@@ -38,6 +40,9 @@ memberships and first-party metadata before changing eligibility.
    organization-created canonical candidate whose native description is absent.
    Sharing/package presence alone must not make a package organization-created.
    Do not fall back around a privacy-withheld or unsafe field.
+   Separate canonical candidate eligibility from contributing descriptive
+   sources: a linked shared package may supply permitted About without itself
+   proving local origin. Preserve both native absence and Graph provenance.
 3. Add first-party Microsoft coverage for the supported discovery goal as a
    separately labelled origin, using authoritative saved publisher/package
    evidence. Do not relabel first-party agents as locally created or classify all
@@ -45,8 +50,11 @@ memberships and first-party metadata before changing eligibility.
    Cover Graph-backed Agent Builder candidates when exact saved package/report/
    maker evidence establishes their organization-created origin, including
    Graph-only candidates. If necessary, repair the existing supported collection
-   or normalization path for available evidence; do not invent a manual origin-
-   approval flag or infer origin from names, sharing, or an ID prefix alone.
+   or normalization path only for a reproduced loss of provider-supported exact
+   evidence; missing implementation is not provider unavailability. Do not
+   invent origin approvals, collect speculative new data, or infer origin from
+   names, sharing, or an ID prefix alone. Reuse one classification decision
+   across search/detail/workplace/preview; conflicting evidence stays unknown.
 4. Preserve exact source memberships, full description continuation, safe
    provenance, privacy rendering and current-clock expiry checks. Do not copy
    descriptions into a second catalog/store.
@@ -54,6 +62,8 @@ memberships and first-party metadata before changing eligibility.
    entitlement, workbook access or a verified launch URL. Distinguish Microsoft,
    user-created and third-party origin without inferring Studio authorship from
    native inventory membership.
+   Preserve staff third-party/unknown inventory visibility; do not silently
+   expand the employee catalog into general third-party discovery.
 6. Update staff inventory follow-ups, employee catalog/detail/workplace,
    actual-user profile and staff EndUser preview consumers as implicated.
    Retain explicit subject-bound preview semantics; never borrow the subject's
@@ -70,8 +80,10 @@ memberships and first-party metadata before changing eligibility.
 
 Use shared fixtures for Microsoft/local and verified Graph-only Agent Builder
 candidates, similarly named agents,
-duplicate source records, a complete multi-segment About, missing versus
-withheld descriptions, unknown publisher, expired authority, changed source
+duplicate source records, a linked shared-package About that does not establish
+eligibility, a complete multi-segment About, missing versus withheld descriptions,
+unknown/conflicting publisher, first-party sources without local maker metadata,
+expired authority, changed source
 revision, unlicensed missing profile and all independent privacy flags.
 
 Add backend query/service/route regression cases at the actual discovery owners.
@@ -79,10 +91,13 @@ Run those related selectors together with:
 
 ```sh
 npm run typecheck --workspace backend
-npm run test --workspace backend -- src/routes/mcpApiAuth.test.ts src/routes/mcpReadContracts.test.ts
+npm run typecheck --workspace frontend
+npm run test --workspace backend -- src/db/agentDiscoveryQueries.unit.test.ts src/db/agentDiscoverySchema.unit.test.ts src/services/agentDiscovery.unit.test.ts src/routes/agentDiscovery.unit.test.ts src/routes/mcpApiAuth.test.ts src/routes/mcpReadContracts.test.ts
 ```
 
-Run database-dependent cases in the isolated stack. From `mcp/`:
+Run database-dependent cases in the isolated stack, including the existing
+`mcp-agent-discovery` fixture suite and actual changed browser preview/catalog
+selectors. Record those selectors, not just API/mypy proof. From `mcp/`:
 
 ```sh
 .venv/bin/python -m pytest tests/test_discovery.py tests/test_discovery_models.py tests/test_audience_projection.py tests/test_tools.py
@@ -99,8 +114,8 @@ EndUsers cannot obtain staff evidence through any changed branch.
 
 Obey [the binding production policy](./README.md#always-deploy-production-contract).
 Record real limitations and specific containment. Do not add a description
-certification, first-party enable switch or adoption approval. Phase 07 owns the
-live rollout; phase 06 owns integrated first-use proof.
+certification, first-party enable switch or adoption approval. Phase 06 owns the
+live rollout; phase 05 owns integrated first-use proof.
 
 ## Completion and next phase
 

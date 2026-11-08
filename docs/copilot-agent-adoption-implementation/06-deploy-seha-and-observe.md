@@ -1,4 +1,4 @@
-# 07 - Deploy SEHA and observe
+# 06 - Deploy SEHA and observe
 
 ## Mission and prerequisites
 
@@ -6,11 +6,25 @@ Deploy the exact current campaign revision to the authorized existing SEHA
 installation, execute the justified schema reset when required, and converge
 through actual first-run/adoption observations and fix-forward.
 
-Prerequisite: phase 06 evidence plus all 01-06 exact completion records.
+Prerequisite: phase 05 evidence plus all 01-05 exact completion records:
+`completions/01-evidence-apis-and-mcp-reads.md`,
+`completions/02-safe-discovery-and-agent-descriptions.md`,
+`completions/03-adoption-workspace-and-learning-cards.md`,
+`completions/04-ai-guidance-and-customer-starter-kit.md`, and
+`completions/05-end-to-end-and-capacity-verification.md`.
 Read them, campaign state, [README](./README.md), [CONTRACT](./CONTRACT.md), and
 obey [the binding production policy](./README.md#always-deploy-production-contract).
 Future execution must have been started by the user; writing this plan does not
 perform deployment.
+
+## Production continuation
+
+Obey [the binding production policy](./README.md#always-deploy-production-contract).
+Reconcile every non-passing check truthfully and continue authorized safe
+deployment, observation and fix-forward. Do not open unsafe authority or add
+runtime approval/enable steps. Literal production control-plane/access inability
+leaves `deployment_pending`; deployed but unproven required behavior remains
+`production_hardening_pending`, with an exact owner and resumable action.
 
 ## Read first
 
@@ -27,8 +41,8 @@ perform deployment.
   [genuine CSV import](../official-usage-import.md),
   [MCP client setup](../mcp-clients.md),
   [Studio connection contract](../copilot-studio-mcp-connection.md).
-- Actual phase-03 schema fingerprint/new grants, phase-05 packaged assets,
-  phase-06 release identity, residuals, resource baseline and measurements.
+- Actual phase-03 schema fingerprint/new grants, phase-04 packaged assets,
+  phase-05 release identity, residuals, resource baseline and measurements.
 
 ## Exact target and preflight
 
@@ -44,14 +58,20 @@ perform deployment.
    optimal schema requires a clean reset, use the authorization already recorded
    in README, the guarded operator and exact database confirmation. Do not add
    migration/compatibility scaffolding to avoid the accepted reset.
-4. Attempt the runbook's best available backup/checkpoint and isolated restore
-   proof; record actual result, original genuine CSV availability, expected data
-   loss and reset rationale. A missing restore measurement is not a pass.
-   Do not restore old business data through a compatibility path.
+4. Before replacing/rebuilding the installed operator tag, pin the verified
+   installed operator image ID matching the live schema and attempt its protected
+   backup/checkpoint through the existing helper. The candidate operator cannot
+   verify an incompatible old schema. Keep dump/receipt access-restricted and
+   outside source control; distinguish that old-schema recovery artifact from
+   candidate current-schema restore proof in isolation.
+   Record actual backup/restore results, genuine CSV availability, expected loss
+   of database-stored configuration/history and reset rationale. A missing
+   measurement is not a pass. Never serve an old schema or add compatibility code
+   to restore it. Preserve the installed operator until this attempt is recorded.
 5. Prepare the existing deployment tooling's pinned candidate/preflight identity
    where supported. Record actual identities; no invented release receipt,
    acceptance token or runtime canary gate.
-6. Each residual from phase 06 gets an exact existing containment mechanism,
+6. Each residual from phase 05 gets an exact existing containment mechanism,
    affected scope, observation/canary, numeric threshold, owner and repair
    trigger. Do not describe unimplemented promised behavior as deploy-ready.
 
@@ -73,6 +93,12 @@ pwsh ./deploy-local.ps1 start -Project seha -DbReset
 Read current help and lifecycle behavior before execution; preserve actual
 candidate/preflight parameters when the existing tooling uses them. The reset
 is a deliberate operation, not a retry option for ordinary restarts.
+Bind the release to phase 05's actual source/asset digest and immutable app/MCP/
+operator image IDs; requalify affected proof if source changes before deployment.
+When using the existing pinned path, supply its actual `-Candidate`,
+`-CandidateSha256` and `-ExpectedPreflight` values after `-ReadOnly` target/action
+preflight. These are content/target integrity checks, not a new runtime enable or
+routine human acceptance requirement. Never fabricate a candidate or preflight.
 
 - Rebuild/update app and MCP from the same intended current source; apply
   current schema/grants and retain real revocation/maintenance safeguards.
@@ -94,12 +120,19 @@ Then observe genuine authorized live journeys:
 1. Normal browser sign-in after deployment/reset automatically starts initial
    read-only collection while visible/online. Employee-first authenticated MCP
    entry admits application reads without needing a staff browser bootstrap.
+   Verify Graph/package/user recovery and Office derivation for that entry;
+   qualify delegated native collection separately with eligible staff authority.
 2. Missing workplace/report/source states remain explicit and useful catalog
    discovery is still available where supported. No Permissions visit, capability
    check, feature-enable or adoption approval.
 3. Current saved directory, inventory and Office evidence reappear through the
    existing collection flow. Real provider failures report their actual cause/
    retry state without converting saved or frozen evidence to zero.
+   Verify project-retained privacy/connection configuration is applied by
+   deployment; recover genuinely reset database-owned settings through normal
+   management, not old-schema imports. Record retained versus reset settings.
+   Configuration recovery must not add a staff/operator visit before ordinary
+   sign-in, supported discovery or automatic initial sync.
 4. If genuine official CSVs are available, use the existing authorized import
    flow to restore report-based analysis. If not, do not manufacture reports:
    prove missing-report behavior and record the exact unavailable live-analysis
@@ -107,10 +140,22 @@ Then observe genuine authorized live journeys:
 5. Connected staff consumer retrieves the exact department evidence, complete
    agent descriptions, peer relationships and a useful starter brief. Sample
    facts come from the newly selected live contexts, not the old research counts.
-6. On explicit request, save a bounded canary brief/action/card through MCP, then
+6. On explicit request, save a genuine useful bounded brief/action/card through
+   MCP, then
    verify app reload, cross-account staff sharing, allowed owner progress and
-   safe EndUser card retrieval with real authority. Use identifiable, nonpersonal
-   canary records and remove only those exact owned IDs afterward.
+   safe EndUser card retrieval with real authority. Use actual selected evidence
+   and an appropriate nonsensitive workflow; do not invent participants,
+   successful-use claims or synthetic learning to populate live tenant content.
+   Employee-shared live proof uses a genuine author-shared card. Synthetic
+   save/delete/conflict/privacy fixtures stay in the isolated exact-image stack,
+   not a test audience/flag added to the production card schema.
+   Verify tenant-wide employee sharing across department labels, unchanged
+   aggregate baseline on reload and explicit follow-up drift/expired evidence.
+   Lost-response retries and post-delete retries must not create new records.
+   Inject lost responses/destructive failure cases only in isolation; do not
+   disrupt live users to repeat already qualified failure proof.
+   Retain genuine business records unless their author requests exact deletion;
+   do not delete legitimate learning merely to tidy qualification evidence.
 7. Observe roleless discovery/staff-preview/privacy behavior with actual
    permitted sessions or clearly distinguish fixture/preview proof from a real
    EndUser consumer. Do not impersonate users or claim a preview proves their
@@ -135,6 +180,9 @@ Use current logs/request IDs with no sensitive payloads:
   threshold **one event**, contain the exact affected route/projection and fix.
 - Any duplicate persisted canary on an idempotent retry:
   threshold **one duplicate**, repair write identity/revision handling.
+- Any deleted record resurrected by retry, unauthorized cross-owner cascade,
+  reused actor-bound lease or silent relabelling of saved baseline as current:
+  threshold **one event**, contain the exact mutation/reference path and repair.
 - Any ordinary first-run requiring a new manual gate or failing to admit
   automatic sync despite valid authority/source setup:
   threshold **one reproducible occurrence**, fix the owning entry/sync contract.
@@ -160,6 +208,9 @@ No rollback compatibility writer or false passing result.
 - Stop/delete only exact disposable campaign resources after all dependent work.
   Restore the safe pre-campaign Docker baseline; preserve live SEHA, other
   installations, operator backups and actual revocation authority.
+- Synthetic qualification records are removed only from isolated targets.
+  Live business-content deletion requires its normal exact-target confirmation;
+  never delete unrelated content or globally shared cards as fixture cleanup.
 - Cleanup failure remains an owned incident with resource, risk/cost, threshold
   and exact next action. Never broad-prune Docker or recursively delete roots.
 - Update current runbooks with deployed contracts, kit installation, schema/reset
@@ -169,7 +220,7 @@ No rollback compatibility writer or false passing result.
 
 ## Completion
 
-Write `completions/07-deploy-seha-and-observe.md` using CONTRACT's factual fields
+Write `completions/06-deploy-seha-and-observe.md` using CONTRACT's factual fields
 and update `completions/IMPLEMENTATION_CAMPAIGN.md`.
 
 Include exact deployed source/image/schema/target identities, actual reset and

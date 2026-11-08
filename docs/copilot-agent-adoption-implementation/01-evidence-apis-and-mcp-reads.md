@@ -50,12 +50,21 @@ a guessed filename, DTO field, tool action or historical count as a contract.
    context. Do not introduce generic routes or a second Office owner.
 3. Add one compact department opportunity API operation under the existing
    adoption route family and its MCP action. Use existing read/selection/SQL
-   helpers. Its request pins the independent report, Office and inventory
-   contexts; its output follows CONTRACT's department-evidence shape.
+   helpers. Pin the independent report/Office contexts, plus available optional
+   inventory/current-directory enrichment, with one coherent selected-read
+   dependency fence. Preserve each input's actor/query/source binding; return
+   contexts and continuations usable through their actual existing endpoints.
+   Its output follows CONTRACT's department-evidence shape. Do not invent a
+   generic context coordinator or require inventory for report-only facts.
 4. Calculate exact positive/no-reported/unknown agent evidence on the captured
    Office-paid audience. Report current directory/agent-paid denominators
    separately, without recasting historical eligibility. Return null/explicit
    unavailable where the evidence cannot establish a value.
+   Include positive Users facts even when companion agent relationships are
+   missing. Use captured Office identities/affiliations and whole-observation
+   ambiguity checks, not current directory reassignment or filtered-page keys.
+   Assert disjoint categories reconcile to the Office-active audience; preserve
+   unresolvable report identities and source completeness as coverage limits.
 5. Keep aggregate pages scalar and capped at ten groups/128 KiB. Supply bounded
    audience, peer and agent drilldowns using existing identities/read contracts.
    Preserve top-three champion edges rather than substituting department-wide
@@ -71,6 +80,10 @@ a guessed filename, DTO field, tool action or historical count as a contract.
    A synthetic 22-paid/22-Office-active/7-definite-agent-user case must produce
    the exact 15-person opportunity only when every relationship is resolvable.
    Add ambiguity cases where that subtraction would be false.
+   Include a positive Users-only person with no bridge edge, duplicate/renamed
+   UPNs, moved departments/changed licensing after Office capture, report
+   correction/deletion during paging and missing optional inventory. Group
+   follow-up compares aggregate contexts, not archived original participants.
 8. Remove superseded declarations only if this phase replaces an existing
    current operation. No aliases, per-use-case tools, shadow summaries or schema
    compatibility scaffolding. Do not create saved briefs/cards yet.
@@ -80,7 +93,14 @@ a guessed filename, DTO field, tool action or historical count as a contract.
 Add focused opportunity unit/SQL/route tests in the existing test layout. Verify
 all scalar fields, denominators, selections, cursor continuation, source expiry,
 mixed tenant/principal rejection, legitimate null filters, missing sources and
-explicit limit errors. Prove weekly Office person reads stay aggregate-only.
+explicit limit errors. Prove weekly Office people requests fail with
+`office_history_aggregate_only` while historical aggregate reads remain usable.
+Prove scalar rankings/counts are over the complete selected group population,
+not just the returned ten groups, and exclude child payloads from compact pages.
+Exercise authority expiry during awaited work and source clear/correction before
+response release. Check the existing MCP output-envelope bound for every new
+Office binding; an oversized canonical HTTP response must produce an explicit
+limit error or a supported smaller page, never silently clipped evidence.
 
 Use the existing environment; representative commands from repository root:
 
@@ -100,6 +120,9 @@ From `mcp/`:
 .venv/bin/python -m mypy
 ```
 
+New operation selectors and SQL fixtures must be registered with these existing
+runners and recorded exactly; no promised cohort proof from typechecks alone.
+Run frontend typecheck when shared evidence types or existing clients change.
 If the local declared runtime is missing, record the failure and use/restore the
 approved project environment, not a different Python version or public registry.
 Measure page bytes and representative call count; final capacity owns scale.
