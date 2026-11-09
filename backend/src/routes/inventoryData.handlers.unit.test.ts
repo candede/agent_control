@@ -66,7 +66,9 @@ beforeEach(() => {
     rows: [{ id: "scope", published: true, previously_published: true, preparing: false }],
   });
   mocks.identity.mockResolvedValue(identity);
-  mocks.capture.mockResolvedValue({ id: selectionId });
+  mocks.capture.mockResolvedValue({ id: selectionId, revision: "1", evaluatedAt: new Date("2026-10-30T00:00:00Z"),
+    validatedAt: new Date("2026-10-30T00:00:00Z"), expiresAt: new Date("2026-10-30T00:10:00Z"),
+    publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } });
   mocks.page.mockResolvedValue({ value: [] });
   mocks.presentation.mockReturnValue(receipt);
   mocks.invalidate.mockResolvedValue(undefined);

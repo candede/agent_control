@@ -26,7 +26,7 @@ export const officialAgentsSql = `
 // choosing quadratic nested loops on unanalysed freshly published CTEs.
 const reportColumns = `f.kind,f.payload_hash,f.identity_key,f.agent_id,f.username,f.agent_name,f.display_name,f.creator_type,
       f.responses,f.agents_used,f.licensed_users,f.unlicensed_users,f.last_activity`;
-const reportRows = `SELECT ${reportColumns}
+export const selectedReportRowsSql = `SELECT ${reportColumns}
     FROM official_usage_set_versions m
     JOIN official_usage_version_rows r ON r.version_id=m.version_id AND r.tenant_id=m.tenant_id AND r.kind=m.kind
     JOIN official_usage_row_facts f ON f.tenant_id=r.tenant_id AND f.kind=r.kind AND f.payload_hash=r.payload_hash
@@ -35,7 +35,7 @@ const reportKeyCounts = `SELECT identity_key,count(*) AS match_count,min(identit
 const unresolvedReports = `EXISTS(SELECT 1 FROM matches WHERE match_count<>1 OR user_rows>1 OR alias_ambiguous)
       OR EXISTS(SELECT 1 FROM resolved WHERE identity_count>1)`;
 
-function relations(directory: string, reports: string, keyCounts = reportKeyCounts, unresolved: string | null = unresolvedReports, prefix = "") {
+export function reportIdentityRelationsSql(directory: string, reports: string, keyCounts = reportKeyCounts, unresolved: string | null = unresolvedReports, prefix = "") {
   // Compatibility-folded report keys are not directory aliases.
   return `WITH ${prefix} directory AS MATERIALIZED (${directory}),
   reports AS MATERIALIZED (${reports}), report_users AS (
@@ -86,7 +86,7 @@ function relations(directory: string, reports: string, keyCounts = reportKeyCoun
   ), official_agents AS (${officialAgentsSql})`;
 }
 
-export const reportRelationsSql = relations(userSourceFactsSql(), reportRows);
+export const reportRelationsSql = reportIdentityRelationsSql(userSourceFactsSql(), selectedReportRowsSql);
 
 // Only an already bounded directory candidate page enters this relation.
 // Ambiguity still counts the complete captured directory, and unresolved
@@ -115,7 +115,7 @@ export function selectedDirectoryReportRelationsSql(candidate: string, unresolve
         UNION SELECT d.identity FROM directory_user_rows d WHERE d.generation_id=$1 AND d.upn_key=k.identity_key
       ) matched
     ) counted`;
-  return relations(userSourceFactsSql(true), reports, keys, unresolvedParameter === null ? null : `${unresolvedParameter}::boolean`,
+  return reportIdentityRelationsSql(userSourceFactsSql(true), reports, keys, unresolvedParameter === null ? null : `${unresolvedParameter}::boolean`,
     `${prefix}selected_directory AS MATERIALIZED (${candidate}),`);
 }
 
@@ -142,5 +142,5 @@ export function selectedOfficialReportRelationsSql(kind: "users" | "agents" | "u
             WHERE r.version_id=versions.version_id AND r.tenant_id=$4 AND r.kind=f.kind AND r.payload_hash=f.payload_hash OFFSET 0)
         OFFSET 0
       ) f`;
-  return relations(userSourceFactsSql(), reports, reportKeyCounts, unresolvedReports, prefix);
+  return reportIdentityRelationsSql(userSourceFactsSql(), reports, reportKeyCounts, unresolvedReports, prefix);
 }

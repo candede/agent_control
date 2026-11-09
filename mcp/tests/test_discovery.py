@@ -26,7 +26,8 @@ BASELINE = json.loads(
 )
 CORPUS = json.loads(
     (
-        Path(__file__).resolve().parents[2] / "backend/scripts/fixtures/mcp-workflows.json"
+        Path(__file__).resolve().parents[2]
+        / "frontend/public/customer-kit/adoption-intelligence/recipes.json"
     ).read_text()
 )
 RETIRED_OPERATIONS = {
@@ -49,6 +50,30 @@ RETIRED_OPERATIONS = {
     "cancel_hunt",
     "delete_hunting_cache",
     "list_hunting_rows",
+}
+EVIDENCE_OPERATIONS = {
+    "list_adoption_content",
+    "read_adoption_content",
+    "create_adoption_content",
+    "update_adoption_content",
+    "progress_adoption_action",
+    "delete_adoption_content",
+    "follow_up_adoption_content",
+    "read_shared_learning",
+    "preview_shared_learning",
+    "get_adoption_summary",
+    "list_adoption_departments",
+    "list_adoption_history",
+    "list_department_opportunities",
+    "list_opportunity_people",
+    "get_office_context",
+    "get_office_summary",
+    "get_office_comparison",
+    "list_office_history",
+    "list_office_groups",
+    "list_office_departments",
+    "list_office_facets",
+    "list_office_people",
 }
 
 
@@ -128,10 +153,19 @@ async def test_complete_sdk_discovery(browser, entra):
     assert len(tools) == len({tool.name for tool in tools}) == len(PUBLIC_TOOLS)
     assert measurement["sdk"] == BASELINE["sdk"]
     assert measurement["serializer"] == BASELINE["serializer"]
+    historical_names = {operation["name"] for operation in BASELINE["operations"]}
+    current_additions = {
+        operation["name"]
+        for operation in measurement["operations"]
+        if operation["name"] not in historical_names
+        and operation["path"] not in {"/api/discovery/read", "/api/discovery/preview"}
+    }
+    assert current_additions == EVIDENCE_OPERATIONS
     assert [
         operation
         for operation in measurement["operations"]
         if operation["path"] not in {"/api/discovery/read", "/api/discovery/preview"}
+        and operation["name"] not in EVIDENCE_OPERATIONS
     ] == [
         operation
         for operation in BASELINE["operations"]
@@ -147,6 +181,18 @@ def test_complete_unique_mapping_and_unchanged_safety():
     assert {branch.operation.name for branch in branches} == {op.name for op in OPERATIONS}
     for tool in PUBLIC_TOOLS:
         assert len({branch.action for branch in tool.branches}) == len(tool.branches)
+        if tool.name == "adoption_content":
+            assert {branch.action for branch in tool.branches} == {
+                "list",
+                "detail",
+                "create",
+                "update",
+                "progress",
+                "delete",
+                "follow_up",
+            }
+            assert sum(branch.operation.destructive for branch in tool.branches) == 1
+            continue
         assert (
             len(
                 {

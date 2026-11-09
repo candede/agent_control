@@ -22,6 +22,7 @@ in, visible and online; CSV history requires import.
 | Office adoption | Saved directory/app evidence; frozen `office_observations`, `office_group_facts`, `office_person_facts` |
 | Selections and cursors | Actor-bound read context over exact roots, query, revisions and expiry |
 | Jobs, controls, exports and audit | API-owned execution, receipts and lifecycle state |
+| Adoption business content | Tenant-owned `adoption_content`; bounded `adoption_content_receipts`; measured storage view |
 
 Delegated authority uses verified `(tenantId, MSAL homeAccountId)`, never report
 usernames, guest resource IDs or names. Tenant sharing excludes tokens, sessions
@@ -36,15 +37,35 @@ an exact saved member identifier/UPN, and requires the actual actor's Viewer
 hierarchy. Preview never changes the actor, borrows a target token or inherits
 the target's roles. Both routes return neutral self/preview labels.
 
-Search covers current organization-created canonical records: authoritative
-Power Platform evidence or package type `lob`/`custom`, not presence, sharing,
-deployment or usage alone. Full saved About chunks participate; snippets disclose
-clipping and detail continuations return safe 4,096-character portions. Goals
-are at most 512 characters; expanded terms at most eight of 128 characters each;
+Search covers current organization-created and Microsoft first-party canonical
+records through one query-owned classification reused by detail, workplace and
+subject-bound preview. Tenant-native agent resources and package type
+`lob`/`custom` establish organization origin. Exact package-ID official
+`creator type` evidence also covers Graph-only Agent Builder candidates;
+report names, similarly named IDs, sharing, ownership, ID prefixes, deployment
+and package membership do not establish origin. First-party package types,
+authoritative Microsoft publisher or exact Microsoft report origin are labelled
+`microsoft`, never local creation. Conflicting or unsupported explicit origin
+claims remain unknown; third-party and unknown inventory remains staff-visible,
+not a general employee catalog.
+
+Canonical eligibility is independent of descriptive contribution. All exactly
+linked current sources may supply permitted full Graph About, including a shared
+package that did not prove origin. Native absence remains `absent` in source
+provenance. A withheld/unsafe native field cannot be replaced with linked Graph
+text; source rendering and combined withholding precede final search/excerpts.
+No copied description, origin approval, second catalog or new collection is
+stored. `origin.evidence` and description `sources` retain exact generation,
+source identity and canonical publication revision, with set/version identity
+for report-origin evidence. Full saved About chunks participate; snippets disclose
+clipping and detail continuations return safe 4,096-character portions.
+Source descriptions that exceed 4 MiB before or after normalization are reported
+as `limit_withheld`, never as available text.
+Goals are at most 512 characters; expanded terms at most eight of 128 characters each;
 card pages default to five and allow at most twenty. Unknown options, personal
 filters and workplace/privacy overrides fail explicitly. Matches are candidates,
 not proof of capability or provider access; missing coverage is reported.
-Complete approved descriptions identify canonical candidates before people
+Complete saved descriptions identify canonical candidates before people
 rendering; final matching, ordering and excerpts use only permitted rendered text.
 Unfiltered reads bound candidates before rendering. Discovery disables parallel
 hashing within its read transaction so bounded PostgreSQL shared memory cannot
@@ -67,8 +88,11 @@ initiating account without requiring an employee to hold a staff role; control
 publication retains its staff-role check. Selection query bindings include real
 actor authority, self/preview mode, canonical subject, saved profile digest,
 directory generation, report set and association revision. Current-clock
-inventory fences apply again before returning, including complete-description
-continuation.
+inventory fences apply to both origin and each contributing descriptive source
+again before returning, including complete-description continuation. Expiry,
+replacement or source removal invalidates a supplied selection rather than
+returning archived text. New captures can still return unrelated supported
+catalog evidence; missing profile/report/licence is not a discovery gate.
 
 The API reapplies deployment-owned `hide_employee_details` and
 `hide_champion_employee` independently on every response, including ordinary
@@ -84,6 +108,67 @@ IDs or administrative links in these DTOs. Current saved source contracts supply
 no verified agent-use URL, so `useLink` is honestly absent.
 
 ## Current schema
+
+### Durable MCP-led adoption content
+
+One current tenant-owned table stores typed briefs, learning cards and actions;
+there is no copied telemetry, participant registry, cursor archive or second
+catalog. Payloads are bounded to 32 KiB, canonical aggregate baselines and agent
+source references to 16 KiB each, and linked references to 2 KiB; reference lists
+contain at most eight exact IDs. Tenant content plus receipts is bounded to
+20,000 rows and 128 MiB of measured serialized storage, under a tenant lock.
+Pages default to ten/max twenty and staff/shared responses to 512 KiB. MCP content
+reads and employee discovery expose smaller page sizes; employee continuations
+discard cached projections before current source/privacy revalidation.
+Staff authoring and follow-up are AI-consumer workflows through MCP, not a
+dedicated app page or a second set of browser forms.
+
+Saving a measured baseline validates the caller's live selected reads and exact
+filters, then stores the canonical group aggregate, definitions, exact Office
+observation/report set/version lineage and dates—not leases, people or cursors.
+Reload binds new reads to the current caller and exact saved sources. Expired,
+deleted and corrected evidence stays explicitly unavailable/superseded; follow-up
+is a separate explicitly selected same-group aggregate, never individual
+conversion or a claim about the same original people.
+Before returning a follow-up, the original record's revision is checked again;
+concurrent deletion or editing invalidates the comparison instead of returning
+the superseded content.
+Office D28 overlap and report activity-range overlap are checked independently;
+missing or partial report dates leave report overlap explicitly unknown.
+Ordinary core edits retain an existing agent reference's exact source membership;
+they do not silently refresh it. Newly added exact IDs capture current permitted
+sources. An intentional replacement requires removing the old reference and
+explicitly adding it again; dated unavailable references do not block prose edits.
+New references must retain the complete captured source membership through save:
+source additions, removals or revision changes conflict rather than silently
+persisting an already unavailable reference.
+
+Create identity is actual tenant + actor + timestamped UUID request + canonical
+payload SHA-256. Mismatches conflict; a repeated key resolves the original identity
+and its current record or deleted outcome, not an archived initial payload.
+Interrupted outcomes remain unknown and clients retain the same key/payload.
+Unmatched keys older than seven days or principal revocation are rejected.
+Content-free receipts expire eight days after their request timestamp and are
+removed by existing bounded retention, so cleanup cannot enable resurrection.
+
+Business content survives normal sign-out and another actor's session cleanup.
+Exact creator/Admin deletion removes payload and marks independent linked records'
+reference removed; it never cascades other authors' cards/actions. Real principal
+privacy erasure additionally clears private assignments/progress and receipts
+while preserving principal epoch/cutoff authority. Backup/fingerprints include
+both tables. Restore retains exact current payload/evidence/linked-ID membership
+and current receipts; revision/timestamp or automatic removed-reference marker changes
+alone do not discard independently authored content. Missing linked targets
+remain removed. Changed/erased older payloads cannot resurface. Current receipts
+are transferred in the existing bounded restore review, including deletions after
+the snapshot; missing targets become deleted outcomes, so delayed retries cannot
+resurrect them. This is not historical version recovery.
+
+The new DDL is part of `currentSchemaSql` and its fingerprint/grants verifier.
+No migrations, adapters or old schema aliases are retained. A clean reset loses
+old business content, reports and caches; only the approved isolated reset is
+proved in phase 03. Phase 06 owns the exact live checkpoint/reset/deploy and
+automatic authenticated first-run observation.
 
 [Current DDL](../backend/src/db/currentSchema.ts) and
 [verification](../backend/src/db/schema.ts) define the only supported schema.
@@ -405,6 +490,21 @@ See [Office interpretation](copilot-license-usage.md#what-office-metrics-mean).
 Owners: [capture/storage](../backend/src/db/officeAppAdoption.ts),
 [metrics](../backend/src/services/officeAppAdoption.ts) and
 [reads](../backend/src/services/officeAppAdoptionReads.ts).
+
+Department opportunity reads reuse the report owner's exact identity SQL against
+the **entire frozen Office observation**, then filter groups. Positive Users
+facts count without companion relationship edges. Positive/no-reported/unknown
+partition the captured Office-active paid audience; incomplete or unresolved
+whole-observation report identities prevent false negative cohorts. Current
+directory and agent-paid denominators remain separately labelled. Independent
+report/Office and optional inventory selections share one ordered dependency
+fence; expiry, correction and clear invalidate before response release. Report
+capture can omit optional inventory enrichment without losing report-only
+facts. Scalar pages are ten groups/128 KiB; exact audiences and existing
+top-three champion edges are separate bounded reads. Current-directory SQL
+enrichment returns only the at-most-ten selected group counts, never a whole
+person inventory or an unbounded group collection. No additional schema,
+analytics store or provider permission is introduced.
 
 ## Browser saved-read cache
 

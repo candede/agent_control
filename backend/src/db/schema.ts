@@ -11,6 +11,7 @@ import { verifyAuditOriginSchema } from "./auditOriginSchema.js";
 import { verifyAgentControlReceiptsSchema } from "./agentControlReceiptsSchema.js";
 import { verifyOfficeAppAdoptionSchema } from "./officeAppAdoptionSchema.js";
 import { verifyAgentDiscoverySchema } from "./agentDiscoverySchema.js";
+import { verifyAdoptionContentSchema } from "./adoptionContentSchema.js";
 
 export const schemaSql: string = currentSchemaSql;
 export const schemaFingerprint: string = createHash("sha256").update(schemaSql).digest("hex");
@@ -114,6 +115,7 @@ export async function verifySchema(database: Pick<pg.Pool, "query">): Promise<vo
   await verifyAgentControlReceiptsSchema(database);
   await verifyOfficeAppAdoptionSchema(database);
   await verifyAgentDiscoverySchema(database);
+  await verifyAdoptionContentSchema(database);
 }
 
 async function verifyDataSyncCleanupSchema(database: Pick<pg.Pool, "query">) {

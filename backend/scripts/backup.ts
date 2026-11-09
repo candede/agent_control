@@ -280,12 +280,36 @@ async function withCurrentReview<T>(current: pg.Pool, operation: (review: pg.Poo
 }
 
 async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolClient, history: OfficialReportHistory) {
+  await reconcileCurrentPrincipalRevocations(current, restored);
   const currentIdentity = await current.query<{ database: string }>("SELECT current_database() AS database");
   const restoredIdentity = await restored.query<{ database: string }>("SELECT current_database() AS database");
   if (!currentIdentity.rows[0]?.database || !restoredIdentity.rows[0]?.database) {
     throw new Error("Restore reopening requires available current and restored database identities.");
   }
-  await reconcileRestoredOffice(current, restored);
+  await reconcileRestoredSources(current, restored);
+  await purgeMismatched(restored, "adoption_content", await exactCurrentIds(current, restored, `
+    SELECT id,md5(jsonb_build_array(to_jsonb(content)-'revision'-'updated_at'-'linked_references',
+      (SELECT coalesce(jsonb_agg(reference->'id' ORDER BY reference->>'id'),'[]'::jsonb)
+       FROM jsonb_array_elements(content.linked_references) reference))::text) AS signature
+    FROM adoption_content content`));
+  await mutateReviewRows(restored, "adoption_content_receipts");
+  const capturedAt = (await current.query<{ now: Date }>("SELECT transaction_timestamp() AS now")).rows[0].now;
+  for await (const rows of boundedReviewRows(current, `
+    SELECT content_id AS id,to_jsonb(receipt)::text AS signature FROM adoption_content_receipts receipt`, capturedAt, false)) {
+    await restored.query(`INSERT INTO adoption_content_receipts
+      SELECT * FROM jsonb_populate_recordset(NULL::adoption_content_receipts,$1::jsonb)`,
+    [JSON.stringify(rows.map(row => JSON.parse(row.signature)))]);
+  }
+  await restored.query(`UPDATE adoption_content_receipts receipt SET deleted=true WHERE NOT EXISTS(
+    SELECT 1 FROM adoption_content content WHERE content.tenant_id=receipt.tenant_id AND content.id=receipt.content_id)`);
+  await restored.query(`UPDATE adoption_content content SET linked_references=(
+    SELECT coalesce(jsonb_agg(CASE WHEN EXISTS(SELECT 1 FROM adoption_content linked
+      WHERE linked.tenant_id=content.tenant_id AND linked.id=(reference->>'id')::uuid)
+      THEN reference ELSE jsonb_set(reference,'{state}','"removed"'::jsonb) END),'[]'::jsonb)
+    FROM jsonb_array_elements(content.linked_references) reference),revision=revision+1,updated_at=clock_timestamp()
+    WHERE EXISTS(SELECT 1 FROM jsonb_array_elements(content.linked_references) reference
+      WHERE reference->>'state'='available' AND NOT EXISTS(SELECT 1 FROM adoption_content linked
+        WHERE linked.tenant_id=content.tenant_id AND linked.id=(reference->>'id')::uuid))`);
   await purgeMismatched(restored, "package_inventory_snapshots", await exactCurrentIds(current, restored, `
     SELECT snapshot.id,md5(jsonb_build_array(snapshot.id,snapshot.tenant_id,snapshot.principal_id,snapshot.token_mode,
       snapshot.query_hash,snapshot.scope_kind,snapshot.requested_ids)::text) AS signature
@@ -352,20 +376,61 @@ async function reconcileCurrentCaches(current: pg.PoolClient, restored: pg.PoolC
   await reconcileOfficialSelection(current, restored, safeSets);
 }
 
-export async function reconcileRestoredOffice(current: pg.PoolClient, restored: pg.PoolClient) {
+async function reconcileCurrentPrincipalRevocations(current: pg.PoolClient, restored: pg.PoolClient) {
+  let after: { tenant_id: string; principal_id: string } | undefined, count = 0;
+  for (;;) {
+    const rows = (await current.query<{ tenant_id: string; principal_id: string; epoch: string; bearer_issued_after: string; adoption_request_cutoff: string }>(`
+      SELECT tenant_id,principal_id,epoch::text,bearer_issued_after::text,adoption_request_cutoff::text FROM data_principal_epochs
+      WHERE (epoch>0 OR bearer_issued_after>0)
+        AND ($1::text IS NULL OR (tenant_id,principal_id)>($1::text,$2::text))
+      ORDER BY tenant_id,principal_id LIMIT 250`, [after?.tenant_id ?? null, after?.principal_id ?? null])).rows;
+    if (!rows.length) return;
+    count += rows.length;
+    if (count > 100_000) throw new Error("Current deletion/access review exceeds its safe bound.");
+    await restored.query(`INSERT INTO data_principal_epochs AS existing(tenant_id,principal_id,epoch,bearer_issued_after,adoption_request_cutoff)
+      SELECT tenant_id,principal_id,epoch+1,GREATEST(bearer_issued_after,$2::bigint,
+        ceil(extract(epoch FROM clock_timestamp())*1000)::bigint),adoption_request_cutoff
+      FROM jsonb_to_recordset($1::jsonb) AS reviewed(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint,adoption_request_cutoff bigint)
+      ON CONFLICT(tenant_id,principal_id) DO UPDATE SET epoch=GREATEST(existing.epoch,EXCLUDED.epoch),
+        bearer_issued_after=GREATEST(existing.bearer_issued_after,EXCLUDED.bearer_issued_after),
+        adoption_request_cutoff=GREATEST(existing.adoption_request_cutoff,EXCLUDED.adoption_request_cutoff)`,
+    [JSON.stringify(rows), Date.now()]);
+    after = rows.at(-1);
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+
+export async function reconcileRestoredSources(current: pg.PoolClient, restored: pg.PoolClient) {
     let after = "";
     for (;;) {
-      const scopes = (await restored.query(`SELECT id,tenant_id,source,epoch::text FROM data_scope_epochs
-        WHERE source IN ('directory','app_activity') AND id::text>$1 ORDER BY id LIMIT 250`, [after])).rows;
+      const scopes = (await restored.query(`SELECT id,tenant_id,source,selector,epoch::text FROM data_scope_epochs
+        WHERE source IN ('directory','app_activity','user_sources','agent_people','inventory_packages','inventory_power_platform','inventory_canonical')
+          AND id::text>$1 ORDER BY id LIMIT 250`, [after])).rows;
       if (!scopes.length) break;
       for (const scope of scopes) {
         const live = (await current.query(`SELECT epoch::text FROM data_scope_epochs WHERE tenant_id=$1
-          AND source=$2 AND scope_kind='tenant' AND selector='complete'`, [scope.tenant_id,scope.source])).rows[0];
+          AND source=$2 AND scope_kind='tenant' AND selector=$3`, [scope.tenant_id,scope.source,scope.selector])).rows[0];
         if (!live || BigInt(live.epoch)>BigInt(scope.epoch)) {
-          // The source epoch trigger fences all derived Office captures before GC.
-          await restored.query("UPDATE data_scope_epochs SET epoch=epoch+1 WHERE id=$1", [scope.id]);
+          // Directory/app epoch triggers also fence derived Office captures before GC.
+          await restored.query("UPDATE data_scope_epochs SET epoch=GREATEST(epoch+1,$2::bigint) WHERE id=$1", [scope.id, live?.epoch ?? null]);
           await restored.query("UPDATE data_generations SET state='retired' WHERE scope_id=$1 AND state='published'", [scope.id]);
-          await restored.query("DELETE FROM data_generation_heads WHERE scope_id=$1", [scope.id]);
+          if (scope.source.startsWith("inventory_")) {
+            await restored.query("UPDATE inventory_roots SET current=false WHERE scope_id=$1 AND current", [scope.id]);
+            // The UPDATE guard permits clearing only inside the runtime clear trigger.
+            await restored.query(`WITH cleared AS (
+              DELETE FROM data_generation_heads WHERE scope_id=$1 AND generation_id IS NOT NULL
+              RETURNING scope_id,tenant_id,revision
+            ) INSERT INTO data_generation_heads(scope_id,tenant_id,generation_id,revision)
+              SELECT scope_id,tenant_id,NULL,revision+1 FROM cleared`, [scope.id]);
+            await restored.query(`UPDATE inventory_reconciliation SET active_id=NULL,active_inputs=NULL,active_until=NULL,active_deadline=NULL,
+              active_epoch=NULL,active_sequence=NULL,pending_inputs=NULL,pending_deadline=NULL,published_inputs=NULL,
+              published_sequence=pending_sequence,status='idle' WHERE scope_id=$1`, [scope.id]);
+          } else {
+            await restored.query("DELETE FROM data_generation_heads WHERE scope_id=$1", [scope.id]);
+            if (scope.source === "agent_people") {
+              await mutateReviewRows(restored, "agent_people_cache", `record.tenant_id=${pg.escapeLiteral(scope.tenant_id)}`);
+            }
+          }
         }
       }
       after = scopes.at(-1)!.id;

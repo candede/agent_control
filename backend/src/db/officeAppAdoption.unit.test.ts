@@ -9,7 +9,7 @@ import type { GenerationLease } from "./dataGenerations.js";
 import type { OfficeStatus } from "../types/officeAppAdoption.js";
 import { dataWorkMetricScope, flushDataWorkMetrics } from "../services/dataMetrics.js";
 
-afterEach(() => { flushDataWorkMetrics(); vi.restoreAllMocks(); });
+afterEach(() => { flushDataWorkMetrics(); vi.restoreAllMocks(); vi.useRealTimers(); });
 describe("Office storage and matching contract", () => {
   it("wires immutable tenant-owned retained evidence into current schema, roots, clear, grants and backup", () => {
     for (const table of ["office_observations","office_person_facts","office_group_facts"]) expect(schemaSql).toContain(`CREATE TABLE ${table}`);
@@ -383,6 +383,56 @@ describe("Office capture Bind-byte boundaries without a database", () => {
       await expect(repository.recover(tenantId)).resolves.toBeUndefined();
       expect(repository.generations.publish).toHaveBeenCalledTimes(2);
       expect(repository.generations.abort).toHaveBeenCalledTimes(2);
+    } finally { await database.end(); }
+  });
+
+  it("automatically recovers an unchanged future-dated report when its UTC date arrives", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-09T23:59:30Z"));
+    const { repository, database, client, query, tenantId, sourceRows, facts, result } = capture("people");
+    const base = query.getMockImplementation()!;
+    query.mockImplementation((statement, values) => String(statement).startsWith("UPDATE data_read_selections")
+      ? Promise.resolve(result()) : base(statement, values));
+    vi.mocked(repository.generations.publish).mockImplementation(async (_lease, options) => {
+      await options?.completeJob?.(client, { jobId: "synthetic-office-job", runId: null, rows: facts.length, bytes: 0 });
+      options?.onCommitted?.("1");
+      return "1";
+    });
+    const refresh = "2026-11-10";
+    sourceRows[1].report_refresh_date = refresh;
+    for (const fact of facts) {
+      fact.report_refresh_date = refresh;
+      fact.word_date = refresh;
+    }
+    const vector = digest(JSON.stringify(sourceRows.map(row => [row.scope_id, row.epoch, row.id, row.revision])));
+    try {
+      await expect(repository.reconcile(tenantId)).resolves.toEqual({ state: "unavailable", copied: 0 });
+      expect(query).toHaveBeenCalledWith(expect.stringContaining("UPDATE user_source_attempts"),
+        [sourceRows[1].id, "unavailable", vector, "office_source_unavailable"]);
+      Object.assign(sourceRows[1], {
+        office_status: "unavailable", office_vector: vector, office_error_code: "office_source_unavailable",
+      });
+      await expect(repository.reconcile(tenantId)).resolves.toEqual({ state: "idle", copied: 0 });
+      expect(repository.generations.begin).not.toHaveBeenCalled();
+
+      vi.setSystemTime(new Date("2026-11-10T00:00:00Z"));
+      await repository.recover(tenantId);
+      expect(repository.generations.publish).toHaveBeenCalledOnce();
+      expect(repository.generations.abort).not.toHaveBeenCalled();
+      expect(query).toHaveBeenCalledWith(expect.stringContaining("UPDATE user_source_attempts"),
+        [sourceRows[1].id, "available", vector, null]);
+    } finally { await database.end(); }
+  });
+
+  it("does not recopy an acknowledged regressed report", async () => {
+    const { repository, database, tenantId, sourceRows } = capture("people");
+    Object.assign(sourceRows[1], {
+      office_status: "unavailable", office_error_code: "office_report_regressed",
+      office_vector: digest(JSON.stringify(sourceRows.map(row => [row.scope_id, row.epoch, row.id, row.revision]))),
+    });
+    try {
+      await expect(repository.reconcile(tenantId)).resolves.toEqual({ state: "idle", copied: 0 });
+      expect(repository.generations.begin).not.toHaveBeenCalled();
     } finally { await database.end(); }
   });
 

@@ -20,7 +20,7 @@ const exportRow = (status: ExportRow["status"] = "queued"): ExportRow => ({
   bytes: 1024,
 });
 
-function fixture(exports: ExportRow[] = [], resume = "0", acquired = true) {
+function fixture(exports: ExportRow[] = [], resume = "0", acquired = true, expiredReceipts = 0) {
   const client = Object.assign(new pg.Client(), { release: vi.fn() });
   const result = (rows: pg.QueryResultRow[] = []): pg.QueryResult =>
     ({ command: "SELECT", oid: 0, fields: [], rowCount: rows.length, rows });
@@ -31,9 +31,10 @@ function fixture(exports: ExportRow[] = [], resume = "0", acquired = true) {
     if (statement.startsWith("SELECT count(*)::text AS roots")) return result([{ roots: "0", age: "0" }]);
     if (statement.startsWith("SELECT id,kind,status")) return result(exports);
     if (statement.startsWith("SELECT current_setting(")) return result([{ rows: "0", bytes: "0" }]);
-    if (statement.startsWith("WITH ")) return result([{
-      rows: 0, bytes: 0, reserved_bytes: 0, charged_rows: 0, base_rows: 0, full: false,
-    }]);
+    if (statement.startsWith("WITH ")) {
+      const rows = statement.includes("DELETE FROM adoption_content_receipts") ? expiredReceipts : 0;
+      return result([{ rows, bytes: rows * 512, reserved_bytes: rows * 512, charged_rows: rows, base_rows: rows, full: false }]);
+    }
     if (statement.startsWith("SET LOCAL") || statement.startsWith("SELECT set_config(")
       || statement.startsWith("UPDATE data_exports") || statement.startsWith("UPDATE data_lifecycle_progress")) return result();
     throw new Error(`Unexpected retention query: ${statement}`);
@@ -55,11 +56,11 @@ describe("record retention shared lifecycle bounds", () => {
     expect({ rows: slice.rows, bytes: slice.bytes }).toEqual(before);
     await slice.finish();
     expect(query).toHaveBeenCalledWith(expect.stringContaining("UPDATE data_lifecycle_progress"),
-      [2, before.rows, before.bytes, "records"]);
+      [3, before.rows, before.bytes, "records"]);
   });
 
   it("does not repeat export expiration while resuming a later relation", async () => {
-    const { client, query } = fixture([exportRow()], "3");
+    const { client, query } = fixture([exportRow()], "4");
     expect((await retainRecordData(client)).recordExpiredExports).toBe(0);
     expect(query.mock.calls.some(([sql]) => String(sql).startsWith("UPDATE data_exports"))).toBe(false);
     expect(reportExportAudit).not.toHaveBeenCalled();
@@ -112,6 +113,39 @@ describe("record retention shared lifecycle bounds", () => {
     query.mockClear();
     for (const limit of [0, 251, 1.5]) await expect(retainRecordData(client, limit)).rejects.toThrow("data_retention_batch");
     expect(query).not.toHaveBeenCalled();
+  });
+});
+
+describe("adoption receipt retention", () => {
+  it("collects only expired receipts through the shared bounded slice", async () => {
+    const { client, query, change } = fixture([], "0", true, 1);
+    const slice = new LifecycleSlice(client, 1);
+    expect((await retainRecordData(client, 1, slice)).adoptionReceipts).toBe(1);
+    expect(change).toHaveBeenNthCalledWith(1, "adoptionReceipts", "adoption_content_receipts",
+      "target.expires_at<=clock_timestamp()");
+    const deletion = query.mock.calls.find(([sql]) => String(sql).includes("DELETE FROM adoption_content_receipts"));
+    expect(deletion?.[0]).toContain("ORDER BY target.ctid LIMIT $1");
+    expect(deletion?.[1]).toEqual([1, lifecycleLimits.bytes - 512]);
+    expect({ rows: slice.rows, bytes: slice.bytes }).toEqual({ rows: 2, bytes: 1024 });
+  });
+
+  it("defers later work when receipt collection exhausts the shared row budget", async () => {
+    const { client, query } = fixture([exportRow()], "0", true, 1);
+    const slice = new LifecycleSlice(client, 1);
+    slice.rows = lifecycleLimits.rows - 1;
+    const affected = await retainRecordData(client, 1, slice);
+    expect(affected).toMatchObject({ adoptionReceipts: 1, recordExpiredExports: 0 });
+    expect(slice.rows).toBe(lifecycleLimits.rows);
+    expect(reportExportAudit).not.toHaveBeenCalled();
+    await slice.finish();
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("UPDATE data_lifecycle_progress"),
+      [1, lifecycleLimits.rows, 1024, "records"]);
+  });
+
+  it("does not recollect receipts while resuming a later lifecycle step", async () => {
+    const { client, query } = fixture([], "1", true, 1);
+    expect((await retainRecordData(client)).adoptionReceipts).toBe(0);
+    expect(query.mock.calls.some(([sql]) => String(sql).includes("DELETE FROM adoption_content_receipts"))).toBe(false);
   });
 });
 

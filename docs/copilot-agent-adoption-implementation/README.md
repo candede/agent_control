@@ -81,7 +81,9 @@ The chosen runtime flow is:
 4. A customer-configured AI consumer uses the delivered instructions/skill and
    tested recipes to draft a brief, exercises and peer-learning suggestions.
    Model interpretation never becomes metric, origin or access authority.
-5. An explicit save uses the same adoption-content API as normal browser forms.
+5. On explicit user intent, the connected AI consumer saves through typed MCP
+   operations backed by the adoption-content API. There is no dedicated
+   Adoption page, manual browser editor or parallel staff authoring workflow.
    The backend validates evidence bindings, owns record identity/revisions and
    persists bounded business content, not a second telemetry snapshot.
 6. An author can explicitly share a suitable card with all active employees in
@@ -122,7 +124,7 @@ README and CONTRACT are support documents, not executable phases.
 | --- | --- | --- | --- |
 | 01 | [Evidence APIs and MCP reads](./01-evidence-apis-and-mcp-reads.md): canonical evidence, exact opportunity cohorts, read bindings and shared fixtures | None | `completions/01-evidence-apis-and-mcp-reads.md` |
 | 02 | [Safe discovery and agent descriptions](./02-safe-discovery-and-agent-descriptions.md): canonical eligibility, linked descriptions, first-party coverage and staff/EndUser consumers | 01 contexts and representative fixtures | `completions/02-safe-discovery-and-agent-descriptions.md` |
-| 03 | [Adoption workspace and learning cards](./03-adoption-workspace-and-learning-cards.md): current schema, object authorization, API/MCP persistence, UI and tenant-wide employee sharing | 01, 02 | `completions/03-adoption-workspace-and-learning-cards.md` |
+| 03 | [MCP-led adoption content and learning cards](./03-adoption-workspace-and-learning-cards.md): current schema, object authorization, API/MCP persistence and tenant-wide employee sharing | 01, 02 | `completions/03-adoption-workspace-and-learning-cards.md` |
 | 04 | [AI guidance and customer starter kit](./04-ai-guidance-and-customer-starter-kit.md): delivered server/tool guidance, canonical recipes/assets, Studio setup and copy/download UX | 01, 02, 03 | `completions/04-ai-guidance-and-customer-starter-kit.md` |
 | 05 | [End-to-end and capacity verification](./05-end-to-end-and-capacity-verification.md): integrated journeys, model/client evidence, scale, privacy and reset proof | 01-04 | `completions/05-end-to-end-and-capacity-verification.md` |
 | 06 | [Deploy SEHA and observe](./06-deploy-seha-and-observe.md): exact local rollout, justified reset, live journeys, fix-forward and cleanup | 05 attempted checks, repair evidence and residuals | `completions/06-deploy-seha-and-observe.md` |
@@ -172,7 +174,7 @@ machine's filesystem path. The application boundaries are:
 
 - [backend](../../backend/): Node API, PostgreSQL schema, evidence and authorization.
 - [mcp](../../mcp/): FastMCP transport, typed actions, OAuth and server guidance.
-- [frontend](../../frontend/): staff workspace, employee handoff and customer kit.
+- [frontend](../../frontend/): existing analytics/sync/settings, employee handoff and customer kit; no dedicated Adoption page.
 - [scripts](../../scripts/), [infra](../../infra/), and deployment files:
   current local lifecycle, images, grants and qualification.
 

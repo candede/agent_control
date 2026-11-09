@@ -14,7 +14,7 @@ import { verifySchema } from "./schema.js";
 import { officeRetentionCutoff } from "../services/officeAppAdoption.js";
 import * as officeSemantics from "../services/officeAppAdoption.js";
 import * as copilotSemantics from "../types/copilotUsage.js";
-import { reconcileRestoredOffice } from "../../scripts/backup.js";
+import { reconcileRestoredSources } from "../../scripts/backup.js";
 import { checkpointQueries, observeQueryWork } from "../services/peakMemory.js";
 
 describe("retained Office SQL/publication/lifecycle",()=>{
@@ -448,11 +448,11 @@ describe("retained Office SQL/publication/lifecycle",()=>{
     try {
       await publishOfficeSource(current.runtime,"directory",[officeFixturePerson()]);
       await publishOfficeSource(current.runtime,"app_activity",[officeFixtureActivity(1,{ teams_date:date })]);
-      await reconcileRestoredOffice(live,restored);
+      await reconcileRestoredSources(live,restored);
       expect((await reads.context(selectionIdentity,{})).observation).toBeNull();
       expect((await repository.reconcile(selectionIdentity.tenantId)).state).toBe("idle");
       await live.query("UPDATE data_scope_epochs SET epoch=epoch+1 WHERE source IN ('directory','app_activity')");
-      await reconcileRestoredOffice(live,restored);
+      await reconcileRestoredSources(live,restored);
       expect((await fixture.operator.query("SELECT count(*) FROM data_generation_heads h JOIN data_scope_epochs s ON s.id=h.scope_id WHERE s.source IN ('directory','app_activity','office_app_adoption')")).rows[0].count).toBe("0");
       await gc();
       expect((await fixture.operator.query("SELECT count(*) FROM office_person_facts")).rows[0].count).toBe("0");
@@ -559,14 +559,14 @@ describe("retained Office SQL/publication/lifecycle",()=>{
     const freshness=vi.spyOn(copilotSemantics,"isCopilotAppActivityFresh").mockReturnValue(true);
     await publishOfficeSource(fixture.runtime,"directory",[officeFixturePerson()]);
     await publishOfficeSource(fixture.runtime,"app_activity",[officeFixtureActivity(1,{word_date:previous},previous)]);
-    const old=await reads.context(selectionIdentity,{});
+    await reads.context(selectionIdentity,{});
     expiry.mockRestore();
     freshness.mockRestore();
     await publishOfficeSource(fixture.runtime,"app_activity",[officeFixtureActivity(1,{word_date:date})]);
     const latest=await reads.context(selectionIdentity,{});
     expect((await reads.history(selectionIdentity,{},latest.selection.id)).value).toHaveLength(2);
     expect(Date.parse(latest.selection.expiresAt)-Date.now()).toBeGreaterThan(1000);
-    await new Promise(resolve=>setTimeout(resolve,Math.max(0,Date.parse(old.observation!.expiresAt)-Date.now())+20));
+    await new Promise(resolve=>setTimeout(resolve,Math.max(0,Date.parse(latest.selection.expiresAt)-Date.now())+20));
     await expect(reads.history(selectionIdentity,{},latest.selection.id)).rejects.toMatchObject({code:"selection_invalidated"});
     let invalidated=false;
     for(let pass=0;pass<5 && !invalidated;pass++) {

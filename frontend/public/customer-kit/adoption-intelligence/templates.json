@@ -1,0 +1,22 @@
+{
+  "brief": ["scope","evidence and independent contexts","opportunity with exact counts/coverage","three suitable task/agent candidates","draft prompt/input/output/review per exercise","proposed action/owner","known versus unknown access/data","aggregate follow-up and independent window caveats","unknowns"],
+  "peer": ["exact permitted dated peer","used edges","created edges","complete description basis","learning questions","no expertise/access/outcome claim"],
+  "employee": ["safe task candidate","origin and declared capability","beginner input/prompt/output/review","permitted link/contact or explicit missing/withheld state","no staff metrics"],
+  "action": ["actual content ID","business next step","authorized assignee or unassigned","due date or none","status/progress","success measure","no sent message or provider execution"],
+  "draft": {
+    "kind":"brief","title":"Department activation draft",
+    "scope":{"company":null,"department":null},
+    "narrative":{"task":"","inputs":"","prompt":"","expectedOutput":"","reviewSteps":"","limitations":"","example":"","opportunity":"","exercises":"","successMeasure":"","unknowns":""},
+    "learning":null,"evidenceKind":"generated_draft","visibility":"staff_only",
+    "assigneeId":null,"dueDate":null,"status":"open","progress":"","agentIds":[],"linkedIds":[]
+  },
+  "employeeLearning": {
+    "task":"draft","inputs":"synthetic_example","output":"draft_document","prompt":"draft_for_review",
+    "reviews":["verify_sources","human_review"],"failures":["missing_context","incorrect_facts"]
+  },
+  "measuredBaseline": {
+    "groupId":"$groupId",
+    "query":{"company":"$company","department":"$department","officeSelectionId":"$officeSelectionId","reportSelectionId":"$reportSelectionId","inventorySelectionId":"$inventorySelectionId"}
+  },
+  "bounds": "Draft <=32 KiB; title<=256 chars, each narrative/progress<=2048; <=8 unique agentIds/linkedIds. requestId=<13-digit epoch-ms>.<lowercase UUID>. Bind exact returned variables. learning requires card and finite slots; actions cannot be employees. Updates use draft without baseline, expectedRevision from current read; never replace measured scope."
+}

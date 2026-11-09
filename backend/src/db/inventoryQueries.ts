@@ -138,11 +138,13 @@ export class InventoryQueries {
     await this.reports.history.ensure(identity.tenantId);
     await this.reports.history.connections.run(client => this.reports.history.reconcileHead(client, identity.tenantId));
     while (await this.reports.history.expire(identity.tenantId) > 0) { /* bounded maintenance transactions */ }
-    return this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
+    let publicationRevisions: Context["data"]["publicationRevisions"] | undefined;
+    const selection = await this.selections.captureWith(identity, "inventory", { values: metadata, allowed: ["inventoryQuery", "operationIdPrefix"] }, async (client, at) => {
       const pinUntil = new Date(at.getTime() + 30 * 60_000);
       const roots = await inventorySelectionRoots(client, { id: scopeId, tenantId: identity.tenantId }, pinUntil);
       if (!roots.length) throw new SelectionError("selection_invalidated");
       const data = await this.reports.currentInventoryData(client, identity, at, query.setId);
+      publicationRevisions = data.publicationRevisions;
       roots.push(await this.reports.history.root(client, identity.tenantId, at));
       if (needsPeopleCache(query)) {
         const epoch = (await client.query("SELECT epoch FROM data_scope_epochs WHERE id=$1", [sourceScope])).rows[0].epoch;
@@ -162,6 +164,8 @@ export class InventoryQueries {
           VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb)`, [selection.id, identity.tenantId, JSON.stringify(data), association, scopeId, JSON.stringify(criteria)]);
       } };
     });
+    if (!isPublicationRevisions(publicationRevisions)) throw new SelectionError("selection_invalidated", "unavailable");
+    return { ...selection, publicationRevisions };
   }
 
   private read<T>(id: string, identity: SelectionIdentity, work: (client: pg.PoolClient, context: Context, selection: Record<string, unknown>) => Promise<T>,

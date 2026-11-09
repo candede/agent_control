@@ -159,7 +159,8 @@ export class LargeTenantUsersReports {
     while (await this.history.expire(tenantId) > 0) { /* bounded maintenance transactions */ }
   }
 
-  async capture(identity: SelectionIdentity, endpoint: ReportEndpoint, input: ReportQuery = {}) {
+  async capture(identity: SelectionIdentity, endpoint: ReportEndpoint, input: ReportQuery = {},
+    options: { inventoryEnrichment?: boolean } = {}) {
     assertSelectionIdentity(identity);
     const query = reportQuery(endpoint, input);
     await this.prepareHistoryCapture(identity.tenantId);
@@ -177,7 +178,7 @@ export class LargeTenantUsersReports {
       const publicationRevisions = await readAutomaticInventoryRevisions(identity, client);
       const roots: DependencyRoot[] = [history];
       let associationRevision: string | undefined;
-      if (endpoint === "adoption" && report.lineages.some(lineage => lineage.kind === "userAgents")) {
+      if (endpoint === "adoption" && options.inventoryEnrichment !== false && report.lineages.some(lineage => lineage.kind === "userAgents")) {
         const scope = (await client.query<{ id: string }>(`SELECT id FROM data_scope_epochs
           WHERE tenant_id=$1 AND scope_kind='tenant' AND source='inventory_canonical'
             AND token_mode='tenant' AND selector='complete'`,

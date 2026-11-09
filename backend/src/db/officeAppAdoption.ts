@@ -30,7 +30,7 @@ export const readableOfficeSql = `FROM office_observations o JOIN data_generatio
   JOIN data_generation_heads h ON h.scope_id=o.scope_id AND h.generation_id=o.generation_id
   WHERE o.tenant_id=$1 AND g.state='published' AND g.validated AND g.expires_at>clock_timestamp()`;
 
-export const officeMetricProjection = `count(*)::text AS licensed,
+const officeMetricProjection = `count(*)::text AS licensed,
   count(*) FILTER(WHERE jsonb_array_length(payload->'recentApps')>0)::text AS active,
   coalesce(sum(jsonb_array_length(payload->'recentApps')),0)::text AS pairs,
   count(*) FILTER(WHERE jsonb_array_length(payload->'recentApps')=0)::text AS no_recent,
@@ -147,7 +147,9 @@ export class OfficeAppAdoptionRepository {
       }, false, options.signal);
       return { state: "unavailable" as const, copied: 0 };
     }
-    if (vector.app.office_vector === vector.hash && ["available", "unavailable"].includes(vector.app.office_status ?? "")) {
+    if (vector.app.office_vector === vector.hash
+      && (vector.app.office_status === "available"
+        || vector.app.office_status === "unavailable" && vector.app.office_error_code === "office_report_regressed")) {
       return { state: "idle" as const, copied: 0 };
     }
     const refreshDate = refresh!;

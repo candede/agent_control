@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { vi } from "vitest";
 import { createApp } from "../app.js";
@@ -42,8 +43,16 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
     acquireTokenByCode: async () => { throw new Error("No live browser login"); },
     acquireTokenByClientCredential: async () => ({ ...browserAuthenticationResult(), account: null, idTokenClaims: {},
       scopes: ["https://graph.microsoft.com/.default"], accessToken: "synthetic-application-membership-token" }),
-    acquireTokenSilent: async request => ({ ...authentication, scopes: Array.isArray(request.scopes) ? request.scopes : [] }),
-    getTokenCache: () => ({ getAccountByHomeId: async () => selected, removeAccount: async () => undefined }),
+    acquireTokenSilent: async request => {
+      const member = identityAccounts.get(request.account.localAccountId);
+      if (!member) throw new Error("Unregistered synthetic account.");
+      return { ...authentication, account: member.account, uniqueId: member.account.localAccountId,
+        idTokenClaims: { ...authentication.idTokenClaims, oid: member.account.localAccountId, roles: member.roles },
+        scopes: Array.isArray(request.scopes) ? request.scopes : [] };
+    },
+    getTokenCache: () => ({ getAccountByHomeId: async id =>
+      [...identityAccounts.values()].find(member => member.account.homeAccountId === id)?.account ?? null,
+    removeAccount: async () => undefined }),
   });
   await activateAccountSession(tenant.tenantId, selected.homeAccountId, async () => undefined);
   await loadOperationalState(fixture.runtime);
@@ -97,7 +106,17 @@ export async function setupAuditOriginHttp(transport: "webapp" | "mcp", selected
     headers: { ...(kind === "mcp"
       ? { authorization: `Bearer ${apiToken({ roles, oid: selected.localAccountId, azp: integrationClientId })}`, "X-Agent-Control-Mcp-Context": context }
       : { cookie, Origin: config.frontendOrigin, "X-CSRF-Token": "synthetic-csrf" }), ...options.headers } });
-  return { base, integrationClientId, database: fixture.runtime, providerWork, identityAccounts, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs };
+  const browserRequestFor = async (member: typeof selected, memberRoles: AppRole[]) => {
+    identityAccounts.set(member.localAccountId, { account: member, roles: memberRoles });
+    await activateAccountSession(tenant.tenantId, member.homeAccountId, async () => undefined);
+    const memberSession = browserSession(member);
+    memberSession.user!.roles = memberRoles; memberSession.user!.localAccountId = member.localAccountId;
+    memberSession.csrfToken = "synthetic-csrf";
+    const memberCookie = await browserFixtureCookie(application!.store, config.sessionSecret, memberSession, `synthetic-auth-${randomUUID()}`);
+    return (path: string, options: RequestInit = {}) => fetch(`${base}${path}`, { ...options,
+      headers: { cookie: memberCookie, Origin: config.frontendOrigin, "X-CSRF-Token": "synthetic-csrf", ...options.headers } });
+  };
+  return { base, integrationClientId, database: fixture.runtime, providerWork, identityAccounts, actor: session.user!, scope: { tenantId: tenant.tenantId, principalId: selected.homeAccountId }, request, requestAs, browserRequestFor };
 }
 
 export async function closeAuditOriginHttp() {

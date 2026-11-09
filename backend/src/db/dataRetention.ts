@@ -49,6 +49,7 @@ export async function retainRecordData(client: pg.PoolClient, limit = 250, share
   if (!(await client.query("SELECT pg_try_advisory_xact_lock(3650111) AS acquired")).rows[0].acquired) return affected;
   const slice = sharedSlice ?? new LifecycleSlice(client, limit);
   if (!sharedSlice) await slice.open();
+  affected.adoptionReceipts = await slice.change("adoptionReceipts", "adoption_content_receipts", "target.expires_at<=clock_timestamp()");
   const backlog = (await client.query(`SELECT count(*)::text AS roots,
     greatest(0,floor(extract(epoch FROM (clock_timestamp()-min(created_at)))*1000))::text AS age
     FROM data_generations WHERE state='deleting' AND collected_at IS NULL`)).rows[0];

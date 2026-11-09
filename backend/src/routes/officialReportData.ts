@@ -23,6 +23,10 @@ import { readAdoptionDepartments, readAdoptionSummary } from "../services/adopti
 import { SavedReadContracts } from "../services/savedReadContracts.js";
 import type { AgentRelationship } from "../types/savedReadContracts.js";
 import { hasAppRole } from "../types/capability.js";
+import { DepartmentOpportunities } from "../services/departmentOpportunity.js";
+import { OfficeAppAdoptionReads } from "../services/officeAppAdoptionReads.js";
+import { officeRequestQuery } from "./officeAppAdoption.js";
+import type { OpportunityCohort, OpportunityQuery } from "../types/departmentOpportunity.js";
 
 type ReportHandlerIdentity = { identity: SelectionIdentity };
 export type ReportHandlerOptions = {
@@ -83,6 +87,8 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
   const inventoryUsage = new OfficialAgentUsage(reports, options.inventory ?? new InventoryQueries(reports.database,
     config.sessionSecret, reports.staleAfterDays, { source: "inventory_canonical" }));
   const savedReads = new SavedReadContracts(reports, inventoryUsage.inventory!);
+  const opportunities = new DepartmentOpportunities(reports, new OfficeAppAdoptionReads(reports.database, config.sessionSecret),
+    inventoryUsage.inventory!);
   router.use((_request, response, next) => { response.setHeader("Cache-Control", "private, no-store"); next(); });
   const route = (method: RouteMethod, path: string, access: "read" | "admin" | "browser-read" | "browser-admin" | "browser-uploader", ...handlers: RequestHandler[]) => {
     const dataClass = path.startsWith("/copilot-usage/") ? "licensed_copilot_usage"
@@ -197,6 +203,33 @@ export function createOfficialReportDataRouter(options: ReportHandlerOptions) {
     response.json(await reports.read(context.id, context.identity, (client, read) =>
       readAdoptionDepartments(client, reports, read, { ...pageOptions(request.query),
         ...(pageNumber === undefined ? {} : { pageNumber }) })));
+  }));
+  function opportunityInput(raw: Record<string, unknown>, people = false) {
+    const remaining = { ...raw }, query: OpportunityQuery = {};
+    for (const key of ["setId", "reportSelectionId", "officeSelectionId", "inventorySelectionId"] as const) {
+      if (remaining[key] !== undefined) query[key] = reportUuid(remaining[key]).toLowerCase();
+      delete remaining[key];
+    }
+    const cohort = people ? scalar(remaining.cohort, 16) : undefined;
+    if (people) delete remaining.cohort;
+    if (remaining.selectionId !== undefined || remaining.anchor !== undefined || remaining.pageNumber !== undefined) {
+      throw new AppError(400, "invalid_opportunity_query", "Use independent reportSelectionId and officeSelectionId with returned cursors.");
+    }
+    // Office parsing requires its actual selected ID when a cursor is supplied.
+    const { query: office, options } = officeRequestQuery({ ...remaining,
+      ...(query.officeSelectionId ? { selectionId: query.officeSelectionId } : {}) }, true);
+    return { query: { ...office, ...query }, options, cohort };
+  }
+  route("get", "/copilot-usage/adoption/opportunities", "read", failSafe(async (request, response) => {
+    const { query, options: paging } = opportunityInput(request.query);
+    const who = await options.identity(request);
+    response.json(await opportunities.page(who.identity, query, paging));
+  }));
+  route("get", "/copilot-usage/adoption/opportunities/:groupId/people", "read", failSafe(async (request, response) => {
+    const { query, options: paging, cohort } = opportunityInput(request.query, true);
+    if (!["positive", "no_reported", "unknown"].includes(cohort!)) throw new AppError(400, "invalid_opportunity_query", "Use positive, no_reported or unknown.");
+    const who = await options.identity(request);
+    response.json(await opportunities.people(who.identity, query, scalar(request.params.groupId, 64), cohort as OpportunityCohort, paging));
   }));
   for (const [path, endpoint] of lists) route("get", path, "read", failSafe(async (request, response) => {
     const context = await selected(request, endpoint); response.json(await reports.page(context.id, context.identity, pageOptions(request.query)));

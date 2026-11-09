@@ -20,9 +20,15 @@ import type { AppRole } from "../types/capability.js";
 import { DataGenerations } from "../db/dataGenerations.js";
 import { discoveryCatalogQuery, discoveryPopularitySql, discoverySearchSql } from "../db/agentDiscoveryQueries.js";
 import { inventorySelectionFixture } from "../../scripts/inventoryFixtures.js";
+import type { InventoryQueries } from "../db/inventoryQueries.js";
 import { sdkJourney, type SdkCall } from "./mcpSdkJourneyTestSupport.js";
+import { discoveryEvidenceAbout, discoveryEvidenceGroups, discoveryEvidenceId } from "../../scripts/discoveryEvidenceFixtures.js";
+import type { AgentAboutPage } from "../types/savedReadContracts.js";
 
 const originalPrivacy = config.employeePrivacy;
+const sdkPrivacyCases = [false, true].flatMap(hide_employee_details => [false, true].flatMap(hide_champion_employee =>
+  ([[], ["AgentControl.Viewer"], ["AgentControl.UsageReportUploader"], ["AgentControl.Admin"]] as AppRole[][])
+    .map(roles => ({ hide_employee_details, hide_champion_employee, roles }))));
 afterEach(async () => { config.employeePrivacy = originalPrivacy; await closeAuditOriginHttp(); });
 const agent = (i: number) => `90000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
 const person = (i: number) => `80000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
@@ -112,11 +118,12 @@ function assertNoMetrics(value: unknown) {
 }
 
 describe.sequential("real authenticated saved discovery journeys", () => {
-  it.runIf(Boolean(process.env.AGENT_CONTROL_MCP_SQL_JOURNEY))("binds real native self/preview schemas and all privacy combinations to the same SQL reads", async () => {
+  it.runIf(Boolean(process.env.AGENT_CONTROL_MCP_SQL_JOURNEY)).each(sdkPrivacyCases)(
+    "binds real native self/preview schemas for $roles and privacy $hide_employee_details/$hide_champion_employee", async ({
+      hide_employee_details, hide_champion_employee, roles,
+    }) => {
     const equivalent = (value: DiscoveryWorkplace) => ({ ...value, selection: undefined,
       context: { ...value.context, mode: undefined, subject: undefined } });
-    for (const hide_employee_details of [false, true]) for (const hide_champion_employee of [false, true]) {
-      for (const roles of [[], ["AgentControl.Viewer"], ["AgentControl.UsageReportUploader"], ["AgentControl.Admin"]] as AppRole[][]) {
         const f = await setupAuditOriginHttp("mcp", account(), tenant.integration!.clientId, roles);
         config.employeePrivacy = { hide_employee_details, hide_champion_employee };
         const { people } = await seed(f);
@@ -167,9 +174,7 @@ describe.sequential("real authenticated saved discovery journeys", () => {
           roles, privacy: config.employeePrivacy, ...f.providerWork,
         }));
         await closeAuditOriginHttp();
-      }
-    }
-  }, 480_000);
+  }, 120_000);
   it("retrieves all twelve deterministic goal cases, beyond page one and full chunked About without provider work", async () => {
     const f = await setupAuditOriginHttp("mcp", account(), tenant.integration!.clientId, []);
     await seed(f);
@@ -198,8 +203,10 @@ describe.sequential("real authenticated saved discovery journeys", () => {
     }
     const nativeEvidence = await read<DiscoveryPage>(f, { operation: "search", goal: "native craftsmanship" });
     expect(nativeEvidence.value.map(card => card.id)).toEqual([agent(5)]);
+    const nativeSource = nativeEvidence.value[0].sources.find(source => source.source === "power_platform")!;
     expect(nativeEvidence.value[0].evidence).toEqual([{
-      source: "power_platform", field: "description", excerpt: "draft policy guidance with native craftsmanship",
+      source: nativeSource.source, generationId: nativeSource.generationId, sourceIdentity: nativeSource.sourceIdentity,
+      revision: nativeSource.revision, field: "description", excerpt: "draft policy guidance with native craftsmanship",
     }]);
     const first = await read<DiscoveryPage>(f, { operation: "search", limit: 20 });
     expect(first.value).toHaveLength(20); expect(first.nextCursor).not.toBeNull();
@@ -208,8 +215,9 @@ describe.sequential("real authenticated saved discovery journeys", () => {
       const next = await read<DiscoveryPage>(f, { operation: "search", limit: 20, selectionId: first.selection.id, cursor });
       catalog.push(...next.value); cursor = next.nextCursor;
     }
-    expect(catalog).toHaveLength(71); expect(new Set(catalog.map(item => item.id)).size).toBe(71);
-    for (const id of [31, 32, 33, 34]) expect(catalog.map(item => item.id)).not.toContain(agent(id));
+    expect(catalog).toHaveLength(72); expect(new Set(catalog.map(item => item.id)).size).toBe(72);
+    for (const id of [31, 33, 34]) expect(catalog.map(item => item.id)).not.toContain(agent(id));
+    expect(catalog.find(item => item.id === agent(32))?.origin.kind).toBe("microsoft");
     const detail = await read<{ description: { text: string }; agent: { title: unknown }; nextCursor: string | null; selection: { id: string } }>(
       f, { operation: "detail", agentId: agent(75) });
     let full = detail.description.text, cursor = detail.nextCursor;
@@ -230,7 +238,7 @@ describe.sequential("real authenticated saved discovery journeys", () => {
     ] as const) {
       const plan = await f.database.query(`EXPLAIN (ANALYZE,BUFFERS,SETTINGS,FORMAT JSON) ${sql}`, [...parameters, ...tail]);
       process.stdout.write(`${JSON.stringify({ event: "discovery_fixture_query_plan", shape,
-        dataset: { people: 5, catalog: 75, eligible: 71 }, plan: plan.rows })}\n`);
+        dataset: { people: 5, catalog: 75, eligible: 72 }, plan: plan.rows })}\n`);
     }
     expect(f.providerWork.requests).toBe(0);
     const forged = await f.request("/discovery/preview", { method: "POST", headers: { "content-type": "application/json" },
@@ -238,6 +246,142 @@ describe.sequential("real authenticated saved discovery journeys", () => {
     expect(forged.status).toBe(403);
     expect((await f.request("/discovery/read", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ operation: "profile", subject: person(1) }) })).status).toBe(400);
+  }, 120_000);
+
+  it.each(["webapp", "mcp"] as const)("reproduces linked native absence and exact origin on the %s transport without a shadow catalog", async transport => {
+    const f = await setupAuditOriginHttp(transport);
+    const owner = account().localAccountId;
+    const people = [directoryPerson(owner)];
+    await savePeople(f, people);
+    await saveUsageInventory(f.database, f.scope, discoveryEvidenceGroups(owner));
+    const imports = new OfficialReportImports(f.database), identity = await usageIdentity(f.database, f.scope), bundleId = randomUUID();
+    for (const [kind, rows] of [
+      ["agents", ["Evidence-4,Similarly named assistant,Your org,1,0,1,2026-11-05",
+        "evidence-15,Similarly named assistant,Your org,1,0,1,2026-11-05",
+        "Evidence-16,Similarly named assistant,Your org,1,0,1,2026-11-05",
+        "Evidence-19,Similarly named assistant,Microsoft,1,0,1,2026-11-05"]],
+      ["userAgents", [`Evidence-4,Similarly named assistant,Your org,${people[0].identity.userPrincipalName},1,2026-11-05`,
+        `Evidence-16,Similarly named assistant,Microsoft,${people[0].identity.userPrincipalName},1,2026-11-05`]],
+      ["users", [`${people[0].identity.userPrincipalName},Alice Owner,2,2,2026-11-05`]],
+    ] as const) {
+      await imports.stage(identity, { bundleId }, (async function* () {
+        yield Buffer.from(`${schemaRegistry[kind].headers.join(",")}\n${rows.join("\n")}\n`);
+      })(), { reportingPeriod: { startDate: "2026-10-30", endDate: "2026-11-05", provenance: "operator_asserted" } });
+    }
+    await imports.acceptBundle(identity, bundleId, await imports.bundle(identity, bundleId));
+    const captured = await f.request("/agent-inventory/selections", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: {} }) });
+    expect(captured.status, await captured.clone().text()).toBe(201);
+    const staff: Awaited<ReturnType<InventoryQueries["capture"]>> = await captured.json();
+    const staffPage = await f.request(`/agent-inventory?selectionId=${staff.id}&limit=50`);
+    expect(staffPage.status, await staffPage.clone().text()).toBe(200);
+    expect((await staffPage.json()).value).toHaveLength(19);
+    const source = (await f.database.query(`SELECT * FROM inventory_live_sources
+      WHERE tenant_id=$1 AND agent_id=$2 AND source='graph_packages'`, [f.scope.tenantId, discoveryEvidenceId(1)])).rows[0];
+    const aboutResponse = await f.request(`/agent-inventory/agent:${discoveryEvidenceId(1)}/about?${new URLSearchParams({
+      selectionId: staff.id, sourceScopeId: source.source_scope_id, sourceIdentity: source.source_identity, field: "long",
+    })}`);
+    expect(aboutResponse.status, await aboutResponse.clone().text()).toBe(200);
+    const about: AgentAboutPage = await aboutResponse.json();
+    expect(about.totalBytes).toBe(Buffer.byteLength(discoveryEvidenceAbout));
+    const catalog = await read<DiscoveryPage>(f, { operation: "search", limit: 20 });
+    expect(catalog.value.map(card => card.id)).toEqual([1, 3, 4, 10, 11, 12, 13, 14, 17, 18, 19].map(discoveryEvidenceId));
+    const linked = catalog.value.find(card => card.id === discoveryEvidenceId(1))!;
+    expect(linked.origin.kind).toBe("organization_created");
+    expect(linked.origin.evidence.map(evidence => evidence.source)).toEqual(["power_platform"]);
+    expect(linked.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: "power_platform", descriptionState: "absent", descriptionField: "details.description" }),
+      expect.objectContaining({ source: "graph_packages", descriptionState: "available", sourceIdentity: "Evidence-1",
+        descriptionField: "longDescription" }),
+    ]));
+    const sqlCase = (await f.database.query(`SELECT r.domain,r.generation_id,r.identity,
+      r.residual->'details'->>'description' AS native_description,
+      (SELECT count(*)::int FROM inventory_facts fact WHERE fact.generation_id=r.generation_id
+        AND fact.identity=r.identity AND fact.kind='about:long') AS graph_segments
+      FROM inventory_live_sources live JOIN inventory_records r ON r.generation_id=live.source_generation_id AND r.identity=live.source_identity
+      WHERE live.tenant_id=$1 AND live.agent_id=$2`, [f.scope.tenantId, discoveryEvidenceId(1)])).rows;
+    expect(sqlCase.find(row => row.domain === "power_platform")?.native_description).toBeNull();
+    expect(sqlCase.find(row => row.domain === "packages")?.graph_segments).toBeGreaterThan(2);
+    console.info("linked_description_reproduction", JSON.stringify({ transport, privacy: config.employeePrivacy, sources: sqlCase }));
+    expect(catalog.value.find(card => card.id === discoveryEvidenceId(3))?.origin.kind).toBe("microsoft");
+    for (const firstParty of [18, 19]) expect(catalog.value.find(card => card.id === discoveryEvidenceId(firstParty))?.origin.kind).toBe("microsoft");
+    const builder = catalog.value.find(card => card.id === discoveryEvidenceId(4))!;
+    expect(builder.origin.kind).toBe("organization_created");
+    expect(builder.origin.evidence).toEqual([expect.objectContaining({ source: "graph_packages", sourceIdentity: "Evidence-4",
+      field: "creatorType", setId: expect.any(String), versionId: expect.any(String) }),
+    expect.objectContaining({ source: "graph_packages", sourceIdentity: "Evidence-4", field: "creatorType",
+      setId: expect.any(String), versionId: expect.any(String) })]);
+    const workplace = await read<DiscoveryWorkplace>(f, { operation: "workplace", selectionId: catalog.selection.id });
+    expect(workplace.department.value.map(card => card.id)).toEqual([discoveryEvidenceId(4)]);
+    expect(workplace.department.value[0].origin).toEqual(builder.origin);
+    expect(workplace.useCases.value.find(item => item.agent.id === discoveryEvidenceId(4))?.relationships).toEqual(["used_here"]);
+    expect((await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(4), selectionId: catalog.selection.id })).agent.origin)
+      .toEqual(builder.origin);
+    for (const hide_employee_details of [false, true]) for (const hide_champion_employee of [false, true]) {
+      config.employeePrivacy = { hide_employee_details, hide_champion_employee };
+      const selected = await read<DiscoveryPage>(f, { operation: "search", goal: "Complete Graph About tail" });
+      expect(selected.value.map(card => card.id)).toEqual([discoveryEvidenceId(1)]);
+      const preview = await read<DiscoveryPage>(f, { operation: "search", goal: "Complete Graph About tail" }, owner);
+      expect(preview.value).toEqual(selected.value);
+      let complete = "", cursor: string | null = null;
+      do {
+        const detail = await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(1),
+          selectionId: selected.selection.id, ...(cursor ? { cursor } : {}) });
+        complete += detail.description.text; cursor = detail.nextCursor;
+        assertNoMetrics(detail);
+      } while (cursor);
+      expect(complete).toBe(discoveryEvidenceAbout);
+      const unsafe = await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(10) });
+      expect(unsafe.description.text).toBeNull();
+      expect(unsafe.description.state).toBe("unsafe_withheld");
+      expect((await read<DiscoveryPage>(f, { operation: "search", goal: "replacement" })).value.map(card => card.id))
+        .not.toContain(discoveryEvidenceId(10));
+      const privacy = await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(11) });
+      expect(privacy.description.state).toBe(hide_employee_details || hide_champion_employee ? "privacy_withheld" : "available");
+      for (const absent of [12, 13]) expect((await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(absent) }))
+        .description).toMatchObject({ state: "absent", text: null, clipped: false });
+      expect((await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(14) })).description.text)
+        .toBe("Same complete source text");
+    }
+    config.employeePrivacy = originalPrivacy;
+    const old = await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(1) });
+    await saveUsageInventory(f.database, f.scope, discoveryEvidenceGroups(owner).map(group => group.canonicalId === discoveryEvidenceId(1)
+      ? { ...group, packages: [], packageFields: undefined } : group));
+    expect((await f.request("/discovery/read", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation: "detail", agentId: discoveryEvidenceId(1), selectionId: old.selection.id, cursor: old.nextCursor }) })).status)
+      .toBe(409);
+    expect((await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(1) })).description.state).toBe("absent");
+    assertNoMetrics(catalog);
+    expect(f.providerWork.requests).toBe(0);
+  }, 120_000);
+
+  it("reports byte-limit withholding for an oversized saved-source fault without substituting another description", async () => {
+    const f = await setupAuditOriginHttp("mcp", account(), tenant.integration!.clientId, []);
+    await saveUsageInventory(f.database, f.scope, [{ canonicalId: discoveryEvidenceId(21), packages: ["Limit-package"],
+      packageFields: { type: "shared", longDescription: discoveryEvidenceAbout },
+      native: { nativeId: "Limit-native", environmentId: null, description: "Permitted native description." } }],
+    { packageAboutOverflow: true });
+    const row = (await f.database.query(`SELECT r.generation_id,r.scope_id,r.identity FROM inventory_records r
+      JOIN data_generations g ON g.id=r.generation_id JOIN data_scope_epochs s ON s.id=g.scope_id
+      WHERE s.tenant_id=$1 AND r.domain='packages' AND r.native_id='Limit-package'`, [f.scope.tenantId])).rows[0];
+    expect(row).toBeDefined();
+    const facts = (await f.database.query("SELECT * FROM inventory_facts WHERE generation_id=$1 AND identity=$2",
+      [row.generation_id, row.identity])).rows;
+    const chunks = facts.filter(fact => fact.kind === "about:long");
+    expect(chunks.reduce((bytes, fact) => bytes + Buffer.byteLength(fact.payload.text), 0)).toBeGreaterThan(4 * 1024 ** 2);
+    expect(chunks.every(fact => Buffer.byteLength(JSON.stringify(fact.payload)) < 262144)).toBe(true);
+    const detail = await read<DiscoveryDetail>(f, { operation: "detail", agentId: discoveryEvidenceId(21) });
+    expect(detail.description).toMatchObject({ state: "limit_withheld", text: null, clipped: false });
+    expect(detail.nextCursor).toBeNull();
+    expect(detail.agent.sources.find(source => source.source === "graph_packages")?.descriptionState).toBe("limit_withheld");
+    if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY) {
+      const [sdk] = await sdkJourney(f, [{ name: "read_discovery_detail",
+        request: { agentId: discoveryEvidenceId(21), selectionId: detail.selection.id } }]) as DiscoveryDetail[];
+      expect(sdk.description).toMatchObject({ state: "limit_withheld", text: null, clipped: false });
+      expect(sdk.nextCursor).toBeNull();
+    }
+    expect((await read<DiscoveryPage>(f, { operation: "search", goal: "Permitted native description" })).value).toEqual([]);
+    expect((await f.request("/agent-inventory?limit=1")).status).toBe(403);
   }, 120_000);
 
   it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as AppRole[])(
@@ -456,6 +600,32 @@ describe.sequential("real authenticated saved discovery journeys", () => {
       body: JSON.stringify({ operation: "detail", agentId: agent(3), selectionId: detail.selection.id, cursor: detail.nextCursor }) });
     expect([404, 409]).toContain(expired.status);
     expect((await read<DiscoveryPage>(f, { operation: "search" })).value).toHaveLength(0);
+  }, 120_000);
+
+  it("invalidates expiring canonical input authority without serving stale About and reuses fresh native-only evidence", async () => {
+    const f = await setupAuditOriginHttp("mcp");
+    await savePeople(f, [directoryPerson(account().localAccountId)]);
+    const packageExpiresAt = new Date(Date.now() + 3000);
+    const native = { nativeId: randomUUID(), environmentId: null, createdBy: account().localAccountId };
+    await saveUsageInventory(f.database, f.scope, [{
+      canonicalId: agent(1), packages: ["Brief-lived-about"],
+      packageFields: { type: "shared", ownerId: account().localAccountId, longDescription: "Graph About continuation ".repeat(700) },
+      native,
+    }], { packageExpiresAt });
+    const detail = await read<DiscoveryDetail>(f, { operation: "detail", agentId: agent(1) });
+    expect(detail.nextCursor).not.toBeNull();
+    await f.database.query("SELECT pg_sleep(GREATEST(extract(epoch FROM ($1::timestamptz-clock_timestamp())),0)+0.05)", [packageExpiresAt]);
+    const response = await f.request("/discovery/read", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation: "detail", agentId: agent(1), selectionId: detail.selection.id, cursor: detail.nextCursor }) });
+    expect(response.status).toBe(409);
+    expect((await f.request("/discovery/read", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation: "detail", agentId: agent(1) }) })).status).toBe(404);
+    await saveUsageInventory(f.database, f.scope, [{ canonicalId: agent(1), packages: [], native }]);
+    const fresh = await read<DiscoveryDetail>(f, { operation: "detail", agentId: agent(1) });
+    expect(fresh.agent.origin.kind).toBe("organization_created");
+    expect(fresh.agent.sources.map(source => source.source)).toEqual(["power_platform"]);
+    expect(fresh.description).toEqual({ state: "absent", text: null, clipped: false });
+    expect(fresh.nextCursor).toBeNull();
   }, 120_000);
 
   it("pins latest content periods, preserves catalog-only and ambiguous report semantics, and bounds unsafe source text", async () => {

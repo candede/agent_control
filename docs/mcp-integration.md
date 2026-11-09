@@ -140,7 +140,7 @@ Enter:
 The public MCP URL is required on first setup; the example is not a default.
 On later edits, the wizard shows the saved URL and Enter keeps it.
 Public resource and callback URLs must be canonical, contain no wildcards, and
-be at most 2,048 characters. Callback paths cannot contain repeated `/` separators,
+be at most 2,048 characters. Resource and callback paths cannot contain repeated `/` separators,
 and explicit ports must be from 1 to 65535. Callback paths are case-sensitive;
 paths differing only by case are separate allowlist entries.
 

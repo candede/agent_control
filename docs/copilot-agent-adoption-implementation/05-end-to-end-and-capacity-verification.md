@@ -44,10 +44,10 @@ Implement these cases in existing fixture/browser/MCP runners:
    windows, exact opportunity/unknown counts, Microsoft/local candidates, exact
    champion edges, complete About, generated starter tasks and evidence caveats.
 2. **Save and follow-through:** consumer explicitly saves brief/actions through
-   MCP; another authorized staff account sees the same records in the app;
+   MCP; another authorized staff account reads the same records through MCP;
    creator/assignee update behavior, concurrency conflict, retry idempotence
-   and exact delete work. Expired browser selections are not reused by another
-   MCP/app principal; lost create outcomes, mismatched payload retry and delayed
+   and exact delete work. Expired consumer selections are not reused by another
+   MCP principal; lost create outcomes, mismatched payload retry and delayed
    retry after deletion cannot duplicate or resurrect records.
 3. **Peer knowledge transfer:** a contributor-provided anonymized workflow is
    saved, its sharing is changed, and an EndUser retrieves only the safe card.
@@ -64,7 +64,7 @@ Implement these cases in existing fixture/browser/MCP runners:
    subsequent self-service returns to the actual caller.
 6. **First run/reset:** fresh current schema and isolated guarded reset, ordinary
    browser sign-in and MCP authenticated entry, automatic initial read-only
-   sync, explicit missing CSV/source states, and useful catalog/workspace access
+   sync, explicit missing CSV/source states, and useful catalog/MCP content access
    without Permissions/check/enable/approval visits.
    Assert roleless application-read admission separately from eligible staff
    delegated native collection; missing native permissions cannot erase already
@@ -84,7 +84,8 @@ Implement these cases in existing fixture/browser/MCP runners:
    launch URL or provider execution is invented.
 10. **Usability:** empty/error/loading states, keyboard/focus, mobile layout,
     copy/download, action feedback, cancelled requests and principal-scoped
-    caches. No browser call to MCP or fake AI-generation button.
+    caches. No browser call to MCP, fake AI-generation button, dedicated Adoption
+    page or manual browser authoring workflow.
 11. **Group measurement:** saved aggregate baseline survives reload and lease
     expiry; follow-up uses explicit compatible contexts and discloses membership,
     license, source and window drift. Removed/superseded sources remain explicit;
@@ -180,10 +181,10 @@ pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite office-app
 pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite mcp-agent-discovery -BaselineImage <verified-image> -BaselineImageId <verified-sha256>
 pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite mcp-agent-discovery-capacity -BaselineImage <verified-image> -BaselineImageId <verified-sha256>
 pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite fresh-installation-current -BaselineImage <verified-image> -BaselineImageId <verified-sha256>
-pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite cutover-browser-contract -BrowserFiles "mcpSettings.spec.ts,signIn.spec.ts,permissions.spec.ts,dataSync.spec.ts,agentCatalog.spec.ts,adoptionWorkspace.spec.ts" -BaselineImage <verified-image> -BaselineImageId <verified-sha256> -BrowserImage <verified-browser-image> -BrowserImageId <verified-sha256>
+pwsh -NoLogo -NoProfile -File ./scripts/large-tenant-tests.ps1 -Suite cutover-browser-contract -BrowserFiles "mcpSettings.spec.ts,signIn.spec.ts,permissions.spec.ts,dataSync.spec.ts,agentCatalog.spec.ts,customerStarterKit.spec.ts" -BaselineImage <verified-image> -BaselineImageId <verified-sha256> -BrowserImage <verified-browser-image> -BrowserImageId <verified-sha256>
 ```
 
-Add the new workspace/discovery/kit cases to those runner selections. Resolve
+Add the MCP content/discovery/kit cases to the existing runner selections. Resolve
 placeholders to verified existing image IDs; they are not literal commands.
 Use the scale compose override when the default PostgreSQL tmpfs is too small.
 Reuse still-valid exact-content results for these suites, not a repeated run

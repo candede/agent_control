@@ -402,7 +402,19 @@ export async function enterDiscovery(options: { signal?: AbortSignal } = {}) {
     || value.errorCode !== undefined && typeof value.errorCode !== "string") {
     throw new ApiError(200, "invalid_response", "The server returned an invalid automatic collection admission.");
   }
+
   return value;
+}
+
+export async function getDiscoveryConnection(signal?: AbortSignal) {
+  const value = await request<import("../../../backend/src/types/mcpSettings").McpDiscoveryConnection>("/api/discovery/connection", { signal });
+  if (value?.state === "not_configured" && Object.keys(value).length === 1) return value;
+  if (value?.state === "available" && Object.keys(value).length === 2 && typeof value.resourceUrl === "string") {
+    let url: URL | undefined;
+    try { url = new URL(value.resourceUrl); } catch { /* Rejected below. */ }
+    if (url?.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash && url.pathname !== "/") return value;
+  }
+  throw new ApiError(200, "invalid_response", "The server returned an invalid discovery connection.");
 }
 
 export function getCapabilities(options: { signal?: AbortSignal } = {}) {

@@ -9,6 +9,7 @@ import { LifecycleSlice } from "../src/db/lifecycleSlice.js";
 import { emptyReportStaging, orphanReportVersion } from "../src/db/officialReportRetention.js";
 import { dataWorkMetricScope, flushDataWorkMetrics } from "../src/services/dataMetrics.js";
 import { clientErrorState } from "../src/db/clientErrors.js";
+import { removeAdoptionContent } from "../src/services/adoptionContent.js";
 
 class DatabaseSchemaError extends Error {
   readonly code = "database_schema_reset_required";
@@ -105,14 +106,16 @@ export async function initializeSchema(database: pg.Pool) {
       try {
         const exists = (await maintenance.query("SELECT to_regclass('public.agentcontrol_principal_revocations') AS name")).rows[0]?.name;
         if (exists) revocations = (await maintenance.query<ProtectedPrincipalRevocation>(`SELECT tenant_id,principal_id,
-          epoch::text,bearer_issued_after::text FROM public.agentcontrol_principal_revocations WHERE database_name=$1`,
+          epoch::text,bearer_issued_after::text,
+          coalesce((to_jsonb(saved)->>'adoption_request_cutoff')::bigint,0)::text AS adoption_request_cutoff
+          FROM public.agentcontrol_principal_revocations saved WHERE database_name=$1`,
         [database.options.database])).rows;
       } finally { await maintenance.end(); }
       await client.query(schemaSql);
       for (let offset = 0; offset < revocations.length; offset += 1000) {
-        await client.query(`INSERT INTO data_principal_epochs(tenant_id,principal_id,epoch,bearer_issued_after)
-          SELECT tenant_id,principal_id,epoch,bearer_issued_after FROM jsonb_to_recordset($1::jsonb)
-            AS records(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint)`,
+        await client.query(`INSERT INTO data_principal_epochs(tenant_id,principal_id,epoch,bearer_issued_after,adoption_request_cutoff)
+          SELECT tenant_id,principal_id,epoch,bearer_issued_after,adoption_request_cutoff FROM jsonb_to_recordset($1::jsonb)
+            AS records(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint,adoption_request_cutoff bigint)`,
         [JSON.stringify(revocations.slice(offset, offset + 1000))]);
       }
       await client.query("INSERT INTO app_schema(singleton,fingerprint) VALUES (true,$1)", [schemaFingerprint]);
@@ -154,6 +157,8 @@ export async function grantRuntime(database: pg.Pool) {
     REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
     REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM agentcontrol_app;
     GRANT SELECT ON app_schema TO agentcontrol_app;
+    GRANT SELECT,INSERT,UPDATE,DELETE ON adoption_content,adoption_content_receipts TO agentcontrol_app;
+    GRANT SELECT ON adoption_content_storage TO agentcontrol_app;
     GRANT EXECUTE ON FUNCTION discovery_safe_text(text,jsonb,boolean,boolean) TO agentcontrol_app;
     GRANT SELECT, INSERT, UPDATE, DELETE ON sessions, jobs, job_items, job_attempts, source_identifiers, capability_configuration, capability_evidence TO agentcontrol_app;
     GRANT SELECT, INSERT, UPDATE ON power_platform_refresh_jobs TO agentcontrol_app;
@@ -517,13 +522,43 @@ export async function retainUntilConverged(
   }
 }
 
+export async function eraseAdoptionPrivate(database: pg.Pool, tenantId: string, principalId: string, confirmation: string) {
+  const target = database.options.database;
+  if (!tenantId || tenantId.length > 128 || !principalId || principalId.length > 256
+    || confirmation !== `${target}/${tenantId}/${principalId}`) throw new Error("Private content erasure requires exact database/tenant/principal confirmation.");
+  return transaction(database, async client => {
+    if ((await client.query("SELECT current_user AS name")).rows[0]?.name !== "agentcontrol_admin") throw new Error("Private erasure requires the protected operator.");
+    await verifySchema(client);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('adoption-content:'||$1,0))", [tenantId]);
+    await client.query(`INSERT INTO data_principal_epochs(tenant_id,principal_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, [tenantId, principalId]);
+    await client.query(`UPDATE data_principal_epochs SET epoch=epoch+1,
+      bearer_issued_after=GREATEST(bearer_issued_after,$3::bigint,ceil(extract(epoch FROM clock_timestamp())*1000)::bigint),
+      adoption_request_cutoff=GREATEST(adoption_request_cutoff,coalesce((
+        SELECT max(substring(request_id FROM '^([0-9]{13})[.]')::bigint)
+        FROM adoption_content_receipts WHERE tenant_id=$1 AND actor_id=$2),0))
+      WHERE tenant_id=$1 AND principal_id=$2`, [tenantId, principalId, Date.now()]);
+    let count = 0;
+    for (;;) {
+      const rows = (await client.query<{ id: string }>("SELECT id FROM adoption_content WHERE tenant_id=$1 AND creator_id=$2 ORDER BY id LIMIT 250",
+        [tenantId, principalId])).rows;
+      if (!rows.length) break;
+      for (const row of rows) await removeAdoptionContent(client, tenantId, row.id);
+      count += rows.length;
+    }
+    await client.query(`UPDATE adoption_content SET payload=jsonb_set(jsonb_set(payload,'{assigneeId}','null'),'{progress}','""'),
+      revision=revision+1,updated_at=clock_timestamp() WHERE tenant_id=$1 AND payload->>'assigneeId'=$2`, [tenantId, principalId]);
+    const receipts = await client.query("DELETE FROM adoption_content_receipts WHERE tenant_id=$1 AND actor_id=$2", [tenantId, principalId]);
+    return { removedRecords: count, removedReceipts: receipts.rowCount ?? 0 };
+  });
+}
+
 async function main() {
   const command = process.argv[2] ?? "initialize";
   const settings = databaseSettings();
   const resetting = command === "preflight-reset" || command === "reset";
   const database = new pg.Pool(resetting ? { ...settings, database: "postgres" } : settings);
   try {
-    if (!["preflight", "preflight-reset", "reset", "initialize", "retain", "maintenance", "resume"].includes(command)) throw new Error("Unsupported database operator command.");
+    if (!["preflight", "preflight-reset", "reset", "initialize", "retain", "maintenance", "resume", "erase-adoption-private"].includes(command)) throw new Error("Unsupported database operator command.");
     if (resetting) {
       const operation = command === "reset" ? resetDatabase : preflightDatabaseReset;
       const result = await operation(database, settings.database ?? "", process.argv[3] ?? "");
@@ -544,6 +579,9 @@ async function main() {
     } else if (command === "resume") {
       if (process.argv[3] !== "confirmed") throw new Error("Admission requires explicit operator confirmation.");
       await setDeploymentAdmission(database);
+    } else if (command === "erase-adoption-private") {
+      const result = await eraseAdoptionPrivate(database, process.argv[3] ?? "", process.argv[4] ?? "", process.argv[5] ?? "");
+      console.log(JSON.stringify({ event: "adoption_private_erasure", outcome: "succeeded", ...result }));
     } else if (command === "retain") {
       if (process.argv[3] !== "confirmed") throw new Error("Retention requires an explicit confirmed target.");
       const batchSize = Number(process.argv[4] ?? 1_000);

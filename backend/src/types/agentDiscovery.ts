@@ -1,17 +1,27 @@
 export const discoveryOperations = ["profile", "search", "detail", "workplace"] as const;
 export type DiscoveryPrivacy = { hide_employee_details: boolean; hide_champion_employee: boolean };
-export type DiscoveryText = { state: "available" | "absent" | "privacy_withheld" | "unsafe_withheld"; text: string | null };
+export type DiscoveryText = { state: "available" | "absent" | "privacy_withheld" | "unsafe_withheld" | "limit_withheld"; text: string | null };
 export type DiscoveryContact = { name: string | null; contact: string | null; company: string | null; department: string | null };
+type DiscoverySource = {
+  source: "graph_packages" | "power_platform"; generationId: string; sourceIdentity: string; revision: string;
+};
+type DiscoveryOrigin = {
+  kind: "organization_created" | "microsoft";
+  evidence: (DiscoverySource & { field: "type" | "publisher" | "resourceType" | "creatorType";
+    setId: string | null; versionId: string | null })[];
+};
 export type DiscoveryCard = {
   id: string;
+  origin: DiscoveryOrigin;
   title: DiscoveryText;
   description: DiscoveryText & { clipped: boolean };
   lifecycle: "draft" | "published" | "unknown";
   people: { state: "available" | "absent" | "privacy_withheld" | "unavailable"; value: DiscoveryContact[] };
   affiliations: { company: string | null; department: string | null }[];
   useLink: DiscoveryText;
-  evidence: { source: "graph_packages" | "power_platform"; field: "description" | "title"; excerpt: string }[];
-  sources: { source: "graph_packages" | "power_platform"; observedAt: string; descriptionField: string; descriptionState: DiscoveryText["state"] }[];
+  evidence: (DiscoverySource & { field: "description" | "title"; excerpt: string })[];
+  sources: (DiscoverySource & { observedAt: string; descriptionField: "longDescription" | "shortDescription" | "details.description";
+    descriptionState: DiscoveryText["state"] })[];
 };
 export type DiscoveryContext = {
   mode: "self" | "preview";

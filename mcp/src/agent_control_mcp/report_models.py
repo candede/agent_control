@@ -541,6 +541,47 @@ class AdoptionPage(ReportList[AdoptionGroup]):
     summary: AdoptionSummary
 
 
+class AdoptionDepartment(WireModel):
+    id: str
+    company: str | None
+    department: str | None
+    people: SafeInteger
+    activePeople: SafeInteger | None
+
+
+class AdoptionDepartments(ReportList[AdoptionDepartment]):
+    page: AdoptionPaging
+    directory: SourceMetadata
+
+
+class OrganizationAdoption(WireModel):
+    organization: ReportSummary
+    champions: SafeInteger | None
+
+
+class AdoptionOrganization(ReportList[OrganizationAdoption]):
+    pass
+
+
+class AdoptionSnapshot(WireModel):
+    id: str
+    reportingStart: str | None
+    reportingEnd: str | None
+    periodProvenance: str
+    acceptedAt: str
+    activeUsers: SafeInteger
+    activeAgents: SafeInteger
+    responses: SafeInteger
+    userReportActiveUsers: SafeInteger
+    relationshipActiveUsers: SafeInteger
+    userReportResponses: SafeInteger
+    relationshipResponses: SafeInteger
+
+
+class AdoptionHistory(ReportList[AdoptionSnapshot]):
+    pass
+
+
 class UsageContext(WireModel):
     selectionId: str
     reportSetId: str | None

@@ -26,7 +26,7 @@ periods through MCP without synchronization.
 
 The current native catalog is request-scoped to the actual connection user.
 An active member without staff roles receives `agent_catalog`, `my_workplace`
-and `my_discovery_profile`; staff also receive authorized staff operations and
+and `my_discovery_profile`, plus employee-safe `shared_learning`; staff also receive authorized staff operations and
 `preview_end_user`. Use an individual delegated connection, not a shared
 privileged author connection as an employee lens. Explicit subject requests
 must use safe preview on every action; this never authenticates as that subject
@@ -51,6 +51,21 @@ not the Studio conversation transcript.
 The captured Studio authorization request omitted `resource`. Native Studio
 token-request fields were not logged. Do not claim every Studio request omits
 that parameter, or generalize this result to other Microsoft MCP clients.
+
+### Current distributed guidance
+
+The built application's MCP settings and employee handoff now deliver the
+[canonical customer kit](../frontend/public/customer-kit/adoption-intelligence/SKILL.md),
+its exact source hashes, copy/download bytes and self-contained skill ZIP.
+Use its [setup matrix](../frontend/public/customer-kit/adoption-intelligence/setup.md)
+and [prompt checklists](../frontend/public/customer-kit/adoption-intelligence/prompts.json).
+The public official sources were rechecked **2026-11-08**: native Markdown/ZIP
+upload is documented for the GitHub Copilot harness, standard MCP onboarding is
+documented for the standard harness, and Customer Conversation has its own
+Generative/Topic authoring model. Instruction-only equivalents are provided where
+native import is unverified. The 2026-11-05 author-chat evidence above does not
+verify these new assets, native refresh, skill import or published employee sessions.
+Use each user's actual connection and preserve the host's native source presentation.
 
 ## 2. Keep the three URL roles separate
 
@@ -132,37 +147,39 @@ while troubleshooting.
 - Redacted callback components are not configuration values. Obtain an exact
   callback securely if redaction removed anything required for registration.
 
-### VPS extraction command
+### Log extraction script
 
 The installed helper reads log lines from **stdin**. Docker's daemon owns the
 container logs; `docker exec` alone cannot read them. Pipe the host's `docker logs`
 output into the helper. No Docker socket mount or duplicate log file is needed.
 
-Run in **Bash on the VPS**, with Docker access:
+Run from the repository root on macOS, Linux, or a VPS with Bash and Docker access:
 
 ```bash
-set -o pipefail
-MCP_CONTAINER=seha-agent-control-mcp-1
-
-docker logs --since 24h --timestamps "$MCP_CONTAINER" 2>&1 \
-  | docker exec -i "$MCP_CONTAINER" \
-      python -m agent_control_mcp.redirect_diagnostics
+./scripts/mcp-redirect-diagnostics.sh
 ```
 
-Replace the container name for the installation. Use `-i`, **not `-t`**, and do
-not use `docker logs --follow`. Keep `pipefail` so a Docker command failure cannot
-be mistaken for an empty successful extraction.
-
-For a JSON export saved on the **VPS host**:
+The [script](../scripts/mcp-redirect-diagnostics.sh) defaults to container
+`seha-agent-control-mcp-1`, the last `30m`, and table output. Optional positional
+arguments are `CONTAINER SINCE FORMAT`; use `--help` for usage. For another
+installation or a wider time window:
 
 ```bash
-docker logs --since 24h --timestamps "$MCP_CONTAINER" 2>&1 \
-  | docker exec -i "$MCP_CONTAINER" \
-      python -m agent_control_mcp.redirect_diagnostics --format json \
+./scripts/mcp-redirect-diagnostics.sh my-mcp-container 24h
+```
+
+The script uses `docker exec -i`, **not `-t`**, and does not follow logs. It keeps
+`pipefail` so a Docker command failure cannot be mistaken for an empty successful
+extraction.
+
+For a JSON export saved on the **Docker host**:
+
+```bash
+./scripts/mcp-redirect-diagnostics.sh seha-agent-control-mcp-1 24h json \
   > mcp-redirect-diagnostics.json
 ```
 
-Use `--format csv` and a `.csv` output filename for CSV. The helper deduplicates
+Use `csv` as the third argument and a `.csv` output filename for CSV. The helper deduplicates
 callbacks and reports occurrence count, first/last known UTC timestamps, and:
 
 | Status | Meaning |
@@ -291,6 +308,7 @@ synchronization or administrative control.
 | Concern | Repository source |
 | --- | --- |
 | Exact callback validation and sanitized rejection logging | [auth.py](../mcp/src/agent_control_mcp/auth.py) |
+| Host-side Docker log extraction script | [mcp-redirect-diagnostics.sh](../scripts/mcp-redirect-diagnostics.sh) |
 | Read-only container log extraction | [redirect_diagnostics.py](../mcp/src/agent_control_mcp/redirect_diagnostics.py) |
 | Resource normalization, request bounds and content length | [service.py](../mcp/src/agent_control_mcp/service.py) |
 | SDK OAuth log sanitization | [package initialization](../mcp/src/agent_control_mcp/__init__.py) |

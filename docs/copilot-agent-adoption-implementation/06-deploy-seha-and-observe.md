@@ -142,7 +142,7 @@ Then observe genuine authorized live journeys:
    facts come from the newly selected live contexts, not the old research counts.
 6. On explicit request, save a genuine useful bounded brief/action/card through
    MCP, then
-   verify app reload, cross-account staff sharing, allowed owner progress and
+   verify fresh MCP reads, cross-account staff sharing, allowed owner progress and
    safe EndUser card retrieval with real authority. Use actual selected evidence
    and an appropriate nonsensitive workflow; do not invent participants,
    successful-use claims or synthetic learning to populate live tenant content.

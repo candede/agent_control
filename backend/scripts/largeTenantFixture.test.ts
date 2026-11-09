@@ -17,8 +17,8 @@ describe("large tenant fixture and frozen semantic seeds", () => {
   it("qualifies discovery SQL and bounded representative capacity through the existing runner", () => {
     const functional = fixtureCommands("mcp-agent-discovery");
     expect(functional[0]).toContain("src/routes/agentDiscovery.test.ts");
-    expect(functional[0]).toContain("scripts/databaseReset.test.ts");
-    const files = functional[0].filter(value => value.endsWith(".test.ts"));
+    expect(functional.flat()).toContain("scripts/databaseReset.test.ts");
+    const files = functional.flat().filter(value => value.endsWith(".test.ts"));
     expect(new Set(files).size).toBe(files.length);
     for (const file of fixtureCommands("mcp-roleless-authority")[0].filter(value => value.endsWith(".test.ts"))) {
       expect(files).toContain(file);
@@ -26,23 +26,39 @@ describe("large tenant fixture and frozen semantic seeds", () => {
     expect(files).toContain("src/services/mcpSettings.test.ts");
     expect(files).toContain("src/services/copilotUsage.unit.test.ts");
     const capacity = fixtureCommands("mcp-agent-discovery-capacity");
-    expect(capacity).toEqual([["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts", "--silent=false"]]);
+    expect(capacity).toEqual([["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts",
+      "src/services/departmentOpportunity.unit.test.ts", "--silent=false"]]);
     const execute = vi.fn(() => ({ pid: 42, status: 0, signal: null,
       stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), output: [] }));
     runFixtureCommand(capacity[0], {}, execute);
     expect(execute).toHaveBeenLastCalledWith("npm", capacity[0], expect.objectContaining({ timeout: 1_740_000, detached: true }));
     runFixtureCommand(functional[0], {}, execute);
     expect(execute).toHaveBeenLastCalledWith("npm", functional[0], expect.objectContaining({ timeout: 600_000 }));
+    const sdk = fixtureCommands("mcp-end-to-end")[0];
+    runFixtureCommand(sdk, { AGENT_CONTROL_MCP_SQL_JOURNEY: "/opt/mcp/.venv/bin/python" }, execute);
+    expect(execute).toHaveBeenLastCalledWith("npm", sdk, expect.objectContaining({ timeout: 1_740_000, detached: true }));
   });
   it("discovers Office SQL/API/publication/lifecycle proof in the isolated existing owner", () => {
     const commands = fixtureCommands("office-app-adoption");
-    expect(commands).toHaveLength(2);
+    expect(commands).toHaveLength(4);
     expect(commands[0]).toContain("src/db/officeAppAdoption.test.ts");
     expect(commands[0]).toContain("src/routes/officeAppAdoption.test.ts");
     for (const file of commands[0].filter(value => /\.test\.ts$/.test(value))) {
       expect(existsSync(new URL(`../${file}`,import.meta.url))).toBe(true);
     }
     expect(commands[1]).toEqual(["run","typecheck","--workspace","backend"]);
+    expect(commands[2]).toEqual(["run", "test", "--workspace", "frontend", "--", "src/api/reportData.test.ts"]);
+    expect(commands[3]).toEqual(["run", "typecheck", "--workspace", "frontend"]);
+  });
+  it("registers every department evidence SQL and route selector in the guarded runner", () => {
+    const commands = fixtureCommands("department-evidence");
+    for (const file of commands[0].filter(value => /\.test\.ts$/.test(value))) {
+      expect(existsSync(new URL(`../${file}`, import.meta.url))).toBe(true);
+    }
+    expect(commands[0]).toContain("src/services/departmentOpportunity.test.ts");
+    expect(commands[0]).toContain("src/routes/departmentOpportunity.test.ts");
+    expect(commands[1]).toEqual(["run", "typecheck", "--workspace", "backend"]);
+    expect(commands[2]).toEqual(["run", "test", "--workspace", "frontend", "--", "src/api/reportData.test.ts"]);
   });
   it("keeps the approved registry in the production runtime, not only dependency stages", () => {
     const dockerfile = readFileSync(new URL("../../Dockerfile", import.meta.url), "utf8");
@@ -54,12 +70,18 @@ describe("large tenant fixture and frozen semantic seeds", () => {
     expect(fixtureCommands("mcp-end-to-end")).toEqual([
       ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
         "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
+        "src/routes/inventoryData.unit.test.ts", "src/routes/inventoryData.handlers.unit.test.ts",
+        "src/routes/inventoryDataPublication.unit.test.ts",
+        "src/routes/departmentOpportunity.test.ts",
+        "src/db/adoptionContent.test.ts", "src/routes/adoptionContent.test.ts",
         "src/routes/sharedAgentControls.test.ts", "src/routes/agentDiscovery.test.ts",
         "src/services/mcpSettings.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
+      ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts",
+        "-t", "measures correct compact", "--silent=false"],
       ["run", "typecheck", "--workspace", "backend"],
     ]);
     const runner = readFileSync(new URL("./largeTenantFixture.ts", import.meta.url), "utf8");
-    expect(runner).toContain('if (process.argv[2] === "mcp-end-to-end")');
+    expect(runner).toContain('["mcp-end-to-end", "adoption-content", "mcp-agent-discovery-capacity"].includes(process.argv[2])');
     expect(runner).toContain('process.env.AGENT_CONTROL_MCP_SQL_JOURNEY !== "/opt/mcp/.venv/bin/python"');
   });
   it("bounds deployment preparation to current schema, reset, backup and authority contracts", () => {

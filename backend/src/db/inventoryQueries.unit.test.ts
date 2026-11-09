@@ -114,7 +114,8 @@ describe("selected inventory request snapshots", () => {
       expect(who).toEqual(identity);
       return selection;
     });
-    await inventory.capture(identity, "scope", setId ? { setId: setId.toUpperCase() } : {});
+    const captured = await inventory.capture(identity, "scope", setId ? { setId: setId.toUpperCase() } : {});
+    expect(captured.publicationRevisions).toEqual(data.publicationRevisions);
     expect(reconcile).toHaveBeenCalledExactlyOnceWith(client, identity.tenantId);
     expect(report).toHaveBeenCalledWith(client, identity, at, setId);
     const insert = readQuery.mock.calls.find(([sql]) => sql.startsWith("INSERT INTO inventory_read_contexts"))!;

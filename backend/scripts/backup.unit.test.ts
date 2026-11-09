@@ -3,8 +3,9 @@ import { Readable } from "node:stream";
 import { createHash } from "node:crypto";
 import pg from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { assertDistinctDatabaseTargets, backup, prepareRestoredDatabase, reopenRestoredDatabase, restore } from "./backup.js";
+import { assertDistinctDatabaseTargets, backup, prepareRestoredDatabase, reopenPreparedRestoredDatabase, reopenRestoredDatabase, restore } from "./backup.js";
 import { backupTableKeys, fingerprintAlgorithm } from "./backupInventory.js";
+import { currentSchemaSql } from "../src/db/currentSchema.js";
 
 const mocks = vi.hoisted(() => ({
   files: new Map<string, { body: string; mode: number }>(),
@@ -286,6 +287,156 @@ describe("backup filesystem and exact-target contracts without infrastructure", 
     const review = await vi.mocked(current.connect).mock.results[0].value;
     expect(review.query).toHaveBeenCalledWith("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
     expect(review.release).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["preparation", prepareRestoredDatabase],
+    ["reopening", reopenPreparedRestoredDatabase],
+  ] as const)("preserves erased future-request fences separately from bearer issuance during %s", async (_stage, recover) => {
+    const current = new pg.Pool(operatorSettings);
+    const restored = new pg.Pool({ ...operatorSettings, database: "agentcontrol_restore_unit" });
+    const currentClient = client(), restoredClient = client();
+    const records = [{ tenant_id: "tenant", principal_id: "principal", epoch: "2",
+      bearer_issued_after: "1000", adoption_request_cutoff: "31000" }];
+    vi.mocked(pg.Pool.prototype.connect).mockImplementation(async function(this: pg.Pool) {
+      return this === current ? currentClient : restoredClient;
+    });
+    vi.mocked(currentClient.query).mockImplementation(async (sql, values) => {
+      if (String(sql).includes("FROM data_principal_epochs")) {
+        expect(sql).toContain("adoption_request_cutoff::text");
+        return result(values?.[0] === null ? records : []);
+      }
+      return queryResult(String(sql));
+    });
+    await recover(current, restored);
+    const merge = vi.mocked(restoredClient.query).mock.calls.find(([sql]) =>
+      String(sql).startsWith("INSERT INTO data_principal_epochs AS existing"));
+    expect(merge?.[0]).toContain("adoption_request_cutoff=GREATEST(existing.adoption_request_cutoff,EXCLUDED.adoption_request_cutoff)");
+    expect(merge?.[1]).toEqual([JSON.stringify(records), expect.any(Number)]);
+    expect(String(merge?.[0]).split("FROM jsonb_to_recordset")[0])
+      .toContain("ceil(extract(epoch FROM clock_timestamp())*1000)::bigint),adoption_request_cutoff");
+  });
+
+  it.each([
+    ["preparation", prepareRestoredDatabase],
+    ["reopening", reopenPreparedRestoredDatabase],
+  ] as const)("clears inventory heads without violating their UPDATE guard during %s", async (_stage, recover) => {
+    const guard = currentSchemaSql.slice(currentSchemaSql.indexOf("CREATE FUNCTION data_protect_head()"),
+      currentSchemaSql.indexOf("CREATE FUNCTION data_protect_record()"));
+    expect(guard).toContain("IF NEW.generation_id IS NULL AND pg_trigger_depth()>1");
+    expect(guard).toContain("WHERE g.id=NEW.generation_id");
+    const current = new pg.Pool(operatorSettings);
+    const restored = new pg.Pool({ ...operatorSettings, database: "agentcontrol_restore_unit" });
+    const currentClient = client(), restoredClient = client();
+    vi.mocked(pg.Pool.prototype.connect).mockImplementation(async function(this: pg.Pool) {
+      return this === current ? currentClient : restoredClient;
+    });
+    const scopes = ["inventory_packages", "inventory_power_platform", "inventory_canonical"].map((source, index) => ({
+      id: `${String(index).padStart(8, "0")}-0000-4000-8000-000000000001`,
+      tenant_id: "cleared-tenant", source, selector: "complete", epoch: "0",
+    }));
+    const revision = 9007199254740993n;
+    const heads = new Map([
+      [scopes[0].id, { generationId: "restored-generation" as string | null, revision }],
+      [scopes[1].id, { generationId: null as string | null, revision }],
+    ]);
+    const retired = new Set<string>(), clearedRoots = new Set<string>();
+    vi.mocked(currentClient.query).mockImplementation(async sql => String(sql).startsWith("SELECT epoch::text FROM data_scope_epochs")
+      ? result([{ epoch: "5" }]) : queryResult(String(sql)));
+    vi.mocked(restoredClient.query).mockImplementation(async (sql, values) => {
+      const statement = String(sql);
+      if (statement.startsWith("SELECT id,tenant_id,source,selector,epoch::text FROM data_scope_epochs")) {
+        return result(values?.[0] === "" ? scopes : []);
+      }
+      const scopeId = String(values?.[0]);
+      if (statement.startsWith("UPDATE data_generations SET state='retired' WHERE scope_id=")) retired.add(scopeId);
+      if (statement.startsWith("UPDATE inventory_roots SET current=false")) clearedRoots.add(scopeId);
+      if (statement.startsWith("UPDATE data_generation_heads SET generation_id=NULL")) throw new Error("data_head_fenced");
+      if (statement.startsWith("WITH cleared AS (")) {
+        expect(retired.has(scopeId) && clearedRoots.has(scopeId)).toBe(true);
+        const normalized = statement.replace(/\s+/g, " ");
+        expect(normalized).toContain("DELETE FROM data_generation_heads WHERE scope_id=$1 AND generation_id IS NOT NULL");
+        expect(normalized).toContain("RETURNING scope_id,tenant_id,revision");
+        expect(normalized).toContain("INSERT INTO data_generation_heads(scope_id,tenant_id,generation_id,revision)");
+        expect(normalized).toContain("SELECT scope_id,tenant_id,NULL,revision+1 FROM cleared");
+        const head = heads.get(scopeId);
+        if (head?.generationId) heads.set(scopeId, { generationId: null, revision: head.revision + 1n });
+      }
+      return queryResult(statement);
+    });
+
+    await recover(current, restored);
+
+    expect(heads.get(scopes[0].id)).toEqual({ generationId: null, revision: revision + 1n });
+    expect(heads.get(scopes[1].id)).toEqual({ generationId: null, revision });
+    expect(heads.has(scopes[2].id)).toBe(false);
+    expect(restoredClient.query).toHaveBeenCalledWith("COMMIT");
+  });
+
+  it.each([
+    ["preparation", prepareRestoredDatabase],
+    ["reopening", reopenPreparedRestoredDatabase],
+  ] as const)("preserves source clear fences and inventory recollection revisions during %s", async (_stage, recover) => {
+    const current = new pg.Pool(operatorSettings);
+    const restored = new pg.Pool({ ...operatorSettings, database: "agentcontrol_restore_unit" });
+    const currentClient = client(), restoredClient = client();
+    vi.mocked(pg.Pool.prototype.connect).mockImplementation(async function (this: pg.Pool) {
+      return this === current ? currentClient : restoredClient;
+    });
+    const sources = ["inventory_packages", "inventory_power_platform", "inventory_canonical", "user_sources", "agent_people"];
+    const scopes = sources.flatMap((source, domain) => [
+      { tenant_id: "cleared-tenant", epoch: "0" },
+      { tenant_id: "missing-tenant", epoch: "0" },
+      { tenant_id: "unchanged-tenant", epoch: "0" },
+      { tenant_id: "older-tenant", epoch: "2" },
+    ].map((scope, index) => ({ ...scope, source, selector: source === "agent_people" ? "cache" : "complete",
+      id: `${String(domain).padStart(8, "0")}-0000-4000-8000-${String(index).padStart(12, "0")}` })));
+    vi.mocked(currentClient.query).mockImplementation(async (sql, values) => {
+      if (String(sql).startsWith("SELECT epoch::text FROM data_scope_epochs")) {
+        expect(values).toEqual([expect.any(String), expect.any(String), values?.[1] === "agent_people" ? "cache" : "complete"]);
+        return result(values?.[0] === "missing-tenant" ? [] : [{ epoch: values?.[0] === "cleared-tenant" ? "5" : "0" }]);
+      }
+      return queryResult(String(sql));
+    });
+    vi.mocked(restoredClient.query).mockImplementation(async (sql, values) => {
+      if (String(sql).startsWith("SELECT id,tenant_id,source,selector,epoch::text FROM data_scope_epochs")) {
+        return result(values?.[0] === "" ? scopes.filter(scope => String(sql).includes(`'${scope.source}'`)) : []);
+      }
+      return queryResult(String(sql));
+    });
+
+    await recover(current, restored);
+
+    for (const scope of scopes) {
+      const invalidated = ["cleared-tenant", "missing-tenant"].includes(scope.tenant_id);
+      const rootUpdate = ["UPDATE inventory_roots SET current=false WHERE scope_id=$1 AND current", [scope.id]];
+      if (invalidated) {
+        expect(restoredClient.query).toHaveBeenCalledWith("UPDATE data_scope_epochs SET epoch=GREATEST(epoch+1,$2::bigint) WHERE id=$1",
+          [scope.id, scope.tenant_id === "cleared-tenant" ? "5" : null]);
+        expect(restoredClient.query).toHaveBeenCalledWith(
+          "UPDATE data_generations SET state='retired' WHERE scope_id=$1 AND state='published'", [scope.id]);
+        if (scope.source.startsWith("inventory_")) {
+          expect(restoredClient.query).toHaveBeenCalledWith(...rootUpdate);
+          expect(restoredClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("SELECT scope_id,tenant_id,NULL,revision+1 FROM cleared"), [scope.id]);
+          expect(restoredClient.query).toHaveBeenCalledWith(
+            expect.stringContaining("published_sequence=pending_sequence,status='idle'"), [scope.id]);
+          expect(restoredClient.query).not.toHaveBeenCalledWith("DELETE FROM data_generation_heads WHERE scope_id=$1", [scope.id]);
+        } else {
+          expect(restoredClient.query).toHaveBeenCalledWith("DELETE FROM data_generation_heads WHERE scope_id=$1", [scope.id]);
+          if (scope.source === "agent_people") {
+            expect(restoredClient.query).toHaveBeenCalledWith(expect.stringContaining(
+              `FROM agent_people_cache AS record WHERE record.tenant_id='${scope.tenant_id}'`));
+          }
+        }
+      } else {
+        expect(restoredClient.query).not.toHaveBeenCalledWith(...rootUpdate);
+        expect(restoredClient.query).not.toHaveBeenCalledWith("UPDATE data_scope_epochs SET epoch=GREATEST(epoch+1,$2::bigint) WHERE id=$1",
+          [scope.id, "0"]);
+      }
+    }
+    expect(vi.mocked(currentClient.query).mock.calls.filter(([sql]) => String(sql).startsWith("SELECT epoch::text FROM data_scope_epochs")))
+      .toHaveLength(scopes.length);
   });
 
   it("delegates failed current reviews to standard transaction cleanup without hiding the failure", async () => {

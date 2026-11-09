@@ -27,7 +27,16 @@ def exact_id(value: str) -> str:
     return value
 
 
-ExactId = Annotated[str, StringConstraints(min_length=1, max_length=512), AfterValidator(exact_id)]
+def bounded_exact_id(value: str) -> str:
+    exact_id(value)
+    if len(value.encode("utf-16-le")) > 1024:
+        raise ValueError("Identity exceeds its canonical UTF-16 bound.")
+    return value
+
+
+ExactId = Annotated[
+    str, StringConstraints(min_length=1, max_length=512), AfterValidator(bounded_exact_id)
+]
 Guid = Annotated[
     str,
     StringConstraints(pattern=r"^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$"),
@@ -56,10 +65,7 @@ def record_id(value: str) -> str:
         if re.search(r"%(?![a-fA-F0-9]{2})", part):
             raise ValueError("Source identity contains malformed percent encoding.")
         decoded = unquote(part, errors="strict")
-        # The canonical API measures decoded identities in UTF-16 code units.
-        if len(decoded.encode("utf-16-le")) > 1024:
-            raise ValueError("Source identity exceeds its canonical bound.")
-        exact_id(decoded)
+        bounded_exact_id(decoded)
     return value
 
 
@@ -88,6 +94,7 @@ def calendar_date(value: str) -> str:
 CalendarDate = Annotated[
     str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$"), AfterValidator(calendar_date)
 ]
+OfficeFacetText = Annotated[str, StringConstraints(max_length=256, pattern=r"^[^\x00\r\n]*$")]
 
 
 class Input(WireModel):
@@ -446,7 +453,104 @@ class AdoptionInput(ReportBase):
 
 
 class ChampionsInput(Selected):
-    inventorySelectionId: Guid
+    inventorySelectionId: Guid = Field(
+        description="Unfiltered inventoryScope=all capture; selectionId is exact-group adoption."
+    )
+
+
+class AdoptionSummaryInput(Input):
+    selectionId: Guid | None = None
+    setId: Guid | None = None
+
+
+class AdoptionDepartmentsInput(ReportBase):
+    company: FacetText | None = None
+    department: FacetText | None = None
+    search: Search | None = None
+    sort: Literal["adoptionRate"] | None = None
+    pageNumber: Annotated[int, Field(ge=1, le=9007199254740991)] | None = None
+
+    @model_validator(mode="after")
+    def one_position(self) -> Self:
+        if self.pageNumber is not None and self.cursor:
+            raise ValueError("Use one page number or cursor.")
+        return self
+
+
+class AdoptionHistoryInput(Paging):
+    selectionId: Guid | None = None
+
+
+class OfficeQueryInput(Input):
+    officeSnapshot: Guid | None = None
+    officeBaseline: Guid | None = None
+    company: OfficeFacetText | None = None
+    department: OfficeFacetText | None = None
+    search: Search | None = None
+    app: Literal["word", "excel", "powerpoint", "outlook", "onenote", "loop", "teams"] | None = None
+
+
+class OfficeInput(OfficeQueryInput):
+    selectionId: Guid | None = None
+
+
+class OfficePagingInput(OfficeInput, Paging):
+    pageNumber: Annotated[int, Field(ge=1, le=9007199254740991)] | None = None
+
+    @model_validator(mode="after")
+    def office_position(self) -> Self:
+        if self.cursor and (not self.selectionId or self.pageNumber is not None):
+            raise ValueError("Office cursors require the same selection and no page number.")
+        return self
+
+
+class OfficeGroupsInput(OfficePagingInput):
+    limit: Literal[5] | None = None
+    anchor: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")] | None = None
+
+    @model_validator(mode="after")
+    def anchor_position(self) -> Self:
+        if self.anchor and (not self.selectionId or self.cursor or self.pageNumber is not None):
+            raise ValueError("Use a selected anchor, cursor or page number, not several.")
+        return self
+
+
+class OfficeFacetsInput(OfficePagingInput):
+    kind: Literal["company", "department"]
+
+
+class OfficePeopleInput(OfficePagingInput):
+    groupId: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+
+
+class OpportunityInput(OfficeQueryInput, Paging):
+    setId: Guid | None = None
+    officeSelectionId: Guid | None = Field(
+        default=None,
+        description="Independent actor-bound frozen Office selection; keep exact query.",
+    )
+    reportSelectionId: Guid | None = Field(
+        default=None,
+        description="Independent report set/version selection; omit setId when supplied.",
+    )
+    inventorySelectionId: Guid | None = None
+    limit: Annotated[int, Field(ge=1, le=10)] | None = None
+
+    @model_validator(mode="after")
+    def opportunity_position(self) -> Self:
+        if self.setId and self.reportSelectionId:
+            raise ValueError("The report selection already fixes its set.")
+        if self.cursor and (not self.officeSelectionId or not self.reportSelectionId):
+            raise ValueError("Continue with both exact independent selections.")
+        return self
+
+
+class OpportunityPeopleInput(OpportunityInput):
+    groupId: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
+    cohort: Literal["positive", "no_reported", "unknown"]
+    officeSelectionId: Guid
+    reportSelectionId: Guid
+    limit: Limit | None = None
 
 
 class ReportFacetInput(Selected):
@@ -487,9 +591,16 @@ class OverviewInput(ReportBase):
 
 class UsageInput(Paging):
     recordId: RecordId
-    selectionId: Guid | None = None
-    inventorySelectionId: Guid | None = None
-    setId: Guid | None = None
+    selectionId: Guid | None = Field(
+        default=None, description="Must equal inventorySelectionId when inventory is selected."
+    )
+    inventorySelectionId: Guid | None = Field(
+        default=None,
+        description="Exact saved inventory selection, paired with identical selectionId.",
+    )
+    setId: Guid | None = Field(
+        default=None, description="Separate exact official report set; not an inventory selection."
+    )
 
     @model_validator(mode="after")
     def exact_selection(self) -> Self:

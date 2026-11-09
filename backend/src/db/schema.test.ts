@@ -102,6 +102,7 @@ function schemaResults(): Array<{ name: string; rows: unknown[] }> {
     { name: "agent control receipts", rows: [{ valid: true }] },
     { name: "Office evidence", rows: [{ valid: true }] },
     { name: "discovery and reset authority", rows: [{ valid: true }] },
+    { name: "adoption content", rows: [{ valid: true }] },
   ];
 }
 
@@ -157,14 +158,14 @@ describe("current schema source contracts", () => {
   });
 
   it("constructs the exact current objects once", () => {
-    for (const [kind, count] of [["TABLE", 107], ["VIEW", 3], ["FUNCTION", 81], ["TRIGGER", 111], ["COLLATION", 2]] as const) {
+    for (const [kind, count] of [["TABLE", 109], ["VIEW", 4], ["FUNCTION", 81], ["TRIGGER", 111], ["COLLATION", 2]] as const) {
       const names = [...topLevel.matchAll(new RegExp("^CREATE " + kind + " ([a-z_]+)", "gm"))].map(match => match[1]);
       expect(names).toHaveLength(count);
       if (kind !== "TRIGGER") expect(new Set(names).size).toBe(count);
     }
     const tables = [...topLevel.matchAll(/^CREATE TABLE ([a-z_]+)/gm)].map(match => match[1]).sort();
     expect(tables).toEqual(Object.keys(backupTableKeys).sort());
-    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(169);
+    expect([...topLevel.matchAll(/^CREATE (?:UNIQUE )?INDEX /gm)]).toHaveLength(172);
     const alterations = topLevel.split(";").map(statement => statement.trim()).filter(statement => /^ALTER /i.test(statement));
     expect(alterations).toHaveLength(90);
     for (const statement of alterations) {

@@ -13,6 +13,7 @@ import { activateAccountSession, clearAccountSessionMutationsForTest, revokeAcco
 import { requestScope } from "../middleware/auth.js";
 import { capabilities } from "../services/capabilities.js";
 import * as operationalState from "../services/operationalState.js";
+import { unifiedAgentRecordId } from "../types/unifiedAgents.js";
 import type { RoutePolicy } from "./policy.js";
 import { createInventoryDataRouter } from "./inventoryData.js";
 
@@ -20,7 +21,7 @@ const mocks = vi.hoisted(() => ({
   handlers: new Map<string, { handler: RequestHandler; policy: RoutePolicy }>(),
   capture: vi.fn(), page: vi.fn(), summary: vi.fn(), responsibility: vi.fn(), facets: vi.fn(),
   packageDetail: vi.fn(), children: vi.fn(), members: vi.fn(), sections: vi.fn(), about: vi.fn(), invalidate: vi.fn(),
-  submitSelected: vi.fn(),
+  sourceReferences: vi.fn(), submitSelected: vi.fn(),
 }));
 
 vi.mock("../db/pool.js", () => ({ pool: {}, secretValue: vi.fn() }));
@@ -42,6 +43,7 @@ vi.mock("../db/inventoryQueries.js", () => ({
     members = mocks.members;
     sections = mocks.sections;
     about = mocks.about;
+    sourceReferences = mocks.sourceReferences;
   },
 }));
 vi.mock("../db/packageRefreshJobs.js", () => ({
@@ -70,11 +72,15 @@ const savedPage = {
   sources: {}, partial: false, errors: [], counts: { total: 1 }, page: { nextCursor: null },
 };
 const defaults = {
-  capture: savedSelection, page: savedPage, summary: { total: 1 },
+  capture: { id: selectionId, revision: "1", evaluatedAt: new Date(savedSelection.evaluatedAt),
+    validatedAt: new Date(savedSelection.evaluatedAt), expiresAt: new Date("2026-10-30T00:10:00Z"),
+    publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } },
+  page: savedPage, summary: { total: 1 },
   responsibility: { ...savedPage, sourceRows: [], selected: null },
   facets: { value: [], total: 0, nextCursor: null }, packageDetail: { id: "package-id" },
   children: { value: [], nextCursor: null }, members: { value: [], total: 0, nextCursor: null },
   sections: { value: [], nextCursor: null }, about: { text: "saved description" }, invalidate: undefined,
+  sourceReferences: [],
   submitSelected: { id: "refresh-job", status: "waiting_authorization" },
 };
 const routes = [
@@ -159,6 +165,97 @@ async function transport(spec: typeof routes[number], kind: "standalone" | "brow
   };
   return { request, response, run };
 }
+
+describe("saved inventory exact-record continuations", () => {
+  const continuations = routes.filter(spec => ["children", "members", "sections", "about"].includes(spec.phase));
+  const canonicalId = "abcdefab-1234-4567-89ab-abcdefabcdef";
+  const nativeId = "\u754c".repeat(512);
+  const targets = [
+    { source: "graph_packages" as const, packageId: nativeId },
+    { source: "power_platform" as const, nativeId, environmentId: nativeId },
+  ];
+
+  it.each(continuations)("normalizes canonical UUIDs for $route", async spec => {
+    const { request, run } = await transport(spec);
+    request.params.recordId = `agent:${canonicalId.toUpperCase()}`;
+    await run();
+    expect(mocks[spec.phase]).toHaveBeenCalledWith(selectionId, expect.any(Object), canonicalId, expect.any(Object));
+    expect(mocks.sourceReferences).not.toHaveBeenCalled();
+  });
+
+  it.each(continuations)("resolves bounded source-qualified references for $route", async spec => {
+    for (const target of targets) {
+      mocks.sourceReferences.mockResolvedValueOnce([{ canonical_id: canonicalId }]);
+      const { request, run } = await transport(spec);
+      request.params.recordId = unifiedAgentRecordId(target);
+      request.query.cursor = "saved-continuation";
+      request.query.limit = "2";
+      expect(request.params.recordId.length).toBeGreaterThan(4096);
+      await run();
+      expect(mocks.sourceReferences).toHaveBeenLastCalledWith(selectionId, expect.any(Object), [{
+        domain: target.source === "graph_packages" ? "packages" : "power_platform",
+        nativeId: target.source === "graph_packages" ? target.packageId : target.nativeId,
+        environmentId: target.source === "graph_packages" ? null : target.environmentId,
+      }]);
+      expect(mocks[spec.phase]).toHaveBeenLastCalledWith(selectionId, expect.any(Object), canonicalId,
+        expect.objectContaining({ cursor: "saved-continuation", ...spec.phase === "about" ? {} : { limit: 2 } }));
+    }
+    expect(mocks.capture).not.toHaveBeenCalled();
+  });
+
+  it.each(continuations)("rejects absent and ambiguous source references for $route", async spec => {
+    for (const [matches, status] of [[[], 404], [[canonicalId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"], 409]] as const) {
+      mocks.sourceReferences.mockResolvedValueOnce(matches.map(canonical_id => ({ canonical_id })));
+      const { request, response, run } = await transport(spec);
+      request.params.recordId = "graph_packages:missing-or-ambiguous";
+      await expect(run()).rejects.toMatchObject({ status });
+      expect(mocks[spec.phase]).not.toHaveBeenCalled();
+      expect(response.json).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(continuations)("accepts repeated memberships of the same canonical record for $route", async spec => {
+    mocks.sourceReferences.mockResolvedValueOnce([{ canonical_id: canonicalId }, { canonical_id: canonicalId }]);
+    const { request, run } = await transport(spec);
+    request.params.recordId = "graph_packages:shared-package";
+    await run();
+    expect(mocks[spec.phase]).toHaveBeenCalledWith(selectionId, expect.any(Object), canonicalId, expect.any(Object));
+  });
+
+  it.each(continuations)("preserves saved lookup failures without recapture for $route", async spec => {
+    const failure = new Error("Synthetic pinned source lookup failure");
+    mocks.sourceReferences.mockRejectedValueOnce(failure);
+    const { request, response, run } = await transport(spec);
+    request.params.recordId = "graph_packages:package";
+    await expect(run()).rejects.toBe(failure);
+    expect(mocks[spec.phase]).not.toHaveBeenCalled();
+    expect(mocks.capture).not.toHaveBeenCalled();
+    expect(response.json).not.toHaveBeenCalled();
+  });
+
+  it.each(continuations)("withholds JSON after logout during source resolution for $route", async spec => {
+    const { request, response, run } = await transport(spec);
+    request.params.recordId = "graph_packages:package";
+    const scope = requestScope(request);
+    mocks.sourceReferences.mockImplementationOnce(async () => {
+      await revokeAccountSessionMutations(scope.tenantId, scope.principalId, async () => undefined);
+      return [{ canonical_id: canonicalId }];
+    });
+    await expect(run()).rejects.toMatchObject({ status: 401 });
+    expect(response.json).not.toHaveBeenCalled();
+  });
+
+  it.each(continuations)("rejects malformed record references for $route", async spec => {
+    for (const recordId of ["unknown:record", "agent:not-a-uuid", "graph_packages:%broken"]) {
+      const { request, response, run } = await transport(spec);
+      request.params.recordId = recordId;
+      await expect(run()).rejects.toMatchObject({ status: 400, code: "invalid_inventory_query" });
+      expect(mocks.sourceReferences).not.toHaveBeenCalled();
+      expect(mocks[spec.phase]).not.toHaveBeenCalled();
+      expect(response.json).not.toHaveBeenCalled();
+    }
+  });
+});
 
 describe("saved inventory JSON publication", () => {
   it.each(routes)("preserves current Viewer reads: $route", async spec => {

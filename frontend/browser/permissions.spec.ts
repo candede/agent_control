@@ -11,6 +11,7 @@ import { downloadedCsvRows } from "./usageCsvFixture";
 import { fixtureLoginUrl, isExternalFixtureRequest, isPackageMutationRequest, isUnexpectedPermissionCommand, permissionLayoutRequestKind } from "./permissionFixtures";
 import { isAutomaticRefreshRequest, mockAutomaticRefresh } from "./automaticRefreshFixtures";
 import { isInventorySelectionRequest } from "./selectedInventoryFixture";
+import type { DiscoveryPage } from "../../backend/src/types/agentDiscovery";
 
 async function login(page: Page, scenario: string, username?: string) {
   const checked = page.waitForResponse(response => response.request().method() === "POST"
@@ -36,13 +37,25 @@ for (const [role, scenario] of [["employee", "roleless-employee"], ["viewer", "r
     await page.goto(loginUrl.href);
     if (role === "employee") {
       await expect(page.getByRole("heading", { name: "Agent discovery", exact: true })).toBeVisible();
+      await expect(page.getByText(/Microsoft first-party and organization-created candidates/)).toBeVisible();
       await expect.poll(() => calls.filter(call => call === "POST /api/mcp/authenticated-entry").length).toBe(1);
       await expect(page.getByRole("navigation", { name: "Primary views" })).toHaveCount(0);
       await expect(page.getByRole("button", { name: /^Sync/ })).toHaveCount(0);
       await expect(page.getByRole("alert")).toHaveCount(0);
       expect(calls).not.toContain("POST /api/capabilities/check");
-      expect(calls.filter(call => !/^GET \/api\/(?:auth\/login|auth\/callback|auth\/status|me)$/.test(call)))
-        .toEqual(["POST /api/mcp/authenticated-entry"]);
+      expect(calls.filter(call => !/^GET \/api\/(?:auth\/login|auth\/callback|auth\/status|me)$/.test(call)).sort())
+        .toEqual(["POST /api/mcp/authenticated-entry", "POST /api/discovery/learning", "GET /api/discovery/connection"].sort());
+      await expect.poll(async () => page.evaluate(async () => {
+        const session = await (await fetch("/api/me")).json();
+        const response = await fetch("/api/discovery/read", { method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": session.csrfToken },
+          body: JSON.stringify({ operation: "search", goal: "business requirements" }) });
+        const body: DiscoveryPage = await response.json();
+        return { status: response.status, profileState: body.context?.profileState,
+          origins: body.value?.map(card => card.origin.kind), fields: body.value?.flatMap(card => card.sources.map(source => source.descriptionField)) };
+      }), { timeout: 15_000 }).toEqual({ status: 200, profileState: "unavailable",
+        origins: ["organization_created"], fields: ["shortDescription"] });
+      expect((await page.request.get("/api/agent-inventory?limit=1")).status()).toBe(403);
     } else {
       await expect(page.getByRole("region", { name: "Agent inventory", exact: true })).toBeVisible();
       await expect.poll(() => calls.filter(call => call === "POST /api/data-sync/auto-refresh").length).toBeGreaterThan(0);

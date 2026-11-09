@@ -211,6 +211,7 @@ describe("registered canonical HTTP authentication", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toMatchObject({ audience: "end_user", staffPreviewAuthorized: false, operations: [
+      { method: "POST", route: "/api/discovery/learning" },
       { method: "POST", route: "/api/discovery/read", inputChoices: { operation: ["profile", "search", "detail", "workplace"] } },
       { method: "GET", route: "/api/mcp/access-profile" }, { method: "POST", route: "/api/mcp/authenticated-entry" },
     ] });

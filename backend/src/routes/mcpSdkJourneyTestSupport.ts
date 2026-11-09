@@ -7,9 +7,11 @@ import type { setupAuditOriginHttp } from "./auditOriginHttpTestSupport.js";
 // Names identify canonical operations for SQL/browser parity assertions. The Python
 // test adapter resolves the current public tool/action; no old wire alias is called.
 export type SdkCall = { name: string; request: Record<string, unknown>; expected?: unknown };
+export type SdkTrace = { tool: string; status: number; bytes: number; seconds: number };
 
 export async function sdkJourney(fixture: Awaited<ReturnType<typeof setupAuditOriginHttp>>, calls: SdkCall[],
-  actor = { oid: fixture.actor.localAccountId ?? account().localAccountId, roles: fixture.actor.roles as AppRole[] }) {
+  actor = { oid: fixture.actor.localAccountId ?? account().localAccountId, roles: fixture.actor.roles as AppRole[] },
+  observe?: (trace: SdkTrace[]) => void) {
   const python = process.env.AGENT_CONTROL_MCP_SQL_JOURNEY;
   if (python !== "/opt/mcp/.venv/bin/python" || process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1"
     || process.env.PGHOST !== "127.0.0.1" || process.env.PGDATABASE !== "agentcontrol_test_control") throw new Error("Exact isolated SDK/SQL fixture required.");
@@ -36,10 +38,11 @@ export async function sdkJourney(fixture: Awaited<ReturnType<typeof setupAuditOr
         `SDK SQL journey failed: exit=${code},signal=${signal}; ${Buffer.concat(stderr).toString("utf8")}`)));
       child.stdin.end(JSON.stringify(payload));
     });
-    const result: { results: unknown[]; trace: Array<{ tool: string; status: number; bytes: number; seconds: number }> } =
+    const result: { results: unknown[]; trace: SdkTrace[] } =
       JSON.parse(Buffer.concat(stdout).toString("utf8"));
     if (result.results.length !== calls.length) throw new Error("Incomplete SDK SQL journey.");
     console.info("mcp_sql_sdk_journey", JSON.stringify({ calls: result.trace, count: calls.length }));
+    observe?.(result.trace);
     return result.results;
   } finally { clearTimeout(timer); }
 }

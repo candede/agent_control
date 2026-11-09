@@ -28,7 +28,8 @@ const identity: SelectionIdentity = { tenantId: config.tenants[0].tenantId, prin
   authorizationHash: "viewer", sessionEpoch: "1" };
 const at = new Date("2026-10-01T00:00:00Z");
 const selection = { id: selectionId, revision: "1", evaluatedAt: at, validatedAt: at,
-  expiresAt: new Date(at.getTime() + 600_000), endpoint: "inventory", queryHash: "query" };
+  expiresAt: new Date(at.getTime() + 600_000), endpoint: "inventory", queryHash: "query",
+  publicationRevisions: { graph_packages: "1".repeat(64), power_platform: "2".repeat(64), users: "3".repeat(64) } };
 const database = new pg.Pool({ max: 4 });
 let server: Server, signedIn = true;
 
@@ -127,6 +128,13 @@ function request(method: "GET" | "POST", path: string, body?: unknown, csrf = tr
 }
 
 describe("endpoint-local inventory searches", () => {
+  it.each(["agent-inventory", "agents"])("publishes exactly the current canonical selection contract for %s", async resource => {
+    const response = await request("POST", `/${resource}/selections`, { query: {} });
+    expect(response.status).toBe(201);
+    expect(response.body).toEqual({ id: selection.id, revision: selection.revision,
+      evaluatedAt: selection.evaluatedAt.toISOString(), validatedAt: selection.validatedAt.toISOString(),
+      expiresAt: selection.expiresAt.toISOString(), publicationRevisions: selection.publicationRevisions });
+  });
   it("captures a Viewer's explicit report choice for inventory", async () => {
     const setId = "ABCDEFAB-1234-4567-89AB-ABCDEFABCDEF";
     const response = await request("POST", "/agent-inventory/selections", { query: { setId } });

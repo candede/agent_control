@@ -92,6 +92,17 @@ def _family(name: str, **actions: str) -> PublicTool:
 
 
 _FAMILIES = (
+    _family(
+        "adoption_content",
+        list="list_adoption_content",
+        detail="read_adoption_content",
+        create="create_adoption_content",
+        update="update_adoption_content",
+        progress="progress_adoption_action",
+        delete="delete_adoption_content",
+        follow_up="follow_up_adoption_content",
+    ),
+    _family("shared_learning", read="read_shared_learning"),
     _family("agent_catalog", search="search_agent_catalog", detail="read_discovery_detail"),
     _family("my_workplace", read="read_my_workplace"),
     _family("my_discovery_profile", read="read_my_discovery_profile"),
@@ -101,6 +112,7 @@ _FAMILIES = (
         search="preview_discovery_search",
         detail="preview_discovery_detail",
         workplace="preview_discovery_workplace",
+        learning="preview_shared_learning",
     ),
     _family("capabilities", list="list_capabilities", progress="get_capability_check_progress"),
     _family(
@@ -137,7 +149,23 @@ _FAMILIES = (
         "adoption",
         groups="list_adoption_groups",
         facets="list_adoption_facets",
+        summary="get_adoption_summary",
+        departments="list_adoption_departments",
+        history="list_adoption_history",
+        opportunities="list_department_opportunities",
+        opportunity_people="list_opportunity_people",
         champion_agents="list_champion_agents",
+    ),
+    _family(
+        "office_adoption",
+        context="get_office_context",
+        summary="get_office_summary",
+        comparison="get_office_comparison",
+        history="list_office_history",
+        groups="list_office_groups",
+        departments="list_office_departments",
+        facets="list_office_facets",
+        people="list_office_people",
     ),
     _family(
         "report_agents",

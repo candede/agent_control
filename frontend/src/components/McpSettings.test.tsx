@@ -6,6 +6,13 @@ import { getMcpSettings, type SessionUser } from "../api/client";
 import { McpSettings } from "./McpSettings";
 
 vi.mock("../api/client", async original => ({ ...await original<typeof import("../api/client")>(), getMcpSettings: vi.fn() }));
+vi.mock("./CustomerStarterKit", async () => {
+  const { McpCopyText } = await import("./McpCopyText");
+  return { CustomerStarterKit: ({ resourceUrl }: { resourceUrl?: string }) => <div>Customer kit tested separately
+    {resourceUrl ? <McpCopyText value={resourceUrl} label="resource URL" /> : null}</div> };
+});
+vi.mock("./McpSuggestedPrompts", () => ({ McpSuggestedPrompts: () =>
+  <section aria-labelledby="suggested-prompts-test-title"><h3 id="suggested-prompts-test-title">Suggested prompts</h3></section> }));
 const user: SessionUser = { tenantId: "tenant", homeAccountId: "reader", roles: ["AgentControl.Viewer"],
   displayName: "Reader", username: "reader@example.invalid" };
 const description = "  Long exact\n<script>alert('inert')</script>  ";
@@ -19,11 +26,35 @@ const settings: Settings = { state: "available", configured: { resourceUrl: "htt
       outputSchema: { type: "object" }, annotations: { readOnlyHint: name === "saved_read" } })),
   } };
 afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); });
+async function openTools() { await userEvent.click(await screen.findByText("Tool catalog", { exact: true })); }
+it("places suggested prompts before setup and metadata, including when metadata fails", async () => {
+  vi.mocked(getMcpSettings).mockRejectedValue(new Error("unavailable"));
+  const { container } = render(<McpSettings user={user} />);
+  await screen.findByRole("button", { name: "Retry metadata" });
+  expect(container.querySelector(".mcp-settings > section")).toHaveAccessibleName("Suggested prompts");
+  expect(screen.getByText("Customer kit tested separately")).toBeVisible();
+});
+it("materializes full schemas only when the exact tool is expanded while searching their complete source", async () => {
+  const inputSchema = { type: "object", description: "complete-hidden-schema-marker " + "payload ".repeat(5000) };
+  vi.mocked(getMcpSettings).mockResolvedValue({ ...settings, runtime: { ...settings.runtime,
+    tools: [{ ...settings.runtime.tools[0], inputSchema }] } });
+  const { container } = render(<McpSettings user={user} />);
+  await openTools();
+  await screen.findByText("1 shown / 1 advertised tools");
+  expect(container.querySelector(".mcp-schemas")).toBeNull();
+  await userEvent.type(screen.getByRole("searchbox"), "complete-hidden-schema-marker");
+  expect(screen.getByText("1 shown / 1 advertised tools")).toBeVisible();
+  await userEvent.click(screen.getByLabelText("Inspect saved_read"));
+  await userEvent.click(await screen.findByText("Input schema — saved_read"));
+  expect(screen.getByRole("region", { name: "Input schema for saved_read" }).textContent).toBe(JSON.stringify(inputSchema, null, 2));
+});
 it.each([[false, false], [true, false], [false, true], [true, true]])("shows independent API privacy values during metadata outage (%s,%s)", async (employee, champion) => {
   vi.mocked(getMcpSettings).mockResolvedValue({ state: "unavailable", configured: settings.configured, code: "metadata_unavailable",
     privacy: { hide_employee_details: employee, hide_champion_employee: champion }, privacyScope: "end_user_and_preview" });
   render(<McpSettings user={user} />);
   await screen.findByRole("heading", { name: "Employee discovery privacy" });
+  await userEvent.click(screen.getByText("Employee discovery privacy", { exact: true }));
+  expect(screen.getByText("hide_employee_details")).toBeVisible();
   expect(screen.getByText("hide_employee_details").closest("div")).toHaveTextContent(String(employee));
   expect(screen.getByText("hide_champion_employee").closest("div")).toHaveTextContent(String(champion));
   expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
@@ -31,6 +62,7 @@ it.each([[false, false], [true, false], [false, true], [true, true]])("shows ind
 it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)("shows exact inert metadata to %s", async role => {
   vi.mocked(getMcpSettings).mockResolvedValue(settings);
   const { container } = render(<McpSettings user={{ ...user, roles: [role] }} />);
+  await openTools();
   expect(await screen.findByText("2 shown / 2 advertised tools")).toBeVisible();
   expect(screen.getByTestId("mcp-instructions").textContent).toBe(description);
   expect(screen.getAllByTestId("mcp-description")[0].textContent).toBe(description);
@@ -57,6 +89,7 @@ it("retries metadata only after a failed request", async () => {
   vi.mocked(getMcpSettings).mockRejectedValueOnce(new Error("redacted")).mockResolvedValueOnce(settings);
   render(<McpSettings user={user} />);
   await userEvent.click(await screen.findByRole("button", { name: "Retry metadata" }));
+  await openTools();
   expect(await screen.findByText("2 shown / 2 advertised tools")).toBeVisible();
   expect(getMcpSettings).toHaveBeenCalledTimes(2);
 });
@@ -68,10 +101,12 @@ it("cancels principal-bound requests and hides old data immediately across accou
   rerender(<McpSettings user={{ ...user, tenantId: "other", homeAccountId: "other-reader" }} />);
   expect(oldSignal?.aborted).toBe(true);
   await act(async () => finish(settings));
+  await openTools();
   await waitFor(() => expect(screen.getByText("2 shown / 2 advertised tools")).toBeVisible());
   rerender(<McpSettings user={{ ...user, roles: [] }} />);
   expect(screen.queryByRole("heading", { name: /Tool catalog/ })).not.toBeInTheDocument();
   expect(screen.getByRole("alert")).toHaveTextContent("Viewer access");
+  expect(screen.queryByRole("heading", { name: "Suggested prompts" })).not.toBeInTheDocument();
   unmount();
   expect(vi.mocked(getMcpSettings).mock.calls[1][0]!.signal?.aborted).toBe(true);
 });
@@ -89,6 +124,7 @@ it("never restores a previous principal's result when identities cycle while req
 it("searches complete schemas without changing the displayed tool descriptions", async () => {
   vi.mocked(getMcpSettings).mockResolvedValue(settings);
   render(<McpSettings user={user} />);
+  await openTools();
   await screen.findByText("2 shown / 2 advertised tools");
   await userEvent.type(screen.getByRole("searchbox"), "onerror");
   expect(screen.getByText("2 shown / 2 advertised tools")).toBeVisible();
@@ -103,8 +139,9 @@ it.each([
     ...settings, runtime: { ...settings.runtime, tools: [{ ...settings.runtime.tools[0], title }] },
   });
   render(<McpSettings user={user} />);
+  await openTools();
   await screen.findByText("1 shown / 1 advertised tools");
-  expect(screen.getByRole("heading", { level: 4, name: displayed })).toBeVisible();
+  expect(screen.getByRole("heading", { level: 5, name: displayed })).toBeVisible();
   if (displayed !== "saved_read") expect(screen.getByText("saved_read", { selector: "code" })).toBeVisible();
 });
 it("uses the application heading hierarchy and progressively discloses complete instructions and tool details", async () => {
@@ -114,10 +151,12 @@ it("uses the application heading hierarchy and progressively discloses complete 
   expect(screen.getByRole("heading", { name: "MCP settings", level: 2 })).toBeVisible();
   expect(screen.queryByRole("heading", { level: 1 })).not.toBeInTheDocument();
   expect(screen.getByTestId("mcp-instructions")).not.toBeVisible();
+  expect(screen.getByText("2 shown / 2 advertised tools")).not.toBeVisible();
   expect(screen.getAllByTestId("mcp-description")[0]).not.toBeVisible();
   await userEvent.click(screen.getByText("Server instructions", { exact: true }));
   expect(screen.getByTestId("mcp-instructions")).toBeVisible();
   expect(screen.getByTestId("mcp-instructions").textContent).toBe(description);
+  await openTools();
   await userEvent.click(screen.getByLabelText("Inspect saved_read"));
   expect(screen.getAllByTestId("mcp-description")[0]).toBeVisible();
   expect(screen.getAllByTestId("mcp-description")[0].textContent).toBe(description);
@@ -125,6 +164,7 @@ it("uses the application heading hierarchy and progressively discloses complete 
 it("filters by explicit read-only hints and provides a recoverable empty search", async () => {
   vi.mocked(getMcpSettings).mockResolvedValue(settings);
   render(<McpSettings user={user} />);
+  await openTools();
   await screen.findByText("2 shown / 2 advertised tools");
   await userEvent.click(screen.getByRole("checkbox", { name: "Read-only tools" }));
   expect(screen.getByText("1 shown / 2 advertised tools")).toBeVisible();

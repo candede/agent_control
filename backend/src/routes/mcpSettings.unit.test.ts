@@ -11,14 +11,16 @@ import { activateAccountSession, revokeAccountSessionMutations } from "../db/ses
 import type { McpAccessProfile, McpConnectionSettings as McpSettings } from "../types/mcpSettings.js";
 import { createMcpSettingsRouter } from "./mcpSettings.js";
 
-const mocks = vi.hoisted(() => ({ handler: undefined as RequestHandler | undefined }));
+const mocks = vi.hoisted(() => ({ handler: undefined as RequestHandler | undefined,
+  discovery: undefined as RequestHandler | undefined, discoveryPolicy: undefined as unknown }));
 vi.mock("../services/mcpAccess.js", () => ({
   mcpAccessProfile: () => ({ audience: "adoption", operations: [], staffPreviewAuthorized: true,
     privacy: { hide_employee_details: false, hide_champion_employee: false } }),
 }));
 vi.mock("./policy.js", () => ({
-  policyRoute: (_router: unknown, _method: string, _path: string, _policy: unknown, handler: RequestHandler) => {
-    mocks.handler = handler;
+  policyRoute: (_router: unknown, _method: string, path: string, policy: unknown, handler: RequestHandler) => {
+    if (path === "/discovery/connection") { mocks.discovery = handler; mocks.discoveryPolicy = policy; }
+    else mocks.handler = handler;
   },
 }));
 vi.mock("../db/pool.js", () => ({
@@ -61,6 +63,15 @@ function transport() {
 }
 
 describe("MCP settings request lifecycle without sockets", () => {
+  it("registers a browser-only employee connection read with no role/catalog or metadata access", async () => {
+    expect(mocks.discoveryPolicy).toEqual({ access: "authenticated", browserOnly: true, dataClass: "employee_discovery" });
+    const { request, response } = transport();
+    (request as unknown as Request).session.user!.roles = [];
+    await mocks.discovery!(request as unknown as Request, response as unknown as Response, error => { if (error) throw error; });
+    expect(response.json).toHaveBeenCalledWith({ state: "not_configured" });
+    expect(response.setHeader).toHaveBeenCalledWith("Cache-Control", "no-store");
+    expect(reader).not.toHaveBeenCalled();
+  });
   it("uses only the initiating tenant, disables caching, and removes listeners on success", async () => {
     const { response, run, expectCleanup } = transport();
     await run();

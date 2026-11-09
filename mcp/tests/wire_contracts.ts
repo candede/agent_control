@@ -12,6 +12,9 @@ import type { OfficialReportDetail, OfficialReportFacetPage, CandidateAgentUsage
   CandidateAgentUsageUsers, CandidateAgentUsageAssociations, CandidateAgentUsageCandidates } from "../../backend/src/types/officialReportApi.js";
 import type { UserResolution, SavedRelationshipPage, ChampionAgentPage, AgentAboutPage } from "../../backend/src/types/savedReadContracts.js";
 import type { AdoptionPage } from "../../backend/src/types/adoption.js";
+import type { AdoptionSummaryPage, AdoptionDepartmentPage, AdoptionHistoryPage } from "../../backend/src/types/adoptionDashboard.js";
+import type { OfficeContext, OfficeSummary, OfficePage, OfficeGroup, OfficePerson, OfficeFacet, OfficeHistoryPoint } from "../../backend/src/types/officeAppAdoption.js";
+import type { OpportunityPage, OpportunityPeoplePage } from "../../backend/src/types/departmentOpportunity.js";
 import type { DataSyncState, DataSyncRun, PackageDetailSyncState } from "../../backend/src/types/dataSync.js";
 import type { InventoryRefreshJob, InventoryRefreshJobList } from "../../backend/src/types/powerPlatformInventory.js";
 import type { AuditEvent } from "../../backend/src/types/audit.js";
@@ -24,8 +27,15 @@ import type { NativeInventory } from "../../backend/src/db/nativeInventory.js";
 import type { JobRepository } from "../../backend/src/db/jobs.js";
 import type { reconcileBulkJob } from "../../backend/src/services/bulkJobs.js";
 import type { DiscoveryPage, DiscoveryProfile, DiscoveryDetail, DiscoveryWorkplace } from "../../backend/src/types/agentDiscovery.js";
+import type { ContentPage, ContentRecord, ContentSave, ContentFollowUp, SharedLearningPage } from "../../backend/src/types/adoptionContent.js";
 
 export type Contracts = {
+  contentPage: ContentPage;
+  contentRecord: ContentRecord;
+  contentSave: ContentSave;
+  contentDeleted: { id: string; state: "deleted" };
+  contentFollowUp: ContentFollowUp;
+  sharedLearning: SharedLearningPage;
   discoveryPage: DiscoveryPage;
   discoveryProfile: DiscoveryProfile;
   discoveryDetail: DiscoveryDetail;
@@ -60,6 +70,17 @@ export type Contracts = {
   savedRelationships: SavedRelationshipPage;
   champions: ChampionAgentPage;
   adoption: AdoptionPage;
+  adoptionOrganization: AdoptionSummaryPage;
+  adoptionDepartments: AdoptionDepartmentPage;
+  adoptionHistory: AdoptionHistoryPage;
+  officeContext: OfficeContext;
+  officeSummary: OfficeSummary;
+  officeGroups: OfficePage<OfficeGroup>;
+  officePeople: OfficePage<OfficePerson>;
+  officeFacets: OfficePage<OfficeFacet>;
+  officeHistory: OfficePage<OfficeHistoryPoint>;
+  opportunities: OpportunityPage;
+  opportunityPeople: OpportunityPeoplePage;
   about: AgentAboutPage;
   usage: CandidateAgentUsageSummary;
   usageHistory: CandidateAgentUsageHistory;

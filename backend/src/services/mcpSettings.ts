@@ -5,7 +5,7 @@ import { isIP } from "node:net";
 import { config, findTenantConfiguration } from "../config.js";
 import {
   mcpMetadataMaximumBytes, parseBoundedMcpJson, parseMcpRuntimeMetadata,
-  type McpAccessProfile, type McpBinding, type McpConfiguredSettings, type McpConnectionSettings,
+  type McpAccessProfile, type McpBinding, type McpConfiguredSettings, type McpConnectionSettings, type McpDiscoveryConnection,
 } from "../types/mcpSettings.js";
 
 type BindingDecision = { configured: McpConfiguredSettings; binding: McpBinding; origin?: string; code?: string };
@@ -19,8 +19,8 @@ const reserved = ["/health", "/ready", "/diagnostics", "/internal/mcp-metadata",
 function configuredResourceUrl(raw: string) {
   try {
     const resource = new URL(raw);
-    if (raw.length > 2048 || resource.href !== raw || resource.protocol !== "https:" || resource.pathname === "/"
-      || resource.pathname.endsWith("/") || reserved.includes(resource.pathname) || resource.pathname.startsWith("/.well-known/")
+    if (raw.length > 2048 || resource.href !== raw || resource.protocol !== "https:" || resource.port === "0" || resource.pathname === "/"
+      || resource.pathname.includes("//") || resource.pathname.endsWith("/") || reserved.includes(resource.pathname) || resource.pathname.startsWith("/.well-known/")
       || resource.search || resource.hash || resource.username || resource.password || /[?#%\\\s*]/.test(raw)) return "";
     return raw;
   } catch { return ""; }
@@ -47,6 +47,12 @@ export function mcpBindingForTenant(tenantId: string): BindingDecision | undefin
         && !/^[a-z][a-z0-9-]*$/.test(origin.hostname)) throw new Error();
     return { ...decision, origin: raw };
   } catch { return { ...decision, code: "metadata_configuration_unavailable" }; }
+}
+
+export function readMcpDiscoveryConnection(tenantId: string): McpDiscoveryConnection {
+  const decision = mcpBindingForTenant(tenantId);
+  return !decision?.configured.resourceUrl || decision.code === "binding_mismatch"
+    ? { state: "not_configured" } : { state: "available", resourceUrl: decision.configured.resourceUrl };
 }
 
 function metadataCredential() {

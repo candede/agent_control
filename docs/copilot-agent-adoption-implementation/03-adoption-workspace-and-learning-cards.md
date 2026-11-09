@@ -1,10 +1,11 @@
-# 03 - Adoption workspace and learning cards
+# 03 - MCP-led adoption content and learning cards
 
 ## Mission and prerequisites
 
-Make AI recommendations usable inside the app: save/read/edit department briefs,
-track staff actions, capture real workflow learning, and share only safe cards
-with employees. Implement schema, API, MCP and browser contracts coherently.
+Let the connected AI agent save/read/edit department briefs, track staff actions,
+capture real workflow learning and share only safe cards through MCP.
+Implement schema/API/MCP contracts and existing employee discovery coherently.
+Do not add a dedicated Adoption page or manual browser authoring workflow.
 
 Prerequisites: phases 01 and 02 and their exact completion records:
 `completions/01-evidence-apis-and-mcp-reads.md` and
@@ -31,7 +32,7 @@ campaign state, [README](./README.md), and [CONTRACT](./CONTRACT.md).
 - [Existing safe-discovery architecture](../data-architecture.md#restricted-agent-discovery).
 
 Resolve current storage accounting, scoped deletes, error handling, confirmation,
-CSRF and UI form/list patterns; reuse them rather than inventing a content CMS.
+CSRF and employee discovery/list patterns; reuse them rather than inventing a content CMS.
 
 ## Concrete work
 
@@ -64,18 +65,17 @@ CSRF and UI form/list patterns; reuse them rather than inventing a content CMS.
    Keep employee-safe slots separate from staff notes/raw generated narrative.
    Source regexes are not a general prose-safety guarantee: insufficient privacy
    evidence means explicit withholding, not an author-supplied approval flag.
-5. Add an adoption workspace in the existing app with company/department/report
-   context, evidence drilldowns, saved briefs, an action worklist and learning-card
-   editor/list. Include useful empty, partial, stale, save-failed, conflict and
-   unavailable states. Reuse API-calculated cohorts.
-   Show baseline versus current group/window/coverage and cohort-drift warnings.
+5. Expose bounded MCP reads for saved briefs, actions and learning cards with
+   company/department/report context and exact evidence drilldowns. Include
+   useful empty, partial, stale, save-failed, conflict and unavailable states.
+   Reuse API-calculated cohorts. Return baseline versus current group/window/
+   coverage and cohort-drift warnings for consumer interpretation.
    Source correction/deletion/expiry must not silently rewrite saved evidence
    into a current fact or make a stored selection someone else's read authority.
-6. Let a connected consumer save through MCP; let staff create/edit the same
-   records through normal forms. Provide an honest "Copy analysis prompt" path
-   for external-consumer handoff. Do not add a hosted model service or imply the
-   browser/MCP server itself generates text.
-   Copy durable requested source IDs/filter intent, never cookies, tokens or
+6. Let the connected AI consumer drive requested saves, edits and progress through
+   MCP. Keep one staff workflow, not parallel browser forms or an Adoption page.
+   Do not add a hosted model service or imply the browser/MCP server generates text.
+   Optional request templates carry durable requested source IDs/filter intent, never cookies, tokens or
    actor-bound selection/cursor values intended for reuse by another client.
    The consumer obtains its own authorized selections and reports expired intent.
 7. Capture task, prompt pattern, inputs, expected output, review steps, known
@@ -95,7 +95,7 @@ CSRF and UI form/list patterns; reuse them rather than inventing a content CMS.
    current evidence is unavailable, disclose that state; do not fabricate
    current availability or silently attach another similarly named agent.
 10. Wire types, grants, schema fingerprint, storage cleanup/accounting, current
-    API docs, browser navigation and MCP metadata together. Remove any
+    API docs, existing employee discovery and MCP metadata together. Remove any
     superseded implementation in this owner. Schema change uses current-schema
     initialization and a justified reset, not compatibility migrations.
     Update the existing role/permission documentation for these new content
@@ -119,14 +119,14 @@ Add current-layout storage/SQL/route/UI/MCP tests. Required cases:
   deleted content; storage/receipt accounting and bounded cleanup.
 - Privacy changes after saving, hidden names in prose, inert malicious text,
   removed agent membership, employee-visible versus staff-only cards.
-- Expired browser selections followed by MCP/app reload as another staff actor;
+- Expired consumer selections followed by fresh MCP reads as another staff actor;
   deleted/corrected reports and expired Office evidence; unchanged saved aggregate
   baseline with explicitly changed follow-up membership/licensing/window.
 - Tenant-wide employee sharing across departments, labels changed without
   authorization changes, roleless missing-profile search, unsafe arbitrary prose
   withheld rather than incorrectly declared redacted.
-- Empty workspace before sync/report import; create/edit/reload/assign/progress;
-  interrupted save, explicit notification and preservation of unsaved inputs.
+- Empty content before sync/report import; MCP create/edit/read/assign/progress;
+  interrupted save, explicit errors and preservation of the consumer's unsaved inputs.
 - Fresh schema, grants and reset initialization with new content objects;
   mismatch produces the existing honest reset-required path.
 
@@ -160,10 +160,10 @@ From `mcp/`, combine new content cases with:
 .venv/bin/python -m mypy
 ```
 
-Add `frontend/browser/adoptionWorkspace.spec.ts` in the existing browser layout
-for workspace persistence, aggregate follow-up and safe-card handoff; extend
-existing catalog/preview cases rather than adding another browser harness.
-Check keyboard/focus, mobile widths, accessible labels and confirmation.
+Prove content persistence and aggregate follow-up through the existing API/MCP
+fixtures. Extend existing catalog/preview cases for safe-card handoff and assert
+the app has no dedicated Adoption page or manual editor. Check keyboard/focus,
+mobile widths and accessible labels on the remaining employee discovery surfaces.
 Do not repeat unrelated full suites after every edit.
 
 ## Production continuation
@@ -181,6 +181,6 @@ state. Include exact new record/authorization/revision contracts, reset rational
 shared-card privacy behavior and all changed API/MCP/browser surfaces.
 
 Done means real records survive reload and concurrent updates behave honestly,
-the same authorized record is accessible through UI and MCP, safe cards reach
+the same authorized record is accessible across staff MCP sessions, safe cards reach
 EndUsers without staff leakage, and current fresh initialization is proved.
 Phase 04 may describe actual implemented read/write operations, not planned ones.

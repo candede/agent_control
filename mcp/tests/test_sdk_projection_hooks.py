@@ -42,12 +42,19 @@ async def test_supported_initialize_list_call_hooks_are_identity_scoped(browser,
                 await session.initialize()
                 listed = await session.list_tools()
                 counts.append(len(listed.tools))
+                if not roles:
+                    assert {tool.name for tool in listed.tools} == {
+                        "agent_catalog",
+                        "my_workplace",
+                        "my_discovery_profile",
+                        "shared_learning",
+                    }
                 if roles:
                     result = await session.call_tool(
                         "capabilities", {"request": {"action": "list", "input": {}}}
                     )
                     assert not result.is_error
-    assert counts[0] == 3 and counts[1] > 3
+    assert counts[0] == 4 and counts[1] > 4
     assert ("initialize", []) in observed
     assert ("initialize", ["AgentControl.Viewer"]) in observed
     assert observed.count(("call", "capabilities")) == 1

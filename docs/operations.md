@@ -1,5 +1,49 @@
 # Operations runbook
 
+## MCP-led adoption content lifecycle
+
+Adoption recommendations, briefs, actions, learning-card authoring and follow-up
+are driven by the connected AI agent through the typed MCP adoption operations.
+There is no dedicated Adoption page or manual browser editor. The existing app
+retains analytics, collection, MCP setup and safe employee-learning discovery.
+The backend owns evidence, authorization and durable tenant content; the AI
+consumer interprets evidence and saves only on explicit user intent.
+Drafts need no inventory/report prerequisite. Expected-revision conflicts retain
+the consumer's unsaved work; interrupted create retries must retain the original
+timestamped UUID request and exact canonical payload. MCP content and employee
+learning reads accept smaller bounded pages when the response limit is reached.
+Employee browser continuations clear the prior projection before revalidating privacy.
+Exact creator/Admin deletion requires `delete:<record UUID>` confirmation through
+the existing authorized API/bearer policy, not a provider job.
+
+Ordinary sign-out/session cleanup does not delete tenant business content.
+For an actual principal privacy deletion, use the existing database operator CLI:
+`node node_modules/tsx/dist/cli.mjs backend/scripts/database.ts erase-adoption-private <tenant-id> <actual-principal-id> <database-name>/<tenant-id>/<actual-principal-id>`.
+It requires the existing `agentcontrol_admin` connection and current schema,
+serializes exact tenant content, removes authored payloads/receipts/references,
+clears assignment/progress in independently authored records and retains/increments
+revocation authority. It does not remove independently authored cards/actions.
+The principal's separate create-request cutoff preserves erased retry identities,
+including accepted clock-skewed timestamps, across reset and restore. It does not
+advance the bearer-issuance cutoff into the future or delay fresh authentication.
+Use the exact saved `creatorId`/session `homeAccountId` authority key, not a guessed
+email, display name or different local object identifier.
+The existing explicitly confirmed database reset is the tenant/database-wide
+content-erasure owner; never drop a volume or erase revocation authority instead.
+
+Receipt retention uses the existing bounded lifecycle worker. Full capacity is a
+concrete storage limitation, not a release, approval or feature-enable gate.
+Current-schema backup/restore cannot resurrect content erased/corrected after
+the snapshot. Current bounded receipts preserve deleted outcomes even for content
+created/deleted after that snapshot. Independent unchanged content survives with
+removed-reference markers. Existing principal epoch/cutoff revocations are merged
+monotonically from the current database, including post-snapshot privacy deletions,
+before preparation and again before reopening. After a clean reset, expect business-content and imported CSV loss;
+automatic application reads repopulate provider evidence on normal authenticated
+entry, while genuine CSV reimport remains explicit. A successful reset/deployment
+does not prove recovery until a real caller completes sign-in and the applicable
+sources publish.
+
 For initial setup, use [Deployment setup](deployment-setup.md); for hosted
 updates, monitoring and recovery, use [Azure deployment](azure-production-deployment.md).
 Identity and data-scope rules are in the [security model](security-model.md).
@@ -46,9 +90,11 @@ Never clear maintenance markers or alter operational state to force readiness.
 
 1. Sign in; keep the browser visible and online. Read-only sync starts automatically,
    including after reset: no Admin session, Permissions visit or enable step.
-2. Open **Sync**: expect **Users**, **Graph packages** and **Power Platform** complete
-   with saved counts. The modal closes when all three are saved;
-   **Continue to workspace** dismisses it without cancelling sync.
+2. Open **Sync**: expect applicable **Users** and **Graph packages** application
+   reads to publish saved counts. Eligible staff separately collect delegated
+   **Power Platform**; roleless entry does not acquire that authority. Provider
+   denial remains explicit and does not block unrelated supported sources.
+   **Continue to workspace** dismisses the notice without cancelling sync.
 3. Check saved **Agents** and **Users**. Complete sources are tenant-shared;
    another account needs no personal first sync.
 
@@ -106,7 +152,10 @@ Package controls and Studio quarantine have separate [requirements](user-roles-a
 
 Office uses saved directory/license and Office app reports, not agent CSVs/manual sync.
 If preparation fails after collection succeeds, keep the sources: local recovery
-runs every 30 seconds during normal operation. For persistent failure, correlate
+runs every 30 seconds during normal operation. A future-dated saved report is
+automatically reconsidered when its UTC date arrives, provided both saved sources
+are still fresh and valid; it needs no recollection or manual start.
+For persistent failure, correlate
 `office_derivation_failed` / `office_publication_cleanup_failed` with source/read
 diagnostics and repair derivation, storage or integrity; do not recollect healthy
 sources. Unknown/stale/denied/malformed is not zero adoption.
@@ -159,6 +208,15 @@ Incomplete pairs are not verified; repair failures and use a new filename.
 Existing targets are never overwritten.
 Omitting `-BackupFile` chooses a timestamped file in `.local/<project>/backups/`.
 
+Before a schema-changing deployment replaces the operator tag, inspect and
+preserve the installed operator's immutable image ID and attempt this backup
+with `$context.OperatorImageId` set to that verified matching image. Use a
+distinct dependency-base tag for rebuilding; do not use a tag the deployment
+will overwrite. Record the actual checksum, receipt and backup outcome.
+An installed-schema dump remains a protected recovery artifact; it is not
+compatible with a different current runtime and does not justify an old-schema
+serving path. Qualify current-schema restore separately in isolation.
+
 ### Restore for review
 
 ```powershell
@@ -179,6 +237,11 @@ Invoke-LocalDeployment $context 'Reopen' `
 ```
 
 Reopen repeats reconciliation/retention and returns the review database to normal.
+Saved inventory and people cleared since the backup stay unavailable in the
+restored database; source fences and inventory publication revisions still permit
+normal authorized recollection.
+Cleared inventory heads retain an advanced revision fence rather than restarting
+publication at revision zero; already-empty heads keep their existing revision.
 Neither command switches the app's database. Sessions stay revoked; never replay
 uncertain writes. After failure, keep any created target isolated, repair and use
 a new name. Follow [Disaster recovery](../infra/disaster-recovery.md) for serving
@@ -252,7 +315,9 @@ pwsh ./deploy-local.ps1 start -Project agent-control -DbReset
   signed-token cutoffs in the PostgreSQL maintenance database before deletion.
   It locks the canonical principal owner through DROP; a missing owner in an
   initialized database, a failed security publication, or an observed loss of
-  the principal-lock connection before DROP prevents deletion. Reset targets
+  either the reset-lock or principal-lock connection before DROP prevents deletion.
+  Maintenance connection errors retain the exact validation/drop/create failure
+  phase rather than escaping as uncaught events. Reset targets
   must fit PostgreSQL's 63-byte identifier limit; truncated names are rejected.
   Fresh initialization transactionally restores that minimum authority to the
   current principal owner, including after an interrupted reset. It reads the
@@ -330,3 +395,20 @@ engine, Playwright package version and installed browser revisions. It reuses
 the current fixture authentication/loopback/provider/resource-ownership guards;
 the catalog case does not intercept settings requests. Evidence belongs to the
 runner's project-owned artifact directory, not a host `/evidence` directory.
+
+The existing `adoption-content` and `mcp-end-to-end` suites also execute the
+complete selected department/SDK/browser-account journey and compact capacity
+case. `mcp-agent-discovery-capacity` retains the original 100k-person/200k-agent/
+1m-edge scenario and adds 10,000 frozen people in 500 exact company/department
+groups with overlapping reports and ambiguous identities. Compact qualification
+uses five warm-ups and twenty measured correct reads, retaining every HTTP/SQL
+sample and separate MCP envelope bytes; nearest-rank p95 must be at most two
+seconds. Exact 128-KiB UTF-8 acceptance and one-byte-over rejection are tested.
+Settings browser failures retain their request timeline and Playwright trace;
+the ordinary 20-second deadline is unchanged.
+Complete tool schemas are materialized on expansion rather than eagerly
+rendered while hidden; complete-schema search and exact accessible disclosure
+remain available. This is a rendering optimization, not an access prerequisite.
+Inventory and package capture return only the canonical selected-read fields
+and their transaction-pinned publication revisions, never internal endpoint or
+query-hash fields.

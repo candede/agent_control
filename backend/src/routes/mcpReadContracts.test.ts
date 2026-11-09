@@ -31,7 +31,7 @@ vi.hoisted(() => {
     clientId: "22222222-2222-2222-2222-222222222222", clientSecret: "synthetic-only", domains: ["example.invalid"],
     integration: { clientId: "33333333-3333-3333-3333-333333333333", audience: "22222222-2222-2222-2222-222222222222", scope: "AgentControl.Access" } }]);
 });
-const corpus = JSON.parse(readFileSync(new URL("../../scripts/fixtures/mcp-workflows.json", import.meta.url), "utf8"));
+const corpus = JSON.parse(readFileSync(new URL("../../../frontend/public/customer-kit/adoption-intelligence/recipes.json", import.meta.url), "utf8"));
 const alex: string = corpus.ids.nativePerson;
 const canonical = (n: number) => `${corpus.ids.canonicalPrefix}${String(n).padStart(12, "0")}`;
 const person = (n: number) => `${corpus.ids.personPrefix}${String(n).padStart(12, "0")}`;

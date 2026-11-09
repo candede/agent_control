@@ -20,6 +20,7 @@ export type McpRuntimeMetadata = {
   instructions: string; tools: McpTool[]; storageReady: boolean; transport: "streamable-http";
 };
 export type McpConfiguredSettings = { resourceUrl: string; localHostPort?: number };
+export type McpDiscoveryConnection = { state: "not_configured" } | { state: "available"; resourceUrl: string };
 export type McpConnectionSettings =
   | { state: "not_configured" }
   | { state: "unavailable" | "binding_mismatch"; configured: McpConfiguredSettings; code: string }
@@ -60,19 +61,25 @@ function parseBoundedJson(raw: string, maximumBytes: number, maximumDepth: numbe
   if (typeof raw !== "string" || new TextEncoder().encode(raw).length > maximumBytes) invalid();
   const frames: Array<Set<string> | null> = [];
   let tokens = 0;
-  for (const match of raw.matchAll(/"(?:[^"\\]|\\.)*"|[{}[\]]/g)) {
+  for (let index = 0; index < raw.length; index++) {
+    const token = raw[index];
+    if (token !== '"' && token !== "{" && token !== "[" && token !== "}" && token !== "]") continue;
     if (++tokens > maximumTokens) invalid();
-    const token = match[0];
     if (token === "{" || token === "[") {
       frames.push(token === "{" ? new Set() : null);
       if (frames.length > maximumDepth) invalid();
     } else if (token === "}" || token === "]") frames.pop();
     else {
+      const start = index++;
+      for (; index < raw.length && raw[index] !== '"'; index++) {
+        if (raw[index] === "\\") index++;
+      }
+      if (index >= raw.length) invalid();
       const keys = frames.at(-1);
-      let next = match.index + token.length;
+      let next = index + 1;
       while (/[\t\n\r ]/.test(raw.charAt(next))) next++;
       if (!keys || raw.charAt(next) !== ":") continue;
-      const key: string = JSON.parse(token);
+      const key: string = JSON.parse(raw.slice(start, index + 1));
       if (keys.has(key)) invalid();
       keys.add(key);
     }

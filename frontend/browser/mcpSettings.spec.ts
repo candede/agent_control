@@ -2,28 +2,59 @@ import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { fixtureLoginUrl } from "./permissionFixtures";
 
+test.use({ trace: "retain-on-failure" });
+type TimelineEntry = { event: string; path: string; ms: number; status?: number };
+const timelines = new WeakMap<Page, TimelineEntry[]>();
+test.beforeEach(async ({ page }) => {
+  const start = performance.now();
+  const timeline: TimelineEntry[] = [];
+  timelines.set(page, timeline);
+  page.on("request", request => {
+    if (timeline.length < 200) timeline.push({ event: "request", path: new URL(request.url()).pathname, ms: performance.now() - start });
+  });
+  page.on("response", response => {
+    if (timeline.length < 200) timeline.push({ event: "response", path: new URL(response.url()).pathname,
+      ms: performance.now() - start, status: response.status() });
+  });
+});
+test.afterEach(async ({ page }, info) => {
+  await info.attach("request-timeline", { body: JSON.stringify(timelines.get(page)), contentType: "application/json" });
+});
+
 async function login(page: Page, scenario: string, username = "fixture@example.invalid") {
   const url = new URL(fixtureLoginUrl(scenario, username));
   url.searchParams.set("returnTo", `/mcp-settings?${new URLSearchParams({ fixture: scenario })}`);
   await page.goto(url.href);
 }
 
-test("real browser to session API to Python MCP displays the caller's projected catalog exactly", async ({ page }) => {
-  // Deliberately no route interception: all settings traffic reaches the real API and Python service.
+async function availableSettings(page: Page) {
   await login(page, "role-Viewer");
   await expect(page.getByRole("heading", { name: "MCP settings", exact: true })).toBeVisible();
   await expect(page.getByText(/^\d+ shown \/ \d+ advertised tools$/)).toBeVisible();
-  await expect(page.getByRole("heading", { name: "MCP settings", exact: true })).toHaveCSS("font-size",
-    test.info().project.name === "mobile" ? "25px" : "28px");
-  await page.screenshot({ path: test.info().outputPath("mcp-settings-overview.png") });
-  expect(new URL(page.url()).pathname).toBe("/mcp-settings");
   const response = await page.request.get("/api/mcp/settings");
   expect(response.status()).toBe(200);
   expect(response.headers()["cache-control"]).toBe("no-store");
   const settings = await response.json();
   expect(settings.state).toBe("available");
+  return settings;
+}
+
+test("real browser to session API to Python MCP displays the caller's projected catalog exactly", async ({ page }) => {
+  // Deliberately no route interception: all settings traffic reaches the real API and Python service.
+  const settings = await availableSettings(page);
+  await expect(page.getByRole("heading", { name: "MCP settings", exact: true })).toHaveCSS("font-size",
+    test.info().project.name === "mobile" ? "25px" : "28px");
+  await page.screenshot({ path: test.info().outputPath("mcp-settings-overview.png") });
+  expect(new URL(page.url()).pathname).toBe("/mcp-settings");
   const count = settings.runtime.tools.length;
   expect(settings.runtime.tools.some((tool: { name: string }) => tool.name === "preview_end_user")).toBe(true);
+  for (const name of ["agent_catalog", "preview_end_user"]) {
+    const tool = settings.runtime.tools.find((tool: { name: string }) => tool.name === name);
+    expect(tool.description).toContain("Origin is API-owned");
+    const schema = JSON.stringify(tool.outputSchema);
+    for (const field of ["origin", "organization_created", "microsoft", "generationId", "sourceIdentity", "revision", "descriptionState"])
+      expect(schema).toContain(field);
+  }
   expect(settings.runtime.tools.some((tool: { name: string }) => tool.name === "execute_agent_control")).toBe(false);
   expect(settings.privacy).toEqual({ hide_employee_details: false, hide_champion_employee: false });
   await expect(page.getByRole("heading", { name: "Employee discovery privacy" })).toBeVisible();
@@ -42,6 +73,11 @@ test("real browser to session API to Python MCP displays the caller's projected 
   await expect(page.getByText("http://localhost:53109/client/callback")).toBeVisible();
   await expect(page.getByText(String(settings.configured.localHostPort), { exact: true })).toBeVisible();
   await expect(page.getByText("Unverified", { exact: true })).toHaveCount(2);
+});
+
+test("real MCP catalog schema inspection is exact, keyboard accessible and bounded", async ({ page }) => {
+  const settings = await availableSettings(page);
+  const count = settings.runtime.tools.length;
   const search = page.getByRole("searchbox", { name: "Search tools, descriptions and schemas" });
   await search.fill("inventory");
   const filtered = settings.runtime.tools.filter((tool: { name: string; description?: string; inputSchema: unknown; outputSchema?: unknown }) =>
@@ -62,10 +98,22 @@ test("real browser to session API to Python MCP displays the caller's projected 
   await page.screenshot({ path: test.info().outputPath("mcp-settings-tool-detail.png") });
   expect((await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21aa"]).analyze()).violations).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test("real MCP catalog refresh and reload preserve filtering while sign-out discards metadata", async ({ page }) => {
+  const settings = await availableSettings(page);
+  const count = settings.runtime.tools.length;
+  await page.getByRole("searchbox", { name: "Search tools, descriptions and schemas" }).fill("inventory");
+  const filtered = settings.runtime.tools.filter((tool: { name: string; description?: string; inputSchema: unknown; outputSchema?: unknown }) =>
+    `${tool.name}\n${tool.description ?? ""}`.toLowerCase().includes("inventory")
+    || JSON.stringify({ input: tool.inputSchema, output: tool.outputSchema }).toLowerCase().includes("inventory"));
+  await expect(page.getByText(`${filtered.length} shown / ${count} advertised tools`)).toBeVisible();
   await page.getByRole("button", { name: "Refresh metadata", exact: true }).click();
   await expect(page.getByText(`${filtered.length} shown / ${count} advertised tools`)).toBeVisible();
   await page.reload();
   await expect(page.getByText(`${count} shown / ${count} advertised tools`)).toBeVisible();
+  await page.getByText("Server instructions", { exact: true }).click();
+  await expect(page.getByTestId("mcp-instructions")).toBeVisible();
   await page.getByRole("button", { name: /Sign out/ }).click();
   await expect(page.getByRole("button", { name: "Sign in with Entra ID" })).toBeVisible();
   await expect(page.getByTestId("mcp-instructions")).toHaveCount(0);

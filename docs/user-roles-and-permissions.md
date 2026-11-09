@@ -31,6 +31,8 @@ access and a browser conversational handoff; they cannot read adoption, enumerat
 people, inspect jobs or run manual sync/controls. Exact member verification uses
 the actual tenant-local `oid`, not licensing, email affiliation or guessed workplace
 fields. Application-only reads bootstrap automatically at authenticated entry.
+They also read explicitly employee-shared, tenant-wide structured learning cards.
+They never receive staff briefs/actions, narratives, attribution or baseline metrics.
 Viewer/Uploader/Admin remain the actual authorization actors for read-only employee
 preview; a selected subject never supplies roles, tokens or permissions.
 
@@ -47,6 +49,27 @@ routes, including Admin previews and ordinary staff discovery. They do not
 remove authorized existing adoption/admin reads or change collection/ranking.
 Identity-bearing saved workplace labels are redacted for display without changing
 the saved company/department scope used for these answers.
+
+### MCP-led adoption content
+
+All three staff roles use MCP to read tenant-owned briefs/cards/actions. Creators and tenant
+Admins edit core fields, choose card visibility and delete exact records. Assigned
+staff update only action status/progress; assignment grants neither roles nor
+provider access and requires no prior app-workspace sign-in. Expected revisions reject
+lost updates. Company/department labels filter relevance, never grant access.
+Missing-profile active employees can read all explicitly employee-shared cards.
+Only finite task/input/prompt/output/review/failure slots are republished; arbitrary
+prose, examples, attribution and arbitrary labels lack complete identity evidence
+and are explicitly withheld through the current discovery privacy renderer.
+Linked agents must retain the exact saved canonical source set and current privacy
+permission; unavailable/deleted/corrected references are not substituted.
+The connected AI agent drives staff authoring, requested saves and follow-up;
+there is no dedicated Adoption page or manual browser content editor.
+
+No roles were added. Exact identifiers remain Viewer
+`8a02b7f3-bdbf-4193-8b29-4da05684fb5a`, UsageReportUploader
+`fdc127ee-2377-4708-a5d4-0ddc4f46d83b`, Admin
+`9feab889-b807-4a97-a504-944ab53a380b`; the content unit suite asserts the manifest.
 
 Read-only sync starts automatically after sign-in while the app is visible and
 online, including on first use. No **Permissions** visit or **Check status** is required.

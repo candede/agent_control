@@ -24,6 +24,9 @@ import { InventoryQueries } from "../src/db/inventoryQueries.js";
 import { backupTableKeys, fingerprintAlgorithm } from "./backupInventory.js";
 import { seedDisjointReportUnion } from "./officialReportFixtures.js";
 import { DataGenerations } from "../src/db/dataGenerations.js";
+import { AdoptionContent } from "../src/services/adoptionContent.js";
+import { manualDraft } from "../src/services/adoptionContentTestSupport.js";
+import { eraseAdoptionPrivate } from "./database.js";
 
 let fixture: Awaited<ReturnType<typeof testDatabase>>;
 const directory = join(process.cwd(), "artifacts", "test-scratch", `postgres-backup-${randomUUID()}`);
@@ -155,6 +158,17 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await fixture.operator.query(`INSERT INTO job_items(id,job_id,ordinal,target_id,display_name,status,sent_at)
     VALUES(gen_random_uuid(),$1,0,'fixture-package','Fixture package','running',clock_timestamp())`,[uncertainJob]);
   await fixture.operator.query("INSERT INTO sessions(sid,sess,expire) VALUES ('restored-session','{}',clock_timestamp()+interval '1 hour')");
+  const content = new AdoptionContent(fixture.runtime);
+  const contentActor = (id: string) => ({ tenantId: "content-restore-tenant", homeAccountId: id, username: "fixture@example.invalid",
+    displayName: "Fixture", roles: ["AgentControl.Viewer" as const] });
+  const contentKey = () => `${Date.now()}.${randomUUID()}`;
+  const retainedContent = await content.create(contentActor("retained-owner"), contentKey(), manualDraft("card"));
+  const editedContent = await content.create(contentActor("edited-owner"), contentKey(), manualDraft());
+  const erasedContent = await content.create(contentActor("erased-owner"), contentKey(), manualDraft("card"));
+  const deletedParentKey = contentKey();
+  const deletedParent = await content.create(contentActor("parent-owner"), deletedParentKey, manualDraft());
+  const independentCard = await content.create(contentActor("independent-owner"), contentKey(),
+    { ...manualDraft("card"), linkedIds: [deletedParent.id] });
   const filename = join(directory,"fixture.dump");
   const before = await fingerprints(fixture.operator);
   expect(before.inventory_exact_heads.count).toBe(1);
@@ -162,6 +176,16 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await expect(fingerprints(fixture.operator, Array.from({ length: 129 }, (_, index) => `table_${index}`)))
     .rejects.toThrow("Backup table inventory is invalid.");
   await backup(fixture.operator,filename);
+  await content.delete(contentActor("parent-owner"), deletedParent.id,
+    { expectedRevision: 1, confirmation: `delete:${deletedParent.id}` });
+  const postSnapshotKey = contentKey();
+  const postSnapshotContent = await content.create(contentActor("post-snapshot-owner"), postSnapshotKey, manualDraft());
+  await content.delete(contentActor("post-snapshot-owner"), postSnapshotContent.id,
+    { expectedRevision: 1, confirmation: `delete:${postSnapshotContent.id}` });
+  const postErasedKey = contentKey();
+  await content.create(contentActor("post-snapshot-erased"), postErasedKey, manualDraft());
+  await eraseAdoptionPrivate(fixture.operator, "content-restore-tenant", "post-snapshot-erased",
+    `${fixture.operator.options.database}/content-restore-tenant/post-snapshot-erased`);
   expect(statSync(filename).mode & 0o777).toBe(0o600);
   expect(statSync(`${filename}.json`).mode & 0o777).toBe(0o600);
   const receipt=JSON.parse(readFileSync(`${filename}.json`,"utf8"));
@@ -180,12 +204,23 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
   await usage.confirmDeletion(laterCorrectionScope,await usage.previewDeletion(laterCorrectionScope,laterCorrection.setId));
   await usage.confirmDeletion(usageScope,await usage.previewDeletion(usageScope,historicalReports.setId));
   await fixture.operator.query("DELETE FROM defender_hunting_jobs WHERE id=$1",[historicalHunt.jobId]);
+  await content.update(contentActor("edited-owner"), editedContent.id, { expectedRevision: 1, draft: { ...manualDraft(), title: "Current corrected content" } });
+  await eraseAdoptionPrivate(fixture.operator, "content-restore-tenant", "erased-owner",
+    `${fixture.operator.options.database}/content-restore-tenant/erased-owner`);
   const currentAfterReviewChanges=await fingerprints(fixture.operator);
   expect(await restore(fixture.operator,filename,target)).toEqual(before);
   expect(await fingerprints(fixture.operator)).toEqual(currentAfterReviewChanges);
   const restoredOperator = new pg.Pool({ ...databaseSettings(), database: target });
   const restoredRuntime = new pg.Pool({ ...databaseSettings(), database: target, user: "agentcontrol_app", password: fixturePassword });
   try {
+    expect((await restoredRuntime.query("SELECT id FROM adoption_content ORDER BY id")).rows.map(row => row.id))
+      .toEqual([retainedContent.id, independentCard.id].sort());
+    expect((await restoredRuntime.query("SELECT linked_references FROM adoption_content WHERE id=$1", [independentCard.id])).rows[0].linked_references)
+      .toEqual([{ id: deletedParent.id, state: "removed" }]);
+    expect((await restoredRuntime.query("SELECT id FROM adoption_content WHERE id=$1", [deletedParent.id])).rowCount).toBe(0);
+    expect((await restoredRuntime.query("SELECT content_id FROM adoption_content_receipts WHERE actor_id='erased-owner'")).rowCount).toBe(0);
+    expect((await restoredRuntime.query("SELECT deleted FROM adoption_content_receipts WHERE content_id=$1", [editedContent.id])).rows[0].deleted).toBe(true);
+    expect((await restoredRuntime.query("SELECT id FROM adoption_content WHERE id=$1", [erasedContent.id])).rowCount).toBe(0);
     const restoredInventory = new InventoryQueries(restoredRuntime, "synthetic-inventory-restore-read-secret");
     await expect(restoredInventory.page(inventorySelection.id, inventoryIdentity)).rejects.toMatchObject({ code: "selection_invalidated" });
     const restoredStore = new InventoryGenerations(restoredRuntime);
@@ -201,6 +236,13 @@ it("restores an isolated native PostgreSQL backup with exact schema/count/conten
     expect(restoredFence.unfenced).toBe(0);
     expect((await new DataGenerations(restoredRuntime).bearerAuthority("restored-tenant", "unknown-before-restore")).issuedAfter)
       .toBe("0");
+    const restoredContent = new AdoptionContent(restoredRuntime);
+    expect(await restoredContent.create(contentActor("parent-owner"), deletedParentKey, manualDraft()))
+      .toMatchObject({ id: deletedParent.id, state: "deleted", record: null, replayed: true });
+    expect(await restoredContent.create(contentActor("post-snapshot-owner"), postSnapshotKey, manualDraft()))
+      .toMatchObject({ id: postSnapshotContent.id, state: "deleted", record: null, replayed: true });
+    await expect(restoredContent.create(contentActor("post-snapshot-erased"), postErasedKey, manualDraft()))
+      .rejects.toMatchObject({ status: 409, code: "adoption_request_revoked" });
     expect((await restoredRuntime.query("SELECT status,error_code FROM job_items WHERE job_id=$1",[uncertainJob])).rows[0]).toEqual({status:"inconclusive",error_code:"restored_uncertain_write"});
     expect((await restoredRuntime.query("SELECT status,lease_owner,lease_until FROM jobs WHERE id=$1",[uncertainJob])).rows[0]).toEqual({status:"partial",lease_owner:null,lease_until:null});
     expect((await restoredRuntime.query("SELECT count(*)::int AS count FROM package_record_rows WHERE scope_id=$1",

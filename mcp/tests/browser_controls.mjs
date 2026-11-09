@@ -48,6 +48,11 @@ for (const { name, request: r, response, status = 200 } of cases) {
       return reports.readReportPage(`copilot-usage/users/${objectId}/agent-relationships`, query);
     },
     list_adoption_groups: () => reports.readReportPage("copilot-usage/adoption", r),
+    list_department_opportunities: () => reports.readReportPage("copilot-usage/adoption/opportunities", r),
+    list_opportunity_people: () => {
+      const { groupId, ...query } = r;
+      return reports.readReportPage(`copilot-usage/adoption/opportunities/${encodeURIComponent(groupId)}/people`, query);
+    },
     list_champion_agents: () => reports.readReportPage("copilot-usage/adoption/champions", r),
     list_agent_usage_history: () => {
       const { recordId, ...query } = r;

@@ -58,7 +58,7 @@ Subject = Annotated[
     AfterValidator(lambda value: _bounded_text(value, 512)),
 ]
 CardLimit = Annotated[int, Field(ge=1, le=20)]
-TextState = Literal["available", "absent", "privacy_withheld", "unsafe_withheld"]
+TextState = Literal["available", "absent", "privacy_withheld", "unsafe_withheld", "limit_withheld"]
 Source = Literal["graph_packages", "power_platform"]
 
 
@@ -145,21 +145,38 @@ class Affiliation(WireModel):
     department: str | None
 
 
-class Evidence(WireModel):
+class SourceMembership(WireModel):
     source: Source
+    generationId: str
+    sourceIdentity: str
+    revision: str
+
+
+class Evidence(SourceMembership):
     field: Literal["description", "title"]
     excerpt: str
 
 
-class Provenance(WireModel):
-    source: Source
+class OriginEvidence(SourceMembership):
+    field: Literal["type", "publisher", "resourceType", "creatorType"]
+    setId: str | None
+    versionId: str | None
+
+
+class Origin(WireModel):
+    kind: Literal["organization_created", "microsoft"]
+    evidence: list[OriginEvidence]
+
+
+class Provenance(SourceMembership):
     observedAt: str
-    descriptionField: str
+    descriptionField: Literal["longDescription", "shortDescription", "details.description"]
     descriptionState: TextState
 
 
 class Card(WireModel):
     id: str
+    origin: Origin
     title: DiscoveryText
     description: Description
     lifecycle: Literal["draft", "published", "unknown"]

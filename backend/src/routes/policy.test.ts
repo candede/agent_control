@@ -12,7 +12,10 @@ describe("route policy declarations", () => {
       "GET /auth/login", "POST /auth/login", "GET /auth/callback", "POST /auth/logout", "GET /me",
       "GET /capabilities", "GET /capabilities/check-progress", "POST /capabilities/check", "POST /capabilities/:id/probe", "PUT /capabilities/:id/configuration",
       "GET /workbench/metadata", "GET /workbench/jobs", "GET /mcp/settings", "GET /mcp/access-profile", "POST /mcp/authenticated-entry", "POST /audit/events/export.csv",
-      "POST /discovery/read", "POST /discovery/preview",
+      "GET /discovery/connection", "POST /discovery/read", "POST /discovery/preview",
+      "POST /discovery/learning", "POST /discovery/learning/preview",
+      "GET /adoption-content", "GET /adoption-content/:id", "POST /adoption-content",
+      "PATCH /adoption-content/:id", "DELETE /adoption-content/:id", "POST /adoption-content/:id/follow-up",
       "GET /agent-inventory", "GET /agent-inventory/summary", "GET /agent-inventory/facets", "POST /agent-inventory/selections",
       "GET /agent-inventory/health",
       "GET /agent-inventory/:recordId/about",
@@ -39,6 +42,7 @@ describe("route policy declarations", () => {
       "GET /copilot-usage/users", "GET /copilot-usage/users/facets", "GET /copilot-usage/users/unresolved-identities",
       "GET /copilot-usage/adoption", "GET /copilot-usage/adoption/facets",
       "GET /copilot-usage/adoption/summary", "GET /copilot-usage/adoption/departments",
+      "GET /copilot-usage/adoption/opportunities", "GET /copilot-usage/adoption/opportunities/:groupId/people",
       "GET /office-app-adoption/context", "GET /office-app-adoption/summary", "GET /office-app-adoption/comparison",
       "GET /office-app-adoption/history", "GET /office-app-adoption/groups", "GET /office-app-adoption/departments",
       "GET /office-app-adoption/facets", "GET /office-app-adoption/groups/:groupId/people",
@@ -73,7 +77,8 @@ describe("route policy declarations", () => {
 
   it("requires explicit staff roles on every sensitive authenticated route", () => {
     expect([...declaredRoutePolicies].filter(([, policy]) => policy.access === "authenticated" && !policy.roles?.length).map(([key]) => key).sort())
-      .toEqual(["GET /mcp/access-profile", "GET /me", "POST /auth/logout", "POST /discovery/read", "POST /mcp/authenticated-entry"]);
+      .toEqual(["GET /discovery/connection", "GET /mcp/access-profile", "GET /me", "POST /auth/logout",
+        "POST /discovery/learning", "POST /discovery/read", "POST /mcp/authenticated-entry"]);
   });
 
   it("requires directory-read authorization, Viewer access and CSRF for persisted people resolution", () => {

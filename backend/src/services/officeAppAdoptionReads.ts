@@ -19,7 +19,7 @@ export function boundedOfficeResponse<T>(value: T): T {
   if (bytes > 1048576) throw dataLimitError("office_response_bytes", 1048576, bytes);
   return value;
 }
-function groupRelations(context: OfficeContext) {
+export function officeGroupRelations(context: OfficeContext) {
   const query = context.query;
   const values: unknown[] = [context.observation?.id ?? null, JSON.stringify(query)];
   const sql = `WITH groups AS MATERIALIZED (
@@ -97,7 +97,11 @@ export class OfficeAppAdoptionReads {
     work: (client: pg.PoolClient, read: ReadContext) => Promise<T>): Promise<T> {
     const query = officeQuery(input);
     const selection = selectionId ? { id: selectionId } : await this.capture(identity, query);
-    return this.selections.read(selection.id, identity, async (client, { selection: saved, pins }) => {
+    return this.selections.read(selection.id, identity, async (client, selected) =>
+      boundedOfficeResponse(await work(client, await this.contextInRead(client, identity, query, selected))));
+  }
+  async contextInRead(client: pg.PoolClient, identity: SelectionIdentity, query: OfficeQuery,
+    { selection: saved, pins }: Awaited<ReturnType<DataSelections["assert"]>>): Promise<ReadContext> {
       if (saved.endpoint !== endpoint || saved.query_hash !== canonicalQuery(query, officeQueryFields)) throw new SelectionError("invalid_cursor");
       const observations = await Promise.all(pins.filter(pin => pin.root_kind === "office_observation")
         .map(pin => officeObservation(client, identity.tenantId, pin.generation_id)));
@@ -116,8 +120,7 @@ export class OfficeAppAdoptionReads {
           expiresAt: saved.expires_at.toISOString(), validatedAt: saved.validated_at.toISOString(),
           publicationRevisions: await readAutomaticInventoryRevisions(identity, client) },
       };
-      return boundedOfficeResponse(await work(client, { context, identity, queryHash: saved.query_hash }));
-    });
+      return { context, identity, queryHash: saved.query_hash };
   }
   context(identity: SelectionIdentity, query: OfficeQuery, selectionId?: string) {
     return this.read(identity, query, selectionId, async (_client, read) => read.context);
@@ -126,7 +129,7 @@ export class OfficeAppAdoptionReads {
     return this.read(identity, query, selectionId, async (client, { context }) => {
       if (!context.observation) return { organization: null, matching: null, matchingGroups: 0, filteredPeople: 0,
         suggestedChampions:null,filteredSuggestedChampions:null,baseline: null, context };
-      const { sql, values } = groupRelations(context);
+      const { sql, values } = officeGroupRelations(context);
       const organization = officeSavedMetrics((await client.query("SELECT metrics FROM office_observations WHERE generation_id=$1",
         [context.observation.id])).rows[0].metrics);
       const matching = metrics((await client.query(`${sql} SELECT ${officeGroupMetricProjection} FROM matching_groups`, values)).rows[0]);
@@ -170,7 +173,7 @@ export class OfficeAppAdoptionReads {
     if (!departments && options.limit !== undefined && options.limit !== 5) throw new AppError(400, "invalid_office_query", "Office groups use five groups per page.");
     if (departments && options.anchor !== undefined) throw new SelectionError("invalid_cursor");
     return this.read(identity, query, selectionId, async (client, { context, queryHash }) => {
-      const { sql, values } = groupRelations(context);
+      const { sql, values } = officeGroupRelations(context);
       const counts = (await client.query(`${sql} SELECT (SELECT count(*)::text FROM groups) AS total,
         (SELECT count(*)::text FROM matching_groups) AS filtered`, values)).rows[0];
       const total = exactCount(counts.total), filtered = exactCount(counts.filtered);
@@ -277,7 +280,7 @@ export class OfficeAppAdoptionReads {
   facets(identity: SelectionIdentity, query: OfficeQuery, kind: OfficeFacetKind, selectionId?: string, options: OfficePaging = {}): Promise<OfficePage<OfficeFacet>> {
     if (!["company","department"].includes(kind) || options.anchor !== undefined) throw new AppError(400,"invalid_office_facet","Expected company or department.");
     return this.read(identity, query, selectionId, async (client, { context, queryHash }) => {
-      const { sql, values } = groupRelations(context);
+      const { sql, values } = officeGroupRelations(context);
       const count = (await client.query(`${sql} SELECT count(*)::text AS count FROM (
         SELECT ${reportSearchSql(kind)} FROM matching_groups GROUP BY ${reportSearchSql(kind)}) facets`, values)).rows[0];
       const total = exactCount(count.count), limit = options.limit ?? 50;

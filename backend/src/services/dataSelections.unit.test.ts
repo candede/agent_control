@@ -23,6 +23,7 @@ const identity: SelectionIdentity = {
 };
 const at = new Date("2030-01-01T00:00:00Z");
 const expiresAt = new Date(at.getTime() + 600_000);
+const publicationRevisions = { graph_packages: "a".repeat(64), power_platform: "b".repeat(64), users: "c".repeat(64) };
 const roots: DependencyRoot[] = ["a", "z"].map(scopeId => ({
   kind: "tenant_history", scopeId, revision: "1", expiresAt,
 }));
@@ -100,6 +101,7 @@ describe("inventory selection dependency capacity", () => {
     vi.spyOn(inventory.reports.history, "expire").mockResolvedValue(0);
     vi.spyOn(inventory.reports, "currentInventoryData").mockResolvedValue({
       identity, evaluatedAt: at, query: { lowResponseThreshold: 5 },
+      publicationRevisions,
       metadata: {
         directory: directoryAvailable
           ? { ...source, generationId: "directory-generation", scopeId: "directory", revision: "1", state: "available" }
@@ -140,6 +142,7 @@ describe("inventory selection dependency capacity", () => {
     });
 
     const captured = await inventory.capture(identity, "canonical", { sortBy });
+    expect(captured.publicationRevisions).toEqual(publicationRevisions);
     expect(reconcile).toHaveBeenCalledExactlyOnceWith(expect.any(pg.Client), identity.tenantId);
     expect(rootCount).toBe(pinCount);
     expect(pins.filter(pin => pin.root_kind === "inventory_delta")).toHaveLength(17);
@@ -286,6 +289,7 @@ describe("selection scope-before-domain lock order", () => {
     });
     vi.spyOn(inventory.reports, "currentInventoryData").mockResolvedValue({
       identity, evaluatedAt: at, query: { lowResponseThreshold: 5 },
+      publicationRevisions,
       metadata: { directory: source("directory"), app_activity: source("app_activity") },
       report: { setId: null, activeSetId: null, activeRevision: "1", historyRevision: "0", historyEpoch: "0",
         availability: "never_imported", staleAfterDays: 7, periodAgeDays: null, acceptedAgeDays: null,
@@ -320,7 +324,8 @@ describe("selection scope-before-domain lock order", () => {
       await prepared.persist?.(client, selection);
       return selection;
     });
-    await inventory.capture(suppliedIdentity, "a", suppliedQuery);
+    const captured = await inventory.capture(suppliedIdentity, "a", suppliedQuery);
+    expect(captured.publicationRevisions).toEqual(publicationRevisions);
     expect(events).toEqual(["scopes", "association"]);
     const criteria = { availableTo: "~some-or-all", operationIdPrefix: "REF_CASE", sortBy: initialSort };
     expect(inventory.selections.captureWith).toHaveBeenCalledWith(identity, "inventory", {

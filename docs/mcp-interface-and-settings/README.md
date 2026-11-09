@@ -143,8 +143,11 @@ it is not the owner of unfinished functionality from earlier phases.
   without paraphrasing or dropping tools. Descriptions rendered on screen retain
   their exact text; client use of that guidance remains client-dependent.
 - No extra public MCP prompts/resources or generic discovery gateway are needed.
-  Do not add a separate hand-maintained server description: the purpose comes
-  from the same instructions or supported server-information fields.
+  Do not add a separate hand-maintained runtime server description: the purpose
+  comes from the same instructions or supported server-information fields.
+  Connector-wizard descriptions and consumer system-instruction templates may
+  be delivered as canonical customer setup assets. Clearly distinguish them
+  from exact runtime metadata; never substitute them for advertised instructions.
 
 ### C. Private runtime visibility
 

@@ -5,6 +5,7 @@ import { unknownOrigin } from "../types/actionOrigin.js";
 import { readableReportVersionSql } from "./reportCapacitySchema.js";
 import { officeAppAdoptionSchemaSql } from "./officeAppAdoptionSchema.js";
 import { agentDiscoverySchemaSql } from "./agentDiscoverySchema.js";
+import { adoptionContentSchemaSql } from "./adoptionContentSchema.js";
 
 const schemaBaseSql: string = String.raw`
 CREATE COLLATION inventory_text_order(
@@ -2164,6 +2165,7 @@ CREATE TABLE data_principal_epochs (
   , principal_id text NOT NULL
   , epoch bigint DEFAULT 0 NOT NULL
   , bearer_issued_after bigint DEFAULT 0 NOT NULL CONSTRAINT data_principal_epochs_bearer_issued_after_check CHECK (bearer_issued_after >= 0)
+  , adoption_request_cutoff bigint DEFAULT 0 NOT NULL CONSTRAINT data_principal_epochs_adoption_request_cutoff_check CHECK (adoption_request_cutoff >= 0)
   , CONSTRAINT data_principal_epochs_epoch_check CHECK (epoch >= 0)
   , CONSTRAINT data_principal_epochs_principal_id_check CHECK (length(principal_id) >= 1
                                                            AND length(principal_id) <= 256)
@@ -6698,5 +6700,5 @@ VALUES ('records')
      , ('report_payloads')
      , ('report_staging');
 `;
-export const currentSchemaSql: string = agentDiscoverySchemaSql + auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql
+export const currentSchemaSql: string = agentDiscoverySchemaSql + auditOriginValidationSql + schemaBaseSql + auditOriginIntegritySql + agentControlReceiptsSql + adoptionContentSchemaSql
   + officeAppAdoptionSchemaSql;

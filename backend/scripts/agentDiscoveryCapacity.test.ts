@@ -20,6 +20,109 @@ import { discoveryQuerySettingsSql } from "../src/db/agentDiscoveryQueries.js";
 import type { DiscoveryRequest } from "../src/types/agentDiscovery.js";
 import type { AuthenticatedUser } from "../src/types/session.js";
 import type pg from "pg";
+import { setupAuditOriginHttp, closeAuditOriginHttp } from "../src/routes/auditOriginHttpTestSupport.js";
+import { sdkJourney, type SdkTrace } from "../src/routes/mcpSdkJourneyTestSupport.js";
+import { officeFixturePerson } from "./officeAppAdoptionFixtures.js";
+import { publishDepartmentEvidenceOffice, publishDepartmentEvidenceReports } from "./departmentEvidenceFixtures.js";
+import type { OpportunityPage } from "../src/types/departmentOpportunity.js";
+
+it("measures correct compact SQL/HTTP/MCP reads over 10000 frozen people and 500 overlapping exact groups", async () => {
+  if (process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1" || !process.env.AGENT_CONTROL_MCP_SQL_JOURNEY) {
+    throw new Error("Use the existing isolated mcp-agent-discovery-capacity SDK suite.");
+  }
+  const h = await setupAuditOriginHttp("mcp"), identity = await reportIdentity(h.database, h.actor);
+  const event = (value: object) => console.info(JSON.stringify({ event: "opportunity_capacity", ...value }));
+  const originals = new Map<pg.PoolClient, pg.PoolClient["query"]>();
+  let sqlMs = 0, sqlCalls = 0;
+  let stop: (() => void) | undefined;
+  try {
+    const people = Array.from({ length: 10000 }, (_, index) => {
+      const person = officeFixturePerson(index + 1);
+      person.identity.companyName = `Company ${index % 10}`;
+      person.identity.department = `Department ${Math.floor(index / 10) % 50}`;
+      person.identity.displayName = `Duplicate name ${index % 20}`;
+      return person;
+    });
+    people[9999].identity.userPrincipalName = people[0].identity.userPrincipalName;
+    await publishDepartmentEvidenceOffice(h.database, identity, people);
+    await publishDepartmentEvidenceReports(h.database, identity);
+    await publishDepartmentEvidenceReports(h.database, identity, { extraUsers: ["unresolved-token,Unknown,1,10,"] });
+    const achieved = (await h.database.query(`SELECT count(*)::int AS people,
+      count(DISTINCT (payload->>'company',payload->>'department'))::int AS groups
+      FROM office_person_facts`)).rows[0];
+    expect(achieved).toEqual({ people: 10000, groups: 500 });
+    const sets = (await h.database.query("SELECT count(*)::int AS sets FROM official_usage_sets")).rows[0].sets;
+    expect(sets).toBeGreaterThanOrEqual(2);
+    const first = await h.request("/copilot-usage/adoption/opportunities");
+    expect(first.status).toBe(200);
+    const pin = await first.json() as OpportunityPage;
+    expect(pin.counts).toEqual({ total: 500, filtered: 500 });
+    expect(pin.summary).toEqual({ officeActive: 9999, positive: 6, noReported: 0, unknown: 9993 });
+    const query = pin.value[0].drilldowns.audience.query;
+    const params = new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)]));
+    stop = observeTransactionStart(async client => {
+      if (originals.has(client)) return;
+      const original = client.query; originals.set(client, original);
+      client.query = ((...args: unknown[]) => {
+        const start = performance.now();
+        const result = Reflect.apply(original, client, args) as Promise<unknown> | undefined;
+        if (typeof result?.finally === "function") {
+          return result.finally(() => { sqlMs += performance.now() - start; sqlCalls++; });
+        }
+        return result;
+      }) as typeof client.query;
+    });
+    const samples: Array<{ index: number; warmup: boolean; status: number | null; httpMs: number; sqlMs: number;
+      sqlCalls: number; apiBytes: number; correct: boolean; error: string | null }> = [];
+    for (let index = 0; index < 25; index++) {
+      sqlMs = 0; sqlCalls = 0;
+      const start = performance.now();
+      let status: number | null = null, apiBytes = 0, correct = false, error: string | null = null;
+      try {
+        const response = await h.request(`/copilot-usage/adoption/opportunities?${params}`);
+        status = response.status;
+        const bytes = Buffer.from(await response.arrayBuffer()); apiBytes = bytes.length;
+        const page = JSON.parse(bytes.toString("utf8")) as OpportunityPage;
+        correct = status === 200 && page.value.length === 10 && apiBytes <= 131072
+          && JSON.stringify(page.counts) === JSON.stringify(pin.counts)
+          && JSON.stringify(page.summary) === JSON.stringify(pin.summary)
+          && JSON.stringify(page.value) === JSON.stringify(pin.value)
+          && page.value.every(group => group.coverage.state === "partial"
+            && group.agentEvidence.positive! + group.agentEvidence.noReported! + group.agentEvidence.unknown!
+              === group.denominators.officeActive);
+      } catch { error = "request_or_shape_failed"; }
+      const sample = { index, warmup: index < 5, status, httpMs: performance.now() - start, sqlMs, sqlCalls, apiBytes, correct, error };
+      samples.push(sample); event({ stage: "http_sample", ...sample });
+    }
+    const measured = samples.slice(5), rank = Math.ceil(0.95 * measured.length);
+    const p95Ms = measured.map(sample => sample.httpMs).sort((a, b) => a - b)[rank - 1];
+    let trace: SdkTrace[] = [];
+    const results = await sdkJourney(h, Array.from({ length: 25 }, () =>
+      ({ name: "list_department_opportunities", request: query })), undefined, calls => { trace = calls; });
+    const envelopes = trace.slice(5), envelopeP95Ms = envelopes.map(call => call.seconds * 1000).sort((a, b) => a - b)[rank - 1];
+    event({ stage: "mcp_samples", warmups: trace.slice(0, 5), measured: envelopes });
+    event({ stage: "result", ...achieved, reportSets: sets, warmups: 5, measured: measured.length, rank,
+      p95Ms, envelopeP95Ms, apiBytesMax: Math.max(...samples.map(sample => sample.apiBytes)),
+      envelopeBytesMax: Math.max(...trace.map(call => call.bytes)), node: process.version,
+      platform: process.platform, architecture: process.arch, machine: os.cpus()[0]?.model,
+      cpus: os.cpus().length, memoryBytes: os.totalmem(),
+      cgroupMemory: readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim(),
+      postgres: (await h.database.query("SELECT version() AS version")).rows[0].version });
+    expect(samples.every(sample => sample.correct && !sample.error)).toBe(true);
+    for (const result of results) {
+      const page = result as OpportunityPage;
+      expect(page.summary).toEqual(pin.summary);
+      expect(page.counts).toEqual(pin.counts);
+      expect(page.value).toEqual(pin.value);
+    }
+    expect(p95Ms).toBeLessThanOrEqual(2000);
+    expect(envelopeP95Ms).toBeLessThanOrEqual(2000);
+    expect(trace.every(call => call.status === 200 && call.bytes <= 524288)).toBe(true);
+  } finally {
+    stop?.(); for (const [client, original] of originals) client.query = original;
+    await closeAuditOriginHttp();
+  }
+}, 180000);
 
 it("measures four discovery query shapes at 100k people, 200k catalog and 1m edges", async () => {
   if (process.env.AGENT_CONTROL_ISOLATED_TESTS !== "1") throw new Error("Use the existing isolated mcp-agent-discovery-capacity suite.");

@@ -1,5 +1,7 @@
 // Reviewed final-schema inventory. New DDL must explicitly update this contract.
 export const backupTableKeys: Readonly<Record<string, readonly string[]>> = {
+  adoption_content: ["id"],
+  adoption_content_receipts: ["tenant_id", "actor_id", "request_id"],
   agent_control_receipts: ["id"],
   agent_identity_cache: ["tenant_id", "principal_id", "record_id"],
   agent_people_cache: ["tenant_id", "object_id"],

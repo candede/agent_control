@@ -269,7 +269,7 @@ async def test_cloud_example_filters_to_real_read_only_tools_with_typed_inputs(b
         json={"jsonrpc": "2.0", "id": 100, "method": "tools/list", "params": {}},
     )
     catalog = {tool["name"]: tool for tool in result.json()["result"]["tools"]}
-    assert len(catalog) == len(PUBLIC_TOOLS) == 54
+    assert len(catalog) == len(PUBLIC_TOOLS) == 57
     for name in examples["github-cloud"]["mcpServers"]["agentControl"]["tools"]:
         tool = catalog[name]
         assert tool["annotations"]["readOnlyHint"] is True

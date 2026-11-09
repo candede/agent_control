@@ -843,15 +843,19 @@ def test_catalog_has_one_owner_and_no_control_gate_or_parallel_recovery_framewor
         "preview_discovery_search",
         "preview_discovery_detail",
         "preview_discovery_workplace",
+        "read_shared_learning",
+        "preview_shared_learning",
     }
     assert discovery <= added
-    assert len(added - discovery) == 75
-    assert len(OPERATIONS) == 113
+    assert len(added - discovery) == 95
+    assert len(OPERATIONS) == 135
     assert {operation.method for operation in OPERATIONS if operation.method == "PATCH"} == {
         "PATCH"
     }
     assert [operation.name for operation in OPERATIONS if operation.method == "PATCH"] == [
-        "update_package_access"
+        "update_adoption_content",
+        "progress_adoption_action",
+        "update_package_access",
     ]
     for name in (
         "execute_agent_control",

@@ -4,7 +4,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { config, type TenantConfiguration } from "../config.js";
 import { mcpMetadataMaximumBytes, type McpRuntimeMetadata } from "../types/mcpSettings.js";
-import { readMcpSettings as readProjectedMcpSettings } from "./mcpSettings.js";
+import { readMcpDiscoveryConnection, readMcpSettings as readProjectedMcpSettings } from "./mcpSettings.js";
 import type { McpAccessProfile } from "../types/mcpSettings.js";
 
 const projection: McpAccessProfile = { audience: "adoption", operations: [], staffPreviewAuthorized: true,
@@ -82,6 +82,44 @@ function nativeResponse(options: { status?: number; contentType?: string; body?:
 }
 
 describe("native MCP metadata transport without sockets", () => {
+  it("delivers only the validated tenant public resource to employee browser setup, without metadata transport", () => {
+    expect(readMcpDiscoveryConnection(tenant.tenantId)).toEqual({ state: "available", resourceUrl: metadata.binding.resourceUrl });
+    vi.stubEnv("MCP_METADATA_ORIGIN", "");
+    expect(readMcpDiscoveryConnection(tenant.tenantId)).toEqual({ state: "available", resourceUrl: metadata.binding.resourceUrl });
+    expect(readMcpDiscoveryConnection("other-tenant")).toEqual({ state: "not_configured" });
+    expect(mocks.http).not.toHaveBeenCalled(); expect(mocks.https).not.toHaveBeenCalled();
+  });
+
+  it.each(["MCP_CLIENT_ID", "MCP_API_CLIENT_ID", "MCP_PUBLIC_URL"])("withholds mismatched/invalid %s from employee setup", name => {
+    vi.stubEnv(name, "invalid");
+    expect(readMcpDiscoveryConnection(tenant.tenantId)).toEqual({ state: "not_configured" });
+  });
+
+  it.each([
+    "https://public-mcp.example.invalid//mcp",
+    "https://public-mcp.example.invalid/connect//mcp",
+    "https://public-mcp.example.invalid:0/mcp",
+  ])("withholds resource URLs rejected by the MCP server: %s", async resourceUrl => {
+    vi.stubEnv("MCP_PUBLIC_URL", resourceUrl);
+    expect(readMcpDiscoveryConnection(tenant.tenantId)).toEqual({ state: "not_configured" });
+    expect(await readMcpSettings(tenant.tenantId)).toMatchObject({
+      state: "unavailable", configured: { resourceUrl: "" }, code: "metadata_configuration_unavailable",
+    });
+    expect(mocks.http).not.toHaveBeenCalled();
+    expect(mocks.https).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://public-mcp.example.invalid/connect/mcp",
+    "https://public-mcp.example.invalid:8443/mcp",
+    "https://public-mcp.example.invalid:65535/mcp",
+  ])("preserves supported resource paths and ports: %s", resourceUrl => {
+    vi.stubEnv("MCP_PUBLIC_URL", resourceUrl);
+    expect(readMcpDiscoveryConnection(tenant.tenantId)).toEqual({ state: "available", resourceUrl });
+    expect(mocks.http).not.toHaveBeenCalled();
+    expect(mocks.https).not.toHaveBeenCalled();
+  });
+
   it("uses the private destination and public Host with an independently authenticated POST", async () => {
     const { transport, outgoing, incoming } = nativeResponse();
     const result = await readMcpSettings(tenant.tenantId);

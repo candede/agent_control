@@ -106,7 +106,8 @@ describe("official usage supersession lifecycle SQL", () => {
     expect(queries.some(sql => sql.startsWith("DECLARE ") && sql.includes(`FROM official_usage_sets AS record WHERE deleted_at IS NULL AND id NOT IN (${safeSelection})`))).toBe(true);
     expect(queries.some(sql => sql.startsWith("DECLARE ") && sql.includes(`FROM official_usage_set_versions AS record WHERE set_id NOT IN (${safeSelection})`))).toBe(true);
     expect(queries.some(sql => sql.startsWith("FETCH FORWARD 250 FROM "))).toBe(true);
-    expect(current.client.query).toHaveBeenNthCalledWith(1, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    expect(current.client.query).toHaveBeenNthCalledWith(1, "BEGIN");
+    expect(current.client.query).toHaveBeenNthCalledWith(2, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
     expect(current.client.query).toHaveBeenLastCalledWith("COMMIT");
     expect(current.client.release).toHaveBeenCalledOnce();
     for (const [, parameters] of [...current.client.query.mock.calls, ...restored.client.query.mock.calls]) {

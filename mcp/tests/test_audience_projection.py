@@ -57,7 +57,7 @@ async def test_real_audience_schema_metadata_and_measurement(
     assert {"agent_catalog", "my_workplace", "my_discovery_profile"} <= set(tools)
     assert ("preview_end_user" in tools) is bool(roles)
     if not roles:
-        assert len(tools) == 3
+        assert len(tools) == 4
         assert "subject" not in json.dumps(tools["agent_catalog"]["inputSchema"])
         assert not any(name in tools for name in ("inventory", "adoption", "users", "sync"))
     if audience in {"adoption", "uploader"}:
@@ -173,9 +173,9 @@ async def test_concurrent_same_server_principals_never_share_catalog(browser, se
     employee_catalog, admin_catalog, viewer_catalog = await asyncio.gather(
         read(employee), read(admin), read(viewer)
     )
-    assert len(employee_catalog["tools"]) == 3
+    assert len(employee_catalog["tools"]) == 4
     assert len(admin_catalog["tools"]) == len(PUBLIC_TOOLS)
-    assert len(viewer_catalog["tools"]) == 38
+    assert len(viewer_catalog["tools"]) == 41
     assert "execute_agent_control" not in {tool["name"] for tool in viewer_catalog["tools"]}
     assert not entra.api_calls
 
@@ -219,9 +219,7 @@ async def test_guest_authority_denial_never_grants_native_catalog_or_diagnostics
     assert (await browser.get("/.well-known/oauth-authorization-server")).status_code == 200
 
 
-async def test_initialize_only_refresh_and_repeated_list_always_enter_api_admission(
-    browser, entra
-):
+async def test_initialize_only_refresh_and_repeated_list_always_enter_api_admission(browser, entra):
     entra.response_claims = {"roles": []}
     client, issued = await tokens(browser)
     browser.headers["Authorization"] = "Bearer " + issued["access_token"]
@@ -231,9 +229,10 @@ async def test_initialize_only_refresh_and_repeated_list_always_enter_api_admiss
     ):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            assert [
-                request.url.path for request in entra.authority_calls
-            ] == ["/api/mcp/access-profile", "/api/mcp/authenticated-entry"]
+            assert [request.url.path for request in entra.authority_calls] == [
+                "/api/mcp/access-profile",
+                "/api/mcp/authenticated-entry",
+            ]
             assert not entra.api_calls
     browser.headers.pop("Authorization", None)
     refreshed = await browser.post(
@@ -254,10 +253,11 @@ async def test_initialize_only_refresh_and_repeated_list_always_enter_api_admiss
         async with ClientSession(read, write) as session:
             await session.initialize()
             for _ in range(2):
-                assert len((await session.list_tools()).tools) == 3
-    assert sum(
-        request.url.path.endswith("authenticated-entry") for request in entra.authority_calls
-    ) == 4
+                assert len((await session.list_tools()).tools) == 4
+    assert (
+        sum(request.url.path.endswith("authenticated-entry") for request in entra.authority_calls)
+        == 4
+    )
     assert not entra.api_calls
 
 
@@ -310,6 +310,9 @@ async def test_tightening_privacy_reprojects_the_same_token_and_one_action_famil
     original = await discovery(browser, issued)
     assert "You may contact creator/owners" in json.dumps(original)
     profile = deepcopy(entra.profiles["end_user"])
+    profile["operations"] = [
+        op for op in profile["operations"] if op["route"] == "/api/discovery/read"
+    ]
     profile["operations"][0]["inputChoices"]["operation"] = ["search"]
     entra.profiles_by_oid[USER] = profile
     entra.privacy = {

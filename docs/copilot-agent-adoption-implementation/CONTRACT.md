@@ -23,7 +23,7 @@ They are customer tasks, not sixteen API tools.
 | --- | --- | --- |
 | Office/agent analytics MCP coverage, exact department opportunity, provenance and bounded drilldowns | 01 | 05, 06 |
 | Complete linked About, suitable first-party/local discovery, source authority and privacy | 02 | 05, 06 |
-| Durable briefs/actions/cards, current schema, browser/MCP writes, safe employee learning and saved baselines | 03 | 05, 06 |
+| Durable briefs/actions/cards, current schema, MCP-led staff workflows, safe employee learning and saved baselines | 03 | 05, 06 |
 | Connection-time instructions, operation descriptions, schemas/metadata, canonical recipes/customer assets, Studio setup and copy/download UX | 04 | 05, 06 |
 | Whole-flow, client/model, first-run/reset, accessibility and measurable capacity verification | 05 | 06 |
 | Exact SEHA deployment, clean-reset recovery, live observations, fix-forward and cleanup | 06 | 06 |
@@ -41,9 +41,11 @@ record. Do not add a second implementation for the same requirement.
 - The consumer owns interpretation, functional task tagging, draft prompts,
   recommendations and user-requested save calls. It does not decide permissions
   or independently reconcile counts.
-- The browser reads/writes the API directly. It does not call MCP or invent
-  cohort arithmetic. Without a configured AI consumer, use honest copy-prompt
-  and editing workflows, not a nonfunctional "Generate with AI" button.
+- Staff adoption recommendations, authoring, requested saves, progress and
+  follow-up are driven by the configured AI consumer through MCP. Do not add a
+  dedicated Adoption page, manual browser editor or substitute staff workflow.
+  Existing browser analytics, sync/settings and safe employee discovery call the
+  API directly, never MCP, and do not invent cohort arithmetic or AI generation.
 - Saved content is new business knowledge, not another copy of telemetry.
   Reference canonical agents, scopes and source contexts; do not store complete
   people lists, inventory snapshots, report copies, or historical person facts
@@ -166,7 +168,7 @@ automatically send messages. Assignment never grants app roles or access.
 
 ## Persisted content and evidence lifetimes
 
-Phase 03 owns these contracts across storage, API, MCP and browser:
+Phase 03 owns these contracts across storage, API, MCP and existing employee discovery:
 
 - Selections/cursors are actor-bound read leases of at most ten minutes, not
   durable content identity or proof usable by another account. Validate supplied

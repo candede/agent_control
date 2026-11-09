@@ -145,8 +145,14 @@ function frontendHttpOperations() {
           }
         }
         if (node.expression.text === "fetch" && file.slice(root.length) !== "frontend/src/api/client.ts") {
-          expect(file.slice(root.length)).toBe("frontend/src/App.tsx");
-          expect(pathShape(node.arguments[0])).toBe("/api/auth/status");
+          if (file.slice(root.length) === "frontend/src/components/CustomerStarterKit.tsx") {
+            expect(node.arguments[0].getText(source)).toMatch(/^`\$\{base\}(manifest\.json|adoption-intelligence\/\$\{path\})`$/);
+            expect(node.arguments[1].getText(source)).toContain('credentials: "omit"');
+            expect(readFileSync(file, "utf8")).toContain('const base = "/customer-kit/";');
+          } else {
+            expect(file.slice(root.length)).toBe("frontend/src/App.tsx");
+            expect(pathShape(node.arguments[0])).toBe("/api/auth/status");
+          }
         }
       }
       ts.forEachChild(node, visit);
@@ -217,7 +223,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
         return `${method} ${path.startsWith("/api/") || path === "/{*path}" ? path : `/api${path}`}`;
       });
       expect(new Set(currentRoutes).size).toBe(currentRoutes.length);
-      expect(currentRoutes).toHaveLength(176);
+      expect(currentRoutes).toHaveLength(187);
       expect(currentRoutes.filter(route => route.includes("/office-app-adoption/"))).toHaveLength(8);
       expect(currentRoutes).not.toContain("GET /security");
       expect(currentRoutes).not.toContain("POST /api/auth/consent");
@@ -449,8 +455,8 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document).toContain("Context.client_id");
     expect(document).toContain("remains reported meta");
     expect(document).toContain("The API still assigns **reported**");
-    expect(document).toContain("54 native domain tools");
-    expect(document).toContain("113 canonical operations");
+    expect(document).toContain("57 native domain tools");
+    expect(document).toContain("135 canonical operations");
     expect(document).toContain("request-local invocation owner");
     expect(document).toContain("POST/PATCH/DELETE submissions are never automatically replayed");
     expect(document).toContain("Do not retain protocol session IDs");
@@ -459,7 +465,7 @@ describe("phase 01 canonical contract feasibility (synthetic, no DB/provider/lis
     expect(document).toContain("no automatic double dispatch");
     const tools = routeRows.map(row => row[3].split("|").at(-3)?.trim())
       .filter(tool => tool !== "—" && tool !== "HTTP only").flatMap(tool => tool?.split(", ") ?? []);
-    expect(tools).toHaveLength(113);
+    expect(tools).toHaveLength(135);
     expect(new Set(tools).size).toBe(tools.length);
   });
 });

@@ -32,6 +32,7 @@ describe("API-owned access profile", () => {
   it("has finite restricted roleless operations, no preview, provider readiness or directory data", async () => {
     const result = await profile([]);
     expect(result).toEqual({ audience: "end_user", operations: [
+      { method: "POST", route: "/api/discovery/learning" },
       { method: "POST", route: "/api/discovery/read", inputChoices: { operation: ["profile", "search", "detail", "workplace"] } },
       { method: "GET", route: "/api/mcp/access-profile" },
       { method: "POST", route: "/api/mcp/authenticated-entry" },

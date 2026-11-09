@@ -21,7 +21,8 @@ from agent_control_mcp.tools import operation_named
 
 CORPUS = json.loads(
     (
-        Path(__file__).resolve().parents[2] / "backend/scripts/fixtures/mcp-workflows.json"
+        Path(__file__).resolve().parents[2]
+        / "frontend/public/customer-kit/adoption-intelligence/recipes.json"
     ).read_text()
 )
 IDS = CORPUS["ids"]
@@ -143,6 +144,127 @@ def verify_trace_and_web(name, workflow, entra):
         else:
             assert captured["result"] == expected["response"]
     print("phase09_workflow " + json.dumps(measured, separators=(",", ":")))
+
+
+async def test_department_evidence_five_call_frozen_audience_workflow(
+    workflow, entra, source_fixtures
+):
+    case = CORPUS["departmentEvidence"]
+    aggregate = copy.deepcopy(source_fixtures["opportunities"])
+    aggregate["context"]["inventory"] = None
+    aggregate["context"]["inventoryState"] = "unavailable"
+    aggregate["context"]["office"]["query"] = {
+        "company": case["company"],
+        "department": case["department"],
+    }
+    aggregate["context"]["report"]["selection"]["id"] = INV
+    group = aggregate["value"][0]
+    group.update(company=case["company"], department=case["department"])
+    group["agentEvidence"] = {
+        "positive": case["positive"],
+        "noReported": case["noReported"],
+        "unknown": case["unknown"],
+    }
+    group["denominators"] = {
+        "officePaid": case["paid"],
+        "officeActive": case["officeActive"],
+        "currentDirectory": case["paid"],
+        "currentAgentPaid": case["paid"],
+    }
+    group["office"] = {
+        "savedLicensedPeople": case["paid"],
+        "reportedActiveUsers": case["officeActive"],
+        "activeUserAppPairs": case["officeActive"],
+        "appsUsed": 1,
+        "noRecentEvidencePeople": 0,
+        "unknownEvidencePeople": 0,
+        "perApp": {
+            app: case["officeActive"] if app == "word" else 0 for app in group["office"]["perApp"]
+        },
+    }
+    aggregate["summary"] = {
+        "officeActive": case["officeActive"],
+        "positive": case["positive"],
+        "noReported": case["noReported"],
+        "unknown": case["unknown"],
+    }
+    await workflow(
+        "list_department_opportunities",
+        {"company": case["company"], "department": case["department"]},
+        aggregate,
+    )
+    request = {
+        "company": case["company"],
+        "department": case["department"],
+        "groupId": "a" * 64,
+        "officeSelectionId": SEL,
+        "reportSelectionId": INV,
+        "cohort": "no_reported",
+        "limit": case["audiencePageSize"],
+    }
+
+    def audience_row(index, evidence):
+        row = copy.deepcopy(source_fixtures["opportunityPeople"]["value"][0])
+        row["person"].update(
+            identity=identifier("person", index),
+            userPrincipalName=f"person-{index}@example.invalid",
+            displayName=f"Person {index}",
+            company=case["company"],
+            department=case["department"],
+            groupId=request["groupId"],
+            entitlement="paid_active",
+            recentApps=["word"],
+            unknownReasons=[],
+        )
+        day = aggregate["context"]["office"]["observation"]["reportRefreshDate"]
+        row["person"]["dates"] = {
+            app: day if app == "word" else None for app in row["person"]["dates"]
+        }
+        row["person"]["latestRecentDate"] = day
+        row["agentEvidence"] = evidence
+        row["reportedUsername"] = (
+            row["person"]["userPrincipalName"] if evidence == "positive" else None
+        )
+        return row
+
+    returned = []
+    for offset in range(0, case["noReported"], case["audiencePageSize"]):
+        body = copy.deepcopy(source_fixtures["opportunityPeople"])
+        body["context"] = aggregate["context"]
+        body["value"] = []
+        for index in range(offset, min(offset + case["audiencePageSize"], case["noReported"])):
+            body["value"].append(audience_row(index + 8, "no_reported"))
+        body["counts"] = {"total": case["noReported"], "returned": len(body["value"])}
+        body["page"] = {
+            "limit": case["audiencePageSize"],
+            "nextCursor": f"signed:audience-{offset + 6}"
+            if offset + 6 < case["noReported"]
+            else None,
+        }
+        result = await workflow("list_opportunity_people", {**request}, body)
+        returned.extend(row["person"]["identity"] for row in result["value"])
+        if result["page"]["nextCursor"]:
+            request["cursor"] = result["page"]["nextCursor"]
+    assert len(returned) == len(set(returned)) == case["noReported"]
+    positive = copy.deepcopy(source_fixtures["opportunityPeople"])
+    positive["context"] = aggregate["context"]
+    positive["value"] = []
+    for index in range(1, case["positive"] + 1):
+        positive["value"].append(audience_row(index, "positive"))
+    positive["counts"] = {"total": case["positive"], "returned": len(positive["value"])}
+    positive["page"] = {"limit": 50, "nextCursor": None}
+    await workflow(
+        "list_opportunity_people",
+        {
+            key: value
+            for key, value in {**request, "cohort": "positive", "limit": 50}.items()
+            if key != "cursor"
+        },
+        positive,
+    )
+    assert len(workflow.trace) == 5
+    assert sum(call["bytes"] for call in workflow.trace) <= 1048576
+    verify_trace_and_web("department-evidence", workflow, entra)
 
 
 async def test_case_a_complete_person_pages_about_and_final_claims(
@@ -380,10 +502,15 @@ async def test_case_b_top_three_only_all_associations_and_no_department_substitu
                     (5, 0, None),
                 )
             ],
-            "agents": [{
-                "id": "report:P_extra_9", "name": "Nonchampion", "description": None,
-                "creatorType": "Your org", "inventoryId": agent(9),
-            }],
+            "agents": [
+                {
+                    "id": "report:P_extra_9",
+                    "name": "Nonchampion",
+                    "description": None,
+                    "creatorType": "Your org",
+                    "inventoryId": agent(9),
+                }
+            ],
         }
     ]
     group["page"].update(limit=10, nextCursor=None, previousCursor=None)

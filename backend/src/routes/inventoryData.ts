@@ -16,7 +16,7 @@ import { PackageRefreshJobs } from "../db/packageRefreshJobs.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation, commitAccountSessionValidation } from "../db/sessions.js";
 import { requestScope } from "../middleware/auth.js";
 import { requireProviderAdmissions } from "../services/operationalState.js";
-import type { UnifiedAgentInventoryHealth, UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
+import { parseUnifiedAgentRecordId, type UnifiedAgentInventoryHealth, type UnifiedAgentInventoryUnavailable } from "../types/unifiedAgents.js";
 import { hasAppRole } from "../types/capability.js";
 import { operationalLog } from "../services/telemetry.js";
 
@@ -43,6 +43,12 @@ function inventoryPublication(request: Request, response: Response) {
     }
     response.status(status).json(value);
   };
+}
+
+function publishedSelection(selection: Awaited<ReturnType<InventoryQueries["capture"]>>) {
+  return { id: selection.id, revision: selection.revision, expiresAt: selection.expiresAt.toISOString(),
+    evaluatedAt: selection.evaluatedAt.toISOString(), validatedAt: selection.validatedAt.toISOString(),
+    publicationRevisions: selection.publicationRevisions };
 }
 
 export function createInventoryDataRouter(database: pg.Pool) {
@@ -77,7 +83,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
           : { state: "not_collected", message: "No saved agent inventory is available yet. Automatic collection will populate it when authorized, or open Sync to collect it." };
       return unavailable;
     }
-    return inventory.capture(identity, root.id, Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined)));
+    return publishedSelection(await inventory.capture(identity, root.id,
+      Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined))));
   }
   function capturedQuery(request: Request, extraBodyFields: string[] = []) {
     const body = request.body;
@@ -105,7 +112,8 @@ export function createInventoryDataRouter(database: pg.Pool) {
       AND source='inventory_packages' AND token_mode='tenant' AND selector='complete'`,
     [identity.tenantId])).rows[0];
     if (!root) throw new AppError(409, "inventory_unavailable", "Refresh the package source before reading it.");
-    return packages.capture(identity, root.id, Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined)));
+    return publishedSelection(await packages.capture(identity, root.id,
+      Object.fromEntries(Object.entries(query).filter(([, value]) => value !== undefined))));
   }
   policyRoute(router, "post", "/agent-inventory/selections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"], csrf: true,
@@ -205,6 +213,26 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const expectedQuery = Object.fromEntries(Object.entries(query).filter(([key]) => filterFields.includes(key) && Object.hasOwn(request.query, key)));
     return { identity, id, options: { limit, cursor, ...dependent ? {} : { expectedQuery } } };
   }
+  async function selectedCanonicalId(request: Request, read: Awaited<ReturnType<typeof selected>>) {
+    const invalid = () => new AppError(400, "invalid_inventory_query", "Use an exact canonical or source-qualified inventory record.");
+    let target: ReturnType<typeof parseUnifiedAgentRecordId>;
+    try { target = parseUnifiedAgentRecordId(scalar(request.params.recordId, "recordId", queryFieldMaximums.recordId)); }
+    catch (error) {
+      if (error instanceof URIError || error instanceof RangeError) throw invalid();
+      throw error;
+    }
+    if (!target) throw invalid();
+    if (target.source === "canonical") return target.agentId;
+    const references = await inventory.sourceReferences(read.id, read.identity, [{
+      domain: target.source === "graph_packages" ? "packages" : "power_platform",
+      nativeId: target.source === "graph_packages" ? target.packageId : target.nativeId,
+      environmentId: target.source === "graph_packages" ? null : target.environmentId,
+    }]);
+    const ids = [...new Set<string>(references.map(row => row.canonical_id))];
+    if (!ids.length) throw new AppError(404, "inventory_record_not_found", "The selected inventory record is unavailable.");
+    if (ids.length > 1) throw new AppError(409, "inventory_identity_ambiguous", "The exact source reference has multiple selected memberships.");
+    return ids[0];
+  }
   policyRoute(router, "get", "/agent-inventory", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
   }, async (request, response) => {
@@ -280,7 +308,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     if (request.query.sourceScopeId !== undefined && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(String(request.query.sourceScopeId))) {
       throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     }
-    publish(await inventory.children(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.children(read.id, read.identity, await selectedCanonicalId(request, read),
       { ...read.options, kind: scalar(request.query.kind, "kind", 128),
         sourceScopeId: request.query.sourceScopeId === undefined ? undefined : scalar(request.query.sourceScopeId, "sourceScopeId", 36),
         sourceIdentity: request.query.sourceIdentity === undefined ? undefined : scalar(request.query.sourceIdentity, "sourceIdentity", 512),
@@ -291,7 +319,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
   }, async (request, response) => {
     const publish = inventoryPublication(request, response);
     const read = await selected(request, true);
-    publish(await inventory.members(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""), read.options));
+    publish(await inventory.members(read.id, read.identity, await selectedCanonicalId(request, read), read.options));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/sections", {
     access: "authenticated", dataClass: "private_inventory", roles: ["AgentControl.Viewer"],
@@ -300,7 +328,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     const read = await selected(request, true, ["sourceScopeId", "sourceIdentity"]);
     const sourceScopeId = scalar(request.query.sourceScopeId, "sourceScopeId", 36);
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
-    publish(await inventory.sections(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.sections(read.id, read.identity, await selectedCanonicalId(request, read),
       { ...read.options, sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512) }));
   });
   policyRoute(router, "get", "/agent-inventory/:recordId/about", {
@@ -312,7 +340,7 @@ export function createInventoryDataRouter(database: pg.Pool) {
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceScopeId)) throw new AppError(400, "invalid_inventory_query", "Source scope must be a UUID.");
     const field = scalar(request.query.field, "field", 16);
     if (field !== "long" && field !== "short" && field !== "native") throw new AppError(400, "invalid_inventory_query", "Use long, native or short About text.");
-    publish(await inventory.about(read.id, read.identity, scalar(request.params.recordId, "recordId", 512).replace(/^agent:/, ""),
+    publish(await inventory.about(read.id, read.identity, await selectedCanonicalId(request, read),
       { sourceScopeId, sourceIdentity: scalar(request.query.sourceIdentity, "sourceIdentity", 512), field, cursor: read.options.cursor }));
   });
   policyRoute(router, "get", "/agents", {

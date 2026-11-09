@@ -46,13 +46,17 @@ describe("bounded positive discovery contracts", () => {
   });
   it.each([[false, false], [true, false], [false, true], [true, true]])("allowlists nested fields under privacy %s/%s", (employee, champion) => {
     const row = { identity: "canonical", title: "Task", description: "Business requirements document review",
+      description_state: "available" as const,
+      origin: "organization_created" as const, origin_evidence: [],
       had_title: true, had_description: true, lifecycle: "draft" as const, evidence_complete: true,
       people: [{ id: "object-id", name: "Allowed owner", contact: "owner@example.invalid", company: "A", department: "R",
         responses: 999, license: "secret" }],
       affiliations: [{ company: "A", department: "R", objectId: "object-id" }],
-      sources: [{ source: "graph_packages" as const, observedAt: "2026-11-06T00:00:00Z", descriptionField: "About",
+      sources: [{ source: "graph_packages" as const, observedAt: "2026-11-06T00:00:00Z", descriptionField: "longDescription" as const,
+        generationId: "source-generation", sourceIdentity: "source-record", revision: "revision",
         descriptionState: "available" as const, secret: "raw-report" }],
       evidence: [{ source: "power_platform" as const, field: "description" as const,
+        generationId: "native-generation", sourceIdentity: "native-record", revision: "revision",
         excerpt: "Business requirements document review", responses: 123 }],
       responses: 123, controls: { token: "secret" } };
     const card = discoveryCard(row, { hide_employee_details: employee, hide_champion_employee: champion });
@@ -109,6 +113,8 @@ describe("canonical discovery subject identities", () => {
       const profileSubjects: unknown[] = [];
       const agentId = "ABCDEF02-2345-6789-ABCD-0123456789AB";
       const card = { identity: agentId.toLowerCase(), title: "Saved agent", description: "x".repeat(4097),
+        description_state: "available",
+        origin: "organization_created", origin_evidence: [],
         had_title: true, had_description: true, lifecycle: "unknown", people: [], affiliations: [],
         evidence_complete: true, sources: [] };
       const query = vi.fn<(statement: unknown, values?: unknown[]) => Promise<pg.QueryResult>>(async (statement, values) => {

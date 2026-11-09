@@ -20,6 +20,8 @@ import { declaredRoutePolicies } from "./policy.js";
 import { InventoryQueries } from "../db/inventoryQueries.js";
 import { DataExports } from "../services/dataExports.js";
 import type { AdoptionPage } from "../types/adoption.js";
+import { replaceMsalClientForTest } from "../auth/msal.js";
+import { account, browserAuthenticationResult } from "../auth/authFoundationTestSupport.js";
 
 vi.hoisted(() => {
   delete process.env.TENANTS_JSON_FILE;
@@ -34,11 +36,14 @@ describe("users/report route-to-client boundary", () => {
   let fixture: Awaited<ReturnType<typeof testDatabase>>, server: Server, base: string;
   let application: ReturnType<typeof createApp>, reports: LargeTenantUsersReports, imports: OfficialReportImports, cookie: string;
   const identity = { ...selectionIdentity, tenantId: "11111111-1111-1111-1111-111111111111", principalId: "cutover-http" };
+  const accountIds = new Map<string, string>();
   async function sessionCookie(principalId = identity.principalId, roles: AppRole[] = ["AgentControl.Admin"], tenantId = identity.tenantId) {
+    if (!accountIds.has(principalId)) accountIds.set(principalId, randomUUID());
     const id = randomUUID(), signature = createHmac("sha256", config.sessionSecret).update(id).digest("base64").replace(/=+$/g, "");
     const data = { cookie: new session.Cookie({ maxAge: 600000 }),
       tenantId, accountId: principalId, clientId: config.tenants[0].clientId, csrfToken: "cutover-csrf",
-      signedInAt: Date.now(), rolesValidatedAt: Date.now(), user: { ...usageAudit(identity).actor, tenantId, homeAccountId: principalId, roles },
+      signedInAt: Date.now(), rolesValidatedAt: Date.now(), user: { ...usageAudit(identity).actor, tenantId,
+        homeAccountId: principalId, localAccountId: accountIds.get(principalId), roles },
     };
     const write = () => new Promise<void>((resolve, reject) => application.store.set(id, data, error => error ? reject(error) : resolve()));
     if (tenantId === identity.tenantId) await write();
@@ -89,7 +94,25 @@ describe("users/report route-to-client boundary", () => {
   }
   beforeAll(async () => {
     fixture = await testDatabase();
-    application = createApp(fixture.runtime);
+    replaceMsalClientForTest(identity.tenantId, {
+      getAuthCodeUrl: async () => { throw new Error("No live browser login"); },
+      acquireTokenByCode: async () => { throw new Error("No live browser login"); },
+      acquireTokenSilent: async () => { throw new Error("No unrequested role revalidation"); },
+      acquireTokenByClientCredential: async () => ({ ...browserAuthenticationResult(), account: null, idTokenClaims: {},
+        scopes: ["https://graph.microsoft.com/.default"], accessToken: "synthetic-application-membership-token" }),
+      getTokenCache: () => ({ getAccountByHomeId: async homeAccountId => accountIds.has(homeAccountId)
+        ? { ...account(), tenantId: identity.tenantId, homeAccountId, localAccountId: accountIds.get(homeAccountId)! } : null,
+      removeAccount: async () => undefined }),
+    });
+    application = createApp(fixture.runtime, undefined, async url => {
+      const target = new URL(String(url));
+      if (target.hostname === "graph.microsoft.com" && target.pathname.startsWith("/v1.0/users/")
+        && [...accountIds.values()].includes(target.pathname.slice("/v1.0/users/".length))
+        && target.searchParams.get("$select") === "id,accountEnabled,userType") {
+        return Response.json({ id: target.pathname.slice("/v1.0/users/".length), accountEnabled: true, userType: "Member" });
+      }
+      throw new Error("Unexpected synthetic identity operation");
+    });
     Object.assign(identity, await reportIdentity(fixture.runtime, { ...usageAudit(identity).actor, roles: ["AgentControl.Admin"] }));
     cookie = await sessionCookie();
     reports = reportRuntime(fixture.runtime).reports; imports = new OfficialReportImports(fixture.runtime);
@@ -110,6 +133,7 @@ describe("users/report route-to-client boundary", () => {
   }, 30_000);
   afterAll(async () => {
     if (fixture) await reportRuntime(fixture.runtime).drain();
+    replaceMsalClientForTest(identity.tenantId, undefined);
     application?.store.close(); if (server) await new Promise<void>(resolve => server.close(() => resolve())); await fixture?.close();
   });
   it.each([

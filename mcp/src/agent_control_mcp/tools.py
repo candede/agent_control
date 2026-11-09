@@ -11,12 +11,14 @@ from fastmcp.tools import Tool, ToolResult
 from mcp.types import CallToolResult, ContentBlock, TextContent, ToolAnnotations
 from pydantic import BaseModel, JsonValue, RootModel
 
+from . import content_models as content
 from . import control_inputs as ci
 from . import control_models as controls
 from . import discovery_models as discovery
 from . import inputs as i
 from . import inventory_models as inventory
 from . import job_models as jobs
+from . import office_models as office
 from . import report_models as reports
 from .api import MAX_OUTPUT, CanonicalApi
 from .errors import AdapterError
@@ -43,7 +45,7 @@ class InventoryHealthResult(RootModel[inventory.Health | inventory.Unavailable])
 @dataclass(frozen=True)
 class Operation:
     name: str
-    method: Literal["GET", "POST", "PATCH"]
+    method: Literal["GET", "POST", "PATCH", "DELETE"]
     path: str
     request: type[BaseModel]
     response: type[BaseModel]
@@ -62,12 +64,105 @@ class Operation:
 
 OPERATIONS = (
     Operation(
+        "list_adoption_content",
+        "GET",
+        "/api/adoption-content",
+        content.ListInput,
+        content.ContentPage,
+        "Staff: read tenant brief/card/action records, default ten/max twenty, with permissions "
+        "and source states. Provider-free; continue exact actor-bound nextCursor. "
+        "Expired cursors require explicit fresh reads, not silent page mixing.",
+        saved_read=True,
+    ),
+    Operation(
+        "read_adoption_content",
+        "GET",
+        "/api/adoption-content/{id}",
+        content.DetailInput,
+        content.ContentRecord,
+        "Staff: read exact content ID, current revision/permissions and durable source states. "
+        "Provider-free; fresh reads never reuse author leases or substitute expired sources.",
+        saved_read=True,
+    ),
+    Operation(
+        "create_adoption_content",
+        "POST",
+        "/api/adoption-content",
+        content.CreateInput,
+        content.ContentSave,
+        "Staff explicit save: bounded brief/card/action; returns actual id/record/state/replayed, "
+        "not a sent message or provider execution. requestId is epoch-milliseconds.UUID. "
+        "Retain identity and exact payload after unknown outcomes. Mismatches conflict; "
+        "deleted outcomes never resurrect. Manual drafts need no report. Measured baselines "
+        "require your live exact-group Office/report pins; store durable sources, no person lists. "
+        "No automatic mutation replay.",
+        idempotent=True,
+    ),
+    Operation(
+        "update_adoption_content",
+        "PATCH",
+        "/api/adoption-content/{id}",
+        content.UpdateInput,
+        content.ContentRecord,
+        "Creator/tenant Admin core edit with expectedRevision; conflicts preserve unsaved edits. "
+        "Do not change measured scope or resupply baselines. Employee sharing is tenant-wide.",
+    ),
+    Operation(
+        "progress_adoption_action",
+        "PATCH",
+        "/api/adoption-content/{id}",
+        content.ProgressInput,
+        content.ContentRecord,
+        "Assigned staff/creator/Admin update status/progress with expectedRevision. "
+        "Assignment grants no roles.",
+    ),
+    Operation(
+        "delete_adoption_content",
+        "DELETE",
+        "/api/adoption-content/{id}",
+        content.DeleteInput,
+        content.Deleted,
+        "After genuine user confirmation of exact record/revision, send confirmation delete:<id>. "
+        "Creator/Admin deletion removes payload; independent linked records survive.",
+        destructive=True,
+    ),
+    Operation(
+        "follow_up_adoption_content",
+        "POST",
+        "/api/adoption-content/{id}/follow-up",
+        content.FollowUpInput,
+        content.FollowUp,
+        "Compare original aggregate with explicitly selected fresh same-group follow-up. "
+        "Disclose coverage/licensing drift. No original-person, conversion, impact or ROI claims.",
+        saved_read=True,
+    ),
+    Operation(
+        "read_shared_learning",
+        "POST",
+        "/api/discovery/learning",
+        content.SharedInput,
+        content.SharedPage,
+        "Read employee-shared tenant-wide structured learning without a workplace prerequisite. "
+        "Prose/identities are withheld; agent privacy/source is current. Labels only filter.",
+        saved_read=True,
+    ),
+    Operation(
+        "preview_shared_learning",
+        "POST",
+        "/api/discovery/learning/preview",
+        content.PreviewSharedInput,
+        content.SharedPage,
+        "Preview exact subject's employee-safe learning, no staff prose/metrics/actions.",
+        saved_read=True,
+    ),
+    Operation(
         "search_agent_catalog",
         "POST",
         "/api/discovery/read",
         discovery.SearchInput,
         discovery.Page,
-        "Search organization-created saved task evidence with a goal and up to "
+        "Search Microsoft first-party and organization-created saved task evidence "
+        "with a goal and up to "
         "eight AI-expanded terms (BRD: business requirements document). Default five/max twenty "
         "cards. Omit selectionId to capture provider-free; retain selection and nextCursor.",
         body_operation="search",
@@ -125,7 +220,8 @@ OPERATIONS = (
         "/api/discovery/preview",
         discovery.PreviewSearch,
         discovery.Page,
-        "Search safe saved organization task evidence for this exact subject; "
+        "Search safe saved Microsoft and organization-created task evidence "
+        "for this exact subject; "
         "preserve this subject's selection/cursor for continuation.",
         body_operation="search",
         saved_read=True,
@@ -199,7 +295,9 @@ OPERATIONS = (
         "/api/agent-inventory/selections",
         i.InventoryCapture,
         InventoryCaptureResult,
-        "Capture a saved, principal-bound inventory selection. Provider-free; no refresh.",
+        "Staff: capture saved actor-bound inventory selection, provider-free, no refresh. "
+        "For complete champion created edges use query inventoryScope=all with no filters. "
+        "Return selection/source revisions/expiry; expired reads require explicit recapture.",
     ),
     Operation(
         "list_agents",
@@ -247,7 +345,9 @@ OPERATIONS = (
         "/api/agent-inventory/{recordId}/members",
         i.AgentSelected,
         inventory.Members,
-        "Read one page of exact selected source memberships and generations.",
+        "Staff saved read: exact recordId/selectionId source memberships and generations. "
+        "Exhaust nextCursor with identical record/selection/limit before About; "
+        "use returned source_scope_id/source_identity, never display-name joins. Provider-free.",
     ),
     Operation(
         "list_agent_children",
@@ -271,8 +371,11 @@ OPERATIONS = (
         "/api/agent-inventory/{recordId}/about",
         i.AboutInput,
         AgentAboutPage,
-        "Read one complete saved About segment. Continue nextCursor explicitly until null for "
-        "full text; never truncate, recapture or substitute a different field/source.",
+        "Staff provider-free saved read: exact record/selection/sourceScopeId/sourceIdentity "
+        "from inventory.members and long/native/short field. Output state/text/totalBytes/"
+        "returnedBytes/nextCursor; exhaust same-source cursors until null for full permitted "
+        "text. Missing/withheld/output_limit is not complete. Never truncate, silently recapture "
+        "or substitute a field/source; expired selection requires explicit fresh read.",
     ),
     Operation(
         "list_agent_responsibility",
@@ -337,7 +440,11 @@ OPERATIONS = (
         "/api/copilot-usage/users",
         i.UsersInput,
         reports.ReportPage[reports.CombinedUser],
-        "Read one saved directory/license/report page; unknown license is not unpaid.",
+        "Read one saved directory/license/report page; unknown license is not unpaid. "
+        "Use exact company/department without cohort or entitlement filters for the full "
+        "department recipient roster. Returned UPNs are known directory identifiers: "
+        "pass returned recipient addresses/UPNs directly to connected drafting tools without "
+        "requiring a separate people search. Never derive addresses from display names.",
     ),
     Operation(
         "list_user_facets",
@@ -401,7 +508,10 @@ OPERATIONS = (
         "/api/copilot-usage/adoption",
         i.AdoptionInput,
         reports.AdoptionPage,
-        "Read up to ten saved adoption groups; ranking is API-owned.",
+        "Read up to ten saved adoption groups with all scoped people and each group's "
+        "whole-department distinct reported-used agent union, not only champion agents. "
+        "Agent description is a bounded preview (up to 2048 characters); use exact inventoryId "
+        "and inventory members/About for complete source text. Ranking and counts are API-owned.",
     ),
     Operation(
         "list_adoption_facets",
@@ -412,13 +522,135 @@ OPERATIONS = (
         "Read one saved adoption facet page.",
     ),
     Operation(
+        "get_adoption_summary",
+        "GET",
+        "/api/copilot-usage/adoption/summary",
+        i.AdoptionSummaryInput,
+        reports.AdoptionOrganization,
+        "Read the unfiltered canonical organization agent-adoption summary.",
+    ),
+    Operation(
+        "list_adoption_departments",
+        "GET",
+        "/api/copilot-usage/adoption/departments",
+        i.AdoptionDepartmentsInput,
+        reports.AdoptionDepartments,
+        "Read scalar saved-directory departments ranked by canonical adoption rate; "
+        "not Office eligibility.",
+    ),
+    Operation(
+        "list_adoption_history",
+        "GET",
+        "/api/official-usage/history/adoption",
+        i.AdoptionHistoryInput,
+        reports.AdoptionHistory,
+        "Read retained group-level report aggregates; overlapping snapshots are non-additive.",
+    ),
+    Operation(
+        "list_department_opportunities",
+        "GET",
+        "/api/copilot-usage/adoption/opportunities",
+        i.OpportunityInput,
+        office.OpportunityPage,
+        "Read at most ten scalar exact company/department opportunities (128 KiB). "
+        "Omit independent selection IDs to capture saved evidence; continue with returned Office "
+        "query/reportSelectionId/officeSelectionId and optional inventorySelectionId. "
+        "Frozen Office "
+        "paid/affiliation is authoritative; positive/no-reported/unknown are backend-owned. "
+        "Missing optional inventory is not missing report evidence. "
+        "No provider read is dispatched.",
+    ),
+    Operation(
+        "list_opportunity_people",
+        "GET",
+        "/api/copilot-usage/adoption/opportunities/{groupId}/people",
+        i.OpportunityPeopleInput,
+        office.OpportunityPeoplePage,
+        "Read one bounded exact frozen Office-active positive/no_reported/unknown audience page. "
+        "Keep both independent selections, exact Office query, group/cohort/limit on continuation. "
+        "No-reported is not never used; weekly Office observations contain no people.",
+    ),
+    Operation(
+        "get_office_context",
+        "GET",
+        "/api/office-app-adoption/context",
+        i.OfficeInput,
+        office.OfficeContext,
+        "Capture/read the independent frozen Office D28 observation and baseline. "
+        "Keep query and selection.",
+    ),
+    Operation(
+        "get_office_summary",
+        "GET",
+        "/api/office-app-adoption/summary",
+        i.OfficeInput,
+        office.OfficeSummary,
+        "Read canonical seven-app Office totals; app counts overlap, unknown is not zero.",
+    ),
+    Operation(
+        "get_office_comparison",
+        "GET",
+        "/api/office-app-adoption/comparison",
+        i.OfficeInput,
+        office.OfficeSummary,
+        "Read canonical frozen Office summary and an explicitly earlier retained baseline.",
+    ),
+    Operation(
+        "list_office_history",
+        "GET",
+        "/api/office-app-adoption/history",
+        i.OfficePagingInput,
+        office.OfficePage[office.HistoryPoint],
+        "Read aggregate-only weekly Office history; never reconstruct historical people/licensing.",
+    ),
+    Operation(
+        "list_office_groups",
+        "GET",
+        "/api/office-app-adoption/groups",
+        i.OfficeGroupsInput,
+        office.OfficePage[office.Group],
+        "Read five canonical Office groups with up to three current Office "
+        "participation suggestions.",
+    ),
+    Operation(
+        "list_office_departments",
+        "GET",
+        "/api/office-app-adoption/departments",
+        i.OfficePagingInput,
+        office.OfficePage[office.Group],
+        "Read Office departments ranked by canonical no-recent-evidence/paid counts; "
+        "continue exact pages.",
+    ),
+    Operation(
+        "list_office_facets",
+        "GET",
+        "/api/office-app-adoption/facets",
+        i.OfficeFacetsInput,
+        office.OfficePage[office.Facet],
+        "Read exact company/department Office facets, including legitimate null labels.",
+    ),
+    Operation(
+        "list_office_people",
+        "GET",
+        "/api/office-app-adoption/groups/{groupId}/people",
+        i.OfficePeopleInput,
+        office.OfficePage[office.Person],
+        "Read bounded current frozen Office-paid people. Same query/selection/limit for cursors; "
+        "weekly requests fail office_history_aggregate_only. Large HTTP evidence fails explicit "
+        "MCP output_limit; request a smaller supported page, never treat clipping as complete.",
+    ),
+    Operation(
         "list_champion_agents",
         "GET",
         "/api/copilot-usage/adoption/champions",
         i.ChampionsInput,
         reports.ChampionAgents,
-        "Read only the exact top-three champions' complete used/created edges for one pinned "
-        "company/department group; continue pages, do not substitute all department agents.",
+        "Staff saved read: exact top-three champions and complete used/created edges. "
+        "selectionId must capture one exact company+department via adoption.groups; "
+        "inventorySelectionId must be unfiltered capture_agent_inventory query inventoryScope=all. "
+        "Output champions/value/counts/page; exhaust page.nextCursor with identical selections/"
+        "limit. Report-only edges stay distinct; never substitute all department agents. "
+        "Expired pins require explicit fresh captures, never mutation replay.",
     ),
     Operation(
         "list_report_agents",
@@ -546,7 +778,10 @@ OPERATIONS = (
         "/api/agent-inventory/{recordId}/usage",
         i.UsageInput,
         reports.UsageSummary,
-        "Read API-owned report associations and metrics, preserving missing sources.",
+        "Staff saved read of API-owned report associations/metrics for exact recordId. "
+        "With inventorySelectionId, selectionId must equal it; setId independently selects "
+        "the report. Preserve source states, not inferred zero/access. Provider-free; "
+        "expired selections require an explicit fresh read.",
     ),
     Operation(
         "list_agent_usage_history",
@@ -554,8 +789,10 @@ OPERATIONS = (
         "/api/agent-inventory/{recordId}/usage-history",
         i.UsageHistoryInput,
         reports.UsageHistory,
-        "Read retained snapshots and optional exact paired comparison. Incomparable windows and "
-        "missing metrics stay explicit; this tool calculates no trend.",
+        "Staff saved read: retained snapshots and optional exact paired comparison. "
+        "inventorySelectionId must equal selectionId. Continue exact page.nextCursor; "
+        "incomparable windows/missing metrics remain explicit, not additive trends. "
+        "No provider work or automatic mutation replay on recovery.",
     ),
     Operation(
         "list_agent_usage_users",

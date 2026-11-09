@@ -38,7 +38,7 @@ const agentType = "microsoft.copilotstudio/agents" as const;
 
 export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageScope,
   groups: UsageGroup[] = [{ packages: ["Package-A", "Package-B"] }, { packages: ["Package-C"] }],
-  options: { expiresAt?: Date } = {}) {
+  options: { expiresAt?: Date; packageExpiresAt?: Date; packageAboutOverflow?: boolean } = {}) {
   if (groups.length > 250 || groups.reduce((count, group) => count + group.packages.length + Number(Boolean(group.native)), 0) > 250) {
     throw new Error("Grouped usage inventory accepts only small synthetic fixtures.");
   }
@@ -56,13 +56,24 @@ export async function saveUsageInventory(database: pg.Pool, scope: AgentUsageSco
   const stages = new InventoryGenerations(database);
   const observedAt = new Date(Date.now() - 60_000), expiresAt = options.expiresAt ?? new Date(Date.now() + 600_000);
   const source = async (domain: "packages" | "power_platform", rows: InventoryRecord[]) => {
-    const input = { ...inventoryInput(scope.principalId, domain), observedAt, expiresAt,
+    const input = { ...inventoryInput(scope.principalId, domain), observedAt,
+      expiresAt: domain === "packages" ? options.packageExpiresAt ?? expiresAt : expiresAt,
       sessionEpoch: await stages.generations.sessionEpoch(scope.tenantId, scope.principalId) };
     input.scope.tenantId = scope.tenantId;
     const intent = { domain, mode: "baseline" as const, channel: "catalog" as const,
       ...domain === "power_platform" ? { resourceTypes: [...powerPlatformResourceTypes], roleScope: "full" as const } : {} };
     return stages.execute(input, intent, async lease => {
       await stages.visit(lease, "fixture");
+      if (domain === "packages" && options.packageAboutOverflow) {
+        // Inject the isolated overflow before publication; immutable saved facts stay protected.
+        for (const row of rows) {
+          const parts = row.facts.filter(fact => fact.kind === "about:long").length;
+          if (!parts) throw new Error("The About overflow fixture requires an already chunked description.");
+          row.facts.push(...Array.from({ length: 512 }, (_, index) => ({
+            kind: "about:long", value: String(parts + index), payload: { text: "x".repeat(8192) },
+          })));
+        }
+      }
       await stages.appendBounded(lease, rows);
       await stages.acceptPage(lease, { token: "fixture", nextToken: null, records: rows, rawCount: rows.length,
         expectedCount: rows.length, page: 1 }, rows.length);

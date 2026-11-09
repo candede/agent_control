@@ -216,7 +216,7 @@
 }
 
 .signed-out :is(button, a):focus-visible {
-  outline: 3px solid #d8d4fa;
+  outline: 3px solid var(--ink);
   outline-offset: 3px;
 }
 
@@ -899,7 +899,7 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible {
   border-color: var(--ink);
-  outline: 3px solid #d8d4fa;
+  outline: 3px solid var(--ink);
   outline-offset: 2px;
 }
 
@@ -2194,7 +2194,7 @@ button.audit-result-button:hover {
 }
 
 button.audit-result-button:focus-visible {
-  outline: 3px solid #c9ddd8;
+  outline: 3px solid var(--ink);
   outline-offset: 2px;
 }
 
@@ -3528,3 +3528,8 @@ dialog.inventory-detail-modal:not([open]) {
 .audit-origin-details dt {
   font-weight: 600;
 }
+.shared-learning { padding: 1.25rem; overflow-wrap: anywhere; }
+.shared-learning label { display: block; margin: .75rem 0; }
+.shared-learning select { display: block; width: 100%; max-width: 40rem; }
+.shared-learning article { border-bottom: 1px solid var(--border); padding: .75rem 0; }
+.shared-learning button { margin: .25rem; }

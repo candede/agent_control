@@ -1398,8 +1398,9 @@ function Workbench({ savedQueries }: { savedQueries: ReturnType<typeof createSav
         return id && (view.roles.length === 0 || view.roles.some(role => hasRole(user, role))) ? [id] : [];
       })
     : authorizedViews.filter(view => view !== "mcp-settings");
-  const visibleActiveView = visibleViews.includes(activeView)
-    || activeView === "mcp-settings" && hasRole(user, "AgentControl.Viewer") ? activeView : visibleViews[0] ?? "permissions";
+  const visibleActiveView = user && !hasRole(user, "AgentControl.Viewer") ? "agents"
+    : visibleViews.includes(activeView)
+      || activeView === "mcp-settings" && hasRole(user, "AgentControl.Viewer") ? activeView : visibleViews[0] ?? "permissions";
   const canOperate = hasRole(user, "AgentControl.Admin");
   const canImportReports = hasRole(user, "AgentControl.UsageReportUploader");
   const automaticAction = findWorkbenchAction(workbenchMetadata?.actions, "data-sync.auto-refresh");

@@ -55,6 +55,17 @@ describe("seven-app Office semantics", () => {
   });
   it.each([{ app:"chat" },{ officeSnapshot:"agent-set" },{ search:null },{ company:[] },{ overall:true },{ department:"bad\n" }])(
     "rejects invalid filters %j", query => { expect(()=>officeQuery(query as OfficeQueryForTest)).toThrow(); });
+  it.each(["officeSnapshot", "officeBaseline"] as const)("requires an exact scalar UUID for %s", key => {
+    const id = "10000000-0000-4000-8000-abcdef000001";
+    for (const value of [[id], [[id]], { toString: () => id }, null, `${id}\n`, `${id}\r\n`]) {
+      expect(() => officeQuery({ [key]: value })).toThrow(expect.objectContaining({
+        status: 400, code: "invalid_office_query",
+      }));
+    }
+    for (const value of [id, id.toUpperCase()]) {
+      expect(officeQuery({ [key]: value })).toEqual({ [key]: value });
+    }
+  });
   it("preserves literal directory filters without relaxing search or invalid source text", () => {
     const query = { company: "Example\tCompany", department: "Research\u0001Development" };
     expect(officeQuery(query)).toEqual(query);

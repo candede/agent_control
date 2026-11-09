@@ -54,12 +54,18 @@ def sample(schema, root=None, name=""):
                 return RECORD
             if name == "confirmationHash":
                 return "a" * 64
+            if name == "groupId":
+                return "a" * 64
             if name == "sourceIdentity":
                 return "CaseSensitive%Source"
             if name == "startDateTime":
                 return "2026-10-15T00:00:00Z"
             if name == "endDateTime":
                 return "2026-10-16T00:00:00Z"
+            if name == "requestId":
+                return f"{int(time.time() * 1000)}.{GUID}"
+            if name == "dueDate":
+                return "2026-11-10"
             if name == "search":
                 return "Guest"
             return GUID
@@ -68,6 +74,12 @@ def sample(schema, root=None, name=""):
 
 
 SOURCE_TYPES = {
+    "ContentPage": "contentPage",
+    "ContentRecord": "contentRecord",
+    "ContentSave": "contentSave",
+    "Deleted": "contentDeleted",
+    "FollowUp": "contentFollowUp",
+    "SharedPage": "sharedLearning",
     "Page": "discoveryPage",
     "Profile": "discoveryProfile",
     "Detail": "discoveryDetail",
@@ -100,6 +112,17 @@ SOURCE_TYPES = {
     "SavedRelationships": "savedRelationships",
     "ChampionAgents": "champions",
     "AdoptionPage": "adoption",
+    "AdoptionOrganization": "adoptionOrganization",
+    "AdoptionDepartments": "adoptionDepartments",
+    "AdoptionHistory": "adoptionHistory",
+    "OfficeContext": "officeContext",
+    "OfficeSummary": "officeSummary",
+    "OfficePage[Group]": "officeGroups",
+    "OfficePage[Person]": "officePeople",
+    "OfficePage[Facet]": "officeFacets",
+    "OfficePage[HistoryPoint]": "officeHistory",
+    "OpportunityPage": "opportunities",
+    "OpportunityPeoplePage": "opportunityPeople",
     "AgentAboutPage": "about",
     "UsageSummary": "usage",
     "UsageHistory": "usageHistory",
@@ -380,6 +403,69 @@ async def test_every_registered_tool_is_callable_over_real_sdk(
     )
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        operation
+        for operation in OPERATIONS
+        if operation.path.startswith("/api/office-app-adoption/")
+    ],
+    ids=lambda operation: operation.name,
+)
+async def test_every_office_binding_rejects_oversized_complete_http_evidence(
+    operation, rpc, entra, source_fixtures
+):
+    body = response_for(operation, source_fixtures)
+    context = body if operation.name == "get_office_context" else body["context"]
+    context["status"]["message"] = "🧭" * 70000
+    response = httpx2.Response(200, json=body)
+    assert len(response.content) < 524288
+    entra.api_responses.append(response)
+    result = await rpc(operation.name, sample(operation.request.model_json_schema()), wire=True)
+    assert result["isError"]
+    assert json.loads(result["content"][0]["text"])["code"] == "output_limit"
+    assert len(entra.api_calls) == 1
+    assert (
+        len(CallToolResult.model_validate(result).model_dump_json(by_alias=True).encode()) <= 524288
+    )
+
+
+async def test_office_literal_null_and_query_selection_are_forwarded_unchanged(
+    rpc, entra, source_fixtures
+):
+    entra.api_responses.append(httpx2.Response(200, json=source_fixtures["officeSummary"]))
+    result = await rpc(
+        "get_office_summary",
+        {"company": None, "department": "~null", "selectionId": GUID, "app": "word"},
+    )
+    assert not result.get("isError"), result
+    assert parse_qs(entra.api_calls[0].url.query.decode()) == {
+        "company": ["~null"],
+        "department": ["~string:~null"],
+        "selectionId": [GUID],
+        "app": ["word"],
+    }
+
+
+@pytest.mark.parametrize(
+    "model,payload",
+    [
+        (i.OfficeGroupsInput, {"limit": 10}),
+        (i.OfficeInput, {"app": "chat"}),
+        (i.OfficePagingInput, {"cursor": "unsigned"}),
+        (i.OfficePagingInput, {"selectionId": GUID, "cursor": "signed", "pageNumber": 2}),
+        (i.OpportunityInput, {"limit": 11}),
+        (i.OpportunityInput, {"selectionId": GUID}),
+        (i.OpportunityInput, {"setId": GUID, "reportSelectionId": SOURCE}),
+        (i.OpportunityInput, {"cursor": "signed", "officeSelectionId": GUID}),
+        (i.OpportunityPeopleInput, {"groupId": "a" * 64, "cohort": "no_reported"}),
+    ],
+)
+def test_evidence_inputs_reject_unsupported_and_mixed_selection_contracts(model, payload):
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+
 @pytest.mark.parametrize("age", [300, 301, 1800])
 async def test_department_adoption_accepts_backdated_entra_tokens(age, rpc, entra, source_fixtures):
     now = int(time.time())
@@ -415,7 +501,6 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
     assert len(tools) == len(PUBLIC_TOOLS) == len(set(tools))
     for domain in projected_catalog(AccessProfile.model_validate(entra.profiles["admin"])):
         tool = tools[domain.name]
-        operation = domain.branches[0].operation
         assert tool["inputSchema"]["properties"]["request"]
         assert tool["outputSchema"]["type"] == "object"
         assert tool["outputSchema"] == {
@@ -429,15 +514,27 @@ async def test_discovered_schemas_annotations_and_omitted_boundaries(browser, rp
             }
         assert tool["description"] == domain.description
         assert tool["annotations"]["readOnlyHint"] == (
-            operation.saved_read or operation.method == "GET" and not operation.provider
+            all(
+                branch.operation.saved_read
+                or branch.operation.method == "GET"
+                and not branch.operation.provider
+                for branch in domain.branches
+            )
         )
-        assert tool["annotations"]["destructiveHint"] == operation.destructive
+        assert tool["annotations"]["destructiveHint"] == any(
+            branch.operation.destructive for branch in domain.branches
+        )
         assert tool["annotations"]["idempotentHint"] == (
-            operation.idempotent
-            or operation.saved_read
-            or (operation.method == "GET" and not operation.provider)
+            all(
+                branch.operation.idempotent
+                or branch.operation.saved_read
+                or (branch.operation.method == "GET" and not branch.operation.provider)
+                for branch in domain.branches
+            )
         )
-        assert tool["annotations"]["openWorldHint"] == operation.provider
+        assert tool["annotations"]["openWorldHint"] == any(
+            branch.operation.provider for branch in domain.branches
+        )
         assert "Any" not in json.dumps(tool["outputSchema"])
     assert tools["access_principals"]["annotations"]["readOnlyHint"] is False
     assert tools["capture_agent_inventory"]["annotations"]["readOnlyHint"] is False
@@ -998,6 +1095,48 @@ def test_source_reference_bounds_apply_to_decoded_identities(record_id):
 def test_source_reference_bounds_match_canonical_utf16_units(native_id):
     with pytest.raises(ValidationError):
         i.InventoryQuery(recordId="graph_packages:" + quote(native_id, safe=""))
+
+
+@pytest.mark.parametrize(
+    "model,required,field",
+    [
+        (i.PackageDetailInput, {"selectionId": GUID}, "id"),
+        (i.NativeActivityInput, {"snapshotId": GUID}, "nativeId"),
+        (i.ResolveUser, {}, "username"),
+        (
+            i.AgentSections,
+            {"recordId": RECORD, "selectionId": GUID, "sourceScopeId": SOURCE},
+            "sourceIdentity",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "identity,valid",
+    [
+        ("A" * 512, True),
+        ("\u6f22" * 512, True),
+        ("\U0001f9ed" * 256, True),
+        ("A" * 513, False),
+        ("\u6f22" * 513, False),
+        ("\U0001f9ed" * 257, False),
+        ("A" + "\U0001f9ed" * 256, False),
+    ],
+)
+def test_exact_identity_bounds_match_canonical_utf16_units(model, required, field, identity, valid):
+    payload = {**required, field: identity}
+    if valid:
+        assert model.model_validate(payload).model_dump(exclude_unset=True) == payload
+    else:
+        with pytest.raises(ValidationError):
+            model.model_validate(payload)
+
+
+@pytest.mark.parametrize("model", [i.RefreshPackages, ci.PackageTargets])
+def test_exact_identity_lists_reject_oversized_utf16_targets(model):
+    identity = "\U0001f9ed" * 256
+    assert model(ids=[identity]).ids == [identity]
+    with pytest.raises(ValidationError):
+        model(ids=[identity + "A"])
 
 
 @pytest.mark.parametrize(

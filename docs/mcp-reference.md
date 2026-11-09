@@ -27,10 +27,10 @@ deployment/reset and sign-in.
 
 ## Typed business catalog
 
-The immutable catalog contains **54 native domain tools** covering
-**113 canonical operations**. The API's current authority projects each native initialize/list/call:
-EndUser receives **3 tools / 4 operations**, Viewer and Uploader **38 / 90**,
-and Admin **54 / 113**. These are current measurements, not fixed client limits.
+The immutable catalog contains **57 native domain tools** covering
+**135 canonical operations**. The API's current authority projects each native initialize/list/call:
+EndUser receives **4 tools / 5 operations**, Viewer and Uploader receive their current
+role-qualified operations, and Admin receives **57 / 135**. These are current measurements, not fixed client limits.
 Each tool has one typed `request` object and complete nested input/output schemas.
 [`domains.py`](../mcp/src/agent_control_mcp/domains.py) owns the public families;
 [`tools.py`](../mcp/src/agent_control_mcp/tools.py) owns canonical names/methods/routes/DTOs:
@@ -46,7 +46,45 @@ its action/input and action/result envelopes and honest annotation hints.
 | `agent_catalog` | `search`, `detail` (including description continuation) | `POST /api/discovery/read`, operation `search` / `detail` |
 | `my_workplace` | `read` | `POST /api/discovery/read`, operation `workplace` |
 | `my_discovery_profile` | `read` | `POST /api/discovery/read`, operation `profile` |
-| `preview_end_user` (staff only) | `profile`, `search`, `detail`, `workplace`, each with exact subject | `POST /api/discovery/preview`, corresponding operation |
+| `shared_learning` | `read` | `POST /api/discovery/learning`, employee-safe tenant-wide learning |
+| `adoption_content` (staff only) | `list`, `detail`, `create`, `update`, `progress`, `delete`, `follow_up` | `/api/adoption-content`, exact revisions and durable source intent |
+| `preview_end_user` (staff only) | `profile`, `search`, `detail`, `workplace`, `learning`, each with exact subject | `POST /api/discovery/preview` or `/api/discovery/learning/preview` |
+
+The adoption family combines bounded reads and explicit business-content writes;
+its aggregate annotations are conservatively mutating/destructive/non-idempotent.
+Action descriptions and the canonical API—not annotations—enforce actual authority.
+Creator/Admin core edits and sharing are distinct from assigned-staff progress.
+Create uses a timestamped UUID request bound to actual actor/tenant and canonical
+payload; retain the same key/payload after unknown outcomes. A retry resolves the
+original identity's current record or deleted outcome, not an archived first version.
+Measured saves validate current supplied selections; reload rebinds exact durable
+source intent to the current caller. No leases, people, arbitrary model approval,
+hosted model, participant registry or automatic mutation is retained.
+Create and follow-up use the same selected-evidence query: exact company/department,
+Office observation/baseline, report set, required Office/report read IDs and an
+optional inventory read ID. Supplied read IDs are validated, never persisted as
+business-content authority or copied into the browser analysis prompt.
+Employee `shared_learning` and staff preview expose finite learning slots with
+current agent source/privacy checks; arbitrary prose, labels, examples, attribution,
+actions and staff metrics are withheld. Labels filter relevance, never authorization.
+All discovery and shared-learning reads accept options only in their typed POST
+body, reject query-string options, and return `Cache-Control: no-store`.
+
+Discovery cards expose API-owned `origin.kind` (`organization_created` or
+`microsoft`) with exact source-qualified evidence. Shared/package/name/prefix
+membership is not origin or provider entitlement. A permitted, exactly linked
+Graph About can describe an independently eligible native candidate while its
+native description remains absent. Unsafe/privacy-withheld native text is not
+reconstructed from another source. Exhaust description continuations and keep
+per-source available/absent/withheld states, generation/source identity and
+publication revision. Current authority is rechecked on every page. Staff
+inventory/About retains third-party and unknown coverage; employee catalog and
+staff EndUser preview do not expand to general third-party discovery.
+
+The guarded `mcp-end-to-end` verification aggregate permits 29 minutes for the
+complete SDK matrix. Its 16 discovery role/privacy scenarios have independent
+120-second test bounds; runtime retrieval, SQL, source expiry and response limits
+are unchanged.
 
 Discovery never grants use permission or proves live access. Department evidence
 uses stored company **and** department; company popularity uses stored company
@@ -75,7 +113,7 @@ and direct result. Package block/access execution uses explicit typed actions,
 not a universal control executor. Full schemas retain local `$defs` references.
 
 Staff read families are `capabilities`, `inventory`, `packages`, `native_inventory`,
-`users`, `adoption`, `report_agents`, `report_users`, `report_datasets`,
+`users`, `adoption`, `office_adoption`, `report_agents`, `report_users`, `report_datasets`,
 `agent_usage`, `sync`, `package_refresh_jobs`, `studio_refresh_jobs`,
 `package_control_jobs` and `studio_control_jobs`. Provider families
 `collect_sync`, `collect_packages`, `access_principals` and destructive execution
@@ -118,6 +156,8 @@ descriptions and schemas; tools without a nonblank display title show their
 advertised name. Its read-only filter uses explicit SDK annotation hints,
 not inferred permission. Endpoint/instruction copy actions affect only the
 clipboard and report failure explicitly. No action on this page runs a tool.
+Prompt-copy feedback follows the latest attempt; a failed write selects the exact
+prompt for manual copying when browser selection is supported.
 Expanded schema panes are named, keyboard-focusable regions with bounded
 scrolling; the complete schema remains available without widening the page.
 
@@ -132,6 +172,8 @@ rechecks initiating authority and disables caching. The private metadata read
 enforces a three-second total deadline and 4 MiB streamed bound. The browser
 allows an additional 16 KiB for the settings envelope, plus its outer JSON level
 and bounded wrapper tokens, so a valid boundary-sized catalog remains readable.
+A linear JSON pre-scan enforces nesting and token limits and rejects duplicate
+keys and unterminated strings without repeatedly scanning malformed input.
 Instructions and the complete tool objects
 come from the same projected SDK serialization as initialize/tools-list.
 The metadata credential cannot authorize business tools. Both independent
@@ -360,8 +402,9 @@ limit. Invalidated/expired pages fail without recapture. Counts distinguish
 total/returned and saved memberships/latest collected rows. Unknown metrics,
 dates, descriptions and incomplete evidence stay null/explicit, not zero/empty
 success. Source/report/package IDs preserve case; UUIDs normalize lowercase.
-Source-qualified references allow 10000 encoded characters and 512 UTF-16-unit
-decoded identities; investigation references allow 2048 characters.
+Exact package/native/report identities are bounded to 512 UTF-16 code units.
+Source-qualified references allow 10000 encoded characters and the same bound
+for each decoded identity; investigation references allow 2048 characters.
 
 Saved exact user resolution is trimmed case-insensitive directory UPN matching,
 not fuzzy names. `objectId` is null unless one directory object matches; report
@@ -371,6 +414,41 @@ with matching dependencies. Report-only identities remain readable, not controll
 Champions rank by responses descending, then positively used agent count, name
 and identity; creation counts do not influence rank. Department agent lists are
 not champions-only.
+
+`adoption.opportunities` captures independent Office/report selections and
+available optional all-inventory enrichment without provider access. Its scalar
+page is at most ten groups/128 KiB, ranked across all matching groups by definite
+no-reported evidence, then Office-active count and exact group identity.
+Weekly aggregate-only observations retain that Office-active ranking even
+without person-level agent evidence.
+Positive Users-only facts count without fabricated relationship edges. The
+whole frozen Office observation supplies exact object/UPN identity ambiguity,
+paid eligibility and affiliation; newer saved directory/agent-paid denominators
+are separately labelled. Positive + noReported + unknown reconcile to the
+Office-active audience. Incomplete/unresolvable report evidence cannot create
+negative people. Missing Office people, missing reports, optional inventory,
+unknown and measured zero remain distinct.
+The browser uses the same typed contracts through `readDepartmentOpportunities`
+and `readOpportunityPeople` in `frontend/src/api/reportData.ts`; no UI-side
+cohort calculation is required.
+
+Continue `adoption.opportunity_people` using the returned Office query,
+`officeSelectionId`, `reportSelectionId`, optional `inventorySelectionId`, exact
+group/cohort/limit and cursor. Its `positive`, `no_reported`, `unknown` cohorts
+are disjoint, server-calculated Office-active people, not current-directory
+reassignments. Every contributing selection is checked in one fenced read and
+again before response release. Weekly Office people fail
+`office_history_aggregate_only`; `office_adoption.history`/summary/group
+aggregates remain usable. Office bindings retain literal facet/null and
+cursor/page/anchor semantics. An oversized HTTP payload fails MCP `output_limit`;
+request a smaller supported page rather than accepting clipped evidence.
+
+Follow aggregate drilldown paths through their real endpoints. A peer link
+marked `requiresExactGroupCapture` first captures the exact adoption group and
+an unfiltered all-inventory selection, then calls `adoption.champion_agents`.
+That returns only the top three champions' used/created edges, not the
+department's full agent list. No inventory means created edges are unavailable,
+not zero; report-only agents still appear in the existing adoption/report reads.
 
 `createdWithinDays` freezes at selection `evaluatedAt`: any saved source creation
 at or after the cutoff qualifies. Unknown creation excludes; modification/import/
@@ -489,9 +567,18 @@ registrations, schemas and rows together.
 | `POST /api/mcp/authenticated-entry` | empty body → idempotent due read admission | automatic authenticated entry | HTTP only | S |
 | `POST /api/discovery/read` | finite operation, selection/typed bounds → safe saved DTO | employee discovery | search_agent_catalog, read_discovery_detail, read_my_workplace, read_my_discovery_profile | S |
 | `POST /api/discovery/preview` | exact saved subject, same finite reads → safe preview DTO | staff EndUser lens | preview_discovery_profile, preview_discovery_search, preview_discovery_detail, preview_discovery_workplace | V |
+| `POST /api/discovery/learning` | bounded labels/id/cursor → safe structured shared cards | employee discovery | read_shared_learning | S |
+| `POST /api/discovery/learning/preview` | exact subject + bounded card options → safe shared cards | staff EndUser lens | preview_shared_learning | V |
+| `GET /api/adoption-content` | kind/limit/cursor → tenant staff records | business content | list_adoption_content | V |
+| `GET /api/adoption-content/:id` | exact identity → current record, revisions and source states | business content | read_adoption_content | V |
+| `POST /api/adoption-content` | timestamp.UUID requestId + typed draft → original save identity | business content | create_adoption_content | V |
+| `PATCH /api/adoption-content/:id` | expectedRevision + core draft or status/progress → current record | business content | update_adoption_content, progress_adoption_action | V |
+| `DELETE /api/adoption-content/:id` | expectedRevision + confirmed delete:id → deleted | business content | delete_adoption_content | V |
+| `POST /api/adoption-content/:id/follow-up` | live selected same-group evidence → aggregate comparison/caveats | business content | follow_up_adoption_content | V |
 | `GET /api/workbench/metadata` | none → code-owned definitions | navigation | — | V |
 | `GET /api/workbench/jobs` | none → ≤100 summaries/unavailable sources | Sync recovery | list_workspace_jobs | V |
 | `GET /api/mcp/settings` | none → tenant-bound runtime metadata or explicit unavailable state | MCP settings | — | V |
+| `GET /api/discovery/connection` | none → current validated non-secret resource or not_configured, no tools/IDs | employee browser setup, own active member | — | S |
 | `GET /api/capabilities` | none → saved capability views | Permissions | list_capabilities | V |
 | `GET /api/capabilities/check-progress` | retry?:failed → progress | check progress | get_capability_check_progress | V |
 | `POST /api/capabilities/check` | empty body, retry?:failed → explicit token/read checks | Check status | check_capabilities | V |
@@ -499,6 +586,10 @@ registrations, schemas and rows together.
 | `PUT /api/capabilities/:id/configuration` | enabled/sharedDataScope → revision/view | configuration API | — | A |
 
 ### Inventory, About, configuration and responsibility
+
+Exact-record reads accept canonical `agent:<UUID>` and source-qualified record IDs.
+Members, children, sections and About resolve source references within the supplied
+saved selection; missing or ambiguous references return 404 or 409 without recapturing.
 
 | Method route | Input → output | Browser consumer / feature | Canonical operation | Policy |
 | --- | --- | --- | --- | --- |
@@ -535,19 +626,21 @@ These are saved reads, not provider requests or CSV reparses.
 | `GET /api/copilot-usage/users/:objectId/agents` | R + relationship filters → page | person agents | list_user_used_agents | V |
 | `GET /api/copilot-usage/users/:objectId/agent-relationships` | paired selections, relationship, cursor/limit → edges | exact relationships | list_user_agent_relationships | V |
 | `GET /api/copilot-usage/adoption` | R(adoption), ≤10 groups → adoption page | Adoption | list_adoption_groups | V |
-| `GET /api/copilot-usage/adoption/summary` | R → unfiltered organization summary | adoption totals | HTTP only | V |
-| `GET /api/copilot-usage/adoption/departments` | R, limit/cursor/pageNumber → departments | department groups | HTTP only | V |
-| `GET /api/official-usage/history/adoption` | R, limit/cursor → retained history | adoption trends | HTTP only | V |
+| `GET /api/copilot-usage/adoption/summary` | R → unfiltered organization summary | adoption totals | get_adoption_summary | V |
+| `GET /api/copilot-usage/adoption/departments` | R, limit/cursor/pageNumber → departments | department groups | list_adoption_departments | V |
+| `GET /api/official-usage/history/adoption` | R, limit/cursor → retained history | adoption trends | list_adoption_history | V |
 | `GET /api/copilot-usage/adoption/facets` | R, field/search? → facets | organization filters | list_adoption_facets | V |
 | `GET /api/copilot-usage/adoption/champions` | exact-group/full-inventory selections, paging → top-three edges | champions | list_champion_agents | V |
-| `GET /api/office-app-adoption/context` | OfficeQuery, selection? → frozen context | Office dashboard | HTTP only | V |
-| `GET /api/office-app-adoption/summary` | OfficeQuery/selection → organization totals/comparison | Office cards | HTTP only | V |
-| `GET /api/office-app-adoption/comparison` | OfficeQuery/selection/baseline → summary | Office comparison | HTTP only | V |
-| `GET /api/office-app-adoption/history` | OfficeQuery/selection/paging → provider-date history | Office trends | HTTP only | V |
-| `GET /api/office-app-adoption/groups` | OfficeQuery/selection, limit5/paging → groups | Office group drilldown | HTTP only | V |
-| `GET /api/office-app-adoption/departments` | OfficeQuery/selection/paging → departments | Office departments | HTTP only | V |
-| `GET /api/office-app-adoption/facets` | OfficeQuery/selection/kind/search/paging → facets | Office filters | HTTP only | V |
-| `GET /api/office-app-adoption/groups/:groupId/people` | OfficeQuery/selection, limit100/paging → paid people | person suggestions | HTTP only | V |
+| `GET /api/copilot-usage/adoption/opportunities` | Independent Office/report/inventory selections?, OfficeQuery, ≤10 groups/128 KiB → scalar evidence | Department opportunities | list_department_opportunities | V |
+| `GET /api/copilot-usage/adoption/opportunities/:groupId/people` | Same independent selections/query, exact group/cohort, ≤100 → audience page | Opportunity drilldown | list_opportunity_people | V |
+| `GET /api/office-app-adoption/context` | OfficeQuery, selection? → frozen context | Office dashboard | get_office_context | V |
+| `GET /api/office-app-adoption/summary` | OfficeQuery/selection → organization totals/comparison | Office cards | get_office_summary | V |
+| `GET /api/office-app-adoption/comparison` | OfficeQuery/selection/baseline → summary | Office comparison | get_office_comparison | V |
+| `GET /api/office-app-adoption/history` | OfficeQuery/selection/paging → provider-date history | Office trends | list_office_history | V |
+| `GET /api/office-app-adoption/groups` | OfficeQuery/selection, limit5/paging → groups | Office group drilldown | list_office_groups | V |
+| `GET /api/office-app-adoption/departments` | OfficeQuery/selection/paging → departments | Office departments | list_office_departments | V |
+| `GET /api/office-app-adoption/facets` | OfficeQuery/selection/kind/search/paging → facets | Office filters | list_office_facets | V |
+| `GET /api/office-app-adoption/groups/:groupId/people` | OfficeQuery/selection, limit100/paging → paid people | person suggestions | list_office_people | V |
 | `GET /api/official-usage/aggregate` | R(official_agents) → agent report page | report inspector | list_report_agents | V |
 | `GET /api/official-usage/aggregate/facets` | R, field/search? → facets | inspector filters | list_report_agent_facets | V |
 | `GET /api/official-usage/users` | R(official_users) → report users | reported users | list_report_users | V |

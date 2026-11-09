@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Check, ChevronDown, CircleCheck, CircleHelp, Code2, Copy, FileText, Info, LoaderCircle, Network, RefreshCw, Search, Server } from "lucide-react";
+import { AlertCircle, ChevronDown, CircleCheck, CircleHelp, Code2, FileText, Info, LoaderCircle, Network, RefreshCw, Search, Server, Shield } from "lucide-react";
 import type { McpSettings as Settings, McpTool } from "../../../backend/src/types/mcpSettings";
 import { getMcpSettings, type SessionUser } from "../api/client";
 import { hasRole } from "../authorization";
 import { formatSyncInstant } from "./syncPresentation";
 import "./mcpSettings.css";
+import { CustomerStarterKit } from "./CustomerStarterKit";
+import { McpSuggestedPrompts } from "./McpSuggestedPrompts";
+import { McpCopyText } from "./McpCopyText";
 
 export function McpSettings({ user }: { user: SessionUser }) {
   const owner = JSON.stringify([user.tenantId, user.homeAccountId, [...user.roles].sort()]);
@@ -46,26 +49,27 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
       <div className="mcp-heading-copy">
         <p className="mcp-eyebrow">Connections &amp; integrations</p>
         <h2 id="mcp-settings-title" ref={heading} tabIndex={-1}>MCP settings</h2>
-        <p>Inspect your current caller's server connection, client instructions, and advertised tools.</p>
+        <p>Bring Agent Control into your AI tools. Find a useful prompt, connect your agent, and explore what your connection can do.</p>
       </div>
-      {allowed ? <button type="button" className="secondary mcp-refresh" onClick={refresh} disabled={!current}>
-        <RefreshCw size={16} aria-hidden="true" className={!current ? "mcp-spinner" : undefined} />Refresh metadata
-      </button> : null}
     </header>
     {!allowed ? <div className="mcp-notice" role="alert"><AlertCircle size={20} aria-hidden="true" /><p>Viewer access is required.</p></div> : <>
+      <nav className="mcp-jump-links" aria-label="On this page">
+        <a href="#mcp-prompts">Suggested prompts</a><a href="#mcp-setup">MCP server setup</a><a href="#mcp-server-details">Server details</a>
+      </nav>
+      <McpSuggestedPrompts />
+      <CustomerStarterKit audience="staff" resourceUrl={settings && settings.state !== "not_configured" ? settings.configured.resourceUrl : undefined} />
+      <section id="mcp-server-details" className="mcp-server-section" aria-labelledby="mcp-server-title">
+        <header className="mcp-card-heading">
+          <div><p className="mcp-eyebrow">03 / Inspect</p><h3 id="mcp-server-title">Server details</h3>
+            <p className="mcp-section-intro">Read-only information for your current connection. Configuration is managed through deployment tooling.</p></div>
+          <button type="button" className="secondary mcp-refresh" onClick={refresh} disabled={!current}>
+            <RefreshCw size={16} aria-hidden="true" className={!current ? "mcp-spinner" : undefined} />Refresh metadata
+          </button>
+        </header>
       {!current ? <div className="mcp-loading" role="status"><LoaderCircle className="mcp-spinner" size={22} aria-hidden="true" /><p>Loading MCP metadata…</p></div> : null}
       {current?.error ? <MetadataError message={current.error} onRetry={refresh} /> : null}
-      {settings ? <section className="mcp-card" aria-labelledby="mcp-privacy-title">
-        <header className="mcp-card-heading"><h3 id="mcp-privacy-title">Employee discovery privacy</h3><span className="mcp-badge">View only</span></header>
-        <p>Effective API-owned deployment policy for EndUser discovery and staff EndUser previews.
-          These independent values remain available when MCP metadata is unreachable. Ordinary authorized staff reads are unchanged.</p>
-        <dl className="mcp-status-list">
-          <div><dt>hide_employee_details</dt><dd>{String(settings.privacy.hide_employee_details)}</dd></div>
-          <div><dt>hide_champion_employee</dt><dd>{String(settings.privacy.hide_champion_employee)}</dd></div>
-        </dl>
-      </section> : null}
       {settings?.state === "not_configured" ? <div className="mcp-empty">
-        <Network size={28} aria-hidden="true" /><h3>No server configured</h3>
+        <Network size={28} aria-hidden="true" /><h4>No server configured</h4>
         <p>No MCP server is configured for this organization.</p>
         <p>Connection settings are managed through the deployment tooling.</p>
       </div> : null}
@@ -76,12 +80,8 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
           code={settings.code} onRetry={refresh} /> : null}
         <div className="mcp-overview">
           <section className="mcp-card" aria-labelledby="mcp-connection-title">
-            <header className="mcp-card-heading"><h3 id="mcp-connection-title">Connection details</h3><span className="mcp-badge">View only</span></header>
-            <p className="mcp-card-intro">Deployment-managed settings for connecting an MCP client.</p>
-            <div className="mcp-endpoint">
-              <div className="mcp-field-heading"><span>Resource URL</span>{settings.configured.resourceUrl ? <CopyText value={settings.configured.resourceUrl} label="resource URL" /> : null}</div>
-              <code>{settings.configured.resourceUrl || "Unavailable configured value"}</code>
-            </div>
+            <header className="mcp-card-heading"><h4 id="mcp-connection-title">Connection details</h4><span className="mcp-badge">View only</span></header>
+            <p className="mcp-card-intro">Server callbacks and transport details. The client Resource URL is in setup above.</p>
             {runtime ? <div className="mcp-callback">
               <span className="mcp-field-label">Server Entra callback</span>
               <code>{new URL("/auth/callback", runtime.binding.resourceUrl).href}</code>
@@ -98,7 +98,7 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
             </details> : null}
           </section>
           <section className="mcp-card mcp-runtime" aria-labelledby="mcp-runtime-title">
-            <header className="mcp-card-heading"><h3 id="mcp-runtime-title">Runtime status</h3>
+            <header className="mcp-card-heading"><h4 id="mcp-runtime-title">Runtime status</h4>
               <span className="mcp-badge" data-tone={runtime ? "success" : "warning"}>{runtime ? "Metadata available" : "Unavailable"}</span>
             </header>
             {runtime ? <>
@@ -119,17 +119,17 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
         </div>
         {runtime ? <>
           <details className="mcp-card mcp-instructions">
-            <summary><FileText size={20} aria-hidden="true" /><div><h3>Server instructions</h3><p>Exact guidance sent to clients during initialization.</p></div>
+            <summary><FileText size={20} aria-hidden="true" /><div><h4>Server instructions</h4><p>Exact guidance sent to clients during initialization.</p></div>
               <span className="mcp-count">{runtime.instructions.trim().split(/\s+/).length} words</span><ChevronDown size={18} aria-hidden="true" /></summary>
             <div className="mcp-instructions-body">
-              <div className="mcp-instructions-toolbar"><span>Advertised by the running server</span><CopyText value={runtime.instructions} label="server instructions" /></div>
+              <div className="mcp-instructions-toolbar"><span>Advertised by the running server</span><McpCopyText key={runtime.instructions} value={runtime.instructions} label="server instructions" /></div>
               <pre className="mcp-prose" data-testid="mcp-instructions">{runtime.instructions}</pre>
             </div>
           </details>
-          <section className="mcp-card mcp-catalog" aria-labelledby="mcp-catalog-title">
-            <header className="mcp-catalog-heading"><div><p className="mcp-eyebrow">Advertised capabilities</p>
-              <h3 id="mcp-catalog-title">Tool catalog <span className="mcp-count">{runtime.tools.length}</span></h3>
-              <p>Explore tool descriptions and contracts. This page never executes tools.</p></div></header>
+          <details className="mcp-card mcp-catalog">
+            <summary className="mcp-catalog-heading"><Code2 size={20} aria-hidden="true" /><div>
+              <h4>Tool catalog</h4><p>Explore your caller&apos;s advertised tools and contracts. No tools run here.</p></div>
+              <span className="mcp-count">{runtime.tools.length} tools</span><ChevronDown size={18} aria-hidden="true" /></summary>
             <div className="mcp-catalog-toolbar">
               <label className="mcp-search"><Search size={17} aria-hidden="true" /><span className="sr-only">Search tools, descriptions and schemas</span>
                 <input type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Search tools, descriptions, or schemas" /></label>
@@ -142,9 +142,21 @@ function PrincipalMcpSettings({ user, owner }: { user: SessionUser; owner: strin
               <p>Try a different search or include all tool types.</p>
               <button type="button" className="secondary" onClick={() => { setQuery(""); setReadOnly(false); }}>Clear filters</button>
             </div> : null}
-          </section>
+          </details>
         </> : null}
       </> : null}
+      {settings ? <details className="mcp-card mcp-privacy">
+          <summary><Shield size={20} aria-hidden="true" /><div><h4>Employee discovery privacy</h4>
+            <p>Effective deployment policy for employee discovery and staff previews.</p></div>
+            <span className="mcp-badge">View only</span><ChevronDown size={18} aria-hidden="true" /></summary>
+          <div className="mcp-privacy-body"><p>These independent API-owned values remain available when MCP metadata is unreachable. Ordinary authorized staff reads are unchanged.</p>
+            <dl className="mcp-status-list">
+              <div><dt>hide_employee_details</dt><dd>{String(settings.privacy.hide_employee_details)}</dd></div>
+              <div><dt>hide_champion_employee</dt><dd>{String(settings.privacy.hide_champion_employee)}</dd></div>
+            </dl>
+          </div>
+        </details> : null}
+      </section>
     </>}
   </section>;
 }
@@ -155,30 +167,16 @@ function MetadataError({ message, code, onRetry }: { message: string; code?: str
     <button type="button" className="secondary" onClick={onRetry}>Retry metadata</button></div>;
 }
 
-function CopyText({ value, label }: { value: string; label: string }) {
-  const [state, setState] = useState<"copied" | "failed">();
-  async function copy() {
-    try { await navigator.clipboard.writeText(value); setState("copied"); }
-    catch { setState("failed"); }
-  }
-  return <span className="mcp-copy">
-    <button type="button" className="secondary" aria-label={`Copy ${label}`} onClick={() => void copy()}>
-      {state === "copied" ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
-      {state === "copied" ? "Copied" : "Copy"}</button>
-    {state === "copied" ? <span className="sr-only" role="status">{label} copied.</span> : null}
-    {state === "failed" ? <span className="mcp-copy-error" role="alert">Copy unavailable. Select and copy the text.</span> : null}
-  </span>;
-}
-
 function Tool({ tool }: { tool: McpTool }) {
+  const [open, setOpen] = useState(false);
   const hints = tool.annotations;
   const title = tool.title?.trim() ? tool.title : tool.name;
   const annotations = [["Read-only", hints?.readOnlyHint], ["Destructive", hints?.destructiveHint],
     ["Idempotent", hints?.idempotentHint], ["Open world", hints?.openWorldHint]] as const;
   return <article className="mcp-tool" aria-label={tool.name}>
-    <details>
+    <details onToggle={event => setOpen(event.currentTarget.open)}>
       <summary aria-label={`Inspect ${tool.name}`}><span className="mcp-tool-icon"><Code2 size={18} aria-hidden="true" /></span>
-        <div className="mcp-tool-name"><h4>{title}</h4>{title !== tool.name ? <code>{tool.name}</code> : null}</div>
+        <div className="mcp-tool-name"><h5>{title}</h5>{title !== tool.name ? <code>{tool.name}</code> : null}</div>
         <div className="mcp-tool-badges">
           {hints?.readOnlyHint === true ? <span className="mcp-badge" data-tone="success">Read-only</span> : <span className="mcp-badge">Operation</span>}
           {hints?.destructiveHint === true ? <span className="mcp-badge" data-tone="warning">Destructive</span> : null}
@@ -188,12 +186,12 @@ function Tool({ tool }: { tool: McpTool }) {
         <pre className="mcp-prose" data-testid="mcp-description">{tool.description ?? ""}</pre>
         <dl className="mcp-annotations">{annotations.map(([label, value]) => <div key={label}><dt>{label}</dt>
           <dd>{value === undefined ? "Not advertised" : value ? "Yes" : "No"}</dd></div>)}</dl>
-        <div className="mcp-schemas">
+        {open ? <div className="mcp-schemas">
           <details><summary><Code2 size={15} aria-hidden="true" />Input schema — {tool.name}<ChevronDown size={15} aria-hidden="true" /></summary>
             <pre tabIndex={0} role="region" aria-label={`Input schema for ${tool.name}`}>{JSON.stringify(tool.inputSchema, null, 2)}</pre></details>
           <details><summary><Code2 size={15} aria-hidden="true" />Output schema — {tool.name}<ChevronDown size={15} aria-hidden="true" /></summary>
             <pre tabIndex={0} role="region" aria-label={`Output schema for ${tool.name}`}>{tool.outputSchema ? JSON.stringify(tool.outputSchema, null, 2) : "Not advertised"}</pre></details>
-        </div>
+        </div> : null}
       </div>
     </details>
   </article>;

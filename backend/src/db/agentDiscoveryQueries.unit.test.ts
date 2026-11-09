@@ -15,6 +15,32 @@ const native: PowerPlatformResource = {
 };
 
 describe("discovery saved person identity joins", () => {
+  it("separates canonical eligibility from exactly linked descriptive sources", () => {
+    const sql = discoveryCatalogQuery();
+    expect(sql).toContain("origin_evidence AS");
+    expect(sql).toContain("JOIN eligible");
+    expect(sql).toContain("report.expires_at IS NULL OR report.expires_at>GREATEST($3,clock_timestamp())");
+    expect(sql).not.toContain("WHERE (s.domain='power_platform' OR s.domain='packages'");
+  });
+  it("distinguishes description byte limits from unsafe text and never falls back around either", () => {
+    const sql = discoveryCatalogQuery();
+    expect(sql).toContain("octet_length(description)>4194304 THEN 'limit_withheld'");
+    expect(sql).toContain("bool_or(source_description_state='limit_withheld')");
+    expect(sql).toContain("bool_or(had_description AND source_description IS NULL)");
+  });
+  it("reports normalized description overflow as a byte limit for every catalog reader", () => {
+    const description = "\uFDFA".repeat(131072);
+    const maximumBytes = 4 * 1024 ** 2;
+    expect(Buffer.byteLength(description)).toBeLessThan(maximumBytes);
+    expect(Buffer.byteLength(description.normalize("NFKC"))).toBeGreaterThan(maximumBytes);
+    const saved = packageInventoryRecord(allowlistedPackage({
+      id: "normalized-about", displayName: "Normalized About", isBlocked: false, type: "custom", longDescription: description,
+    }));
+    expect(saved.facts.filter(fact => fact.kind === "about:long").map(fact => fact.payload.text).join("")).toBe(description);
+    for (const sql of [discoveryCatalogQuery(), discoveryCatalogQuery("$13"), discoverySearchSql, discoveryCatalogQuery(undefined, true)]) {
+      expect(sql).toContain("WHEN octet_length(inert_description)>4194304 THEN 'limit_withheld'");
+    }
+  });
   it("accounts for case-preserved inventory IDs and lowercase directory IDs", () => {
     const directory = parseDirectoryUser({
       id: objectId, userPrincipalName: "owner@example.invalid", displayName: "Saved owner",
@@ -49,7 +75,7 @@ describe("discovery saved person identity joins", () => {
 
   it("uses the same normalized creator identity for created-here evidence", () => {
     const sql = discoveryCatalogQuery(undefined, true);
-    expect(sql).toContain("creator.identity=lower(s.residual->>'createdBy')");
+    expect(sql).toContain("creator.identity=lower(maker.residual->>'createdBy')");
     expect(sql).not.toContain("creator.identity=s.residual->>'createdBy'");
   });
 });

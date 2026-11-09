@@ -1,8 +1,9 @@
 import pg from "pg";
 import { transaction } from "../src/db/pool.js";
+import { clientErrorState } from "../src/db/clientErrors.js";
 
 export type ProtectedPrincipalRevocation = {
-  tenant_id: string; principal_id: string; epoch: string; bearer_issued_after: string;
+  tenant_id: string; principal_id: string; epoch: string; bearer_issued_after: string; adoption_request_cutoff: string;
 };
 
 type ResetPhase = "validation" | "drop" | "create";
@@ -51,6 +52,7 @@ export async function preflightDatabaseReset(database: pg.Pool, target: string, 
 export async function resetDatabase(database: pg.Pool, target: string, confirmation: string) {
   assertResetTarget(target, confirmation);
   const client = await database.connect();
+  const state = clientErrorState(client);
   let authority: pg.Client | undefined;
   let authorityError: Error | undefined;
   let phase: ResetPhase = "validation";
@@ -70,7 +72,9 @@ export async function resetDatabase(database: pg.Pool, target: string, confirmat
       if (tables.principals) {
         await authority.query("LOCK TABLE data_principal_epochs IN SHARE MODE");
         revocations = (await authority.query<ProtectedPrincipalRevocation>(`SELECT tenant_id,principal_id,
-          epoch::text,bearer_issued_after::text FROM data_principal_epochs WHERE bearer_issued_after>0`)).rows;
+          epoch::text,bearer_issued_after::text,
+          coalesce((to_jsonb(saved)->>'adoption_request_cutoff')::bigint,0)::text AS adoption_request_cutoff
+          FROM data_principal_epochs saved WHERE bearer_issued_after>0`)).rows;
       }
     }
     // Preserve actual revocation authority, never manufacture a reset-time token cutoff.
@@ -78,28 +82,35 @@ export async function resetDatabase(database: pg.Pool, target: string, confirmat
       database_name text NOT NULL,tenant_id text NOT NULL CHECK(length(tenant_id) BETWEEN 1 AND 128),
       principal_id text NOT NULL CHECK(length(principal_id) BETWEEN 1 AND 256),
       epoch bigint NOT NULL CHECK(epoch>=0),bearer_issued_after bigint NOT NULL CHECK(bearer_issued_after>0),
+      adoption_request_cutoff bigint NOT NULL DEFAULT 0 CHECK(adoption_request_cutoff>=0),
       PRIMARY KEY(database_name,tenant_id,principal_id));
+      ALTER TABLE public.agentcontrol_principal_revocations
+        ADD COLUMN IF NOT EXISTS adoption_request_cutoff bigint NOT NULL DEFAULT 0 CHECK(adoption_request_cutoff>=0);
       REVOKE ALL ON public.agentcontrol_principal_revocations FROM PUBLIC;
       DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='agentcontrol_app') THEN
         REVOKE ALL ON public.agentcontrol_principal_revocations FROM agentcontrol_app;
       END IF; END $$`);
     for (let offset = 0; offset < revocations.length; offset += 1000) {
       await client.query(`INSERT INTO public.agentcontrol_principal_revocations(
-        database_name,tenant_id,principal_id,epoch,bearer_issued_after)
-        SELECT $1,tenant_id,principal_id,epoch,bearer_issued_after FROM jsonb_to_recordset($2::jsonb)
-          AS records(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint)
+        database_name,tenant_id,principal_id,epoch,bearer_issued_after,adoption_request_cutoff)
+        SELECT $1,tenant_id,principal_id,epoch,bearer_issued_after,adoption_request_cutoff FROM jsonb_to_recordset($2::jsonb)
+          AS records(tenant_id text,principal_id text,epoch bigint,bearer_issued_after bigint,adoption_request_cutoff bigint)
         ON CONFLICT(database_name,tenant_id,principal_id) DO UPDATE SET
           epoch=GREATEST(agentcontrol_principal_revocations.epoch,EXCLUDED.epoch),
-          bearer_issued_after=GREATEST(agentcontrol_principal_revocations.bearer_issued_after,EXCLUDED.bearer_issued_after)`,
+          bearer_issued_after=GREATEST(agentcontrol_principal_revocations.bearer_issued_after,EXCLUDED.bearer_issued_after),
+          adoption_request_cutoff=GREATEST(agentcontrol_principal_revocations.adoption_request_cutoff,EXCLUDED.adoption_request_cutoff)`,
       [target, JSON.stringify(revocations.slice(offset, offset + 1000))]);
     }
+    if (state.error) throw state.error;
     if (saved.exists) {
       if (authorityError) throw authorityError;
       phase = "drop";
       await client.query(`DROP DATABASE "${target}" WITH (FORCE)`);
+      if (state.error) throw state.error;
     }
     phase = "create";
     await client.query(`CREATE DATABASE "${target}" OWNER agentcontrol_admin TEMPLATE template0`);
+    if (state.error) throw state.error;
     return { database: target, state: "fresh" };
   } catch (error) {
     if (error instanceof DatabaseResetError) throw error;

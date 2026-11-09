@@ -174,3 +174,47 @@ async def test_invalid_discovery_never_dispatches(operation, payload, rpc, entra
     result = await rpc(operation, payload)
     assert result["isError"]
     assert not entra.api_calls
+
+
+@pytest.mark.parametrize("kind", ["organization_created", "microsoft"])
+def test_origin_and_about_keep_independent_exact_source_memberships(kind):
+    membership = {
+        "source": "graph_packages",
+        "generationId": GUID,
+        "sourceIdentity": "ExactPackage",
+        "revision": GUID,
+    }
+    origin = discovery.Origin.model_validate(
+        {
+            "kind": kind,
+            "evidence": [{**membership, "field": "creatorType", "setId": GUID, "versionId": GUID}],
+        }
+    )
+    native = discovery.Provenance.model_validate(
+        {
+            **membership,
+            "source": "power_platform",
+            "sourceIdentity": "native-source",
+            "observedAt": "2026-11-08T00:00:00Z",
+            "descriptionField": "details.description",
+            "descriptionState": "absent",
+        }
+    )
+    graph = discovery.Provenance.model_validate(
+        {
+            **membership,
+            "observedAt": "2026-11-08T00:00:00Z",
+            "descriptionField": "longDescription",
+            "descriptionState": "available",
+        }
+    )
+    assert origin.kind == kind
+    assert native.descriptionState == "absent"
+    assert graph.descriptionState == "available"
+    assert graph.sourceIdentity == "ExactPackage"
+
+
+@pytest.mark.parametrize("kind", ["third_party", "unknown", "locally_approved"])
+def test_employee_origin_never_expands_to_third_party_or_approval(kind):
+    with pytest.raises(ValidationError):
+        discovery.Origin.model_validate({"kind": kind, "evidence": []})

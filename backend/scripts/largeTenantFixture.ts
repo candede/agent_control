@@ -5,13 +5,38 @@ import { browserFixtureTestFiles } from "./fixtureSupport.js";
 const appSessionFiles = ["src/App.session.test.tsx", "src/App.inventory.test.tsx", "src/App.commands.test.tsx"];
 
 export function fixtureCommands(suite: string): string[][] {
+  if (suite === "adoption-content") return [
+    ["run", "test", "--workspace", "backend", "--", "src/services/adoptionContent.unit.test.ts",
+      "src/routes/adoptionContent.unit.test.ts", "src/db/adoptionContent.test.ts", "src/routes/adoptionContent.test.ts",
+      "src/routes/departmentOpportunity.test.ts",
+      "scripts/database.test.ts", "scripts/databaseReset.test.ts", "scripts/backup.test.ts", "scripts/largeTenantRestore.test.ts",
+      "src/db/schema.test.ts", "src/db/dataRetention.test.ts", "--silent=false"],
+    ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts",
+      "-t", "measures correct compact", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+  ];
+  if (suite === "department-evidence") return [
+    ["run", "test", "--workspace", "backend", "--", "src/services/departmentOpportunity.test.ts",
+      "src/services/departmentOpportunity.unit.test.ts", "src/routes/departmentOpportunity.test.ts",
+      "src/services/officeAppAdoptionReads.unit.test.ts", "src/services/adoptionGroups.unit.test.ts",
+      "src/services/adoptionDepartments.unit.test.ts", "src/routes/mcpContractFeasibility.test.ts",
+      "src/services/adoptionGroups.test.ts", "src/services/largeTenantUsersReports.test.ts",
+      "src/routes/officeAppAdoption.test.ts", "src/routes/mcpReadContracts.test.ts",
+      "src/routes/policy.test.ts", "src/services/dataSelections.test.ts", "--silent=false"],
+    ["run", "typecheck", "--workspace", "backend"],
+    ["run", "test", "--workspace", "frontend", "--", "src/api/reportData.test.ts"],
+    ["run", "typecheck", "--workspace", "frontend"],
+  ];
   if (suite === "mcp-agent-discovery-capacity") return [
-    ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts", "--silent=false"],
+    ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts",
+      "src/services/departmentOpportunity.unit.test.ts", "--silent=false"],
   ];
   if (suite === "mcp-agent-discovery") return [
+    ["run", "test", "--workspace", "backend", "--", "src/routes/agentDiscovery.test.ts", "--silent=false"],
     ["run", "test", "--workspace", "backend", "--", "src/services/agentDiscovery.unit.test.ts",
+      "src/db/agentDiscoveryQueries.unit.test.ts", "src/db/agentDiscoverySchema.unit.test.ts", "src/routes/mcpReadContracts.test.ts",
       "src/routes/agentDiscovery.unit.test.ts", "src/services/adoptionGroups.unit.test.ts", "src/db/inventoryAuthority.unit.test.ts",
-      "src/routes/agentDiscovery.test.ts", "src/routes/policy.test.ts", "src/services/mcpAccess.unit.test.ts",
+      "src/routes/policy.test.ts", "src/services/mcpAccess.unit.test.ts",
       "src/db/schema.test.ts", "scripts/databaseReset.test.ts", "scripts/database.test.ts",
       "scripts/backup.test.ts", "scripts/largeTenantRestore.test.ts", "scripts/largeTenantFixture.test.ts", "src/services/dataSelections.test.ts",
       "src/services/largeTenantUsersReports.test.ts", "src/db/inventoryGenerations.test.ts",
@@ -34,6 +59,9 @@ export function fixtureCommands(suite: string): string[][] {
   ];
   if (suite === "office-app-adoption") return [
     ["run", "test", "--workspace", "backend", "--", "src/db/officeAppAdoption.test.ts", "src/routes/officeAppAdoption.test.ts",
+      "src/services/departmentOpportunity.test.ts", "src/services/departmentOpportunity.unit.test.ts",
+      "src/routes/departmentOpportunity.test.ts", "src/services/officeAppAdoptionReads.unit.test.ts",
+      "src/services/adoptionGroups.unit.test.ts", "src/services/adoptionDepartments.unit.test.ts",
       "src/db/officeAppAdoption.unit.test.ts", "src/services/officeAppAdoption.unit.test.ts", "src/routes/officeAppAdoption.unit.test.ts",
       "src/db/schema.test.ts", "scripts/backup.test.ts", "scripts/largeTenantFixture.test.ts", "src/db/automaticRevisions.unit.test.ts",
       "src/services/dataSync.test.ts", "src/server.test.ts", "src/routes/policy.test.ts",
@@ -42,12 +70,19 @@ export function fixtureCommands(suite: string): string[][] {
       "src/services/automaticRefreshIntegration.test.ts", "src/services/copilotUsage.unit.test.ts",
       "src/services/dataSelections.unit.test.ts", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
+    ["run", "test", "--workspace", "frontend", "--", "src/api/reportData.test.ts"],
+    ["run", "typecheck", "--workspace", "frontend"],
   ];
   if (suite === "mcp-end-to-end") return [
     ["run", "test", "--workspace", "backend", "--", "src/routes/mcpContractFeasibility.test.ts",
       "src/routes/mcpApiAuth.test.ts", "src/routes/mcpReadContracts.test.ts",
+      "src/routes/inventoryData.unit.test.ts", "src/routes/inventoryData.handlers.unit.test.ts",
+      "src/routes/inventoryDataPublication.unit.test.ts",
+      "src/routes/departmentOpportunity.test.ts", "src/db/adoptionContent.test.ts", "src/routes/adoptionContent.test.ts",
       "src/routes/sharedAgentControls.test.ts", "src/routes/agentDiscovery.test.ts",
       "src/services/mcpSettings.test.ts", "scripts/largeTenantFixture.test.ts", "--silent=false"],
+    ["run", "test", "--workspace", "backend", "--", "scripts/agentDiscoveryCapacity.test.ts",
+      "-t", "measures correct compact", "--silent=false"],
     ["run", "typecheck", "--workspace", "backend"],
   ];
   if (suite === "deployment-current") return [
@@ -672,7 +707,8 @@ export function runFixtureCommand(args: string[], environment: NodeJS.ProcessEnv
   execute: FixtureExecutor = spawnSync, kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill) {
   const result = execute("npm", args, {
     env: environment, stdio: "inherit",
-    timeout: args.includes("scripts/agentDiscoveryCapacity.test.ts") ? 1_740_000
+    timeout: args.includes("scripts/agentDiscoveryCapacity.test.ts")
+      || environment.AGENT_CONTROL_MCP_SQL_JOURNEY === "/opt/mcp/.venv/bin/python" ? 1_740_000
       : args.join(" ") === "run test --workspace frontend" ? 300_000 : 600_000, cwd: "/app", detached: true,
   });
   if (result.error && "code" in result.error && result.error.code === "ETIMEDOUT") {
@@ -690,7 +726,7 @@ export function runFixtureCommand(args: string[], environment: NodeJS.ProcessEnv
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const environment = fixtureEnvironment();
-  if (process.argv[2] === "mcp-end-to-end") {
+  if (["mcp-end-to-end", "adoption-content", "mcp-agent-discovery-capacity"].includes(process.argv[2])) {
     if (process.env.AGENT_CONTROL_MCP_SQL_JOURNEY !== "/opt/mcp/.venv/bin/python") throw new Error("SDK fixture image required.");
     environment.AGENT_CONTROL_MCP_SQL_JOURNEY = "/opt/mcp/.venv/bin/python";
   }

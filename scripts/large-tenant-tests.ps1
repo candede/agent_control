@@ -25,6 +25,8 @@ $implemented += @('lifecycle-read-contract','lifecycle-publication-contract')
 $implemented += @('production-frontend','auth-recovery','audit-origin','mcp-read-contracts','shared-agent-controls','webapp-regressions','webapp-qualification')
 $implemented += @('deployment-current','fresh-installation-current','mcp-container','mcp-end-to-end')
 $implemented += @('office-app-adoption')
+$implemented += @('department-evidence')
+$implemented += @('adoption-content')
 $implemented += @('mcp-roleless-authority')
 $implemented += @('mcp-agent-discovery')
 $implemented += @('mcp-agent-discovery-capacity')
@@ -108,7 +110,7 @@ if ($Suite -eq 'cutover-browser-contract') {
 } else {
 $dockerfile = Join-Path $directory 'Dockerfile'
 $base = "FROM $baseline`n"
-if ($Suite -eq 'mcp-end-to-end') {
+if ($Suite -in @('mcp-end-to-end','adoption-content','mcp-agent-discovery-capacity')) {
     . (Join-Path $PSScriptRoot 'local-mcp-fixture.ps1')
     Assert-LocalMcpFixtureEngine
     $sdk = "$project-sdk:local"
@@ -116,9 +118,9 @@ if ($Suite -eq 'mcp-end-to-end') {
         '--label',"io.agent-control.fixture=$project",'-t',$sdk,$root)
     $sdkId = Invoke-DockerCommand @('image','inspect','--format','{{.Id}}',$sdk) -Capture
     Write-LocalText (Join-Path $directory 'sdk-image.json') (@{tag=$sdk;id=$sdkId;purpose='synthetic SDK to canonical SQL HTTP fixture'} | ConvertTo-Json)
-    $base = "FROM $baseline AS installed`nFROM $sdk`nUSER root`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nWORKDIR /app`nENV AGENT_CONTROL_MCP_SQL_JOURNEY=/opt/mcp/.venv/bin/python NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/`nRUN node --version && /opt/mcp/.venv/bin/python --version`n"
+    $base = "FROM $baseline AS installed`nFROM $sdk`nUSER root`nCOPY --from=installed /app /app`nCOPY --from=installed /usr/local /usr/local`nCOPY --from=installed /usr/lib /usr/lib`nWORKDIR /app`nENV PATH=/usr/lib/postgresql/17/bin:`$PATH AGENT_CONTROL_MCP_SQL_JOURNEY=/opt/mcp/.venv/bin/python NPM_CONFIG_REGISTRY=https://packagefeedproxy.microsoft.io/npm/`nRUN node --version && /opt/mcp/.venv/bin/python --version && pg_dump --version && pg_restore --version`n"
 }
-[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY Dockerfile compose.yaml compose.large-tenant-test.yaml /app/`n")
+[IO.File]::WriteAllText($dockerfile,"${base}RUN rm -rf /app/backend/src /app/backend/scripts /app/backend/dist /app/frontend/src /app/frontend/browser /app/frontend/dist /app/scripts /app/docs /app/infra /app/plans`nCOPY backend /app/backend`nCOPY frontend /app/frontend`nCOPY scripts /app/scripts`nCOPY docs /app/docs`nCOPY infra /app/infra`nCOPY Dockerfile compose.yaml compose.large-tenant-test.yaml /app/`n")
 if ($Suite -eq 'software-gate') { [IO.File]::AppendAllText($dockerfile,"RUN npm run build`n") }
 if ($Suite -eq 'gate-failure') {
     [IO.File]::AppendAllText($dockerfile, "RUN printf '%s\n' 'console.error(`"intentional owned gate failure`"); setTimeout(() => process.exit(17), 1200);' > /app/backend/scripts/test-all.ts`n")

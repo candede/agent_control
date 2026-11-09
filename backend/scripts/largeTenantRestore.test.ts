@@ -60,10 +60,12 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
     ], tenantId);
   }
   const original = await reader.summary(identity, {});
-  const observation = original.context.observation!;
+  const retiredObservation = original.context.observation!;
   await publishOfficeSource(fixture.runtime, "app_activity", [officeFixtureActivity(1, { teams_date: officeFixtureDate })], tenant);
   const changedPerson = officeFixturePerson(); changedPerson.identity.department = "Today's changed department";
   await publishOfficeSource(fixture.runtime, "directory", [changedPerson], tenant);
+  await expect(reader.context(identity, { officeSnapshot: retiredObservation.id })).rejects.toMatchObject({ code: "selection_invalidated" });
+  const observation = (await reader.summary(identity, {})).context.observation!;
   const cleanup = async (database: pg.Pool) => {
     const generations = new DataGenerations(database);
     for (let pass = 0, idle = 0; pass < 200 && idle < 2; pass++) {
@@ -74,12 +76,13 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
   };
   await cleanup(fixture.runtime);
   expect((await fixture.runtime.query("SELECT count(*)::int AS n FROM data_generations WHERE id=ANY($1::uuid[])",
-    [[observation.directoryGenerationId, observation.appGenerationId]])).rows[0].n).toBe(0);
+    [[retiredObservation.directoryGenerationId, retiredObservation.appGenerationId]])).rows[0].n).toBe(0);
   const query = { officeSnapshot: observation.id };
   const selected = await reader.context(identity, query);
   const group = (await reader.groups(identity, query, selected.selection.id)).value[0];
   const facts = (await reader.people(identity, query, group.id, selected.selection.id)).value;
   const frozen = await reader.summary(identity, query, selected.selection.id);
+  const timeline = (await reader.history(identity, query)).value.map(point => point.observation.id);
   await fixture.runtime.query("INSERT INTO sessions(sid,sess,expire) VALUES($1,$2,clock_timestamp()+interval '1 hour')",
     [`office-restore-${tenant}`, "{}"]);
   const before = await fingerprints(fixture.operator);
@@ -145,7 +148,9 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
         expect(restoredSummary.organization).toEqual(frozen.organization);
         expect(restoredSummary.context.observation).toEqual(observation);
         expect((await restoredReader.people(restoredIdentity, query, group.id)).value).toEqual(facts);
-        expect((await restoredReader.history(restoredIdentity, query)).value.map(point => point.observation.id)).toEqual([observation.id]);
+        expect((await restoredReader.history(restoredIdentity, query)).value.map(point => point.observation.id)).toEqual(timeline);
+        await expect(restoredReader.context(restoredIdentity, { officeSnapshot: retiredObservation.id }))
+          .rejects.toMatchObject({ code: "selection_invalidated" });
         await expect(restoredReader.context({ ...restoredIdentity, tenantId: clearedTenant }, query)).rejects.toMatchObject({ code: "selection_invalidated" });
         for (const tenantId of [clearedTenant, correctedTenant]) {
           const renewedEpoch = (await runtime.query("SELECT epoch::text FROM data_principal_epochs WHERE tenant_id=$1 AND principal_id=$2",
@@ -156,7 +161,7 @@ it("dumps and fingerprints one snapshot despite a concurrent commit, restoring o
         expect((await runtime.query("SELECT count(*)::int AS n FROM office_person_facts WHERE tenant_id=ANY($1::text[])",
           [[clearedTenant, correctedTenant]])).rows[0].n).toBe(0);
         await verifyDataGenerationCharges(runtime);
-        process.stdout.write(`OFFICE_RESTORE ${JSON.stringify({ history: observation.id, frozenFacts: facts.length,
+        process.stdout.write(`OFFICE_RESTORE ${JSON.stringify({ observation: observation.id, history: timeline, frozenFacts: facts.length,
           originalSourcesRetired: true, oldSelectionsRevoked: true, sessionsDeleted: true, tenantIsolation: true,
           clearAndCorrectionFences: true, byteAccounting: true, schemaFingerprint })}\n`);
       } finally {

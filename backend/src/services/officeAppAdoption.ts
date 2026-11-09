@@ -3,7 +3,7 @@ import { civilDate } from "./userSourceGraphFields.js";
 import { officeApps, type OfficeCoverage, type OfficeDates, type OfficeMetrics, type OfficeQuery, type OfficeUnknownReason } from "../types/officeAppAdoption.js";
 
 export const officeQueryFields = ["officeSnapshot", "officeBaseline", "company", "department", "search", "app"] as const;
-export const officeReasons: readonly OfficeUnknownReason[] = ["missing_row", "ambiguous_identity", "retained_row", "retained_directory",
+const officeReasons: readonly OfficeUnknownReason[] = ["missing_row", "ambiguous_identity", "retained_row", "retained_directory",
   "wrong_window", "no_app_dates", "invalid_app_date", "future_app_date"];
 export function officeDate(value: unknown): value is string {
   if (typeof value !== "string") return false;
@@ -64,7 +64,9 @@ export function officeQuery(input: OfficeQuery): OfficeQuery {
     throw new AppError(400, "invalid_office_query", "Unsupported Office query.");
   }
   for (const key of ["officeSnapshot", "officeBaseline"] as const) {
-    if (input[key] !== undefined && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(input[key]!)) {
+    const value = input[key];
+    if (value !== undefined && (typeof value !== "string" || value.length !== 36
+      || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value))) {
       throw new AppError(400, "invalid_office_query", "Expected an Office observation UUID.");
     }
   }

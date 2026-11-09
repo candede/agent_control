@@ -4,13 +4,20 @@ import { currentAuthority } from "../auth/authorityContext.js";
 import { assertAccountSessionValidation, beginAccountSessionValidation } from "../db/sessions.js";
 import { AppError } from "../errors.js";
 import { requestUser } from "../middleware/requestAuthentication.js";
-import { readMcpSettings } from "../services/mcpSettings.js";
+import { readMcpDiscoveryConnection, readMcpSettings } from "../services/mcpSettings.js";
 import { mcpAccessProfile } from "../services/mcpAccess.js";
 import { hasAppRole } from "../types/capability.js";
 import { policyRoute } from "./policy.js";
 
 export function createMcpSettingsRouter(reader = readMcpSettings) {
   const router = Router();
+  policyRoute(router, "get", "/discovery/connection", { access: "authenticated", browserOnly: true,
+    dataClass: "employee_discovery" }, (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    const user = requestUser(request);
+    currentAuthority()?.assertCurrent();
+    response.json(readMcpDiscoveryConnection(user.tenantId!));
+  });
   policyRoute(router, "get", "/mcp/settings", { access: "authenticated", browserOnly: true,
     dataClass: "operational_metadata", roles: ["AgentControl.Viewer"] }, async (request, response) => {
     response.setHeader("Cache-Control", "no-store");

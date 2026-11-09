@@ -2,8 +2,8 @@ import type pg from "pg";
 import { AppError } from "../errors.js";
 import { config } from "../config.js";
 import { dataLimits, digest } from "../db/dataBounds.js";
-import { inventoryAssociationRevision, inventorySelectionRoots } from "../db/inventorySelections.js";
-import { lockInventorySelection } from "../db/inventoryAuthority.js";
+import { inventoryAssociationRevision, inventorySelectionRoots, selectedInventorySourcesSql } from "../db/inventorySelections.js";
+import { currentInventorySourcesSql, lockInventorySelection } from "../db/inventoryAuthority.js";
 import { discoveryCatalogQuery, discoveryEligibilityQuery, discoveryPopularitySql, discoveryQuerySettingsSql, discoverySearchSql, discoveryWorkplaceSql } from "../db/agentDiscoveryQueries.js";
 import { userSourceSearch } from "../db/userSources.js";
 import { hasAppRole } from "../types/capability.js";
@@ -50,6 +50,8 @@ type Profile = { identity: string; display_name: string | null; upn: string | nu
   account_enabled: boolean | null; user_type: string | null };
 type Binding = { mode: "self" | "preview"; subject: string; profile: string; directory: string | null; report: string | null; association: string };
 type CatalogRow = { identity: string; title: string | null; description: string | null; had_title: boolean; had_description: boolean;
+  description_state: DiscoveryText["state"];
+  origin: DiscoveryCard["origin"]["kind"]; origin_evidence: DiscoveryCard["origin"]["evidence"];
   lifecycle: DiscoveryCard["lifecycle"]; people: { id: string; name: string | null; contact: string | null; company: string | null; department: string | null }[];
   affiliations: DiscoveryCard["affiliations"]; evidence_complete: boolean;
   sources: DiscoveryCard["sources"]; evidence?: DiscoveryCard["evidence"]; rank?: number };
@@ -78,9 +80,13 @@ export function discoveryCard(row: CatalogRow, privacy: DiscoveryPrivacy): Disco
   const people = [...new Map(row.people.map(person => [person.id, person])).values()];
   const description = row.description === null ? null : excerpt(row.description, 0, 512);
   const evidence = (row.evidence ?? []).map(item =>
-    ({ source: item.source, field: item.field, excerpt: item.excerpt }));
-  return { id: row.identity, title: text(row.title, row.had_title, hidden),
-    description: { ...text(description, row.had_description, hidden), clipped: (row.description?.length ?? 0) > 512 },
+    ({ source: item.source, generationId: item.generationId, sourceIdentity: item.sourceIdentity, revision: item.revision,
+      field: item.field, excerpt: item.excerpt }));
+  return { id: row.identity, origin: { kind: row.origin, evidence: row.origin_evidence.map(item => ({
+    source: item.source, generationId: item.generationId, sourceIdentity: item.sourceIdentity, revision: item.revision,
+    field: item.field, setId: item.setId, versionId: item.versionId,
+  })) }, title: text(row.title, row.had_title, hidden),
+    description: { state: row.description_state, text: description, clipped: (row.description?.length ?? 0) > 512 },
     lifecycle: row.lifecycle,
     people: { state: privacy.hide_employee_details ? "privacy_withheld" : row.people.length ? "available" : row.evidence_complete ? "absent" : "unavailable",
       value: privacy.hide_employee_details ? [] : people.map(person => contact(person, hidden)) },
@@ -88,6 +94,7 @@ export function discoveryCard(row: CatalogRow, privacy: DiscoveryPrivacy): Disco
       [JSON.stringify([person.company, person.department]), { company: person.company, department: person.department }])).values()],
     useLink: { state: "absent", text: null }, evidence,
     sources: row.sources.map(source => ({ source: source.source, observedAt: source.observedAt,
+      generationId: source.generationId, sourceIdentity: source.sourceIdentity, revision: source.revision,
       descriptionField: source.descriptionField, descriptionState: source.descriptionState })) };
 }
 
@@ -137,6 +144,16 @@ export class AgentDiscovery {
       const reportState = report.availability === "active" ? "available" as const : report.availability === "stale" ? "stale" as const : "unavailable" as const;
       const values: unknown[] = [binding.directory, null, selected.selection.evaluated_at, identity.tenantId, binding.report, 5,
         id, identity.principalId, hidden, scope.company, scope.department, "[]"];
+      const assertSources = async () => {
+        const lost = await client.query(`SELECT 1 FROM (${selectedInventorySourcesSql("$1", "$2", "NULL", "$5")}) pin
+          LEFT JOIN (${currentInventorySourcesSql}) live ON live.agent_id=pin.agent_id
+            AND live.source_generation_id=pin.source_generation_id AND live.source_identity=pin.source_identity
+            AND live.control_revision=pin.control_revision
+          WHERE live.agent_id IS NULL LIMIT 1`,
+        [identity.tenantId, identity.principalId, null, selected.selection.evaluated_at, id]);
+        if (lost.rowCount) throw new SelectionError("selection_invalidated", "changed");
+      };
+      if (request.selectionId) await assertSources();
       const championData = binding.report && scope.company && scope.department
         && (request.operation === "workplace" || request.operation === "profile" || privacy.hide_champion_employee)
         ? (await client.query<{ value: (Profile & { name: string; contact: string })[]; own_match: string | null }>(`${discoveryWorkplaceSql}
@@ -205,7 +222,7 @@ export class AgentDiscovery {
         const offset = request.cursor ? Number(this.reports.codec.decode(request.cursor, cursorScope).boundary.id) : 0;
         if (!Number.isSafeInteger(offset) || offset < 0 || offset > dataLimits.agentDefinitionWorkBytes) throw invalid();
         const row = (await client.query<CatalogRow>(`${discoveryCatalogQuery("$13")} SELECT * FROM catalog`, [...values, [request.agentId]])).rows[0];
-        if (!row) throw new AppError(404, "discovery_agent_unavailable", "This saved organization-created agent is no longer available.");
+        if (!row) throw new AppError(404, "discovery_agent_unavailable", "This saved Microsoft or organization-created agent is no longer available.");
         const full = row.description;
         if (offset > (full?.length ?? 0)) throw invalid();
         let end = offset + 4096;
@@ -213,7 +230,7 @@ export class AgentDiscovery {
         const nextCursor = full && end < full.length ? this.reports.codec.encode({ ...cursorScope, direction: "next",
           boundary: { key: "description", id: String(end), nullRank: 0 } }) : null;
         return { context: ctx, selection, privacy, agent: discoveryCard(row, privacy),
-          description: { ...text(full?.slice(offset, end) ?? null, row.had_description, Boolean(values[8])), clipped: nextCursor !== null },
+          description: { state: row.description_state, text: full?.slice(offset, end) ?? null, clipped: nextCursor !== null },
           nextCursor };
       }
       const terms = [...new Set([request.goal?.trim() ?? "", ...(request.terms ?? [])].filter(Boolean).map(term => userSourceSearch(term, 512)))];
@@ -231,9 +248,17 @@ export class AgentDiscovery {
       if (coverage.rowCount !== 2) result.state = "coverage_incomplete";
       return result;
       })();
-      const ids = "value" in answer ? answer.value.map(card => card.id) : "agent" in answer ? [answer.agent.id]
-        : "department" in answer ? [...answer.department.value, ...answer.company.value, ...answer.useCases.value.map(item => item.agent)].map(card => card.id) : [];
+      const cards = "value" in answer ? answer.value : "agent" in answer ? [answer.agent]
+        : "department" in answer ? [...answer.department.value, ...answer.company.value, ...answer.useCases.value.map(item => item.agent)] : [];
+      const ids = cards.map(card => card.id);
       if (ids.length) {
+        const lost = await client.query(`SELECT 1 FROM jsonb_to_recordset($5::jsonb)
+          wanted("generationId" uuid,"sourceIdentity" text,revision uuid)
+          LEFT JOIN (${currentInventorySourcesSql}) live ON live.source_generation_id=wanted."generationId"
+            AND live.source_identity=wanted."sourceIdentity" AND live.control_revision=wanted.revision
+          WHERE live.agent_id IS NULL LIMIT 1`,
+        [identity.tenantId, identity.principalId, null, selected.selection.evaluated_at, JSON.stringify(cards.flatMap(card => card.sources))]);
+        if (lost.rowCount) throw new SelectionError("selection_invalidated", "changed");
         const current = (await client.query(`SELECT agent_id FROM (${discoveryEligibilityQuery}) eligible WHERE agent_id=ANY($13::text[])`,
           [...values, [...new Set(ids)]])).rows;
         if (current.length !== new Set(ids).size) throw new SelectionError("selection_invalidated", "changed");

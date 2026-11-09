@@ -356,6 +356,22 @@ export function registerAppSessionTests(register: () => void) {
 
 export function sessionAndNavigationCases() {
   it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)(
+    "keeps adoption actions MCP-led without a dedicated page for %s",
+    async role => {
+      const transport = appTransport({ initialRoles: [role], revalidatedRoles: [role] });
+      vi.stubGlobal("fetch", transport.fetchMock);
+      render(<App />);
+      expect(await screen.findByText(agent.displayName)).toBeVisible();
+      expect(screen.queryByRole("button", { name: "Adoption" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("region", { name: "Adoption workspace" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "MCP settings" })).toBeVisible();
+      expect(screen.queryByText("No Agent Control app role is assigned.")).not.toBeInTheDocument();
+      expect(window.location.pathname).toBe("/agents");
+      expect(transport.fetchMock.mock.calls.some(([input]) => input.startsWith("/api/adoption-content"))).toBe(false);
+    },
+  );
+
+  it.each(["AgentControl.Viewer", "AgentControl.UsageReportUploader", "AgentControl.Admin"] as const)(
     "opens MCP settings for %s without interrupting automatic read-only synchronization",
     async role => {
       const transport = appTransport({ initialRoles: [role], revalidatedRoles: [role] });
@@ -412,7 +428,7 @@ export function sessionAndNavigationCases() {
     expect(screen.queryByRole("heading", { name: "MCP settings" })).not.toBeInTheDocument();
     expect(transport.fetchMock.mock.calls.some(([input]) =>
       ["/api/mcp/settings", "/api/data-sync/auto-refresh"].includes(input))).toBe(false);
-    expect(window.location.pathname).toBe("/permissions");
+    expect(window.location.pathname).toBe("/agents");
   });
 
   it("keeps ordinary agent Dashboard baseline navigation out of the Users URL", async () => {
@@ -6638,8 +6654,9 @@ export function savedInventoryCases() {
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/agents/package-private"))).toBe(false);
     expect(transport.fetchMock.mock.calls.some(([path]) => String(path).includes("/api/agents/refresh-jobs/private-job"))).toBe(false);
     await waitFor(() => expect(transport.fetchMock.mock.calls.filter(([path]) => path === "/api/mcp/authenticated-entry")).toHaveLength(1));
-    expect([...new Set(transport.fetchMock.mock.calls.map(([path]) => String(path)))].sort())
-      .toEqual(["/api/auth/status", "/api/me", "/api/mcp/authenticated-entry"].sort());
+    expect([...new Set(transport.fetchMock.mock.calls.map(([path]) => String(path)).filter(path => path.startsWith("/api/")))].sort())
+      .toEqual(["/api/auth/status", "/api/me", "/api/mcp/authenticated-entry", "/api/discovery/learning", "/api/discovery/connection"].sort());
+    expect(transport.fetchMock.mock.calls.some(([path]) => path === "/api/mcp/settings")).toBe(false);
   });
 
   it("allows Viewer to use read-only bulk-reference filters", async () => {
@@ -13491,6 +13508,8 @@ function appTransport({
     });
     if (input === "/api/auth/status") return Response.json({ authConfigured: true, callback: "http://localhost/api/auth/callback" });
     if (input === "/api/mcp/authenticated-entry") return Response.json({ admission: "scheduled", nextCheckAt: new Date(Date.now() + 300_000).toISOString() });
+    if (input === "/api/discovery/learning") return Response.json({ value: [], nextCursor: null });
+    if (input === "/api/discovery/connection") return Response.json({ state: "not_configured" });
     if (input === "/api/me") {
       currentUserCalls += 1;
       if (!authenticated) return Response.json({ user: null });

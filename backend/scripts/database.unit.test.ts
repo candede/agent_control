@@ -85,8 +85,8 @@ function initializationFixture(current = false) {
 
 it("reads reset revocations only after acquiring the target initialization transaction", async () => {
   const { database, client, connect, query } = initializationFixture();
-  let protectedRows = [{ tenant_id: "tenant", principal_id: "principal", epoch: "1", bearer_issued_after: "1000" }];
-  const latest = [{ tenant_id: "tenant", principal_id: "principal", epoch: "9007199254740993", bearer_issued_after: "2000" }];
+  let protectedRows = [{ tenant_id: "tenant", principal_id: "principal", epoch: "1", bearer_issued_after: "1000", adoption_request_cutoff: "31000" }];
+  const latest = [{ tenant_id: "tenant", principal_id: "principal", epoch: "9007199254740993", bearer_issued_after: "2000", adoption_request_cutoff: "32000" }];
   vi.mocked(pg.Pool.prototype.query).mockImplementation(async function(this: pg.Pool, statement) {
     if (this.options.database !== "postgres" || typeof statement !== "string") throw new Error("Unexpected pool query.");
     if (statement.startsWith("SELECT to_regclass")) return { rows: [{ name: "agentcontrol_principal_revocations" }], rowCount: 1 };
@@ -104,6 +104,7 @@ it("reads reset revocations only after acquiring the target initialization trans
   const insert = query.mock.calls.find(([statement]) => typeof statement === "string"
     && statement.startsWith("INSERT INTO data_principal_epochs"));
   expect(insert?.[1]).toEqual([JSON.stringify(latest)]);
+  expect(insert?.[0]).toContain("adoption_request_cutoff bigint");
   expect(pg.Pool.prototype.query).toHaveBeenCalledWith(
     expect.stringContaining("WHERE database_name=$1"), ["agentcontrol_test_review"],
   );
