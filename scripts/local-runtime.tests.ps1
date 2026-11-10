@@ -1,10 +1,11 @@
 #requires -Version 7.0
+param([switch]$ReceiptOnly)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'local-deployment.ps1')
 $repository = Split-Path $PSScriptRoot -Parent
 $root = Join-Path $repository "artifacts/test-scratch/runtime-$([Guid]::NewGuid().ToString('N'))"
 [IO.Directory]::CreateDirectory((Join-Path $root 'backend')) | Out-Null
-foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.large-tenant-test.yaml')) {
+foreach ($file in @('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.proxy.yaml','compose.mcp-proxy.yaml','compose.large-tenant-test.yaml')) {
     Copy-Item -LiteralPath (Join-Path $repository $file) -Destination (Join-Path $root $file)
 }
 [IO.File]::WriteAllText((Join-Path $root 'backend/input.ts'),'snapshot-v1')
@@ -34,6 +35,8 @@ $script:buildStdout = 'Docker Desktop build summary (Windows)'
 $script:answers = [Collections.Generic.Queue[string]]::new()
 $script:validateDatabaseCompose = $false
 $script:composeValidations = 0
+$script:composeOrphanPolicy = [Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS')
+$script:proxyNetworkId = 'f'*64
 $script:dockerExecutable = (Microsoft.PowerShell.Core\Get-Command docker -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message }; $script:checks++ }
 function Fails([scriptblock]$Action,[string]$Pattern) {
@@ -57,7 +60,7 @@ function git {
         [IO.File]::WriteAllText((Join-Path $root 'backend/added.ts'),'added-during-capture')
         return ((@('Dockerfile','compose.yaml','backend/input.ts','backend/added.ts')) -join "`0") + "`0"
     }
-    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs) -join "`0") + "`0"
+    return ((@('Dockerfile','.dockerignore','compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.proxy.yaml','compose.mcp-proxy.yaml','compose.large-tenant-test.yaml','backend/input.ts','backend/.env.synthetic') + $script:candidateInputs | Sort-Object -Unique) -join "`0") + "`0"
 }
 function Read-Host {
     param([string]$Prompt,[switch]$AsSecureString)
@@ -88,6 +91,10 @@ function docker {
     if ($script:failure -and $script:failure -ne 'checks' -and $line -match $script:failure) { throw 'Simulated Docker failure.' }
     if ($Arguments[0] -eq 'info') { return '29.7.2' }
     if ($line -eq 'compose|version|--short') { return '2.30.0' }
+    if ($Arguments[0] -eq 'network' -and $Arguments[3] -ceq '{{json .}}') {
+        return (@{Name=$Arguments[-1];Id=$script:proxyNetworkId;Driver='bridge';Scope='local';Internal=$false;Ingress=$false;ConfigOnly=$false
+            Containers=@{};Options=@{};Labels=@{'io.shared-proxy.managed'='true';'io.shared-proxy.instance'='fixture-edge';'io.shared-proxy.owner'='/independent-infrastructure'}} | ConvertTo-Json -Depth 5)
+    }
     if ($Arguments[0] -eq 'volume') { if ($script:currentFingerprint) { return $context.Volume }; return '' }
     if ($Arguments[0] -eq 'image' -and $Arguments[1] -eq 'inspect') {
         if ($Arguments[3] -eq '{{.Id}}') { return $(if ($Arguments[-1] -eq 'candidate-runtime:local') {$script:runtime} else {$script:operator}) }
@@ -111,6 +118,7 @@ function docker {
             '{{json .Config.Labels}}' { return (@{'com.docker.compose.project'=$context.Project;'com.docker.compose.project.working_dir'=$(if ($script:wrongOwner) {'/different-checkout'} else {$root});'com.docker.compose.service'=$container.service} | ConvertTo-Json -Compress) }
             '{{json .State}}' { return (@{Running=$container.running;Health=@{Status='healthy'}} | ConvertTo-Json -Compress) }
             '{{.Image}}' { return $container.image }
+            '{{json .NetworkSettings.Networks}}' { return $container.networks | ConvertTo-Json -Depth 5 -Compress }
         }
     }
     if ($Arguments[0] -eq 'stop') { $script:containers[$Arguments[-1]].running=$false; return }
@@ -141,6 +149,12 @@ function docker {
         return
     }
     if ($Arguments[0] -eq 'compose') {
+        $databaseOnly = $Arguments -contains 'up' -and $Arguments[-1] -eq 'postgres'
+        $expectedPolicy = if ($databaseOnly) { 'true' } else { $script:composeOrphanPolicy }
+        Assert ([Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS') -ceq $expectedPolicy) 'Orphan detection must be disabled only for database-only Compose startup.'
+        if ($databaseOnly) {
+            Assert ($Arguments -notcontains '--remove-orphans') 'Database-only Compose must not remove configured MCP containers.'
+        }
         if ($Arguments -contains 'stop') { $script:containers[('a' * 64)].running=$false; return }
         if ($Arguments -contains 'up') {
             $service = $Arguments[-1]
@@ -161,7 +175,9 @@ function docker {
                 Assert (@($Arguments | Where-Object { [IO.Path]::GetFileName($_) -ceq 'compose.mcp.yaml' }).Count -eq 0) 'Database preflight included the unsaved MCP overlay.'
             }
             $id = if ($service -eq 'app') {'a' * 64} else {'b' * 64}
-            $script:containers[$id]=@{service=$service;running=$true;image=$(if ($service -eq 'app') {$script:runtime} else {'sha256:' + ('d' * 64)})}
+            $networks=@{$context.Network=@{}}
+            if ($service -eq 'app' -and $context.ProxyNetwork) { $networks[$context.ProxyNetwork]=@{Aliases=@("$($context.Project)-app")} }
+            $script:containers[$id]=@{service=$service;running=$true;networks=$networks;image=$(if ($service -eq 'app') {$script:runtime} else {'sha256:' + ('d' * 64)})}
             if ($service -eq 'app' -and $script:replacePostgresOnAppStart) {
                 $script:containers.Remove(('b' * 64))
                 $script:containers[('e' * 64)]=@{service='postgres';running=$true;image=('sha256:' + ('d' * 64))}
@@ -175,6 +191,37 @@ function Run-Deploy {
     return @(Invoke-LocalDeployment $context Deploy -ForceChecks:$ForceChecks -DbReset:$DbReset 6>&1)
 }
 try {
+    & {
+        $receiptContext = @{State=(Join-Path $root 'receipt-validation')}
+        [IO.Directory]::CreateDirectory($receiptContext.State) | Out-Null
+        $receiptFile = Join-Path $receiptContext.State 'deployment.json'
+        Assert ($null -eq (Read-LocalDeploymentReceipt $receiptContext)) 'An absent deployment receipt must allow a first deployment.'
+        $valid = @{version=1;runtimeImage=$script:runtime;configuration=('B'*64);database=('C'*64)}
+        $validJson = $valid | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($receiptFile,$validJson)
+        $receipt = Read-LocalDeploymentReceipt $receiptContext
+        Assert ($receipt -is [Collections.IDictionary] -and $receipt.runtimeImage -ceq $script:runtime) 'A valid current deployment receipt was rejected.'
+        $invalid = @('null','[]','{}','true','1','"receipt"','{',
+            (ConvertTo-Json -InputObject @($valid) -Compress),
+            (ConvertTo-Json -InputObject @($valid,$valid) -Compress))
+        foreach ($field in @('version','runtimeImage','configuration','database')) {
+            $arrayField = $valid.Clone()
+            $arrayField[$field] = @($valid[$field],$valid[$field])
+            $invalid += $arrayField | ConvertTo-Json -Compress
+        }
+        $invalidVersion = $valid.Clone()
+        $invalidVersion.version = $true
+        $invalid += $invalidVersion | ConvertTo-Json -Compress
+        foreach ($json in $invalid) {
+            [IO.File]::WriteAllText($receiptFile,$json)
+            Fails { Read-LocalDeploymentReceipt $receiptContext } 'receipt is invalid'
+            Assert ([IO.File]::ReadAllText($receiptFile) -ceq $json) 'Invalid receipt validation changed saved state.'
+        }
+    }
+    if ($ReceiptOnly) {
+        Write-Host "Passed $script:checks local deployment receipt assertions (filesystem only; no Docker or Git operations)."
+        return
+    }
     $context = New-LocalContext $root 'runtime-test'
     & {
         $gitPath = (Microsoft.PowerShell.Core\Get-Command git -CommandType Application | Select-Object -First 1).Source
@@ -430,6 +477,27 @@ exit $ExitCode
     Assert ($script:operationalMode -eq 'normal' -and ($messages -join "`n").Contains('ALREADY RUNNING') -and
         -not (($script:calls -join "`n") -match '\|stop\||database\.ts\|reset\|')) 'Normal start left a healthy deployment stuck in saved-only admission.'
     & {
+        $context.ProxyNetworkInput='agent-control-local-ingress'
+        $context.PublicUrlInput='https://control.runtime.example.invalid'
+        $postgresImage=$script:containers[('b'*64)].image
+        $messages=Run-Deploy
+        Assert (($messages -join "`n").Contains('Shared ingress: agent-control-local-ingress')) 'Ingress deployment omitted its truthful routing summary.'
+        Assert ($script:containers[('a'*64)].networks.Contains($context.Network) -and
+            $script:containers[('a'*64)].networks[$context.ProxyNetwork].Aliases -ccontains 'runtime-test-app') 'App deployment lost its private network or stable ingress alias.'
+        Assert ($script:containers[('b'*64)].image -ceq $postgresImage -and $script:containers[('b'*64)].networks.Count -eq 1) 'Ingress deployment replaced or exposed PostgreSQL.'
+        Assert (-not (($script:calls -join "`n") -match '^network\|(create|rm|connect|disconnect)|database\.ts\|(reset|initialize)')) 'Ingress deployment managed shared infrastructure or reset/reinitialized the database.'
+        $messages=Run-Deploy
+        Assert (($messages -join "`n").Contains('ALREADY RUNNING') -and -not (($script:calls -join "`n") -match '\|stop\||\|90\|app$')) 'Unchanged saved ingress restarted the app.'
+        $script:proxyNetworkId='e'*64
+        Fails { Run-Deploy } 'network identity changed'
+        Assert ($script:containers[('a'*64)].running -and -not (($script:calls -join "`n") -match '^build\||\|stop\|')) 'Changed ingress identity reached app mutation.'
+        $script:proxyNetworkId='f'*64
+        $context.ProxyNetworkInput='none';$context.PublicUrlInput='local'
+        Run-Deploy | Out-Null
+        Assert ($script:containers[('a'*64)].networks.Count -eq 1 -and -not $context.ProxyNetwork) 'Explicit standalone deployment retained ingress attachment.'
+        $context.Remove('ProxyNetworkInput');$context.Remove('PublicUrlInput');$context.Remove('ProxyNetworkId')
+    }
+    & {
         $beforeSettings = (Get-FileHash -LiteralPath (Join-Path $context.State 'settings.json')).Hash
         $beforeEnvironment = (Get-FileHash -LiteralPath (Join-Path $context.State 'compose.env')).Hash
         $beforeRegistry = (Get-FileHash -LiteralPath (Join-Path $context.State 'secrets/tenants.json')).Hash
@@ -640,7 +708,7 @@ exit $ExitCode
     Assert (-not (($script:calls -join "`n") -match '\|--target\|runtime\||\|stop\|')) 'Failed preflight reached runtime compilation or shutdown.'
     $script:failure=''
     # Real candidate consumer with mocked immutable images and the existing executor.
-    $script:candidateInputs=@('deploy-local.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','backend/scripts/database.ts')
+    $script:candidateInputs=@('deploy-local.ps1','deploy-local.sh','scripts/local-launcher.Dockerfile','scripts/local-launcher-inputs.ps1','scripts/local-deployment.ps1','scripts/local-runtime.ps1','scripts/local-mcp.ps1','scripts/local-proxy.ps1','compose.proxy.yaml','compose.mcp-proxy.yaml','backend/scripts/database.ts')
     foreach ($path in $script:candidateInputs) {
         $destination=Join-Path $root $path
         [IO.Directory]::CreateDirectory((Split-Path $destination -Parent)) | Out-Null
@@ -663,6 +731,14 @@ exit $ExitCode
     $context.CandidateSha256=(Get-FileHash -LiteralPath $context.Candidate).Hash.ToLowerInvariant()
     $portableCandidate = Read-LocalCandidate $context
     Assert ($portableCandidate.sourceManifestHash -ceq $context.SourceHash) 'Candidate inventory must match its slash-separated Git manifest on every supported OS.'
+    foreach ($path in @('deploy-local.sh','scripts/local-launcher.Dockerfile','scripts/local-launcher-inputs.ps1','scripts/local-proxy.ps1','compose.proxy.yaml','compose.mcp-proxy.yaml')) {
+        $inputFile=Join-Path $root $path
+        $originalInput=[IO.File]::ReadAllText($inputFile)
+        try {
+            [IO.File]::AppendAllText($inputFile,"`n# synthetic unqualified tooling change`n")
+            Fails { Read-LocalCandidate $context } 'tooling differs'
+        } finally { [IO.File]::WriteAllText($inputFile,$originalInput) }
+    }
     & {
         $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
         $artifactLink = Join-Path $root 'artifacts/linked-candidate'

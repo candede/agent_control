@@ -11,8 +11,10 @@ Track Microsoft 365 Copilot adoption and manage Microsoft 365 and Copilot Studio
 
 ### 1. Install the prerequisites
 
-Install **Git**, **PowerShell 7**, and **Docker Desktop** or **Docker Engine with
-Compose v2**.
+Install **Git** and **Docker Desktop** or **Docker Engine with Compose v2**.
+Windows/macOS use **PowerShell 7**. On Ubuntu/native Linux, `deploy-local.sh`
+automatically runs the same deployment core in a Docker helper when PowerShell
+is not installed.
 
 Clone the repository:
 
@@ -35,11 +37,19 @@ Default local URL: `http://localhost:3001`.
 pwsh ./deploy-local.ps1 start
 ```
 
+On Ubuntu/native Linux:
+
+```bash
+./deploy-local.sh start
+```
+
 The first start opens a setup wizard, saves configuration under
 `.local/agent-control/`, and starts the app with PostgreSQL.
 
 Open [http://localhost:3001](http://localhost:3001), or the port selected in the
 wizard, and sign in with an assigned work or school account.
+Standalone remains the default. For an independently managed shared HTTPS proxy,
+see [optional shared ingress](docs/deployment-setup.md#optional-independent-shared-ingress).
 
 ### 4. Collect data
 

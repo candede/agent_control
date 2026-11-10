@@ -35,7 +35,7 @@ RUN rm -rf backend/src backend/scripts backend/dist frontend/src frontend/browse
 COPY backend backend
 COPY frontend frontend
 COPY scripts scripts
-COPY Dockerfile compose.yaml compose.large-tenant-test.yaml deploy-local.ps1 deploy-azure.ps1 README.md knip.json ./
+COPY Dockerfile compose.yaml compose.proxy.yaml compose.mcp-proxy.yaml compose.large-tenant-test.yaml deploy-local.ps1 deploy-local.sh deploy-azure.ps1 README.md knip.json ./
 COPY docs docs
 COPY infra infra
 CMD ["npm", "test"]
@@ -44,7 +44,7 @@ FROM test AS security-scan
 COPY --from=build /app/backend/dist backend/dist
 COPY --from=build /app/frontend/dist frontend/dist
 COPY scripts scripts
-COPY compose.yaml deploy-local.ps1 deploy-azure.ps1 README.md ./
+COPY compose.yaml compose.proxy.yaml compose.mcp-proxy.yaml deploy-local.ps1 deploy-local.sh deploy-azure.ps1 README.md ./
 CMD ["node", "backend/scripts/security-scan.mjs"]
 
 FROM dependencies AS production-dependencies

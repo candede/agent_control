@@ -212,7 +212,7 @@ function Get-LocalMcpPlan {
 function Get-LocalComposeWithoutMcp {
     param([string[]]$Compose)
     for ($index=0; $index -lt $Compose.Count; $index++) {
-        if ($Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Compose[$index+1]) -cin @('compose.mcp.yaml','compose.mcp-metadata.yaml')) { $index++; continue }
+        if ($Compose[$index] -eq '-f' -and [IO.Path]::GetFileName($Compose[$index+1]) -cin @('compose.mcp.yaml','compose.mcp-metadata.yaml','compose.mcp-proxy.yaml')) { $index++; continue }
         $Compose[$index]
     }
 }
@@ -312,7 +312,7 @@ function Get-LocalMcpRunArguments {
     $arguments += @('--mount',"type=volume,source=$($Context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy")
     $values = [ordered]@{
         MCP_TENANT_ID=$Context.Mcp.tenantId; MCP_CLIENT_ID=$Context.Mcp.clientId; MCP_API_CLIENT_ID=$Context.Mcp.apiClientId
-        MCP_API_ORIGIN='http://app:3001'; MCP_PUBLIC_URL=$Context.Mcp.publicUrl
+        MCP_API_ORIGIN=$(if ($Context.ProxyNetwork) { "http://$($Context.Project)-app:3001" } else { 'http://app:3001' }); MCP_PUBLIC_URL=$Context.Mcp.publicUrl
         MCP_ALLOWED_CLIENT_REDIRECT_URIS=(ConvertTo-Json -InputObject @($Context.Mcp.redirectUris) -Compress)
         MCP_CLIENT_SECRET_FILE='/run/secrets/mcp-client'; MCP_JWT_SIGNING_KEY_FILE='/run/secrets/mcp-signing'
         MCP_OAUTH_ENCRYPTION_KEY_FILE='/run/secrets/mcp-encryption'; MCP_OAUTH_STORAGE_PATH='/var/lib/agent-control-mcp/oauth'
@@ -408,9 +408,8 @@ function Initialize-LocalMcpStorage {
     param($Context)
     $names = (Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture) -split "`n"
     $receiptPath = Join-Path $Context.State 'mcp-storage.json'
-    $receipt = if (Test-Path -LiteralPath $receiptPath) { [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } else { $null }
     if ($Context.McpVolume -notin $names) {
-        if ($receipt) { throw 'Recorded MCP state volume is missing; restore it, never silently recreate/reset OAuth connections.' }
+        if (Test-Path -LiteralPath $receiptPath) { throw 'Recorded MCP state volume is missing; restore it, never silently recreate/reset OAuth connections.' }
         Invoke-DockerCommand @('volume','create','--label',"com.docker.compose.project=$($Context.Project)",'--label','com.docker.compose.volume=mcp-oauth',
             '--label','io.agent-control.purpose=encrypted-oauth-state',$Context.McpVolume) | Out-Null
     }
@@ -463,9 +462,11 @@ function Get-LocalMcpVolume {
         $volume.labels.'com.docker.compose.volume' -cne 'mcp-oauth' -or
         $volume.labels.'io.agent-control.purpose' -cne 'encrypted-oauth-state') { throw 'MCP volume ownership/purpose differs.' }
     $receiptPath = Join-Path $Context.State 'mcp-storage.json'
-    $receipt = if (Test-Path -LiteralPath $receiptPath) { [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } else { $null }
-    if ($receipt -and ($receipt.version -ne 1 -or $receipt.name -cne $volume.name -or
-        $receipt.createdAt -cne $volume.createdAt -or $receipt.driver -cne $volume.driver)) { throw 'Recorded MCP volume identity changed; restore exact state before retrying.' }
+    if (Test-Path -LiteralPath $receiptPath) {
+        $receipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json -AsHashtable -NoEnumerate
+        if ($receipt -isnot [Collections.IDictionary] -or $receipt.version -ne 1 -or $receipt.name -cne $volume.name -or
+            $receipt.createdAt -cne $volume.createdAt -or $receipt.driver -cne $volume.driver) { throw 'Recorded MCP volume identity changed; restore exact state before retrying.' }
+    }
     return $volume
 }
 
@@ -482,7 +483,8 @@ function Assert-LocalMcpContainer {
         $expected['/run/secrets/mcp-metadata']='secrets/mcp-metadata'
     }
     $hostPort = 0
-    if ($details.mounts.Count -ne $expected.Count -or $details.networks.Count -ne 1 -or -not $details.networks.Contains($Context.Network) -or
+    Assert-LocalContainerNetworks $Context $details.networks 'mcp' -AllowRetainedIngress:(-not $RequireConfiguredPort)
+    if ($details.mounts.Count -ne $expected.Count -or
         $details.user -notmatch '^[1-9][0-9]*:[0-9]+$' -or $details.ports.Count -ne 1 -or $details.ports['8000/tcp'].Count -ne 1 -or
         $details.ports['8000/tcp'][0].HostIp -cne '127.0.0.1' -or
         -not [int]::TryParse($details.ports['8000/tcp'][0].HostPort,[ref]$hostPort) -or $hostPort -lt 1024 -or $hostPort -gt 65535 -or
@@ -501,6 +503,7 @@ function Assert-LocalMcpContainer {
 function Start-LocalMcp {
     param($Context)
     if (-not $Context.Mcp) { return }
+    Assert-LocalIngressReady $Context
     Test-LocalMcpConfiguration $Context
     $containers = @(Get-OwnedLocalContainers $Context | Where-Object Service -eq 'mcp')
     if ($containers.Count -gt 1) { throw 'Expected at most one exact MCP container.' }
@@ -510,7 +513,7 @@ function Start-LocalMcp {
     try {
         $hashes = @('mcp-client','mcp-signing','mcp-encryption') | ForEach-Object { (Get-FileHash -LiteralPath (Join-Path $Context.State "secrets/$_")).Hash }
         $hashes += if (Test-LocalMcpMetadataCredential $Context) { (Get-FileHash -LiteralPath (Join-Path $Context.State 'secrets/mcp-metadata')).Hash } else { 'metadata-unavailable' }
-        $text = (@($Context.McpImageId,($Context.Mcp | ConvertTo-Json -Compress)) + $hashes) -join "`n"
+        $text = (@($Context.McpImageId,($Context.Mcp | ConvertTo-Json -Compress),$Context.ProxyNetwork) + $hashes) -join "`n"
         $identity = [Convert]::ToHexString($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
     } finally { $hmac.Dispose(); [Array]::Clear($key,0,$key.Length) }
     $receiptPath = Join-Path $Context.State 'mcp-deployment.json'

@@ -211,7 +211,11 @@ $progressAfter[0].bytes_collected=1048577
 Assert-Refused { Assert-FreshRestartPersistence $before $after $progressBefore $progressAfter }
 $dockerfile = [IO.File]::ReadAllText((Join-Path $root 'Dockerfile'))
 $testStage = ($dockerfile -split 'FROM dependencies AS test')[1] -split 'FROM test AS security-scan' | Select-Object -First 1
-Assert-True ($testStage.Contains('COPY scripts scripts') -and $testStage.Contains('COPY Dockerfile compose.yaml compose.large-tenant-test.yaml')) 'Qualification test inputs omit deployment contracts.'
+Assert-True ($testStage.Contains('COPY scripts scripts')) 'Qualification test inputs omit deployment scripts.'
+$testInputs = @([regex]::Matches($testStage,'(?m)^COPY (.+) \./\r?$') | ForEach-Object { $_.Groups[1].Value -split '\s+' })
+foreach ($path in @('Dockerfile','compose.yaml','compose.large-tenant-test.yaml','compose.proxy.yaml','compose.mcp-proxy.yaml','deploy-local.ps1','deploy-local.sh','deploy-azure.ps1','README.md','knip.json')) {
+    Assert-True ($testInputs -ccontains $path) "Qualification test inputs omit $path."
+}
 $qualificationStage = ($dockerfile -split 'FROM operator AS qualification')[1] -split 'FROM node:' | Select-Object -First 1
 Assert-True ($qualificationStage.Contains('COPY --from=test /app /app') -and $qualificationStage.Contains('COPY --from=build /app/backend/dist') -and $qualificationStage.Contains('COPY --from=build /app/frontend/dist')) 'Qualification must reuse production compilation and retain all test inputs.'
 $buildStage = ($dockerfile -split 'FROM application-base AS build')[1] -split 'FROM dependencies AS test' | Select-Object -First 1

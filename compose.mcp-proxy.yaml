@@ -1,0 +1,12 @@
+services:
+  app:
+    environment:
+      MCP_METADATA_ORIGIN: http://${COMPOSE_PROJECT_NAME:?Project is required}-mcp:8000
+  mcp:
+    environment:
+      MCP_API_ORIGIN: http://${COMPOSE_PROJECT_NAME:?Project is required}-app:3001
+    networks:
+      default:
+        aliases: ["${COMPOSE_PROJECT_NAME:?Project is required}-mcp"]
+      shared-ingress:
+        aliases: ["${COMPOSE_PROJECT_NAME:?Project is required}-mcp"]

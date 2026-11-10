@@ -114,6 +114,9 @@ From the repository root:
 pwsh ./deploy-local.ps1 start -ConfigureMcp
 ```
 
+Ubuntu/native Linux uses `./deploy-local.sh start --configure-mcp`, including
+the same wizard, protected files and OAuth storage, without host PowerShell.
+
 For a named installation, append `-Project <your-existing-project-name>` and
 use that same project name on subsequent commands.
 
@@ -159,7 +162,12 @@ combined existing and new callbacks, comma-separated. `*` is not accepted.
 Changing client callbacks does not change the MCP server's Entra `/auth/callback`.
 
 Point your HTTPS proxy/tunnel at the selected loopback port.
-MCP calls the API internally at `http://app:3001`, not through the web/API tunnel.
+Alternatively, [opt into independent shared ingress](deployment-setup.md#optional-independent-shared-ingress)
+to route directly to `<project>-mcp:8000` while retaining the loopback diagnostics
+port and private network. This does not change the saved MCP resource/callback
+or expose PostgreSQL.
+MCP calls the API internally at `http://app:3001` (or
+`http://<project>-app:3001` with shared ingress), not through the web/API tunnel.
 Changing the saved MCP port replaces the existing owned container on the next
 start; readiness is verified against the new port. Update your proxy/tunnel target
 to match.
@@ -170,7 +178,11 @@ HTTPS ingress. Keep its saved keys and OAuth volume; do not regenerate them on r
 
 For an existing project, database preflight uses the base Compose configuration
 without MCP; new MCP settings and credentials are saved after preflight and builds
-succeed. Adding the first API integration binding can restart the web app and
+succeed. Database-only Compose startup skips orphan detection because the MCP
+service is intentionally excluded, not missing from the saved configuration.
+Existing MCP containers are left untouched; normal full-configuration Compose
+commands retain their usual orphan detection.
+Adding the first API integration binding can restart the web app and
 require users to sign in again, so schedule that setup outside a live demo.
 
 After setup, normal startup includes MCP:
@@ -241,6 +253,7 @@ settings. Health/readiness alone does not verify OAuth or data access.
 | Consent or API access denied | Both custom scopes have admin consent; employee is an active tenant member or staff has its explicit Agent Control role |
 | Discovery/login page unreachable | HTTPS ingress forwards MCP discovery/OAuth paths as well as `/mcp` |
 | Missing signing/encryption keys | Restore the original protected keys/state; do not start with replacement keys |
+| Invalid OAuth volume receipt or missing recorded volume | Restore matching `mcp-storage.json` and the original OAuth volume; retained receipts never authorize recreating or adopting replacement state |
 
 ## Other deployment options
 

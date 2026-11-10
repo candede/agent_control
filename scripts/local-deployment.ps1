@@ -2,14 +2,19 @@
 . (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1')
 . (Join-Path $PSScriptRoot 'local-runtime.ps1')
 . (Join-Path $PSScriptRoot 'local-mcp.ps1')
+. (Join-Path $PSScriptRoot 'local-proxy.ps1')
 
 function Invoke-DockerCommand {
-    param([string[]]$Arguments, [switch]$Capture, [switch]$CaptureError)
+    param([string[]]$Arguments, [switch]$Capture, [switch]$CaptureError, [switch]$IgnoreComposeOrphans)
     $savedEnvironment = @{}
     try {
+        if ($IgnoreComposeOrphans) {
+            $savedEnvironment['COMPOSE_IGNORE_ORPHANS'] = [Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS')
+            $env:COMPOSE_IGNORE_ORPHANS = 'true'
+        }
         if ($Arguments[0] -eq 'compose' -and $Arguments -contains '--env-file') {
             # Project-owned settings must not be replaced by another project's shell environment.
-            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','AGENT_SHARING_DIAGNOSTICS') + @([Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -cmatch '^MCP_' })) {
+            foreach ($name in @('LOCAL_STATE_DIR','LOCAL_TEST_IMAGE','APP_PORT','APP_UID','APP_GID','APP_IMAGE','TENANTS_JSON','TENANTS_JSON_FILE','TENANT_ID','CLIENT_ID','CLIENT_SECRET','CLIENT_SECRET_FILE','TENANT_DOMAINS','TENANT_DISPLAY_NAME','FRONTEND_ORIGIN','REDIRECT_URI','TRUST_PROXY','PROXY_NETWORK','AGENT_SHARING_DIAGNOSTICS') + @([Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -cmatch '^MCP_' })) {
                 $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name)
                 # .NET can retain a null assignment as an empty override of compose.env.
                 if (Test-Path "Env:$name") { Remove-Item "Env:$name" }
@@ -68,6 +73,7 @@ function New-LocalContext {
         Compose=@('compose','--project-directory',$rootPath,'--env-file',(Join-Path $state 'compose.env'),'-f',(Join-Path $rootPath 'compose.yaml'),'-p',$Project)
     }
     Sync-LocalMcpContext $context $settings
+    Sync-LocalProxyContext $context $settings
     return $context
 }
 
@@ -93,14 +99,18 @@ function Read-LocalSettings {
         }
     } catch { throw 'Project settings must be a valid JSON object. Restore settings.json before continuing.' }
     finally { if ($document) { $document.Dispose() } }
-    if (@($settings.Keys | Where-Object { $_ -cnotin @('port','publicUrl','tenants','mcp') }).Count) {
-        throw 'Project settings contain unsupported fields. Use only port, publicUrl, tenants and optional mcp.'
+    if (@($settings.Keys | Where-Object { $_ -cnotin @('port','publicUrl','proxyNetwork','tenants','mcp') }).Count) {
+        throw 'Project settings contain unsupported fields. Use only port, publicUrl, proxyNetwork, tenants and optional mcp.'
     }
     if ($settings.Contains('port') -and ($settings.port -isnot [long] -and $settings.port -isnot [int] -or $settings.port -lt 1024 -or $settings.port -gt 65535)) {
         throw 'Saved project port must be an integer from 1024 to 65535. Repair settings.json before continuing.'
     }
     if ($settings.Contains('publicUrl') -and ($settings.publicUrl -isnot [string] -or ($settings.publicUrl -ne '' -and -not (Test-LocalPublicUrl $settings.publicUrl)))) {
         throw 'Saved publicUrl must be empty or a canonical HTTPS origin without a trailing slash, path, query or fragment. Repair settings.json before continuing.'
+    }
+    if ($settings.Contains('proxyNetwork') -and ($settings.proxyNetwork -isnot [string] -or
+        ($settings.proxyNetwork -ne '' -and -not (Test-LocalProxyNetworkName $settings.proxyNetwork)))) {
+        throw 'Saved proxyNetwork must be empty or a dedicated external network name (1-63 letters, digits, dots, underscores or hyphens).'
     }
     if ($settings.Contains('mcp')) { Assert-LocalMcpSettings $settings.mcp $settings.port }
     return $settings
@@ -389,6 +399,11 @@ function Read-LocalConfiguration {
     $originalSettings = $settings | ConvertTo-Json -Depth 20 -Compress
     $port = if ($settings.Contains('port')) { [int]$settings.port } else { 0 }
     $publicUrl = [string]$settings.publicUrl
+    if ($Context.ContainsKey('PublicUrlInput')) {
+        $publicUrl = if ($Context.PublicUrlInput -ceq 'local') { '' } else { $Context.PublicUrlInput }
+        if (-not $publicUrl -and $Context.PublicUrlInput -cne 'local' -or
+            $publicUrl -and -not (Test-LocalPublicUrl $publicUrl)) { throw 'PublicUrl must be a canonical HTTPS origin without a trailing slash/path/query/fragment, or local.' }
+    }
     $settingsFile = Join-Path $state 'settings.json'
     $registryFile = Join-Path $secretDirectory 'tenants.json'
     $hasRegistry = Test-Path -LiteralPath $registryFile -PathType Leaf
@@ -405,7 +420,8 @@ function Read-LocalConfiguration {
     }
     $previousProfiles = ConvertTo-Json -InputObject $profiles -Depth 20 -Compress
     $previousMetadata = Get-LocalTenantMetadata $profiles
-    $editApplication = $Edit -and -not $Context.ConfigureMcp
+    $editApplication = $Edit -and -not $Context.ConfigureMcp -and
+        -not $Context.ContainsKey('PublicUrlInput') -and -not $Context.ContainsKey('ProxyNetworkInput')
     if ($editApplication -or ($Onboard -and (-not $hasRegistry -or -not $port))) {
         Write-Host "Configure local project '$($Context.Project)'. Press Enter to keep saved values; secret input is hidden."
         Show-LocalRegistrationGuidance
@@ -421,11 +437,22 @@ function Read-LocalConfiguration {
             }
         }
         if ($editApplication -or -not $port) { $port = Read-LocalPort $port }
-        if ($editApplication) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
+        if ($editApplication -and -not $Context.ContainsKey('PublicUrlInput')) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
         $origin = if ($publicUrl) { $publicUrl } else { "http://localhost:$port" }
         Write-Host "Register $origin/api/auth/callback as every configured application's Web reply URL. Begin sign-in at $origin."
     }
     if (-not $port) { throw 'Project port is missing. Run start or edit-config to complete the project wizard.' }
+    $proxyNetwork = [string]$settings.proxyNetwork
+    if ($Context.ContainsKey('ProxyNetworkInput')) {
+        $proxyNetwork = if ($Context.ProxyNetworkInput -ceq 'none') { '' } else { $Context.ProxyNetworkInput }
+        if (-not $proxyNetwork -and $Context.ProxyNetworkInput -cne 'none') { throw 'ProxyNetwork must name an existing shared network, or none to return to standalone.' }
+    }
+    if ($proxyNetwork) {
+        if (-not $publicUrl) { throw 'Shared ingress requires a saved HTTPS publicUrl or -PublicUrl for the correct sign-in callback and proxy trust.' }
+        $identity = Assert-LocalProxyNetwork $Context $proxyNetwork
+        if ($Context.ProxyNetworkId -and $Context.ProxyNetwork -ceq $proxyNetwork -and $Context.ProxyNetworkId -cne $identity) { throw 'Shared proxy network identity changed during configuration.' }
+        $Context.ProxyNetworkId = $identity
+    }
     if ($Edit -and $ExistingVolume) {
         for ($index = 0; $index -lt $previousMetadata.Count; $index++) {
             if ($previousMetadata[$index].tenantId -and $previousMetadata[$index].tenantId -ine $profiles[$index].tenantId) {
@@ -438,10 +465,11 @@ function Read-LocalConfiguration {
         throw 'Complete every tenant profile, including accepted domains, or leave all identity fields unset. Partial credentials are not saved; TENANTS_JSON must contain complete profiles.'
     }
     if ($complete -or $Onboard -or $hasRegistry -or $profiles.Count -gt 1) { Assert-DeploymentTenantProfiles $profiles }
-    $applicationSettingsChanged = $settings.port -ne $port -or [string]$settings.publicUrl -cne $publicUrl
+    $applicationSettingsChanged = $settings.port -ne $port -or [string]$settings.publicUrl -cne $publicUrl -or [string]$settings.proxyNetwork -cne $proxyNetwork
     if (($Onboard -or $Edit) -and $settings.port -ne $port) { Assert-LocalPort $port }
     $settings.port = $port
     if ([string]$settings.publicUrl -cne $publicUrl) { $settings.publicUrl = $publicUrl }
+    if ([string]$settings.proxyNetwork -cne $proxyNetwork) { $settings.proxyNetwork = $proxyNetwork }
     $previousEmployeePrivacy = if ($settings.mcp -and $settings.mcp.Contains('hide_employee_details')) { $settings.mcp.hide_employee_details } else { $false }
     $previousChampionPrivacy = if ($settings.mcp -and $settings.mcp.Contains('hide_champion_employee')) { $settings.mcp.hide_champion_employee } else { $false }
     $mcpPlan = Get-LocalMcpPlan $Context $settings $profiles
@@ -513,6 +541,7 @@ function Save-LocalConfiguration {
     $Context.Url = "http://localhost:$port"
     $Context.PublicUrl = if ($publicUrl) { $publicUrl } else { $Context.Url }
     Sync-LocalMcpContext $Context $settings
+    Sync-LocalProxyContext $Context $settings
     Write-LocalComposeEnvironment $Context
     Protect-LocalPath $settingsFile
     Protect-LocalPath (Join-Path $state 'compose.env')
@@ -534,13 +563,14 @@ function Initialize-LocalState {
 function Write-LocalComposeEnvironment {
     param($Context)
     if ($Context.Mcp) { Sync-LocalMcpContext $Context @{mcp=$Context.Mcp} }
+    Sync-LocalProxyContext $Context @{proxyNetwork=$Context.ProxyNetwork}
     $userId = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
     $groupId = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
     $trustProxy = if ($Context.PublicUrl -cne $Context.Url) { '1' } else { '0' }
     $image = if ($Context.RuntimeImageId) { $Context.RuntimeImageId } else { $Context.Image }
     $diagnostics = if ($Context.AgentSharingDiagnostics) { '1' } else { '0' }
     $lines = @("LOCAL_STATE_DIR='$($Context.State)'","APP_PORT=$($Context.Port)","APP_UID=$userId","APP_GID=$groupId","APP_IMAGE=$image",
-        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy","AGENT_SHARING_DIAGNOSTICS=$diagnostics")
+        "FRONTEND_ORIGIN=$($Context.PublicUrl)","REDIRECT_URI=$($Context.PublicUrl)/api/auth/callback","TRUST_PROXY=$trustProxy","PROXY_NETWORK=$($Context.ProxyNetwork)","AGENT_SHARING_DIAGNOSTICS=$diagnostics")
     if ($Context.Mcp) {
         if ($userId -eq '0') { throw 'MCP cannot run as root; use the owner of its protected files.' }
         $mcpImage = if ($Context.McpImageId) { $Context.McpImageId } else { $Context.McpImage }

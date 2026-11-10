@@ -1,0 +1,11 @@
+services:
+  app:
+    networks:
+      default:
+        aliases: ["${COMPOSE_PROJECT_NAME:?Project is required}-app"]
+      shared-ingress:
+        aliases: ["${COMPOSE_PROJECT_NAME:?Project is required}-app"]
+networks:
+  shared-ingress:
+    external: true
+    name: ${PROXY_NETWORK:?Shared proxy network must be explicitly configured}

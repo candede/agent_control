@@ -7,7 +7,8 @@ For Azure hosting, complete the Entra steps here, then use
 ## Prerequisites
 
 - Git and a checkout of this repository.
-- PowerShell 7.
+- PowerShell 7 on Windows/macOS. Native Linux/Ubuntu can use `deploy-local.sh`
+  without installing host PowerShell.
 - Running Docker Desktop with Linux containers, or Docker Engine with Compose v2.
 - An Entra administrator who can register applications, assign app roles and
   grant tenant admin consent.
@@ -17,6 +18,19 @@ Builds use `https://packagefeedproxy.microsoft.io/npm/`; keep `.npmrc` and Docke
 `NPM_CONFIG_REGISTRY` aligned, with no public-registry fallback.
 Run commands from the repository root in an interactive terminal.
 On Windows, use Linux containers; elevation is not required.
+Both launchers use the existing PowerShell deployment core, not separate
+implementations. The Bash launcher uses installed `pwsh`, or builds a small
+Docker-contained PowerShell/Git/Docker CLI helper on native Linux. The helper
+runs as the current UID/GID with the local Docker socket, host networking for
+loopback diagnostics, the checkout at its original absolute path and the
+current Docker configuration. The contained launcher requires a rootful native
+Linux engine: remote/rootless engines cannot safely provide its host bind mounts
+and loopback diagnostics. Docker
+credential-helper failures remain errors; credentials are not bypassed.
+Initial helper construction needs access to its Microsoft PowerShell/Docker
+images and Microsoft Azure Linux package sources (the helper supports x86_64
+and ARM64). No Node.js, Python or PowerShell installation
+on the Ubuntu host is needed.
 
 ## Configure the Entra application
 
@@ -102,6 +116,18 @@ no source-read access; investigation-only grants are not setup prerequisites.
 pwsh ./deploy-local.ps1 start -Project agent-control
 ```
 
+Equivalent Ubuntu/native Linux command:
+
+```bash
+./deploy-local.sh start --project agent-control
+```
+
+The Bash options correspond directly to PowerShell parameters: `--db-reset`,
+`--force-checks`, `--agent-sharing-diagnostics`, `--mcp-config`,
+`--configure-mcp`, `--candidate`, `--candidate-sha256`, `--expected-preflight`
+and `--read-only`. Commands remain `start`, `stop`, `edit-config` and `check`.
+Use `./deploy-local.sh --help` for the complete launcher contract.
+
 First start opens the wizard:
 
 | Wizard prompt | Input |
@@ -165,6 +191,88 @@ saved values; secrets are hidden. Application changes can stop the app until
 - After changing origin/port, update every registration's Web callback to
   `<origin>/api/auth/callback` and begin sign-in at that origin.
 
+### Optional independent shared ingress
+
+The default deployment is standalone. Infrastructure may independently operate
+a reverse proxy and create an **external**, local-scope Docker bridge network.
+Its required labels are `io.shared-proxy.managed=true`,
+`io.shared-proxy.instance=<proxy-instance>` and
+`io.shared-proxy.owner=<infrastructure-workspace-absolute-path>`.
+Agent Control does not require any particular infrastructure checkout or instance
+name. Built-in, internal, swarm, Compose-owned, unlabelled or missing networks
+are refused before application changes. Alias collisions with another
+installation and a database already exposed on ingress also cause refusal.
+
+After infrastructure has created the network, opt in using the **existing**
+project name:
+
+```bash
+./deploy-local.sh start --project seha \
+  --proxy-network agent-control-local-ingress \
+  --public-url https://control.example.com
+```
+
+```powershell
+pwsh ./deploy-local.ps1 start -Project seha `
+  -ProxyNetwork agent-control-local-ingress -PublicUrl https://control.example.com
+```
+
+`--public-url`/`-PublicUrl` is a canonical HTTPS origin, with no trailing slash,
+path, query or fragment. Omit it to preserve the saved `publicUrl`; a saved or
+supplied HTTPS origin is required for ingress. The generated browser callback
+is always `<publicUrl>/api/auth/callback`, with `TRUST_PROXY=1`. Register that
+callback in each API Entra application; first-run registration guidance uses
+the supplied public URL as well. The proxy must preserve the public
+Host and Origin and forward `X-Forwarded-Proto: https`; do not force a fixed
+Origin or disable same-origin checks.
+
+The saved `proxyNetwork` option is reused by later starts. Only `app` and, if
+already configured, `mcp` join ingress **in addition to** their original private
+network. Stable project-derived upstreams are `seha-app:3001` and
+`seha-mcp:8000` (generally `<project>-app:3001` / `<project>-mcp:8000`).
+Never route by container ID/IP. PostgreSQL stays on the project-private network
+and is never attached to ingress. App and MCP host ports remain loopback-only,
+including local readiness and diagnostics. Proxying a site hostname is separate
+from choosing the public sign-in origin: configure corresponding Host routing
+and register callbacks for the actual saved public URLs.
+
+MCP remains optional; ingress does not configure or enable it. Its saved public
+resource URL, Entra `/auth/callback`, exact client redirect allowlist, private
+API transport and protected OAuth/recording volumes are retained.
+With shared ingress, private app/MCP calls use project-derived names
+(`http://<project>-app:3001` / `http://<project>-mcp:8000`), also aliased on the
+private network, so another project's generic `app`/`mcp` service alias cannot
+misroute authentication or metadata. Standalone keeps `http://app:3001`.
+Route the MCP public host and all its OAuth/discovery paths to
+`<project>-mcp:8000`, not the app. Preserve the resource path; no path rewriting
+is performed by this deployment.
+
+`stop` stops only this project's owned app/MCP/PostgreSQL containers; `start`
+redeploys this project independently. Neither command manages the edge,
+certificates, shared network or other projects. Shared networking never changes
+the normal data-preservation/reset contract. To return to standalone, run
+`start --proxy-network none`; add `--public-url local` only if also removing the
+public origin. A still-saved public URL can continue using an existing
+loopback tunnel. Never use a database reset or change projects for this.
+Explicitly clearing or replacing the saved network does not require the old
+external network to remain available; the selected ingress is validated instead.
+Ingress changes cannot be combined with pinned candidate/preflight parameters:
+save/apply configuration first, then prepare the exact candidate and preflight.
+Normal pinned source, network-identity, maintenance/checkpoint and recovery
+safeguards remain enforced.
+
+On Ubuntu the Docker launcher mounts `--mcp-config` and explicit secret-file
+inputs outside the checkout read-only at their original paths. Inputs already
+inside the checkout use its existing mount, so saved project secrets remain
+writable for permission checks and explicit configuration updates. Existing
+credential ownership, permission, size and non-link checks still apply.
+The metadata JSON must be a non-linked file; it does not contain credential
+values and is not subject to the credential-file permission or 8 KiB limit.
+Configuration and credentials are saved only in the same project-owned state
+as PowerShell.
+Loopback readiness does not claim public TLS, sign-in or live MCP OAuth has
+been verified.
+
 ### Restart or stop without resetting data
 
 ```powershell
@@ -175,8 +283,16 @@ pwsh ./deploy-local.ps1 start -Project agent-control
 Ordinary start reuses saved configuration and data; an unchanged healthy app
 needs no restart. Keep `.local/<project>/` and `<project>_data` together; restore
 missing secrets rather than regenerating them for an existing volume.
+A malformed `.local/<project>/deployment.json` is rejected rather than treated
+as a current deployment; review or restore that receipt, not the database.
 Use a different `-Project` only for an independent installation, and use that
 exact name for all its commands. Never add `-DbReset` to an ordinary restart.
+
+Pinned-release metadata (`-CandidateSha256`, `-ExpectedPreflight`, `-ReadOnly`)
+requires a nonempty `-Candidate`; otherwise the command fails before Docker
+access instead of falling back to ordinary `start`. The same check applies to
+the Bash launcher's corresponding options, including when host PowerShell is
+absent. These options are not needed for normal deployments.
 
 ## Configure multiple tenants
 

@@ -281,6 +281,37 @@ try {
                 $launchFailure.Exception.Message -notmatch 'Standard(?:Output|Error)Encoding') 'Native launch failure was hidden by a shell fallback or reported as a successful command.'
         }
     }
+    & {
+        $savedOrphanPolicy=[Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS')
+        function docker {
+            param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments)
+            $global:LASTEXITCODE=if ($Arguments -contains 'fixture-failure') { 17 } else { 0 }
+            if (Test-Path Env:COMPOSE_IGNORE_ORPHANS) { return $env:COMPOSE_IGNORE_ORPHANS }
+            return 'unset'
+        }
+        $databaseArguments=@('compose','--env-file',(Join-Path $testRoot 'compose.env'),'up','postgres')
+        try {
+            foreach ($originalPolicy in @($null,'false','true')) {
+                if ($null -eq $originalPolicy) {
+                    if (Test-Path Env:COMPOSE_IGNORE_ORPHANS) { Remove-Item Env:COMPOSE_IGNORE_ORPHANS }
+                } else { $env:COMPOSE_IGNORE_ORPHANS=$originalPolicy }
+                foreach ($capture in @($false,$true)) {
+                    $policy=Invoke-DockerCommand $databaseArguments -Capture:$capture -IgnoreComposeOrphans
+                    Assert-True ($policy -ceq 'true') 'Database-only Compose did not disable orphan detection.'
+                    Assert-True ([Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS') -ceq $originalPolicy) 'Successful database-only Compose changed the caller orphan policy.'
+                    Assert-Fails { Invoke-DockerCommand ($databaseArguments + @('fixture-failure')) -Capture:$capture -IgnoreComposeOrphans | Out-Null } 'Docker compose failed \(exit code 17\)'
+                    Assert-True ([Environment]::GetEnvironmentVariable('COMPOSE_IGNORE_ORPHANS') -ceq $originalPolicy) 'Failed database-only Compose changed the caller orphan policy.'
+                }
+                $policy=Invoke-DockerCommand $databaseArguments -Capture
+                $expectedPolicy=if ($null -eq $originalPolicy) { 'unset' } else { $originalPolicy }
+                Assert-True ($policy -ceq $expectedPolicy) 'Normal Compose inherited the database-only orphan override.'
+            }
+        } finally {
+            if ($null -eq $savedOrphanPolicy) {
+                if (Test-Path Env:COMPOSE_IGNORE_ORPHANS) { Remove-Item Env:COMPOSE_IGNORE_ORPHANS }
+            } else { $env:COMPOSE_IGNORE_ORPHANS=$savedOrphanPolicy }
+        }
+    }
     $protectedDirectory=Join-Path $testRoot 'protected-paths'
     $existingDirectory=Join-Path $protectedDirectory 'source'
     $existingFile=Join-Path $existingDirectory 'existing.txt'
@@ -423,14 +454,14 @@ try {
     Assert-True ($guidance.Contains('Reports.Read.All does not replace the Agents, Users & agents, and Users CSV exports.')) 'Office activity must remain distinct from imported agent usage.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     $publicParameters=@($entry.ScriptBlock.Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
+    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','ProxyNetwork','PublicUrl','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
     Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
     Assert-True ($entry.Parameters['DbReset'].Aliases.Count -eq 0) 'DbReset must have one canonical parameter name.'
     Assert-True ($entry.Parameters['ForceChecks'].ParameterType -eq [Management.Automation.SwitchParameter]) 'ForceChecks must be an opt-in switch.'
     Assert-True ($entry.Parameters['AgentSharingDiagnostics'].ParameterType -eq [Management.Automation.SwitchParameter]) 'Temporary sharing diagnostics must be an opt-in switch.'
     Assert-True ($entry.Parameters['ConfigureMcp'].ParameterType -eq [Management.Automation.SwitchParameter]) 'MCP setup must be explicit, not an ordinary startup gate.'
-    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 11) 'Entry point release parameters differ from the bounded start contract.'
+    Assert-True ($entry.ScriptBlock.Ast.ParamBlock.Parameters.Count -eq 13) 'Entry point release parameters differ from the bounded start contract.'
     foreach ($parameter in @('Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')) {
         Assert-True ($entry.Parameters.ContainsKey($parameter)) "Missing release parameter $parameter."
     }
@@ -966,6 +997,7 @@ try {
     Copy-Item -LiteralPath $entry.Source -Destination (Join-Path $entryRoot 'deploy-local.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/local-deployment.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-runtime.ps1') -Destination (Join-Path $entryRoot 'scripts/local-runtime.ps1')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-proxy.ps1') -Destination (Join-Path $entryRoot 'scripts/local-proxy.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'local-mcp.ps1') -Destination (Join-Path $entryRoot 'scripts/local-mcp.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'tenant-deployment.ps1') -Destination (Join-Path $entryRoot 'scripts/tenant-deployment.ps1')
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'fixture-diagnostics.ps1') -Destination (Join-Path $entryRoot 'scripts/fixture-diagnostics.ps1')
@@ -1025,6 +1057,21 @@ try {
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public DbReset combination invoked Docker.'
         Assert-Fails { . $entryPath $invalidResetCommand -ForceChecks } 'ForceChecks.*only with start'
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public ForceChecks combination invoked Docker.'
+    }
+    foreach ($invalidReleaseParameters in @(
+        @{CandidateSha256=('a'*64)},
+        @{ExpectedPreflight=('b'*64)},
+        @{CandidateSha256=('a'*64);ExpectedPreflight=('b'*64)},
+        @{Candidate='';CandidateSha256=('a'*64)},
+        @{Candidate=' ';CandidateSha256=('a'*64);ExpectedPreflight=('b'*64)},
+        @{Candidate=''},
+        @{CandidateSha256=''},
+        @{ExpectedPreflight=''},
+        @{ReadOnly=$true}
+    )) {
+        $callCount=$script:Calls.Count
+        Assert-Fails { . $entryPath start -Project newcustomer @invalidReleaseParameters 6>$null } 'Release parameters require a nonempty -Candidate'
+        Assert-True ($script:Calls.Count -eq $callCount) 'Incomplete public release parameters invoked Docker or fell back to an ordinary deployment.'
     }
     $context=$retainedContext
     Remove-Item -LiteralPath (Join-Path $entryState 'newcustomer/deployment-operation.json')

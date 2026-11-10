@@ -419,6 +419,22 @@ try {
     $script:volume=$false
     Fails { Initialize-LocalMcpStorage $context } 'Recorded MCP state volume is missing'
     $script:volume=$true
+    $oauthReceiptPath=Join-Path $context.State 'mcp-storage.json'
+    $oauthReceipt=[IO.File]::ReadAllText($oauthReceiptPath)
+    foreach ($invalidReceipt in @('null','false','0','[]','{}',"[$oauthReceipt]")) {
+        Write-LocalText $oauthReceiptPath $invalidReceipt
+        $script:calls.Clear()
+        Fails { Initialize-LocalMcpStorage $context } 'Recorded MCP volume identity changed'
+        Assert (-not @($script:calls | Where-Object { $_ -match '^run\||^volume\|create\|' }).Count -and
+            [IO.File]::ReadAllText($oauthReceiptPath) -ceq $invalidReceipt) 'Invalid retained OAuth receipt was overwritten or allowed storage initialization.'
+        $script:volume=$false
+        $script:calls.Clear()
+        Fails { Initialize-LocalMcpStorage $context } 'Recorded MCP state volume is missing'
+        Assert (-not @($script:calls | Where-Object { $_ -match '^run\||^volume\|create\|' }).Count -and
+            [IO.File]::ReadAllText($oauthReceiptPath) -ceq $invalidReceipt) 'Invalid retained OAuth receipt allowed silent volume recreation.'
+        $script:volume=$true
+    }
+    Write-LocalText $oauthReceiptPath $oauthReceipt
     $oauthReceiptHash=(Get-FileHash -LiteralPath (Join-Path $context.State 'mcp-storage.json')).Hash
     $script:recordingVolume=$false
     $script:calls.Clear()
