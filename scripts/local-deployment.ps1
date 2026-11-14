@@ -165,101 +165,11 @@ function Show-LocalRegistrationGuidance {
     Write-Host @'
 
 Registered app permissions and setup
-===================================
-Use an approved Entra Web application for each configured tenant.
-Each registration can remain single-tenant; all use this deployment's callback.
-Enter every accepted username domain explicitly. Domains are exact, not wildcard
-or suffix matches. No tenant discovery or fallback is performed.
-Users enter their username; tenant profiles are managed only by the operator.
-API permissions and tenant administrator consent are prerequisites.
-Configure them before admitting users; the app does not request or grant permissions.
-
-Entra admin center > App registrations > your app > API permissions >
-Add a permission. Select Application permissions for the four standard Graph reads;
-select Delegated permissions for sign-in, Power Platform and administrative changes.
-
-Microsoft Graph - Application permissions:
-  CopilotPackages.Read.All       Tenant package catalog and exact package details.
-  User.Read.All                 Users, agent creators/owners and license assignments.
-  LicenseAssignment.Read.All     Product and service-plan catalog.
-  Reports.Read.All               Per-user Copilot Office app activity.
-These reads use the configured application credentials automatically, without an
-application-enable or scope-approval step. Any assigned Viewer can start them;
-no administrator needs to keep signing into Agent Control.
-Reports.Read.All does not replace the Agents, Users & agents, and Users CSV exports.
-
-Microsoft Graph - Delegated permissions:
-  openid                         Sign-in: authenticate the account.
-  profile                        Sign-in: account identity and display name.
-  offline_access                 Session renewal without repeated sign-in.
-  CopilotPackages.ReadWrite.All  Block/unblock and other package controls.
-                                Also authorizes exact control readback.
-  Group.Read.All                 Management group lookup.
-
-User.Read is not used by Agent Control.
-User search, recipient validation and exact adoption people resolution use
-application User.Read.All. Group.Read.All is only for delegated group lookups.
-MCP identity mapping uses openid/profile and needs no directory-read grant.
-
-Power Platform - Delegated permissions:
-  ResourceQuery.Resources.Read   Read Power Platform inventory.
-  CopilotStudio.AdminActions.Invoke  Read/change Copilot Studio quarantine.
-  Resource/application ID: 8578e004-a5c6-46e7-913e-12f58912df43
-
-Select Grant admin consent in the existing app registration.
-After sign-in, the app checks read access automatically without requiring
-probe-button clicks. Normal sign-in, MFA or Conditional Access may still require
-the user's participation; feature permission grants remain administrator-managed.
-Automatic checks never change packages, quarantine agents or run investigations.
-Token acquisition alone does not prove provider access, roles or licensing.
-No delegated fallback is used for standard Graph collection.
-Purview, Defender and investigation-only identity setup are hidden from the UI.
-Their backend is unchanged; deferred investigation-only permissions are
-AgentIdentity.Read.All, AuditLogsQuery.Read.All and ThreatHunting.Read.All.
-They are not prerequisites for adoption use.
-
-App roles (separate from API permissions):
-  Add the appRoles entries from infra/entra-app-manifest.json, preserving the
-  registration's other settings. When creating roles in the portal, select
-  Users/Groups for Allowed member types. origin: Application describes where
-  a role is defined, not who receives it.
-  In Enterprise applications > your app > Properties, set Assignment required
-  to No after hardened API/MCP deployment. Retain explicit staff assignments.
-  Active roleless tenant members receive only conversational discovery and the
-  browser handoff; no EndUser role exists. Under Users and groups, assign one
-  role to each approved staff user/group:
-    AgentControl.Viewer               Observe tenant data and request read synchronization.
-    AgentControl.UsageReportUploader  Viewer access plus upload, validation and
-                                     publication of new official CSV report sets.
-    AgentControl.Admin                All viewing and upload access plus supported
-                                     changes, report corrections/deletion and configuration.
-  Admin includes Viewer access and Usage Report Uploader access.
-  Usage Report Uploader includes Viewer access; only one role assignment is needed.
-  Assign only the Viewer, UsageReportUploader or Admin role.
-  Uploaders can inspect and discard their own uncommitted drafts; correcting or
-  deleting published reports remains Admin-only. Downloading Microsoft CSVs still
-  requires the external Reports Reader or AI Administrator role; app roles do not
-  grant that provider access.
-  Sign out and back in after assignment. Provider permissions still apply.
-
-Provider-side requirements still apply to the signed-in user for delegated actions:
-  Power Platform inventory: one of Global Administrator, Power Platform Administrator, Dynamics 365
-  Administrator, Global Reader, AI Administrator or AI Reader. AI roles are
-  limited to AI-scoped resources.
-  Quarantine: one of Global Administrator, AI Administrator or Power Platform Administrator.
-  Power Platform Inventory rejects service principals and managed identities.
-  Package controls: application Admin role, delegated CopilotPackages.ReadWrite.All,
-  licensing and exact confirmation. The package API publishes no additional
-  Entra administrator-role prerequisite.
-Applicable licensing is also required (including Microsoft Agent 365 for package
-APIs). CSV report import and local application audit need no external API permission.
-Read collection starts automatically while a signed-in browser is visible and
-online. This is not an unattended scheduler. Consent alone does not enable
-unsupported operations.
-
-This wizard displays guidance only; it does not verify or grant permissions.
-See docs/deployment-setup.md and docs/provider-contracts.md
-for setup details and capability-specific requirements.
+- Entra Web app: tenant ID, client ID and client secret value (not secret ID).
+- Add required API permissions and grant tenant admin consent.
+- Import appRoles from infra/entra-app-manifest.json; assign one staff role.
+- Enter exact username domains (no wildcards).
+Checklist: docs/deployment-setup.md
 
 '@
 }

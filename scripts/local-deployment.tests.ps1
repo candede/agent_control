@@ -434,25 +434,15 @@ try {
         Remove-OwnedFixture $timeoutCompose $timeoutProject $timeoutEvidence
     }
     $guidance=(Show-LocalRegistrationGuidance 6>&1) -join "`n"
-    foreach ($permission in @('openid','profile','offline_access','CopilotPackages.Read.All','CopilotPackages.ReadWrite.All','Group.Read.All','User.Read.All','LicenseAssignment.Read.All','Reports.Read.All','AgentIdentity.Read.All','AuditLogsQuery.Read.All','ThreatHunting.Read.All','ResourceQuery.Resources.Read','CopilotStudio.AdminActions.Invoke')) {
-        Assert-True ($guidance.Contains($permission)) "Registration guidance omitted permission $permission."
-    }
+    $guidanceLines=@($guidance -split "`n" | Where-Object { $_.Trim() })
+    Assert-True ($guidanceLines.Count -le 8 -and [regex]::Matches($guidance,'\S+').Count -le 80) 'Wizard guidance must remain a short checklist, not the full setup reference.'
+    Assert-True ($guidance -match 'Entra Web app:.*tenant ID.*client ID.*client secret value \(not secret ID\)') 'Wizard checklist omitted the required registration inputs.'
+    Assert-True ($guidance -match 'required API permissions.*grant tenant admin consent') 'Wizard checklist omitted administrator-managed permissions and consent.'
+    Assert-True ($guidance -match 'infra/entra-app-manifest\.json.*assign one staff role' -and $guidance -match 'exact username domains \(no wildcards\)') 'Wizard checklist omitted staff roles or exact domain requirements.'
+    Assert-True ($guidance.Contains('docs/deployment-setup.md')) 'Wizard checklist must link to the full setup instructions.'
     $manifest=Get-Content -LiteralPath (Join-Path $repositoryRoot 'infra/entra-app-manifest.json') -Raw | ConvertFrom-Json
     Assert-True (($manifest.appRoles.value -join ',') -ceq 'AgentControl.Viewer,AgentControl.UsageReportUploader,AgentControl.Admin') 'Manifest must expose exactly Viewer, UsageReportUploader and Admin.'
     Assert-True (@($manifest.appRoles | Where-Object { ($_.allowedMemberTypes -join ',') -cne 'User' }).Count -eq 0) 'App roles must be assignable to users/groups only.'
-    foreach ($role in $manifest.appRoles) { Assert-True ($guidance.Contains($role.value)) 'Registration guidance omitted an application role.' }
-    foreach ($requiredText in @('Microsoft Graph - Delegated permissions','Power Platform - Delegated permissions','8578e004-a5c6-46e7-913e-12f58912df43','tenant administrator consent','Microsoft Graph - Application permissions','Admin includes Viewer access','Usage Report Uploader includes Viewer access','only one role assignment','correcting or','published reports remains Admin-only','external Reports Reader or AI Administrator role','Assignment required','Users/Groups for Allowed member types','does not verify or grant permissions')) {
-        Assert-True ($guidance.Contains($requiredText)) "Registration guidance omitted distinction: $requiredText."
-    }
-    foreach ($requiredText in @('checks read access automatically','Normal sign-in, MFA or Conditional Access','Automatic checks never change packages','Token acquisition alone does not prove provider access','Select Grant admin consent','the app does not request or grant permissions')) {
-        Assert-True ($guidance.Contains($requiredText)) "Automatic access-check guidance omitted distinction: $requiredText."
-    }
-    Assert-True (-not $guidance.Contains('sign-in requests all implemented delegated permissions')) 'Sign-in must not request feature consent.'
-    Assert-True ($guidance -notmatch '(?m)^[ \t]+User\.Read[ \t]+') 'OIDC sign-in must not require an unused Graph profile permission.'
-    Assert-True ($guidance.Contains('User.Read is not used by Agent Control.')) 'Registration guidance must identify the unused Graph profile grant.'
-    Assert-True ($guidance.Contains('No delegated fallback is used for standard Graph collection.')) 'Registration guidance must describe application-only Graph collection.'
-    Assert-True ($guidance -match 'without an\s+application-enable or scope-approval step') 'Standard collection must not require a separate application-enable step.'
-    Assert-True ($guidance.Contains('Reports.Read.All does not replace the Agents, Users & agents, and Users CSV exports.')) 'Office activity must remain distinct from imported agent usage.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     $publicParameters=@($entry.ScriptBlock.Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
     Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','DockerNetwork','PublicUrl','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
@@ -1060,7 +1050,7 @@ try {
         Assert-True (Test-Path -LiteralPath (Join-Path $entryState "$projectName/control/maintenance")) 'Explicit stop did not close admissions.'
         Add-EditAnswers @('','','','',$tunnelUrl)
         $messages=. $entryPath -Command edit-config @projectArguments 6>&1
-        Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the complete registration guidance.'
+        Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the short setup checklist.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Edit-config displayed the saved client secret.'
         Assert-True ($script:Prompts.Count -eq $promptCount+16) 'Explicit edit-config did not prompt for all settings.'
         $entrySettings=Read-LocalSettings (Join-Path $entryState $projectName)

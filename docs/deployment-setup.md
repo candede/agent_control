@@ -130,7 +130,9 @@ The Bash options correspond directly to PowerShell parameters: `--db-reset`,
 and `--read-only`. Commands are `start`, `stop`, `edit-config`, `check` and `delete`.
 Use `./deploy-local.sh --help` for the complete launcher contract.
 
-First start opens the wizard:
+First start shows a short Entra checklist and opens the wizard. Complete the
+[Entra setup steps above](#configure-the-entra-application) for full permissions,
+consent and role requirements.
 
 | Wizard prompt | Input |
 | --- | --- |
