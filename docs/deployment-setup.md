@@ -25,7 +25,9 @@ runs as the current UID/GID with the local Docker socket, host networking for
 loopback diagnostics, the checkout at its original absolute path and the
 current Docker configuration. The contained launcher requires a rootful native
 Linux engine: remote/rootless engines cannot safely provide its host bind mounts
-and loopback diagnostics. Docker
+and loopback diagnostics. Its root filesystem stays read-only; PowerShell
+temporary files, configuration, cache and data use the writable checkout's
+`artifacts/local-launcher/<uid>/`, not the host home directory. Docker
 credential-helper failures remain errors; credentials are not bypassed.
 Initial helper construction needs access to its Microsoft PowerShell/Docker
 images and Microsoft Azure Linux package sources (the helper supports x86_64

@@ -119,7 +119,8 @@ run=(run --rm --init --network host --read-only --cap-drop ALL --security-opt no
     --mount "type=bind,source=$socket,target=$socket"
     --workdir "$root" --env "HOME=$HOME" --env "DOCKER_CONFIG=$config"
     --env "TMPDIR=$work" --env "XDG_CACHE_HOME=$work/cache"
-    --env "XDG_CONFIG_HOME=$work/config" --env DOTNET_EnableDiagnostics=0
+    --env "XDG_CONFIG_HOME=$work/config" --env "XDG_DATA_HOME=$work/data"
+    --env DOTNET_EnableDiagnostics=0
     --env POWERSHELL_TELEMETRY_OPTOUT=1 --env POWERSHELL_UPDATECHECK=Off)
 if [[ -d $config ]]; then
     run+=(--mount "type=bind,source=$config,target=$config")

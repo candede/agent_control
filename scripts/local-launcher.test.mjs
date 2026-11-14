@@ -124,6 +124,18 @@ test("native Linux bootstraps the same core without host PowerShell and preserve
   assert.ok(!container.includes("--privileged") && !container.includes("--detach"));
 });
 
+test("PowerShell initialization data uses the writable checkout instead of the read-only home", () => {
+  const home = join(scratch, "unmounted-home");
+  const result = run(["start"], { HOME: home, XDG_DATA_HOME: join(home, ".local", "share") });
+  assert.equal(result.status, 0, result.stderr);
+  const container = calls().find(args => args[0] === "run");
+  assert.ok(container.includes("--read-only"));
+  assert.ok(container.includes(`HOME=${home}`));
+  const dataHome = container.find(argument => argument.startsWith("XDG_DATA_HOME="))?.slice("XDG_DATA_HOME=".length);
+  assert.ok(dataHome?.startsWith(`${root}/`), "PowerShell data must be redirected into the writable checkout mount.");
+  assert.ok(container.includes(`type=bind,source=${root},target=${root}`));
+});
+
 test("a symbolic Docker socket uses the target socket group", () => {
   const link = join(scratch, "socket-link");
   symlinkSync(socket, link);
