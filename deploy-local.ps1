@@ -1,4 +1,13 @@
 #requires -Version 7.0
+<#
+.SYNOPSIS
+Deploy Agent Control with optional shared Docker ingress.
+.DESCRIPTION
+First start and edit-config prompt for an optional HTTPS public URL (default:
+localhost) and an existing proxy network (default: none/standalone).
+New app/MCP port defaults skip occupied host and Docker-published TCP ports.
+Saved ports are retained so registered callbacks do not change automatically.
+#>
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Position=0)]

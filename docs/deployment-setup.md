@@ -138,7 +138,22 @@ First start opens the wizard:
 | Entra client ID | **Application (client) ID**, not object ID |
 | Entra client secret value | Secret **Value** from step 2; input is hidden |
 | Accepted username domains | Exact domains, e.g. `contoso.com,contoso.onmicrosoft.com`; no usernames, URLs or wildcards |
-| Local port | Enter for `3001`, or an available `1024`–`65535` port matching the callback |
+| Local port | Enter for the first available port from `3001`, or choose an available `1024`–`65535` port matching the callback |
+| Public URL | Optional external HTTPS origin, e.g. `https://control.example.com`; Enter defaults to localhost |
+| Docker proxy network | Optional existing shared ingress network, e.g. `agent-control-ingress`; Enter defaults to `none` (standalone) |
+
+New app and MCP port defaults skip occupied host listeners and TCP ports published
+by running Docker containers. MCP also skips the selected app port, starting at
+`8001`. Explicitly entered ports are not silently replaced. Saved ports stay
+unchanged on subsequent starts and edits, because changing them may invalidate
+registered callbacks; free a conflicting saved port or change it with
+`edit-config`. Docker still checks availability at startup if another process
+claims a port after configuration.
+
+PostgreSQL does **not** publish host port `5432` and never joins shared ingress.
+Each deployment keeps its own database on its project-private network, so
+Automations and Agent Control can both use container port `5432` without a
+collision. No database port reassignment or shared database is needed.
 
 Under `.local/agent-control/`, the wizard saves `settings.json`, protected
 `secrets/tenants.json` credentials and generated database/session keys in
@@ -182,7 +197,8 @@ pwsh ./deploy-local.ps1 start -Project agent-control
 ```
 
 The editor prompts for tenant IDs, secret, domains and optional display name,
-then **Add another tenant?**, **Local port** and **Public URL**. Enter keeps
+then **Add another tenant?**, **Local port**, **Public URL** and **Docker proxy
+network**. Enter keeps
 saved values; secrets are hidden. Application changes can stop the app until
 `start`; identity/domain changes require sign-in again.
 
@@ -204,6 +220,15 @@ Agent Control does not require any particular infrastructure checkout or instanc
 name. Built-in, internal, swarm, Compose-owned, unlabelled or missing networks
 are refused before application changes. Alias collisions with another
 installation and a database already exposed on ingress also cause refusal.
+
+First start and `edit-config` offer these settings interactively. Keep the
+network at `none` without a container proxy (including a host-based HTTPS tunnel).
+With shared ingress, supply both the external HTTPS origin and the network name.
+An external URL is needed even though the proxy manages certificates: Agent
+Control uses it for Entra callbacks, browser origin checks and secure cookies.
+Use the same workflow on another VPS with its own DNS, proxy and managed ingress
+network. Without a proxy, localhost remains the default; a remote host can be
+accessed through an SSH port forward rather than publishing an insecure app port.
 
 After infrastructure has created the network, opt in using the **existing**
 project name:
@@ -237,6 +262,16 @@ and is never attached to ingress. App and MCP host ports remain loopback-only,
 including local readiness and diagnostics. Proxying a site hostname is separate
 from choosing the public sign-in origin: configure corresponding Host routing
 and register callbacks for the actual saved public URLs.
+
+For the Automations shared proxy, use the network in its **Agent Control** app
+entry, not its database or Automations-private network. The production proxy
+example uses `agent-control-ingress`, with browser/API upstream
+`http://agent-control-app:3001` and optional MCP upstream
+`http://agent-control-mcp:8000` for the default `agent-control` project. A different
+project needs matching aliases in the proxy configuration. Apply that proxy
+configuration first so it creates the managed network and certificate routes.
+The browser and API share the `app` container; no separate web/API ports or
+certificates are managed by this launcher.
 
 MCP remains optional; ingress does not configure or enable it. Its saved public
 resource URL, Entra `/auth/callback`, exact client redirect allowlist, private

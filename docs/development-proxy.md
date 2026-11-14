@@ -1,6 +1,7 @@
 # Optional development proxy
 
-Agent Control defaults to `http://localhost:3001`; a proxy is optional, for remote
+Agent Control defaults to `http://localhost:3001` (or the next free port on first
+setup); a proxy is optional, for remote
 access only. Complete [local setup](deployment-setup.md) and verify local sign-in
 first. Run commands from the repository root with PowerShell 7 and Docker/Compose
 running. Add the same `-Project <name>` to each deployment command for a named project.
@@ -23,7 +24,10 @@ running. Add the same `-Project <name>` to each deployment command for a named p
    ```
 
    Keep other values; set **Public URL** to the canonical HTTPS origin only
-   (no trailing slash, path, query or fragment).
+   (no trailing slash, path, query or fragment). First start also asks for this
+   optional URL. Keep **Docker proxy network** at `none` for a host-based
+   proxy/tunnel, or enter its existing managed ingress network for a
+   [shared Docker proxy](deployment-setup.md#optional-independent-shared-ingress).
 3. In each configured tenant's Agent Control Web app registration, add
    `https://<proxy-host>/api/auth/callback` as a **Web** redirect URI.
 4. Apply the saved configuration:
@@ -40,7 +44,8 @@ at the proxy origin. Startup checks local readiness, not tunnel reachability.
 ## Return to localhost
 
 Run `pwsh ./deploy-local.ps1 edit-config`; enter `local` at **Public URL**
-(Enter keeps the proxy). Keep `http://localhost:3001/api/auth/callback`
+(Enter keeps the proxy), and `none` at **Docker proxy network** if it was set.
+Keep `http://localhost:3001/api/auth/callback`
 registered, substituting the saved port, then run:
 
 ```powershell

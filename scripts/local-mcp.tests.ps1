@@ -712,7 +712,7 @@ try {
     Remove-Item -LiteralPath (Join-Path $firstRun.State 'settings.json')
     Remove-Item -LiteralPath (Join-Path $firstRun.State 'secrets/tenants.json')
     $firstRun.ConfigureMcp=$true
-    Set-SetupAnswers @($mcp.tenantId,$mcp.apiClientId,'example.invalid','8001','',$mcp.clientId,$mcp.publicUrl,'https://client.example.test/callback','') @('synthetic-first-api-credential','synthetic-first-mcp-credential')
+    Set-SetupAnswers @($mcp.tenantId,$mcp.apiClientId,'example.invalid','8001','','','',$mcp.clientId,$mcp.publicUrl,'https://client.example.test/callback','') @('synthetic-first-api-credential','synthetic-first-mcp-credential')
     $firstPlan=Read-LocalConfiguration $firstRun $false -Onboard
     Assert ($firstPlan.McpPlan.Settings.tenantId -ceq $mcp.tenantId -and
         $firstPlan.McpPlan.Settings.apiClientId -ceq $mcp.apiClientId -and

@@ -4,6 +4,20 @@ function Test-LocalProxyNetworkName {
         $Value -cnotin @('bridge','host','none'))
 }
 
+function Read-LocalProxyNetwork {
+    param([string]$Current)
+    $display = if ($Current) { $Current } else { 'none (standalone project-private network)' }
+    Write-Host 'Optional: join an existing shared proxy ingress network created by deploy-proxy.sh. Only app/MCP join it; PostgreSQL stays private. Leave unset when no container reverse proxy is used.'
+    while ($true) {
+        $value = [string](Read-Host "Docker proxy network [$display; Enter to keep; 'none' for standalone]")
+        if ([string]::IsNullOrWhiteSpace($value)) { return $Current }
+        $value = $value.Trim()
+        if ($value -ieq 'none') { return '' }
+        if (Test-LocalProxyNetworkName $value) { return $value }
+        Write-Warning 'Enter an existing shared ingress network name (1-63 letters, digits, dots, underscores or hyphens), or none.'
+    }
+}
+
 function Assert-LocalProxyNetwork {
     param($Context,[string]$Name)
     if (-not (Test-LocalProxyNetworkName $Name) -or $Name -ceq $Context.Network) {

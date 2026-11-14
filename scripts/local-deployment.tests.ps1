@@ -51,6 +51,7 @@ function Add-EditAnswers {
     foreach ($answer in $Values[0..2]) { $script:Answers.Enqueue($answer) }
     foreach ($answer in @($Domains,$DisplayName,'')) { $script:Answers.Enqueue($answer) }
     foreach ($answer in $Values[3..4]) { $script:Answers.Enqueue($answer) }
+    $script:Answers.Enqueue('')
 }
 function Read-FixtureRegistry {
     param($Context)
@@ -514,13 +515,13 @@ try {
     foreach ($removedAction in @('Start','Reset')) { Assert-Fails { Invoke-LocalDeployment $context $removedAction } 'ValidateSet|validate argument' }
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     try { Assert-Fails { Assert-LocalPort $listener.LocalEndpoint.Port } 'occupied' } finally { $listener.Stop() }
-    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $context $false -Onboard 6>$null
     foreach ($failure in @('^build\|','\|initialize$','\|--wait-timeout\|90\|postgres$','\|--wait-timeout\|90\|app$')) {
         $script:Failure=$failure
         Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Simulated'
     }
-    Assert-True ($script:Prompts.Count -eq 4) 'New project did not onboard exactly once.'
+    Assert-True ($script:Prompts.Count -eq 6) 'New project did not onboard identity and optional ingress exactly once.'
     Assert-True ($script:Prompts[2] -match 'secure=True$') 'Client secret was not prompted securely.'
     $saved=Get-Content -LiteralPath (Join-Path $context.State 'settings.json') -Raw | ConvertFrom-Json
     Assert-True ($saved.tenants[0].tenantId -ceq $tenant -and $saved.tenants[0].clientId -ceq $client) 'Onboarding identifiers were not saved.'
@@ -552,7 +553,7 @@ try {
     $before=[IO.File]::ReadAllText($secret)
     Invoke-LocalDeployment $context 'Deploy' 6>$null
     Invoke-LocalDeployment $context 'Deploy' 6>$null
-    Assert-True ($script:Prompts.Count -eq 4) 'Configured Deploy/Start prompted again.'
+    Assert-True ($script:Prompts.Count -eq 6) 'Configured Deploy/Start prompted again.'
     Assert-True ([IO.File]::ReadAllText($secret) -ceq $before) 'Repeat deploy rotated credentials.'
     Assert-True ((Read-FixtureRegistry $context)[0].clientSecret -ceq $clientSecret) 'Repeat deploy changed the Entra secret.'
     Assert-True (($script:Calls -join "`n") -notlike "*$before*") 'Secret leaked to command arguments.'
@@ -581,10 +582,10 @@ try {
     $otherClient='44444444-4444-4444-4444-444444444444'
     foreach ($target in @($defaultContext,$customerContext)) {
         $promptCount=$script:Prompts.Count
-        foreach ($answer in @($otherTenant,$otherClient,'other-fixture-secret','fabrikam.com','14392')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @($otherTenant,$otherClient,'other-fixture-secret','fabrikam.com','14392','','')) { $script:Answers.Enqueue($answer) }
         Initialize-LocalState $target $false -Onboard 6>$null
         Initialize-LocalState $target $true -Onboard 6>$null
-        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Default/named project onboarding or reuse failed.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+7) 'Default/named project onboarding or reuse failed.'
         Assert-True ((Read-FixtureRegistry $target)[0].tenantId -ceq $otherTenant) 'Project received the wrong identity.'
         $reloaded=New-LocalContext $testRoot $target.Project
         Assert-True ($reloaded.Port -eq 14392 -and $reloaded.Url -ceq 'http://localhost:14392') 'Project did not load its saved port.'
@@ -640,7 +641,7 @@ try {
     Assert-Fails { ConvertFrom-DeploymentTenantRegistry "[{`"tenantId`":`"$tenant`",`"clientId`":`"$client`",`"clientSecret`":`"$clientSecret`",`"domains`":[`"contoso.com`"],`"integrations`":{}}]" } 'unknown profile field'
 
     $secondSecret='second-tenant-hidden-credential'
-    foreach ($answer in @('','','','','','y',$otherTenant,$otherClient,$secondSecret,'fabrikam.com','Fabrikam','','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','','','y',$otherTenant,$otherClient,$secondSecret,'fabrikam.com','Fabrikam','','','','')) { $script:Answers.Enqueue($answer) }
     $messages=Invoke-LocalDeployment $registryContext 'EditConfig' 6>&1
     $added=Read-FixtureRegistry $registryContext
     Assert-True ($added.Count -eq 2 -and $added[0].clientSecret -ceq $clientSecret -and $added[1].tenantId -ceq $otherTenant -and $added[1].displayName -ceq 'Fabrikam') 'Adding a tenant replaced or lost a saved tenant.'
@@ -651,14 +652,14 @@ try {
     }
     $snapshot=Get-ConfigSnapshot $registryContext
     $callCount=$script:Calls.Count
-    foreach ($answer in @('','','','','','','','','','','','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','','','','','','','','','','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null
     Assert-ConfigUnchanged $registryContext $snapshot
     Assert-True ($script:Calls.Count -eq $callCount+3) 'No-op edit of multiple named tenants stopped the app.'
-    foreach ($answer in @('','','','','','','','','CONTOSO.com','','','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','','','','','','CONTOSO.com','','','','','')) { $script:Answers.Enqueue($answer) }
     Assert-Fails { Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null } 'duplicate accepted domain'
     Assert-ConfigUnchanged $registryContext $snapshot
-    foreach ($answer in @('','','','','','','','updated-second-secret','fabrikam.com,login.fabrikam.com','','','','')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @('','','','','','','','updated-second-secret','fabrikam.com,login.fabrikam.com','','','','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $registryContext 'EditConfig' 6>$null
     $updatedProfiles=Read-FixtureRegistry $registryContext
     Assert-True ($updatedProfiles[0].clientSecret -ceq $clientSecret -and $updatedProfiles[1].clientSecret -ceq 'updated-second-secret' -and $updatedProfiles[1].domains.Count -eq 2) 'Editing the second tenant affected the wrong credential or domains.'
@@ -684,7 +685,7 @@ try {
     Protect-LocalPath $registryFile
 
     $editContext=New-FixtureContext 'editable-project'
-    foreach ($answer in @($tenant,$client,"  $clientSecret  ",'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,"  $clientSecret  ",'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $editContext $false -Onboard 6>$null
     $script:Volumes.Add($editContext.Volume) | Out-Null
     $editSettings=Join-Path $editContext.State 'settings.json'
@@ -770,7 +771,7 @@ try {
     foreach ($url in @($tunnelUrl,'https://test--tunnel.devtunnels.ms','https://example.com:8443','https://127.0.0.1')) {
         Assert-True (Test-LocalPublicUrl $url) "Valid public origin rejected: $url"
     }
-    foreach ($answer in (@('','','','','','','') + $invalidUrls + @(" $tunnelUrl "))) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in (@('','','','','','','') + $invalidUrls + @(" $tunnelUrl ",''))) { $script:Answers.Enqueue($answer) }
     $messages=Invoke-LocalDeployment $editContext 'EditConfig' 3>$null 6>&1
     Assert-ConfigUnchanged $editContext $snapshot @('settings.json','compose.env')
     Assert-True ($script:Calls.Count -eq $callsBefore+4 -and $script:Calls[$script:Calls.Count-1] -match '\|stop\|--timeout\|130\|app$') 'Public-URL edit did not stop/drain the app.'
@@ -880,7 +881,7 @@ try {
     $newSettings=Get-Content -LiteralPath (Join-Path $newPortOnly.State 'settings.json') -Raw | ConvertFrom-Json -AsHashtable
     Assert-True ($newSettings.Count -eq 1 -and $newSettings.port -eq 14395) 'New port-only configuration saved unwanted identity fields.'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $newPortOnly.State 'secrets/client-secret'))) 'New port-only configuration created an unset client secret.'
-    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $newPortOnly 'Deploy' 6>$null
     Assert-True ($newPortOnly.Port -eq 14395 -and (Read-FixtureRegistry $newPortOnly)[0].clientSecret -ceq $clientSecret) 'Start did not complete identity setup while retaining the edited port.'
 
@@ -955,7 +956,7 @@ try {
     }
 
     $invalidContext=New-LocalContext $testRoot 'invalid-input'
-    foreach ($answer in (@('not-a-guid'," $tenant ",$client,$clientSecret) + $invalidDomainInputs + @('*.contoso.com','contoso.com,CONTOSO.com','contoso.com','abc','1023','65536','14391'))) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in (@('not-a-guid'," $tenant ",$client,$clientSecret) + $invalidDomainInputs + @('*.contoso.com','contoso.com,CONTOSO.com','contoso.com','abc','1023','65536','14391','',''))) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $invalidContext $false -Onboard 3>$null 6>$null
     Assert-True ([IO.File]::ReadAllText((Join-Path $invalidContext.State 'settings.json')).Contains($tenant)) 'Invalid GUID input was not retried and trimmed.'
     foreach ($invalidInput in @('blank-tenant','blank-client','blank-secret','multiline-secret')) {
@@ -984,9 +985,9 @@ try {
     Invoke-LocalDeployment $maintenanceContext 'Test' 6>$null
     Invoke-LocalDeployment $maintenanceContext 'Backup' 6>$null
     Assert-True ($script:Prompts.Count -eq $promptCount) 'Maintenance actions unexpectedly required onboarding.'
-    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Invoke-LocalDeployment $maintenanceContext 'Deploy' 6>$null
-    Assert-True ($script:Prompts.Count -eq $promptCount+4) 'Start did not onboard an existing unconfigured project.'
+    Assert-True ($script:Prompts.Count -eq $promptCount+6) 'Start did not onboard an existing unconfigured project.'
     Assert-True ($script:Answers.Count -eq 0) 'Not all expected wizard answers were consumed.'
 
     $entryRoot=Join-Path $testRoot 'entrypoint'
@@ -1006,16 +1007,16 @@ try {
     $retainedContext=$context
     foreach ($projectArguments in @(@{},@{Project='newCustomer'})) {
         $promptCount=$script:Prompts.Count
-        foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','14391')) { $script:Answers.Enqueue($answer) }
+        foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','14391','','')) { $script:Answers.Enqueue($answer) }
         $script:WizardTrace.Clear()
         $messages=. $entryPath @projectArguments 6>&1 | ForEach-Object { $script:WizardTrace.Add([string]$_); $_ }
         $trace=$script:WizardTrace -join "`n"
         Assert-True ($trace.IndexOf('Registered app permissions and setup') -ge 0 -and $trace.IndexOf('Registered app permissions and setup') -lt $trace.IndexOf('PROMPT:')) 'Registration guidance must appear before the first wizard prompt.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Public entry point did not onboard the selected project.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+7) 'Public entry point did not onboard the selected project.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Public entry point printed the client secret.'
         $messages=. $entryPath start @projectArguments 6>&1
         Assert-True (-not ($messages -join "`n").Contains('Registered app permissions and setup')) 'Configured start unnecessarily repeated onboarding guidance.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+5) 'Public entry point did not reuse saved onboarding values.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+7) 'Public entry point did not reuse saved onboarding values.'
         Assert-True (($messages -join "`n").Contains('ALREADY RUNNING')) 'Unchanged public start did not recognize an already healthy deployment.'
         $forceOffset=$script:Calls.Count
         $messages=. $entryPath start @projectArguments -ForceChecks 6>&1
@@ -1031,11 +1032,11 @@ try {
         $messages=. $entryPath -Command edit-config @projectArguments 6>&1
         Assert-True (($messages -join "`n").Contains($guidance)) 'Edit-config did not display the complete registration guidance.'
         Assert-True (-not ($messages -join "`n").Contains($clientSecret)) 'Edit-config displayed the saved client secret.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+13) 'Explicit edit-config did not prompt for all settings.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+16) 'Explicit edit-config did not prompt for all settings.'
         $entrySettings=Read-LocalSettings (Join-Path $entryState $projectName)
         Assert-True ($entrySettings.publicUrl -ceq $tunnelUrl -and $entrySettings.port -eq 14391) 'Edit-config did not persist the public URL independently of the port.'
         $messages=. $entryPath -Command start @projectArguments 6>&1
-        Assert-True ($script:Prompts.Count -eq $promptCount+13 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) 'Start did not reuse the saved public URL.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+16 -and ($messages -join "`n").Contains("Open $tunnelUrl to sign in")) 'Start did not reuse the saved public URL.'
         $savedEntry=Get-ConfigSnapshot $context
         $callOffset=$script:Calls.Count
         $messages=if ($projectArguments.Project) { . $entryPath start @projectArguments -DbReset 6>&1 }
@@ -1043,7 +1044,7 @@ try {
         $resetCalls=@($script:Calls | Select-Object -Skip $callOffset)
         Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' }).Count -eq 1) 'Public DbReset did not reset the selected application database exactly once.'
         Assert-True (@($resetCalls | Where-Object { $_ -match 'database\.ts\|reset\|agentcontrol$' -and $_.Contains("|--network|${projectName}_default|") }).Count -eq 1) 'Public DbReset used another project network.'
-        Assert-True ($script:Prompts.Count -eq $promptCount+13) 'DbReset prompted for existing configuration again.'
+        Assert-True ($script:Prompts.Count -eq $promptCount+16) 'DbReset prompted for existing configuration again.'
         Assert-ConfigUnchanged $context $savedEntry
     }
     $context=$retainedContext
@@ -1082,7 +1083,7 @@ try {
     $context=$retainedContext
 
     $qualification=New-FixtureContext 'preflight-retained'
-    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $qualification $false -Onboard 6>$null
     $script:Volumes.Add($qualification.Volume) | Out-Null
     $snapshot=Get-ConfigSnapshot $qualification
@@ -1262,7 +1263,7 @@ try {
     }
 
     $resetContext=New-FixtureContext 'database-reset-project'
-    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com')) { $script:Answers.Enqueue($answer) }
+    foreach ($answer in @($tenant,$client,$clientSecret,'contoso.com','','')) { $script:Answers.Enqueue($answer) }
     Initialize-LocalState $resetContext $false -Onboard 6>$null
     $script:Volumes.Add($resetContext.Volume) | Out-Null
     $resetSnapshot=Get-ConfigSnapshot $resetContext

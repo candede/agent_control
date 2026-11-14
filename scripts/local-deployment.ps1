@@ -129,7 +129,7 @@ function Test-LocalPublicUrl {
 function Read-LocalPublicUrl {
     param([string]$Current,[int]$Port)
     $display = if ($Current) { $Current } else { "http://localhost:$Port (automatic)" }
-    Write-Host 'For a controlled HTTPS tunnel/reverse proxy, enter its public origin. This enables trust of one proxy hop; it must forward X-Forwarded-Proto: https.'
+    Write-Host 'Optional: enter the external HTTPS origin for this VPS or a controlled tunnel/reverse proxy. Leave unset for localhost. An HTTPS origin enables trust of one proxy hop; it must forward X-Forwarded-Proto: https.'
     Show-LocalTunnelGuidance $Port
     while ($true) {
         $value = [string](Read-Host "Public URL [$display; Enter to keep; 'local' to reset]")
@@ -357,11 +357,14 @@ function Get-LocalTenantMetadata {
 }
 
 function Read-LocalPort {
-    param([int]$Current,[string]$Label='Local port')
-    $default = if ($Current) { $Current } else { 3001 }
+    param([int]$Current,[string]$Label='Local port',[int]$Default=3001,[int[]]$ExcludedPorts=@())
+    $suggested = if ($Current) { $Current } else { Get-LocalAvailablePort $Default -ExcludedPorts $ExcludedPorts }
+    if (-not $Current -and $suggested -ne $Default) {
+        Write-Host "$Label default $Default is unavailable; using $suggested instead."
+    }
     while ($true) {
-        $value = [string](Read-Host "$Label [$default; Enter to keep]")
-        if ([string]::IsNullOrWhiteSpace($value)) { return $default }
+        $value = [string](Read-Host "$Label [$suggested; Enter to keep]")
+        if ([string]::IsNullOrWhiteSpace($value)) { return $suggested }
         $port = 0
         if ([int]::TryParse($value.Trim(),[ref]$port) -and $port -ge 1024 -and $port -le 65535) { return $port }
         Write-Warning 'Enter a whole port number from 1024 to 65535.'
@@ -399,6 +402,7 @@ function Read-LocalConfiguration {
     $originalSettings = $settings | ConvertTo-Json -Depth 20 -Compress
     $port = if ($settings.Contains('port')) { [int]$settings.port } else { 0 }
     $publicUrl = [string]$settings.publicUrl
+    $proxyNetwork = [string]$settings.proxyNetwork
     if ($Context.ContainsKey('PublicUrlInput')) {
         $publicUrl = if ($Context.PublicUrlInput -ceq 'local') { '' } else { $Context.PublicUrlInput }
         if (-not $publicUrl -and $Context.PublicUrlInput -cne 'local' -or
@@ -437,12 +441,12 @@ function Read-LocalConfiguration {
             }
         }
         if ($editApplication -or -not $port) { $port = Read-LocalPort $port }
-        if ($editApplication -and -not $Context.ContainsKey('PublicUrlInput')) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
+        if (-not $Context.ContainsKey('PublicUrlInput')) { $publicUrl = Read-LocalPublicUrl $publicUrl $port }
+        if (-not $Context.ContainsKey('ProxyNetworkInput')) { $proxyNetwork = Read-LocalProxyNetwork $proxyNetwork }
         $origin = if ($publicUrl) { $publicUrl } else { "http://localhost:$port" }
         Write-Host "Register $origin/api/auth/callback as every configured application's Web reply URL. Begin sign-in at $origin."
     }
     if (-not $port) { throw 'Project port is missing. Run start or edit-config to complete the project wizard.' }
-    $proxyNetwork = [string]$settings.proxyNetwork
     if ($Context.ContainsKey('ProxyNetworkInput')) {
         $proxyNetwork = if ($Context.ProxyNetworkInput -ceq 'none') { '' } else { $Context.ProxyNetworkInput }
         if (-not $proxyNetwork -and $Context.ProxyNetworkInput -cne 'none') { throw 'ProxyNetwork must name an existing shared network, or none to return to standalone.' }
@@ -585,11 +589,48 @@ function Write-LocalComposeEnvironment {
     Write-LocalText (Join-Path $Context.State 'compose.env') (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
-function Assert-LocalPort {
+function Test-LocalPortAvailable {
     param([int]$Port)
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,$Port)
-    try { $listener.Start() } catch { throw "Loopback port $Port is occupied. Free it or choose another port with edit-config and register its matching Entra callback." }
+    try {
+        $listener.Server.ExclusiveAddressUse = $true
+        $listener.Start()
+        return $true
+    } catch [Net.Sockets.SocketException] {
+        if ($_.Exception.SocketErrorCode -eq [Net.Sockets.SocketError]::AddressAlreadyInUse) { return $false }
+        throw
+    }
     finally { $listener.Stop() }
+}
+
+function Get-LocalAvailablePort {
+    param([ValidateRange(1024,65535)][int]$Preferred,[int[]]$ExcludedPorts=@())
+    $unavailable = [Collections.Generic.HashSet[int]]::new()
+    foreach ($port in $ExcludedPorts) { $unavailable.Add($port) | Out-Null }
+    $ids = @((Invoke-DockerCommand @('ps','--quiet') -Capture) -split "`n" | Where-Object { $_ })
+    if ($ids.Count) {
+        # Docker can reserve ports without a host listener (NAT or Docker Desktop).
+        $records = Invoke-DockerCommand (@('inspect','--format','{{json .NetworkSettings.Ports}}') + $ids) -Capture
+        foreach ($record in ($records -split "`n" | Where-Object { $_ })) {
+            $bindings = ConvertFrom-Json -InputObject $record -AsHashtable
+            foreach ($key in @($bindings.Keys | Where-Object { $_.EndsWith('/tcp') })) {
+                foreach ($binding in $bindings[$key]) {
+                    if ($binding) { $unavailable.Add([int]$binding.HostPort) | Out-Null }
+                }
+            }
+        }
+    }
+    for ($port=$Preferred; $port -le 65535; $port++) {
+        if (-not $unavailable.Contains($port) -and (Test-LocalPortAvailable $port)) { return $port }
+    }
+    throw "No available loopback TCP port from $Preferred to 65535. Choose a lower starting port."
+}
+
+function Assert-LocalPort {
+    param([int]$Port)
+    if (-not (Test-LocalPortAvailable $Port)) {
+        throw "Loopback port $Port is occupied. Free it or choose another port with edit-config and register its matching Entra callback."
+    }
 }
 
 function Invoke-LocalOperator {

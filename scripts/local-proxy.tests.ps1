@@ -35,6 +35,39 @@ function Invoke-DockerCommand {
 }
 try {
     [IO.Directory]::CreateDirectory($root) | Out-Null
+    & {
+        $published = '{"3001/tcp":[{"HostIp":"0.0.0.0","HostPort":"3001"},{"HostIp":"::","HostPort":"3001"}],"5432/tcp":null,"3004/udp":[{"HostPort":"3004"}]}'
+        $inspections = [Collections.Generic.List[string]]::new()
+        function Invoke-DockerCommand {
+            param([string[]]$Arguments,[switch]$Capture)
+            if ($Arguments[0] -eq 'ps') { return 'synthetic-container' }
+            if ($Arguments[0] -eq 'inspect') { $inspections.Add($Arguments -join '|'); return $published }
+            throw 'Unexpected Docker operation during port selection.'
+        }
+        function Test-LocalPortAvailable {
+            param([int]$Port)
+            return $Port -ne 3002
+        }
+        $answers = [Collections.Generic.Queue[string]]::new()
+        function Read-Host { return $answers.Dequeue() }
+        $answers.Enqueue('')
+        $selected = Read-LocalPort -ExcludedPorts @(3003)
+        Assert ($selected -eq 3004 -and $inspections.Count -eq 1) 'New default did not skip Docker TCP, host listener and reserved ports, or incorrectly skipped UDP.'
+        $inspections.Clear()
+        $answers.Enqueue('')
+        Assert ((Read-LocalPort 3001) -eq 3001 -and $inspections.Count -eq 0) 'A saved port was silently reassigned.'
+        $answers.Enqueue('14400')
+        Assert ((Read-LocalPort) -eq 14400) 'An explicitly entered port was replaced by the suggested port.'
+        Fails { Get-LocalAvailablePort 65535 -ExcludedPorts @(65535) } 'No available'
+        function Invoke-DockerCommand { throw 'synthetic Docker inspection failure' }
+        Fails { Get-LocalAvailablePort 3001 } 'synthetic Docker inspection failure'
+    }
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+    $listener.Start()
+    $occupied = $listener.LocalEndpoint.Port
+    try { Assert (-not (Test-LocalPortAvailable $occupied)) 'A real occupied loopback port was considered available.' }
+    finally { $listener.Stop() }
+    Assert (Test-LocalPortAvailable $occupied) 'A released loopback port remained unavailable.'
     foreach ($file in @('compose.yaml','compose.mcp.yaml','compose.mcp-metadata.yaml','compose.proxy.yaml','compose.mcp-proxy.yaml','Dockerfile')) {
         Copy-Item -LiteralPath (Join-Path $repository $file) -Destination (Join-Path $root $file)
     }
@@ -42,6 +75,42 @@ try {
     [IO.Directory]::CreateDirectory((Join-Path $context.State 'secrets')) | Out-Null
     $profiles = @(@{tenantId='11111111-1111-4111-8111-111111111111';clientId='22222222-2222-4222-8222-222222222222'
         clientSecret='synthetic-proxy-client-secret';domains=@('example.invalid')})
+    & {
+        $answers = [Collections.Generic.Queue[string]]::new()
+        function Read-Host {
+            param([string]$Prompt,[switch]$AsSecureString)
+            if (-not $answers.Count) { throw "Unexpected wizard prompt: $Prompt" }
+            $answer = $answers.Dequeue()
+            if ($AsSecureString) {
+                if (-not $answer) { return [Security.SecureString]::new() }
+                return ConvertTo-SecureString $answer -AsPlainText -Force
+            }
+            return $answer
+        }
+        foreach ($shared in @($false,$true)) {
+            $wizard = New-LocalContext $root $(if ($shared) { 'wizard-shared' } else { 'wizard-standalone' })
+            $publicUrl = if ($shared) { 'https://wizard.example.invalid' } else { '' }
+            $network = if ($shared) { $script:network.Name } else { '' }
+            foreach ($answer in @($profiles[0].tenantId,$profiles[0].clientId,$profiles[0].clientSecret,'example.invalid',
+                '14434',$publicUrl,$network)) { $answers.Enqueue($answer) }
+            $plan = Read-LocalConfiguration $wizard $false -Onboard
+            Assert ($answers.Count -eq 0 -and $plan.PublicUrl -ceq $publicUrl -and
+                [string]$plan.Settings.proxyNetwork -ceq $network) 'First-run wizard did not collect optional URL/network or retain standalone defaults.'
+            Save-LocalConfiguration $wizard $plan
+            $reloaded = New-LocalContext $root $wizard.Project
+            $reused = Read-LocalConfiguration $reloaded $true -Onboard
+            Assert (-not $reused.SettingsChanged -and -not $reused.RegistryChanged -and
+                $reloaded.ProxyNetwork -ceq $network) 'Wizard settings were not persisted and reused without prompts.'
+            foreach ($answer in @('','','','','','','',
+                $(if ($shared) { 'local' } else { '' }),$(if ($shared) { 'none' } else { '' }))) { $answers.Enqueue($answer) }
+            $edited = Read-LocalConfiguration $reloaded $true -Edit
+            Assert ($answers.Count -eq 0 -and -not $edited.PublicUrl -and -not $edited.Settings.proxyNetwork) 'Editor did not offer standalone defaults or reset shared ingress.'
+        }
+        foreach ($answer in @('bridge','invalid/name',' agent-control-local-ingress ')) { $answers.Enqueue($answer) }
+        Assert ((Read-LocalProxyNetwork) -ceq $script:network.Name -and $answers.Count -eq 0) 'Network prompt did not retry invalid names and trim valid input.'
+        $answers.Enqueue('')
+        Assert ((Read-LocalProxyNetwork $script:network.Name) -ceq $script:network.Name) 'Empty network answer discarded saved ingress.'
+    }
     & {
         $answers = [Collections.Generic.Queue[string]]::new()
         foreach ($answer in @($profiles[0].tenantId,$profiles[0].clientId,$profiles[0].clientSecret,'example.invalid','14433')) {
@@ -206,7 +275,8 @@ try {
                     "proxy-test-$service" -cin $config.services[$service].networks.'shared-ingress'.aliases -and
                     "proxy-test-$service" -cin $config.services[$service].networks.default.aliases) 'Compose lost private networking or the project-derived ingress alias.'
             }
-            Assert ($config.services.postgres.networks.Count -eq 1 -and $config.services.postgres.networks.Contains('default')) 'PostgreSQL joined ingress.'
+            Assert ($config.services.postgres.networks.Count -eq 1 -and $config.services.postgres.networks.Contains('default') -and
+                -not $config.services.postgres.ports) 'PostgreSQL joined ingress or published its port, risking a host collision.'
             Assert ($config.services.app.ports[0].host_ip -ceq '127.0.0.1' -and $config.services.mcp.ports[0].host_ip -ceq '127.0.0.1') 'Shared ingress removed loopback diagnostics.'
             Assert ($config.services.app.environment.TRUST_PROXY -ceq '1' -and
                 $config.services.app.environment.REDIRECT_URI -ceq 'https://changed.example.invalid/api/auth/callback') 'Compose changed callback/proxy trust.'

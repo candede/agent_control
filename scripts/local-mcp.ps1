@@ -113,10 +113,10 @@ function Read-LocalMcpSettings {
     }
     $redirects = [string](Read-Host "Allowed client callback URLs, comma-separated [$(@($Current.redirectUris) -join ','); Enter to keep]")
     $redirectUris = if ([string]::IsNullOrWhiteSpace($redirects)) { @($Current.redirectUris) } else { @($redirects -split ',' | ForEach-Object { $_.Trim() }) }
-    $port = if ($Current.port) { [int]$Current.port } elseif ($Settings.port -eq 8001) { 8002 } else { 8001 }
     $result = [ordered]@{
         tenantId=$profile.tenantId.ToLowerInvariant(); apiClientId=$profile.clientId.ToLowerInvariant(); clientId=$client
-        publicUrl=$url.Trim(); redirectUris=@($redirectUris); port=(Read-LocalPort $port -Label 'MCP loopback port')
+        publicUrl=$url.Trim(); redirectUris=@($redirectUris)
+        port=(Read-LocalPort $Current.port -Label 'MCP loopback port' -Default 8001 -ExcludedPorts @($Settings.port))
     }
     foreach ($name in @('hide_employee_details','hide_champion_employee')) {
         $currentValue = if ($Current -and $Current.Contains($name)) { $Current[$name] } else { $false }
