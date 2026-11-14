@@ -347,7 +347,7 @@ exit $ExitCode
         Remove-Item -LiteralPath $directory -Recurse -Force
         Remove-Item -LiteralPath $nativeFixture
     }
-    foreach ($value in @('11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222','synthetic-runtime-test-client-secret','example.invalid','14399')) { $script:answers.Enqueue($value) }
+    foreach ($value in @('11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222','synthetic-runtime-test-client-secret','example.invalid','14399','','')) { $script:answers.Enqueue($value) }
     $script:mutateSource=$true
     $messages=Run-Deploy
     $script:mutateSource=$false
@@ -486,6 +486,15 @@ exit $ExitCode
             $script:containers[('a'*64)].networks[$context.ProxyNetwork].Aliases -ccontains 'runtime-test-app') 'App deployment lost its private network or stable ingress alias.'
         Assert ($script:containers[('b'*64)].image -ceq $postgresImage -and $script:containers[('b'*64)].networks.Count -eq 1) 'Ingress deployment replaced or exposed PostgreSQL.'
         Assert (-not (($script:calls -join "`n") -match '^network\|(create|rm|connect|disconnect)|database\.ts\|(reset|initialize)')) 'Ingress deployment managed shared infrastructure or reset/reinitialized the database.'
+        & {
+            $context = New-LocalContext $root 'runtime-test'
+            Assert (-not $context.ContainsKey('ProxyNetworkInput') -and -not $context.ContainsKey('PublicUrlInput')) 'Fresh start unexpectedly required URL/network overrides.'
+            $messages = Run-Deploy
+            Assert ($context.ProxyNetwork -ceq 'agent-control-local-ingress' -and
+                $context.PublicUrl -ceq 'https://control.runtime.example.invalid') 'A fresh start did not restore both saved wizard settings.'
+            Assert (($messages -join "`n").Contains('ALREADY RUNNING') -and
+                -not (($script:calls -join "`n") -match '\|stop\||\|90\|app$')) 'Starting a new process without URL/network flags changed the saved deployment.'
+        }
         $messages=Run-Deploy
         Assert (($messages -join "`n").Contains('ALREADY RUNNING') -and -not (($script:calls -join "`n") -match '\|stop\||\|90\|app$')) 'Unchanged saved ingress restarted the app.'
         $script:proxyNetworkId='e'*64

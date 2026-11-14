@@ -7,9 +7,9 @@ function Test-LocalProxyNetworkName {
 function Read-LocalProxyNetwork {
     param([string]$Current)
     $display = if ($Current) { $Current } else { 'none (standalone project-private network)' }
-    Write-Host 'Optional: join an existing shared proxy ingress network created by deploy-proxy.sh. Only app/MCP join it; PostgreSQL stays private. Leave unset when no container reverse proxy is used.'
+    Write-Host 'Optional: enter an existing managed Docker network shared with your reverse proxy. Only app/MCP join it in addition to the project-private network; PostgreSQL stays private. Leave unset for standalone deployment. This setting is saved for future starts.'
     while ($true) {
-        $value = [string](Read-Host "Docker proxy network [$display; Enter to keep; 'none' for standalone]")
+        $value = [string](Read-Host "Docker network [$display; Enter to keep; 'none' for standalone]")
         if ([string]::IsNullOrWhiteSpace($value)) { return $Current }
         $value = $value.Trim()
         if ($value -ieq 'none') { return '' }
@@ -21,7 +21,7 @@ function Read-LocalProxyNetwork {
 function Assert-LocalProxyNetwork {
     param($Context,[string]$Name)
     if (-not (Test-LocalProxyNetworkName $Name) -or $Name -ceq $Context.Network) {
-        throw 'ProxyNetwork must name a dedicated external shared bridge, not a built-in or project-private network.'
+        throw 'DockerNetwork must name a dedicated external shared bridge, not a built-in or project-private network.'
     }
     try {
         $network = Invoke-DockerCommand @('network','inspect','--format','{{json .}}',$Name) -Capture -CaptureError | ConvertFrom-Json -AsHashtable

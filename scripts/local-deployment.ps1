@@ -449,7 +449,7 @@ function Read-LocalConfiguration {
     if (-not $port) { throw 'Project port is missing. Run start or edit-config to complete the project wizard.' }
     if ($Context.ContainsKey('ProxyNetworkInput')) {
         $proxyNetwork = if ($Context.ProxyNetworkInput -ceq 'none') { '' } else { $Context.ProxyNetworkInput }
-        if (-not $proxyNetwork -and $Context.ProxyNetworkInput -cne 'none') { throw 'ProxyNetwork must name an existing shared network, or none to return to standalone.' }
+        if (-not $proxyNetwork -and $Context.ProxyNetworkInput -cne 'none') { throw 'DockerNetwork must name an existing shared network, or none to return to standalone.' }
     }
     if ($proxyNetwork) {
         if (-not $publicUrl) { throw 'Shared ingress requires a saved HTTPS publicUrl or -PublicUrl for the correct sign-in callback and proxy trust.' }
@@ -635,8 +635,10 @@ function Assert-LocalPort {
 
 function Invoke-LocalOperator {
     param($Context,[string[]]$Command,[string]$BackupDirectory,[switch]$Capture)
-    $arguments = @('run','--rm','--memory','1536m','--cpus','1.5','--cap-drop','ALL','--security-opt','no-new-privileges:true',
-        '-e','NODE_OPTIONS=--max-old-space-size=768','-e','TSX_DISABLE_CACHE=1','--network',$Context.Network,
+    $uid = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
+    $gid = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
+    $arguments = @('run','--rm','--user',"${uid}:${gid}",'--memory','1536m','--cpus','1.5','--cap-drop','ALL','--security-opt','no-new-privileges:true',
+        '-e','NODE_OPTIONS=--max-old-space-size=768','-e','TSX_DISABLE_CACHE=1','-e','TMPDIR=/tmp','--network',$Context.Network,
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly",
         '--mount',"type=bind,source=$($Context.State)/secrets/postgres-app,target=/run/secrets/postgres-app,readonly",
         '-e','PGHOST=postgres','-e','PGUSER=agentcontrol_admin','-e','PGDATABASE=agentcontrol','-e','PGPASSWORD_FILE=/run/secrets/postgres-admin','-e','APP_PGPASSWORD_FILE=/run/secrets/postgres-app')

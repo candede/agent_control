@@ -140,7 +140,19 @@ First start opens the wizard:
 | Accepted username domains | Exact domains, e.g. `contoso.com,contoso.onmicrosoft.com`; no usernames, URLs or wildcards |
 | Local port | Enter for the first available port from `3001`, or choose an available `1024`–`65535` port matching the callback |
 | Public URL | Optional external HTTPS origin, e.g. `https://control.example.com`; Enter defaults to localhost |
-| Docker proxy network | Optional existing shared ingress network, e.g. `agent-control-ingress`; Enter defaults to `none` (standalone) |
+| Docker network | Optional existing shared ingress network, e.g. `agent-control-ingress`; Enter defaults to `none` (standalone) |
+
+The wizard saves **Public URL** and **Docker network** with the project settings.
+For normal code updates to the default `agent-control` project, run only:
+
+```bash
+./deploy-local.sh start
+```
+
+Or `pwsh ./deploy-local.ps1 start` on PowerShell. No URL or network flags are
+needed again. Use `edit-config` to change the saved settings; CLI options are
+optional saved-setting overrides, not required deployment inputs. For a named
+project, keep specifying its existing `--project` / `-Project` value.
 
 New app and MCP port defaults skip occupied host listeners and TCP ports published
 by running Docker containers. MCP also skips the selected app port, starting at
@@ -159,6 +171,16 @@ Under `.local/agent-control/`, the wizard saves `settings.json`, protected
 `secrets/tenants.json` credentials and generated database/session keys in
 `secrets/`. `compose.env` is generated; no `.env` is needed.
 Application data lives in Docker volume `agent-control_data`.
+
+The app and database operator use the deploying user's numeric UID/GID on
+Linux/macOS (`1000:1000` with Windows Docker Desktop). Database preflight,
+initialization and backups therefore retain access to owner-only secret files
+and backup directories without adding capabilities or loosening permissions.
+The operator uses container `/tmp` for TypeScript CLI IPC; its image's `/app`
+directory is not writable by the deployment user. If an older launcher reports
+`EACCES` reading `/run/secrets/postgres-admin`, update the deployment scripts and
+rerun `start` as the original state owner. Do not make secrets world-readable,
+use `sudo` to bypass the error, reset the database or change the project name.
 
 Container names use `<project>-agent-control-<service>-1`. For `-Project seha`,
 the names are `seha-agent-control-app-1`, `seha-agent-control-postgres-1` and,
@@ -197,8 +219,8 @@ pwsh ./deploy-local.ps1 start -Project agent-control
 ```
 
 The editor prompts for tenant IDs, secret, domains and optional display name,
-then **Add another tenant?**, **Local port**, **Public URL** and **Docker proxy
-network**. Enter keeps
+then **Add another tenant?**, **Local port**, **Public URL** and **Docker network**.
+Enter keeps
 saved values; secrets are hidden. Application changes can stop the app until
 `start`; identity/domain changes require sign-in again.
 
@@ -230,18 +252,20 @@ Use the same workflow on another VPS with its own DNS, proxy and managed ingress
 network. Without a proxy, localhost remains the default; a remote host can be
 accessed through an SSH port forward rather than publishing an insecure app port.
 
-After infrastructure has created the network, opt in using the **existing**
-project name:
+After infrastructure has created the network, run `edit-config` and set
+**Public URL** and **Docker network** once. Later starts reuse them.
+For noninteractive configuration, the equivalent optional overrides using the
+**existing** project name are:
 
 ```bash
 ./deploy-local.sh start --project seha \
-  --proxy-network agent-control-local-ingress \
+  --docker-network agent-control-local-ingress \
   --public-url https://control.example.com
 ```
 
 ```powershell
 pwsh ./deploy-local.ps1 start -Project seha `
-  -ProxyNetwork agent-control-local-ingress -PublicUrl https://control.example.com
+  -DockerNetwork agent-control-local-ingress -PublicUrl https://control.example.com
 ```
 
 `--public-url`/`-PublicUrl` is a canonical HTTPS origin, with no trailing slash,
@@ -253,7 +277,9 @@ the supplied public URL as well. The proxy must preserve the public
 Host and Origin and forward `X-Forwarded-Proto: https`; do not force a fixed
 Origin or disable same-origin checks.
 
-The saved `proxyNetwork` option is reused by later starts. Only `app` and, if
+**Docker network** is stored in the existing `proxyNetwork` settings field and
+reused by later starts; existing saved installations need no reconfiguration.
+Only `app` and, if
 already configured, `mcp` join ingress **in addition to** their original private
 network. Stable project-derived upstreams are `seha-app:3001` and
 `seha-mcp:8000` (generally `<project>-app:3001` / `<project>-mcp:8000`).
@@ -288,7 +314,8 @@ is performed by this deployment.
 redeploys this project independently. Neither command manages the edge,
 certificates, shared network or other projects. Shared networking never changes
 the normal data-preservation/reset contract. To return to standalone, run
-`start --proxy-network none`; add `--public-url local` only if also removing the
+`edit-config` and set **Docker network** to `none`, or use the optional override
+`start --docker-network none`; add `--public-url local` only if also removing the
 public origin. A still-saved public URL can continue using an existing
 loopback tunnel. Never use a database reset or change projects for this.
 Explicitly clearing or replacing the saved network does not require the old

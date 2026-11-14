@@ -455,7 +455,7 @@ try {
     Assert-True ($guidance.Contains('Reports.Read.All does not replace the Agents, Users & agents, and Users CSV exports.')) 'Office activity must remain distinct from imported agent usage.'
     $entry=Microsoft.PowerShell.Core\Get-Command (Join-Path $repositoryRoot 'deploy-local.ps1')
     $publicParameters=@($entry.ScriptBlock.Ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','ProxyNetwork','PublicUrl','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
+    Assert-True (@(Compare-Object $publicParameters @('Command','Project','DbReset','ForceChecks','AgentSharingDiagnostics','McpConfig','ConfigureMcp','DockerNetwork','PublicUrl','Candidate','CandidateSha256','ExpectedPreflight','ReadOnly')).Count -eq 0) 'Entry point parameters differ from the current public contract.'
     Assert-True ($entry.Parameters.ContainsKey('DbReset')) 'Entry point must expose the explicit DbReset switch.'
     Assert-True ($entry.Parameters['DbReset'].ParameterType -eq [Management.Automation.SwitchParameter]) 'DbReset must be an opt-in switch.'
     Assert-True ($entry.Parameters['DbReset'].Aliases.Count -eq 0) 'DbReset must have one canonical parameter name.'
@@ -560,6 +560,36 @@ try {
     Assert-True (-not ($script:Calls -join "`n").Contains($clientSecret)) 'Entra secret leaked to command arguments.'
     Assert-True (-not ($script:Calls -join "`n").Contains('/secrets,target=/run/secrets,readonly')) 'Database operator received the entire tenant credential directory.'
     Assert-True (($script:Calls -join "`n").Contains('/secrets/postgres-admin,target=/run/secrets/postgres-admin,readonly')) 'Database operator lost its explicit administrator secret mount.'
+    & {
+        function id {
+            switch ($args[0]) {
+                '-u' { return '12401' }
+                '-g' { return '12402' }
+                default { throw 'Unexpected operator identity query.' }
+            }
+        }
+        $identity = if ($IsWindows) { '1000:1000' } else { '12401:12402' }
+        $offset = $script:Calls.Count
+        $snapshot = Get-ConfigSnapshot $context
+        $null = Invoke-LocalOperator $context @('backend/scripts/database.ts','preflight') -Capture
+        $backupDirectory = Join-Path $context.State 'backups'
+        Invoke-LocalOperator $context @('backend/scripts/backup.ts','backup','/backups/identity.dump') $backupDirectory
+        $operatorCalls = @($script:Calls | Select-Object -Skip $offset)
+        Assert-True ($operatorCalls.Count -eq 2) 'Operator identity test did not cover preflight and backup.'
+        foreach ($call in $operatorCalls) {
+            Assert-True ($call.Contains("|--user|$identity|")) 'Database operator must run as the deployment owner to read owner-only secrets without DAC override capabilities.'
+            Assert-True ($call.Contains('|-e|TMPDIR=/tmp|') -and $call.Contains('|-e|TSX_DISABLE_CACHE=1|')) 'Owner-mapped operator requires writable CLI temporary storage outside the root-owned application directory.'
+            Assert-True ($call.Contains('|--cap-drop|ALL|') -and $call.Contains('|--security-opt|no-new-privileges:true|') -and
+                -not $call.Contains('|--cap-add|')) 'Database operator weakened its capability restrictions.'
+        }
+        Assert-True ($operatorCalls[1].Contains("type=bind,source=$backupDirectory,target=/backups")) 'Owner-mapped operator lost its writable backup mount.'
+        Assert-ConfigUnchanged $context $snapshot
+        if (-not $IsWindows) {
+            foreach ($name in @('postgres-admin','postgres-app')) {
+                Assert-True ([int][IO.File]::GetUnixFileMode((Join-Path $context.State "secrets/$name")) -eq 384) 'Operator changed owner-only database secret permissions.'
+            }
+        }
+    }
     Assert-True (($script:Calls -join "`n").Contains($testRoot)) 'Paths containing spaces were not preserved.'
     Assert-True (-not (($script:Calls -join "`n") -match '\|-p\|fixture-project\|down\|--volumes')) 'Normal deployment reset the application volume.'
     Assert-Fails { Invoke-LocalDeployment $context 'Retain' } 'cleanup denied'

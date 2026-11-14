@@ -71,7 +71,7 @@ after(async () => {
 test("help and invalid options do not invoke a runtime or Docker", () => {
   assert.equal(run(["--help"]).status, 0);
   assert.deepEqual(calls(), []);
-  for (const args of [["--unknown"], ["--proxy-network"], ["start", "--public-url", "--db-reset"], ["destroy"]]) {
+  for (const args of [["--unknown"], ["--docker-network"], ["start", "--public-url", "--db-reset"], ["destroy"]]) {
     assert.equal(run(args).status, 2);
     assert.deepEqual(calls(), []);
   }
@@ -80,13 +80,13 @@ test("help and invalid options do not invoke a runtime or Docker", () => {
 test("installed PowerShell receives the complete canonical parameter contract unchanged", () => {
   executable("pwsh", `printf '%s\\0' "$@" >> "$TEST_LOG"; printf '\\n' >> "$TEST_LOG"; exit 17`);
   try {
-    const result = run(["start", "--project", "seha", "--proxy-network", "agent-control-local-ingress",
+    const result = run(["start", "--project", "seha", "--docker-network", "agent-control-local-ingress",
       "--public-url", "https://control.example.invalid", "--mcp-config", "private config.json", "--configure-mcp",
       "--db-reset", "--force-checks", "--agent-sharing-diagnostics", "--candidate", "candidate.json",
       "--candidate-sha256", "abc", "--expected-preflight", "def", "--read-only"]);
     assert.equal(result.status, 17);
     assert.deepEqual(calls(), [["-NoLogo", "-NoProfile", "-File", join(root, "deploy-local.ps1"),
-      "start", "-Project", "seha", "-ProxyNetwork", "agent-control-local-ingress",
+      "start", "-Project", "seha", "-DockerNetwork", "agent-control-local-ingress",
       "-PublicUrl", "https://control.example.invalid", "-McpConfig", "private config.json", "-ConfigureMcp",
       "-DbReset", "-ForceChecks", "-AgentSharingDiagnostics", "-Candidate", "candidate.json",
       "-CandidateSha256", "abc", "-ExpectedPreflight", "def", "-ReadOnly"]]);
@@ -106,7 +106,7 @@ test("incomplete pinned-release metadata fails before Docker access", () => {
 });
 
 test("native Linux bootstraps the same core without host PowerShell and preserves failure status", () => {
-  const result = run(["start", "--project", "seha", "--proxy-network", "agent-control-local-ingress"], { TEST_DEPLOY_EXIT: "37" });
+  const result = run(["start", "--project", "seha", "--docker-network", "agent-control-local-ingress"], { TEST_DEPLOY_EXIT: "37" });
   assert.equal(result.status, 37, result.stderr);
   const invocations = calls();
   assert.equal(invocations.filter(args => args[0] === "build").length, 1);
@@ -118,7 +118,7 @@ test("native Linux bootstraps the same core without host PowerShell and preserve
   assert.ok(container.includes(`type=bind,source=${socket},target=${socket}`));
   assert.ok(container.includes("--read-only") && container.includes("--rm"));
   const coreArguments = ["-File", join(root, "deploy-local.ps1"), "start", "-Project", "seha",
-    "-ProxyNetwork", "agent-control-local-ingress"];
+    "-DockerNetwork", "agent-control-local-ingress"];
   assert.deepEqual(container.slice(-coreArguments.length), coreArguments);
   assert.ok(!container.includes("-DbReset") && !container.includes("-PublicUrl"));
   assert.ok(!container.includes("--privileged") && !container.includes("--detach"));

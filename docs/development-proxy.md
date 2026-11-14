@@ -25,7 +25,7 @@ running. Add the same `-Project <name>` to each deployment command for a named p
 
    Keep other values; set **Public URL** to the canonical HTTPS origin only
    (no trailing slash, path, query or fragment). First start also asks for this
-   optional URL. Keep **Docker proxy network** at `none` for a host-based
+   optional URL. Keep **Docker network** at `none` for a host-based
    proxy/tunnel, or enter its existing managed ingress network for a
    [shared Docker proxy](deployment-setup.md#optional-independent-shared-ingress).
 3. In each configured tenant's Agent Control Web app registration, add
@@ -44,7 +44,7 @@ at the proxy origin. Startup checks local readiness, not tunnel reachability.
 ## Return to localhost
 
 Run `pwsh ./deploy-local.ps1 edit-config`; enter `local` at **Public URL**
-(Enter keeps the proxy), and `none` at **Docker proxy network** if it was set.
+(Enter keeps the proxy), and `none` at **Docker network** if it was set.
 Keep `http://localhost:3001/api/auth/callback`
 registered, substituting the saved port, then run:
 

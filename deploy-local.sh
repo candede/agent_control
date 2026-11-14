@@ -6,7 +6,7 @@ usage() {
     cat <<'USAGE'
 Usage: ./deploy-local.sh [start|stop|edit-config|check] [options]
   --project NAME                 Saved project (default: agent-control)
-  --proxy-network NAME           Existing shared ingress network (wizard default: none)
+  --docker-network NAME          Optional additional Docker network (wizard default: none)
   --public-url URL               Canonical HTTPS origin (wizard default: localhost; local clears it)
   --mcp-config FILE              Existing protected MCP configuration input
   --configure-mcp                Interactive MCP configuration
@@ -19,7 +19,8 @@ Usage: ./deploy-local.sh [start|stop|edit-config|check] [options]
 Uses the same PowerShell deployment core as deploy-local.ps1. On native Linux,
 PowerShell runs automatically in a Docker helper when pwsh is not installed.
 The deployment never manages the shared proxy, network or certificates.
-First start and edit-config ask for optional public URL and proxy network.
+First start and edit-config ask for optional public URL and Docker network.
+Both are saved per project; later updates only need ./deploy-local.sh start.
 New app/MCP port defaults skip occupied host and Docker-published TCP ports.
 Application data is retained unless --db-reset is explicitly requested.
 USAGE
@@ -40,7 +41,7 @@ while (($#)); do
     case "$1" in
         --help|-h) usage; exit 0 ;;
         --project) parameter=-Project ;;
-        --proxy-network) parameter=-ProxyNetwork ;;
+        --docker-network) parameter=-DockerNetwork ;;
         --public-url) parameter=-PublicUrl ;;
         --mcp-config) parameter=-McpConfig ;;
         --candidate) parameter=-Candidate; release_requested=true ;;

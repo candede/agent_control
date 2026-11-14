@@ -302,13 +302,17 @@ try {
     }
     $hostExecutable = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
     foreach ($arguments in @(
-        @('stop','-ProxyNetwork','agent-control-local-ingress'),
+        @('stop','-DockerNetwork','agent-control-local-ingress'),
         @('check','-PublicUrl','https://control.example.invalid'),
-        @('start','-ProxyNetwork','agent-control-local-ingress','-Candidate','artifacts/not-a-candidate.json'),
+        @('start','-DockerNetwork','agent-control-local-ingress','-Candidate','artifacts/not-a-candidate.json'),
         @('start','-PublicUrl','https://control.example.invalid','-ReadOnly')
     )) {
         $output = @(& $hostExecutable -NoLogo -NoProfile -File (Join-Path $repository 'deploy-local.ps1') @arguments 2>&1)
         Assert ($LASTEXITCODE -eq 1 -and ($output -join "`n") -match 'supported only|cannot change pinned configuration') 'Entry point failed to reject unsupported/pinned ingress changes before accessing Docker.'
+    }
+    if (-not $IsWindows) {
+        $output = @(& (Join-Path $repository 'deploy-local.sh') stop --docker-network agent-control-local-ingress 2>&1)
+        Assert ($LASTEXITCODE -eq 1 -and ($output -join "`n") -match '-DockerNetwork and -PublicUrl are supported only') 'Bash did not forward the Docker network option to the shared PowerShell entry point.'
     }
     Write-Host "Local shared ingress tests passed ($script:checks assertions; Docker Compose rendering only, no container changes)."
 } finally {

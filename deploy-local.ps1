@@ -4,7 +4,8 @@
 Deploy Agent Control with optional shared Docker ingress.
 .DESCRIPTION
 First start and edit-config prompt for an optional HTTPS public URL (default:
-localhost) and an existing proxy network (default: none/standalone).
+localhost) and an existing Docker network (default: none/standalone).
+Both settings are saved per project; later starts need no URL/network parameters.
 New app/MCP port defaults skip occupied host and Docker-published TCP ports.
 Saved ports are retained so registered callbacks do not change automatically.
 #>
@@ -19,7 +20,7 @@ param(
     [switch]$AgentSharingDiagnostics,
     [string]$McpConfig,
     [switch]$ConfigureMcp,
-    [string]$ProxyNetwork,
+    [string]$DockerNetwork,
     [string]$PublicUrl,
     [string]$Candidate,
     [string]$CandidateSha256,
@@ -35,8 +36,8 @@ try {
     if ($AgentSharingDiagnostics -and $Command -ne 'start') { throw '-AgentSharingDiagnostics is supported only with start.' }
     if ($McpConfig -and $Command -notin @('start','edit-config')) { throw '-McpConfig is supported only with start or edit-config.' }
     if ($ConfigureMcp -and $Command -notin @('start','edit-config')) { throw '-ConfigureMcp is supported only with start or edit-config.' }
-    if (($PSBoundParameters.ContainsKey('ProxyNetwork') -or $PSBoundParameters.ContainsKey('PublicUrl')) -and $Command -notin @('start','edit-config')) { throw '-ProxyNetwork and -PublicUrl are supported only with start or edit-config.' }
-    if (($PSBoundParameters.ContainsKey('ProxyNetwork') -or $PSBoundParameters.ContainsKey('PublicUrl')) -and ($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly)) { throw 'Configure ingress before preparing a pinned release; ingress options cannot change pinned configuration.' }
+    if (($PSBoundParameters.ContainsKey('DockerNetwork') -or $PSBoundParameters.ContainsKey('PublicUrl')) -and $Command -notin @('start','edit-config')) { throw '-DockerNetwork and -PublicUrl are supported only with start or edit-config.' }
+    if (($PSBoundParameters.ContainsKey('DockerNetwork') -or $PSBoundParameters.ContainsKey('PublicUrl')) -and ($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly)) { throw 'Configure ingress before preparing a pinned release; ingress options cannot change pinned configuration.' }
     if ($ConfigureMcp -and ($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly)) { throw 'Configure MCP before preparing a pinned release; -ConfigureMcp cannot change pinned configuration.' }
     if (($Candidate -or $CandidateSha256 -or $ExpectedPreflight -or $ReadOnly) -and $Command -ne 'start') { throw 'Release parameters are supported only with start.' }
     if (($PSBoundParameters.ContainsKey('Candidate') -or $PSBoundParameters.ContainsKey('CandidateSha256') -or
@@ -46,7 +47,7 @@ try {
     $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -eq 'stop')
     $context.McpConfigInput = $McpConfig
     $context.ConfigureMcp = [bool]$ConfigureMcp
-    if ($PSBoundParameters.ContainsKey('ProxyNetwork')) { $context.ProxyNetworkInput = $ProxyNetwork }
+    if ($PSBoundParameters.ContainsKey('DockerNetwork')) { $context.ProxyNetworkInput = $DockerNetwork }
     if ($PSBoundParameters.ContainsKey('PublicUrl')) { $context.PublicUrlInput = $PublicUrl }
     $context.AgentSharingDiagnostics = [bool]$AgentSharingDiagnostics
     $context.Candidate = $Candidate
