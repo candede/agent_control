@@ -127,7 +127,7 @@ Equivalent Ubuntu/native Linux command:
 The Bash options correspond directly to PowerShell parameters: `--db-reset`,
 `--force-checks`, `--agent-sharing-diagnostics`, `--mcp-config`,
 `--configure-mcp`, `--candidate`, `--candidate-sha256`, `--expected-preflight`
-and `--read-only`. Commands remain `start`, `stop`, `edit-config` and `check`.
+and `--read-only`. Commands are `start`, `stop`, `edit-config`, `check` and `delete`.
 Use `./deploy-local.sh --help` for the complete launcher contract.
 
 First start opens the wizard:
@@ -191,6 +191,36 @@ and `<project>_default` are unchanged.
 Existing containers keep their names until renamed or recreated. Normal startup
 deliberately does not recreate PostgreSQL. Do not change `-Project` or reset the
 database just to adopt the display names.
+
+### Delete an old project
+
+After confirming a replacement project works and any required data is backed up,
+delete only the old installation:
+
+```bash
+./deploy-local.sh delete --project agent-control
+```
+
+```powershell
+pwsh ./deploy-local.ps1 delete -Project agent-control
+```
+
+The command displays the selected project and requires typing its exact name
+before deletion. This permanently deletes its app/MCP/PostgreSQL containers,
+database and MCP OAuth/recording volumes, project-private network, and saved
+settings/secrets/local backups. Creating another project does **not** copy data
+from the old one.
+
+Ownership and foreign container attachments are checked before any project
+resources are changed. Missing or damaged settings do not require completing
+the setup wizard to delete the project. On a partial Docker failure, saved state
+is retained; correct the reported problem and rerun the same `delete` command.
+Already-removed resources are tolerated, and deleting an absent project is a no-op.
+
+Other projects, Automations, the shared proxy, external Docker networks, images
+and build cache are retained. The proxy configuration is not edited; remove
+obsolete routes separately through the proxy's deployment workflow.
+Use `stop --project agent-control` instead when data and configuration must remain.
 
 ### Check permissions and collect data
 

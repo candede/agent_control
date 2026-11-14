@@ -8,11 +8,14 @@ localhost) and an existing Docker network (default: none/standalone).
 Both settings are saved per project; later starts need no URL/network parameters.
 New app/MCP port defaults skip occupied host and Docker-published TCP ports.
 Saved ports are retained so registered callbacks do not change automatically.
+delete permanently removes the selected project's containers, database/MCP volumes,
+private network and saved settings/secrets/backups after typed confirmation.
+Shared proxy resources, external networks, images and build cache are retained.
 #>
 [CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Position=0)]
-    [ValidateSet('start','stop','edit-config','check')]
+    [ValidateSet('start','stop','edit-config','check','delete')]
     [string]$Command = 'start',
     [string]$Project = 'agent-control',
     [switch]$DbReset,
@@ -44,7 +47,7 @@ try {
         $PSBoundParameters.ContainsKey('ExpectedPreflight') -or $ReadOnly) -and [string]::IsNullOrWhiteSpace($Candidate)) {
         throw 'Release parameters require a nonempty -Candidate. No ordinary deployment was started.'
     }
-    $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -eq 'stop')
+    $context = New-LocalContext -Root $PSScriptRoot -Project $Project -SkipSettings:($Command -in @('stop','delete'))
     $context.McpConfigInput = $McpConfig
     $context.ConfigureMcp = [bool]$ConfigureMcp
     if ($PSBoundParameters.ContainsKey('DockerNetwork')) { $context.ProxyNetworkInput = $DockerNetwork }
@@ -59,10 +62,15 @@ try {
         'stop' { 'Stop' }
         'edit-config' { 'EditConfig' }
         'check' { 'Test' }
+        'delete' { 'Delete' }
     }
     Invoke-LocalDeployment -Context $context -Action $operation -DbReset:$DbReset -ForceChecks:$ForceChecks
 } catch {
-    $resetStatus = if ($context -and $context.DbResetStarted) {
+    $resetStatus = if ($Command -eq 'delete') {
+        if ($context -and $context.ProjectDeleteStarted) {
+            'Project deletion began and may be partially complete. Correct the reported failure and rerun delete for the same project.'
+        } else { 'No project resources were deleted.' }
+    } elseif ($context -and $context.DbResetStarted) {
         'The explicit database reset began; data may already have been deleted. Reset and initialization failures leave the app in maintenance.'
     } else { 'The application database was not reset.' }
     Write-Error "Local operation failed: $($_.Exception.Message) Review the failed phase above. $resetStatus"

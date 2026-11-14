@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 usage() {
     cat <<'USAGE'
-Usage: ./deploy-local.sh [start|stop|edit-config|check] [options]
+Usage: ./deploy-local.sh [start|stop|edit-config|check|delete] [options]
   --project NAME                 Saved project (default: agent-control)
   --docker-network NAME          Optional additional Docker network (wizard default: none)
   --public-url URL               Canonical HTTPS origin (wizard default: localhost; local clears it)
@@ -22,7 +22,10 @@ The deployment never manages the shared proxy, network or certificates.
 First start and edit-config ask for optional public URL and Docker network.
 Both are saved per project; later updates only need ./deploy-local.sh start.
 New app/MCP port defaults skip occupied host and Docker-published TCP ports.
-Application data is retained unless --db-reset is explicitly requested.
+Normal start/stop retain application data; --db-reset explicitly resets it.
+delete permanently removes only the selected project's containers, database/MCP
+volumes, private network and saved settings/secrets/backups after typed confirmation.
+Shared proxy resources, external networks, images and build cache are retained.
 USAGE
 }
 command=start
@@ -31,7 +34,7 @@ if (($#)) && [[ $1 != -* ]]; then
     shift
 fi
 case "$command" in
-    start|stop|edit-config|check) ;;
+    start|stop|edit-config|check|delete) ;;
     *) printf 'Unknown command: %s\n' "$command" >&2; exit 2 ;;
 esac
 arguments=("$command")

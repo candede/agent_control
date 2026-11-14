@@ -105,6 +105,22 @@ test("incomplete pinned-release metadata fails before Docker access", () => {
   }
 });
 
+test("delete forwards the selected project to the same core through either launcher runtime", () => {
+  const expected = ["-NoLogo", "-NoProfile", "-File", join(root, "deploy-local.ps1"),
+    "delete", "-Project", "agent-control"];
+  executable("pwsh", `printf '%s\\0' "$@" >> "$TEST_LOG"; printf '\\n' >> "$TEST_LOG"`);
+  try {
+    const result = run(["delete", "--project", "agent-control"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(calls(), [expected]);
+  } finally { rmSync(join(bin, "pwsh")); }
+  const result = run(["delete", "--project", "agent-control"]);
+  assert.equal(result.status, 0, result.stderr);
+  const container = calls().find(args => args[0] === "run");
+  assert.ok(container);
+  assert.deepEqual(container.slice(-expected.length), expected);
+});
+
 test("native Linux bootstraps the same core without host PowerShell and preserves failure status", () => {
   const result = run(["start", "--project", "seha", "--docker-network", "agent-control-local-ingress"], { TEST_DEPLOY_EXIT: "37" });
   assert.equal(result.status, 37, result.stderr);

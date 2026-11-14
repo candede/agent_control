@@ -507,7 +507,7 @@ try {
     $script:Failure=''; $script:ComposeVersion='1.29.0'
     Assert-Fails { Invoke-LocalDeployment $context 'Deploy' } 'Compose v2'
     $script:ComposeVersion='2.30.0'
-    foreach ($action in @('Stop','EditConfig','Test','Retain')) {
+    foreach ($action in @('Stop','EditConfig','Test','Retain','Delete')) {
         $callCount=$script:Calls.Count
         Assert-Fails { Invoke-LocalDeployment $context $action -DbReset } 'DbReset.*start'
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid DbReset combination invoked Docker.'
@@ -1082,7 +1082,7 @@ try {
     Assert-Fails { . $entryPath -Port 3001 } 'parameter.*Port'
     Assert-Fails { . $entryPath -StateRoot $testRoot } 'parameter.*StateRoot'
     Assert-Fails { . $entryPath -Command unsupported } 'ValidateSet|validation|not belong'
-    foreach ($invalidResetCommand in @('stop','edit-config')) {
+    foreach ($invalidResetCommand in @('stop','edit-config','delete')) {
         $callCount=$script:Calls.Count
         Assert-Fails { . $entryPath $invalidResetCommand -DbReset } 'DbReset.*only with start'
         Assert-True ($script:Calls.Count -eq $callCount) 'Invalid public DbReset combination invoked Docker.'

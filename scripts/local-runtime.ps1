@@ -363,7 +363,7 @@ function Resolve-LocalDeniedReset {
 }
 
 function Get-OwnedLocalContainers {
-    param($Context)
+    param($Context,[switch]$ForDeletion)
     $ids = Invoke-DockerCommand @('ps','-aq','--no-trunc','--filter',"label=com.docker.compose.project=$($Context.Project)") -Capture
     foreach ($id in ($ids -split "`n" | Where-Object { $_ })) {
         if ($id -cnotmatch '^[a-f0-9]{12,64}$') { throw 'Invalid local container identity.' }
@@ -375,7 +375,7 @@ function Get-OwnedLocalContainers {
         }
         $state = Invoke-DockerCommand @('inspect','--format','{{json .State}}',$id) -Capture | ConvertFrom-Json
         $image = Invoke-DockerCommand @('inspect','--format','{{.Image}}',$id) -Capture
-        if ($labels.'com.docker.compose.service' -ceq 'mcp') { Assert-LocalMcpContainer $Context $id }
+        if ($labels.'com.docker.compose.service' -ceq 'mcp' -and -not $ForDeletion) { Assert-LocalMcpContainer $Context $id }
         @{ Id=$id; Service=$labels.'com.docker.compose.service'; State=$state; Image=$image }
     }
 }
@@ -393,6 +393,88 @@ function Stop-LocalProject {
         }
     }
     Write-Host '[STOP] Project stopped; data and saved configuration are retained.'
+}
+
+function Assert-LocalProjectDeleteState {
+    param($Context)
+    $expected = New-LocalContext $Context.Root $Context.Project -SkipSettings
+    if ($Context.State -cne $expected.State -or $Context.Volume -cne $expected.Volume -or $Context.Network -cne $expected.Network) {
+        throw 'Project deletion context does not match the selected project state, volume and private network.'
+    }
+    Assert-LocalBuildPath $Context.Root $Context.State
+    if (Test-Path -LiteralPath $Context.State) {
+        if (-not (Get-Item -LiteralPath $Context.State -Force).PSIsContainer) { throw 'Saved project state must be a directory.' }
+        foreach ($entry in Get-ChildItem -LiteralPath $Context.State -Recurse -Force -ErrorAction Stop) {
+            if ($entry.LinkType) { throw 'Symbolic paths inside saved project state must be removed before project deletion.' }
+        }
+    }
+}
+
+function Get-LocalProjectDeleteInventory {
+    param($Context)
+    Assert-LocalProjectDeleteState $Context
+    $containers = @(Get-OwnedLocalContainers $Context -ForDeletion)
+    $ids = @($containers.Id)
+    $existingVolumes = (Invoke-DockerCommand @('volume','ls','--format','{{.Name}}') -Capture) -split "`n"
+    $volumes = @(foreach ($logical in @('data','mcp-oauth','mcp-recordings')) {
+        $name = "$($Context.Project)_$logical"
+        if ($name -cnotin $existingVolumes) { continue }
+        $volume = Invoke-DockerCommand @('volume','inspect','--format','{{json .}}',$name) -Capture | ConvertFrom-Json -AsHashtable
+        if ($volume.Name -cne $name -or $volume.Driver -cne 'local' -or
+            $volume.Labels.'com.docker.compose.project' -cne $Context.Project -or
+            $volume.Labels.'com.docker.compose.volume' -cne $logical) {
+            throw "Project volume '$name' ownership mismatch; deletion refused."
+        }
+        $consumers = Invoke-DockerCommand @('ps','-aq','--no-trunc','--filter',"volume=$name") -Capture
+        foreach ($id in ($consumers -split "`n" | Where-Object { $_ })) {
+            if ($id -cnotin $ids) { throw "Project volume '$name' is used by a foreign container; deletion refused." }
+        }
+        $name
+    })
+    $networkId = ''
+    $existingNetworks = (Invoke-DockerCommand @('network','ls','--format','{{.Name}}') -Capture) -split "`n"
+    if ($Context.Network -cin $existingNetworks) {
+        $network = Invoke-DockerCommand @('network','inspect','--format','{{json .}}',$Context.Network) -Capture | ConvertFrom-Json -AsHashtable
+        if ($network.Name -cne $Context.Network -or $network.Id -cnotmatch '^[a-f0-9]{64}$' -or
+            $network.Driver -cne 'bridge' -or $network.Scope -cne 'local' -or
+            $network.Labels.'com.docker.compose.project' -cne $Context.Project -or
+            $network.Labels.'com.docker.compose.network' -cne 'default' -or $network.Labels.'io.shared-proxy.managed') {
+            throw 'Project-private network ownership mismatch; shared or foreign networks must not be deleted.'
+        }
+        $consumers = Invoke-DockerCommand @('ps','-aq','--no-trunc','--filter',"network=$($Context.Network)") -Capture
+        foreach ($id in (@($network.Containers.Keys) + @($consumers -split "`n" | Where-Object { $_ }))) {
+            if ($id -cnotin $ids) { throw 'Project-private network has a foreign container; deletion refused.' }
+        }
+        $networkId = $network.Id
+    }
+    return @{Containers=$containers; Volumes=$volumes; NetworkId=$networkId; HasState=(Test-Path -LiteralPath $Context.State)}
+}
+
+function Remove-LocalProject {
+    param($Context)
+    $inventory = Get-LocalProjectDeleteInventory $Context
+    if (-not $inventory.Containers.Count -and -not $inventory.Volumes.Count -and -not $inventory.NetworkId -and -not $inventory.HasState) {
+        Write-Host "[DELETE] Project '$($Context.Project)' has no remaining containers, managed volumes, private network or saved state."
+        return
+    }
+    Write-Warning "Permanently delete project '$($Context.Project)': $($inventory.Containers.Count) containers, $($inventory.Volumes.Count) database/MCP volumes, its private network and $($Context.State) (including settings, secrets and backups). No data is transferred to another project."
+    Write-Host 'Other projects, the shared proxy, external networks, images and build cache will not be deleted.'
+    $confirmation = [string](Read-Host "Type the exact project name '$($Context.Project)' to permanently delete it")
+    if ($confirmation -cne $Context.Project) { throw 'Project deletion cancelled: the project name was not confirmed. No project resources were deleted.' }
+    # Revalidate ownership and attachments after waiting for the operator's confirmation.
+    $inventory = Get-LocalProjectDeleteInventory $Context
+    $Context.ProjectDeleteStarted = $true
+    foreach ($service in @('mcp','app','postgres')) {
+        foreach ($container in @($inventory.Containers | Where-Object Service -CEQ $service)) {
+            if ($container.State.Running) { Invoke-DockerCommand @('stop','--time','130',$container.Id) }
+            Invoke-DockerCommand @('rm',$container.Id)
+        }
+    }
+    foreach ($volume in $inventory.Volumes) { Invoke-DockerCommand @('volume','rm',$volume) }
+    if ($inventory.NetworkId) { Invoke-DockerCommand @('network','rm',$inventory.NetworkId) }
+    Assert-LocalProjectDeleteState $Context
+    if ($inventory.HasState) { Remove-Item -LiteralPath $Context.State -Recurse -Force -ErrorAction Stop }
+    Write-Host "[DELETE] Deleted project '$($Context.Project)' and its saved data. Shared infrastructure and other projects were retained."
 }
 
 function Get-LocalDeploymentIdentity {

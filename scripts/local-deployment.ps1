@@ -802,7 +802,7 @@ function Remove-ExpiredLocalBackups {
 }
 
 function Invoke-LocalDeployment {
-    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore')][string]$Action,
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore','Delete')][string]$Action,
         [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[switch]$DbReset,[switch]$ForceChecks)
     $operationLock = $null
     try {
@@ -817,16 +817,22 @@ function Invoke-LocalDeployment {
 }
 
 function Invoke-LocalDeploymentCore {
-    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore')][string]$Action,
+    param($Context,[ValidateSet('Deploy','Test','Stop','EditConfig','Retain','Reopen','Backup','Restore','Delete')][string]$Action,
         [string]$BackupFile,[string]$RestoreDatabase,[string]$ConfirmCleanup,[int]$CleanupBatchSize=1000,[switch]$DryRun,[switch]$DbReset,[switch]$ForceChecks)
     if ($DbReset -and $Action -ne 'Deploy') { throw '-DbReset is supported only by the start deployment workflow.' }
     if ($ForceChecks -and $Action -notin @('Deploy','Test')) { throw '-ForceChecks is supported only by start or the internal Test action.' }
     $Context.DbResetStarted = $false
+    $Context.ProjectDeleteStarted = $false
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Install and start the company-approved Docker engine/Desktop and Compose v2 before continuing.' }
     Invoke-DockerCommand @('info','--format','{{.ServerVersion}}') | Out-Null
     $composeVersion = Invoke-DockerCommand @('compose','version','--short') -Capture
     if ($composeVersion -notmatch '^v?([2-9]|[1-9][0-9])\.') { throw 'Docker Compose v2 or newer is required.' }
     if ($Action -eq 'Stop') { Stop-LocalProject $Context; return }
+    if ($Action -eq 'Delete') {
+        if ($DryRun) { throw 'delete does not support DryRun; it requires typed confirmation before removing project resources.' }
+        Remove-LocalProject $Context
+        return
+    }
     if ($Action -in @('Deploy','Test')) {
         Invoke-LocalApplication $Context -CheckOnly:($Action -eq 'Test') -ForceChecks:$ForceChecks -DbReset:$DbReset
         return
