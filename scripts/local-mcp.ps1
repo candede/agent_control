@@ -407,6 +407,7 @@ function Test-LocalMcpConfiguration {
     param($Context)
     if (-not $Context.Mcp) { return }
     Initialize-LocalMcpStorage $Context
+    Write-Host '[MCP PREFLIGHT] Validating credentials, settings and OAuth storage without network access.'
     Invoke-DockerCommand (@('run','--rm','--network','none') + (Get-LocalMcpRunArguments $Context) +
         @('--entrypoint','python',$Context.McpImageId,'-c','from agent_control_mcp.config import Settings; from agent_control_mcp.storage import OAuthStore; OAuthStore(Settings.from_env())')) -Capture -CaptureError | Out-Null
 }
@@ -423,6 +424,7 @@ function Initialize-LocalMcpStorage {
     $volume = Get-LocalMcpVolume $Context
     $uid = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
     $gid = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
+    Write-Host '[MCP PREFLIGHT] Initializing OAuth volume ownership (64 MiB helper).'
     Invoke-DockerCommand @('run','--rm','--network','none','--user','0:0','--read-only','--cap-drop','ALL','--cap-add','CHOWN',
         '--cap-add','FOWNER','--security-opt','no-new-privileges','--memory','64m','--cpus','0.25','--pids-limit','16',
         '--mount',"type=volume,source=$($Context.McpVolume),target=/var/lib/agent-control-mcp/oauth,volume-nocopy",
@@ -442,6 +444,7 @@ function Initialize-LocalMcpRecordingStorage {
     Get-LocalMcpRecordingVolume $Context | Out-Null
     $uid = if ($IsWindows) { '1000' } else { (& id -u).Trim() }
     $gid = if ($IsWindows) { '1000' } else { (& id -g).Trim() }
+    Write-Host '[MCP PREFLIGHT] Initializing recording volume ownership (64 MiB helper).'
     Invoke-DockerCommand @('run','--rm','--network','none','--user','0:0','--read-only','--cap-drop','ALL','--cap-add','CHOWN',
         '--cap-add','FOWNER','--security-opt','no-new-privileges','--memory','64m','--cpus','0.25','--pids-limit','16',
         '--mount',"type=volume,source=$($Context.McpRecordingVolume),target=/var/lib/agent-control-mcp/recordings,volume-nocopy",

@@ -69,6 +69,15 @@ or incorrectly protected existing data instead of silently repairing ownership.
 Runtime directories are `0700`; files are `0600`. The regular MCP container
 remains non-root with a read-only root filesystem.
 
+The ownership helpers run separately with a 64 MiB memory limit. Recording
+initialization does not load the MCP authentication/server stack. The launcher
+prints `[MCP PREFLIGHT]` phases for OAuth ownership, recording ownership and
+configuration validation. Exit code 137 means the helper was killed; a
+container memory-limit kill can happen even when the host has plenty of free
+RAM. Check the host's Docker/kernel OOM diagnostics if it recurs. These helpers
+use `--rm`, so a failed helper will not remain in `docker ps`. Do not reset the
+database or delete OAuth volumes to resolve this failure.
+
 The Azure Blob OAuth profile does not automatically provide recording storage
 or Docker-exec access. This feature is verified for local/VPS Docker. Do not put
 recordings in the OAuth Blob or claim Azure diagnostic persistence without

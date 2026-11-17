@@ -65,6 +65,38 @@ def command(store, *args):
     )
 
 
+def test_initialization_cli_does_not_load_server_dependencies(recording_store):
+    program = """
+import os
+import runpy
+import sys
+
+class NoServerDependencies:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] in {"mcp", "fastmcp", "pydantic", "starlette"}:
+            raise AssertionError(f"Volume initialization imported {fullname}")
+
+sys.meta_path.insert(0, NoServerDependencies())
+uid, gid = os.getuid(), os.getgid()
+sys.argv = ["recording", "initialize", str(uid or 10001), str(gid)]
+os.getuid = lambda: 0
+runpy.run_module("agent_control_mcp.recording", run_name="__main__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        env={
+            **os.environ,
+            "MCP_RECORDING_STORAGE_PATH": str(recording_store.root),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+        },
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    assert result.stdout == b""
+    assert stat.S_IMODE(recording_store.root.stat().st_mode) == 0o700
+
+
 def test_cli_defaults_stop_and_private_export(recording_store):
     store = recording_store
     assert json.loads(command(store, "status").stdout) == {"status": "off"}

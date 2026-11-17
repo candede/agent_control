@@ -21,12 +21,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 from uuid import uuid4
 
-from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from pydantic import JsonValue
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
+if TYPE_CHECKING:
+    from pydantic import JsonValue
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 MIB = 1024 * 1024
@@ -423,6 +423,9 @@ class Recorder:
         started: float,
         received: str | None = None,
     ) -> Capture | None:
+        # The ownership/admin CLI must not load the MCP server's import graph.
+        from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+
         window = self.window
         user = scope.get("user")
         if not window or not window.accepting or not isinstance(user, AuthenticatedUser):
