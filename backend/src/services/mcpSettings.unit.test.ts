@@ -135,6 +135,13 @@ describe("native MCP metadata transport without sockets", () => {
     expect(incoming.destroyed).toBe(true);
   });
 
+  it("keeps runtime metadata available when client callback setup is deferred", async () => {
+    nativeResponse({ body: JSON.stringify({ ...metadata, redirectUris: [] }) });
+    expect(await readMcpSettings(tenant.tenantId)).toMatchObject({
+      state: "available", runtime: { redirectUris: [] },
+    });
+  });
+
   it.each(["?", "#"])("rejects a configured resource with an empty %s delimiter before requesting metadata", async delimiter => {
     vi.stubEnv("MCP_PUBLIC_URL", `${metadata.binding.resourceUrl}${delimiter}`);
     expect(await readMcpSettings(tenant.tenantId)).toMatchObject({

@@ -237,7 +237,7 @@ class Settings:
             raise ConfigurationError("Redirects and encryption keys must be JSON arrays.") from None
         if (
             not isinstance(redirects, list)
-            or not 1 <= len(redirects) <= 32
+            or len(redirects) > 32
             or not all(isinstance(uri, str) for uri in redirects)
             or len(set(redirects)) != len(redirects)
             or not isinstance(keys, list)

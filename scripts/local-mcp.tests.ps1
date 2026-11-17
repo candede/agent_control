@@ -248,7 +248,7 @@ try {
         $bad=$mcp.Clone();$bad.port=$value
         Fails { Assert-LocalMcpSettings $bad 14391 } 'loopback port'
     }
-    foreach ($callback in @('https://*.example.test/callback','http://remote.example.test/callback','https://client.example.test/callback?x=1',
+    foreach ($callback in @('*','https://*.example.test/callback','http://remote.example.test/callback','https://client.example.test/callback?x=1',
         'https://client.example.test/a//callback','https://client.example.test:0/callback','http://127.0.0.1:0/callback')) {
         $bad=$mcp.Clone();$bad.redirectUris=@($callback)
         Fails { Assert-LocalMcpSettings $bad 14391 } 'callbacks'
@@ -590,6 +590,38 @@ try {
     $before=$script:calls.Count
     Save-LocalConfiguration $wizard $callbackEdit
     Assert ($script:calls.Count -eq $before) 'MCP-only callback edit drained or restarted the API.'
+
+    $deferred=New-McpSetupFixture 'deferred-callbacks' @($unbound) 14391
+    $deferred.ConfigureMcp=$true
+    Set-SetupAnswers @('',$mcp.clientId,$mcp.publicUrl,'','') @('synthetic-deferred-mcp-credential')
+    $deferredWarnings=Join-Path $root 'deferred-warnings.txt'
+    $deferredPlan=Read-LocalConfiguration $deferred $false -Edit 3>$deferredWarnings
+    Assert ($deferredPlan.McpPlan.Settings.redirectUris -is [array] -and
+        $deferredPlan.McpPlan.Settings.redirectUris.Count -eq 0) 'Blank first-time callbacks did not produce an empty allowlist.'
+    Assert ($script:prompts[3].text -ceq 'Allowed client callback URLs, comma-separated [optional; Enter to configure later]') 'First-time callback prompt did not explain deferral.'
+    Assert ([IO.File]::ReadAllText($deferredWarnings).Contains('MCP client sign-in is blocked')) 'Deferred setup did not explain that MCP client sign-in is blocked.'
+    Save-LocalConfiguration $deferred $deferredPlan
+    $deferredSettings=Read-LocalSettings $deferred.State
+    Assert ($deferredSettings.mcp.redirectUris -is [array] -and
+        $deferredSettings.mcp.redirectUris.Count -eq 0) 'Saved deferred callbacks were not an empty JSON array.'
+    Assert ([IO.File]::ReadAllText((Join-Path $deferred.State 'compose.env')).Contains("MCP_ALLOWED_CLIENT_REDIRECT_URIS='[]'")) 'Deferred compose configuration did not retain the empty allowlist.'
+    Assert ('MCP_ALLOWED_CLIENT_REDIRECT_URIS=[]' -cin (Get-LocalMcpRunArguments $deferred)) 'Deferred MCP runtime did not receive an empty allowlist.'
+    $deferred.ConfigureMcp=$false
+    Set-SetupAnswers
+    $deferredStart=Read-LocalConfiguration $deferred $false -Onboard
+    Assert ($deferredStart.McpPlan.Settings.redirectUris.Count -eq 0 -and
+        -not $deferredStart.SettingsChanged -and $script:prompts.Count -eq 0) 'Ordinary start could not retain deferred callback setup.'
+    $deferred.ConfigureMcp=$true
+    Set-SetupAnswers @('','','','https://client.example.test/callback','') @('')
+    $completedCallbacks=Read-LocalConfiguration $deferred $false -Edit
+    Assert ($completedCallbacks.McpPlan.Settings.redirectUris.Count -eq 1 -and
+        $completedCallbacks.SettingsChanged -and -not $completedCallbacks.RegistryChanged -and
+        -not $completedCallbacks.ApplicationSettingsChanged -and -not $completedCallbacks.McpPlan.SecretsChanged) 'Completing deferred callbacks changed API configuration or OAuth secrets.'
+    Save-LocalConfiguration $deferred $completedCallbacks
+    Set-SetupAnswers @('','','','','') @('')
+    $keptCallbacks=Read-LocalConfiguration $deferred $false -Edit
+    Assert ($keptCallbacks.McpPlan.Settings.redirectUris[0] -ceq 'https://client.example.test/callback' -and
+        -not $keptCallbacks.SettingsChanged) 'Enter did not retain callbacks added after deferred setup.'
 
     $wizard.ConfigureMcp=$false
     Set-SetupAnswers

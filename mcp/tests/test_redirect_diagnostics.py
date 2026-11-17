@@ -149,7 +149,7 @@ def test_untrusted_input_is_redacted_and_flagged_in_every_output_format(uri):
 
 
 @pytest.mark.parametrize(
-    "value", [None, "bad", "{}", "[]", '["bad"]', "[1]", json.dumps([ALLOWED] * 2)]
+    "value", [None, "bad", "{}", '["bad"]', "[1]", json.dumps([ALLOWED] * 2)]
 )
 def test_invalid_runtime_policy_is_an_explicit_error(value):
     with pytest.raises(DiagnosticError, match="allowlist|missing"):
@@ -162,6 +162,13 @@ def test_policy_reuses_exact_canonical_callback_validation():
         "http://127.0.0.1:33418/",
     }
     assert redacted_redirect_uri(REJECTED) == REJECTED
+
+
+def test_deferred_callback_policy_reports_rejected_callbacks_for_later_setup():
+    rows = collect_redirect_diagnostics(io.StringIO(event([REJECTED])), configured_redirects("[]"))
+    assert len(rows) == 1
+    assert rows[0].redirect_uri == REJECTED
+    assert rows[0].status == "not_allowed"
 
 
 @pytest.mark.parametrize("payload", ["bad", "{}", "[1]", '[["nested"]]', '["unterminated'])

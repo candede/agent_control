@@ -93,7 +93,7 @@ export function parseMcpRuntimeMetadata(value: unknown): McpRuntimeMetadata {
     if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(text(binding[key], 36))) invalid();
   }
   url(binding.resourceUrl);
-  if (!Array.isArray(data.redirectUris) || !data.redirectUris.length || data.redirectUris.length > 32
+  if (!Array.isArray(data.redirectUris) || data.redirectUris.length > 32
     || new Set(data.redirectUris).size !== data.redirectUris.length) invalid();
   data.redirectUris.forEach(uri => url(uri, true));
   const info = fields(data.serverInfo, ["name", "version", "title", "description", "websiteUrl", "icons"]);

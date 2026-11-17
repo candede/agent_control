@@ -49,6 +49,11 @@ addresses for the clients you use, not each individual user or installation.
 Loopback addresses refer to the machine running the client, not the MCP
 container; their ports are separate from the MCP server's listening port.
 
+If the callbacks are not yet known, local server setup can save an empty
+allowlist by leaving this prompt blank on first setup. This allows deployment,
+not client access: MCP client registration and sign-in stay blocked until exact
+callbacks are added. `*` does not enable all clients and is rejected.
+
 | Client | Client callback URLs | Notes |
 | --- | --- | --- |
 | VS Code / GitHub Copilot, web redirects | `https://insiders.vscode.dev/redirect`, `https://vscode.dev/redirect` | Include both with the desktop callbacks below. |

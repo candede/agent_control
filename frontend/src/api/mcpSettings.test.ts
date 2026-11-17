@@ -40,6 +40,12 @@ function respond(raw: string) {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("MCP settings wire contract", () => {
+  it("preserves an empty callback allowlist while setup is deferred", async () => {
+    const runtime = { ...metadata(), redirectUris: [] };
+    respond(JSON.stringify(settings(runtime)));
+    await expect(getMcpSettings()).resolves.toEqual(settings(runtime));
+  });
+
   it("preserves a full 4 MiB runtime catalog through the settings envelope and browser stream", async () => {
     const runtime = metadata();
     runtime.tools[0].inputSchema.description = "";

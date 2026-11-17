@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from agent_control_mcp.auth import TenantAzureProvider, valid_claims
-from agent_control_mcp.config import ConfigurationError
+from agent_control_mcp.config import ConfigurationError, Settings
 from agent_control_mcp.domains import PUBLIC_TOOLS
 from agent_control_mcp.service import ProtocolBoundary, build_service
 from agent_control_mcp.storage import CLIENT_COLLECTION, OAuthStore
@@ -385,6 +385,53 @@ async def test_dynamic_consumers_do_not_require_a_vendor_client_id(browser, sett
     assert len(identifiers) == 3
     assert not any(record.name == "agent_control_mcp.auth" for record in caplog.records)
     assert (await browser.get("/diagnostics")).status_code == 401
+
+
+async def test_deferred_callbacks_start_closed_and_can_be_configured(settings_env, entra):
+    callback = "https://client.example.test/callback"
+    for redirects in ([], [callback]):
+        settings_env["MCP_ALLOWED_CLIENT_REDIRECT_URIS"] = json.dumps(redirects)
+        settings = Settings.from_env(settings_env)
+        runtime = build_service(settings, transport=httpx2.MockTransport(entra.route))
+        sdk_app = runtime.app.app
+        try:
+            async with sdk_app.router.lifespan_context(sdk_app):
+                async with httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=runtime.app),
+                    base_url=settings.public_origin,
+                    follow_redirects=False,
+                ) as browser:
+                    assert (await browser.get("/ready")).status_code == 200
+                    metadata = await browser.post(
+                        "/internal/mcp-metadata",
+                        headers={
+                            "X-Agent-Control-Mcp-Metadata-Token": settings.metadata_key.decode()
+                        },
+                        json=entra.profiles["admin"],
+                    )
+                    assert metadata.status_code == 200, metadata.text
+                    assert metadata.json()["redirectUris"] == redirects
+                    if not redirects:
+                        for rejected in (callback, "http://127.0.0.1:53110/"):
+                            response = await browser.post(
+                                "/register",
+                                json={
+                                    "redirect_uris": [rejected],
+                                    "token_endpoint_auth_method": "none",
+                                },
+                            )
+                            assert response.status_code == 400, response.text
+                            assert response.json()["error"] == "invalid_redirect_uri"
+                        assert not entra.calls
+                    else:
+                        _, issued = await tokens(browser, redirect_uri=callback)
+                        response = await browser.get(
+                            "/diagnostics",
+                            headers={"Authorization": f"Bearer {issued['access_token']}"},
+                        )
+                        assert response.status_code == 200, response.text
+        finally:
+            await runtime.http.aclose()
 
 
 @pytest.mark.parametrize(

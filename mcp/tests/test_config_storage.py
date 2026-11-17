@@ -47,7 +47,8 @@ def test_missing_configuration(settings_env, missing):
         ("MCP_API_ORIGIN", "https://api.example.test/../escape"),
         ("MCP_API_ORIGIN", "http://remote.example.test"),
         ("MCP_OAUTH_STORAGE_PATH", "/"),
-        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", "[]"),
+        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", "null"),
+        ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["*"]'),
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://*.example.test/callback"]'),
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["http://remote.example.test/callback"]'),
         ("MCP_ALLOWED_CLIENT_REDIRECT_URIS", '["https://client.example.test/callback?x=y"]'),
@@ -60,6 +61,11 @@ def test_invalid_configuration(settings_env, name, value):
     settings_env[name] = value
     with pytest.raises(ConfigurationError):
         Settings.from_env(settings_env)
+
+
+def test_callback_allowlist_can_be_configured_later(settings_env):
+    settings_env["MCP_ALLOWED_CLIENT_REDIRECT_URIS"] = "[]"
+    assert Settings.from_env(settings_env).redirect_uris == ()
 
 
 def test_independent_keys_and_permissions(settings_env):

@@ -136,12 +136,19 @@ Enter:
 | Choose a configuration number | Number of an existing Agent Control tenant configuration in this project; Enter selects the shown default |
 | MCP Entra application ID | `<MCP_CLIENT_ID>` from step 2 |
 | Public HTTPS resource URL | Full public endpoint, for example `https://mcp.example.com/mcp`, not just `https://mcp.example.com`; no trailing slash |
-| Allowed client callback URLs | Exact URLs for your client, comma-separated; see below |
+| Allowed client callback URLs | Exact URLs for your client, comma-separated; Enter on first setup defers this until later |
 | MCP loopback port | Normally `8001`; use the port selected by the wizard |
 | MCP Entra client secret | Secret **Value** from step 2; hidden input |
 
 The public MCP URL is required on first setup; the example is not a default.
 On later edits, the wizard shows the saved URL and Enter keeps it.
+Client callback URLs can be left blank on first setup if they are not yet known.
+This saves an empty allowlist (`[]`), not permission for all clients. The server
+can start, but MCP client registration and sign-in remain blocked until exact
+callbacks are configured. The web application is unaffected. On later edits,
+Enter keeps any saved callbacks; an explicit configuration file can also supply
+`"redirectUris": []`.
+
 Public resource and callback URLs must be canonical, contain no wildcards, and
 be at most 2,048 characters. Resource and callback paths cannot contain repeated `/` separators,
 and explicit ports must be from 1 to 65535. Callback paths are case-sensitive;
@@ -159,6 +166,7 @@ It includes Microsoft's documented Teams plugin callback and identifies which
 callbacks must be obtained from the client rather than guessed. When adding a
 client later, rerun `start -ConfigureMcp` for the same project and provide the
 combined existing and new callbacks, comma-separated. `*` is not accepted.
+For example, on Linux: `./deploy-local.sh start --project seha --configure-mcp`.
 Changing client callbacks does not change the MCP server's Entra `/auth/callback`.
 
 Point your HTTPS proxy/tunnel at the selected loopback port.

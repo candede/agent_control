@@ -19,8 +19,8 @@ function Assert-LocalMcpSettings {
         $uri.AbsolutePath -cin @('/health','/ready','/diagnostics','/internal/mcp-metadata','/authorize','/token','/consent','/auth/callback','/register','/revoke') -or
         $uri.AbsolutePath.StartsWith('/.well-known/') -or $uri.AbsolutePath.Contains('//') -or
         $uri.Query -or $uri.Fragment -or $Mcp.publicUrl -match "[%\\\s'*]") { throw 'MCP publicUrl must be one exact canonical HTTPS resource of at most 2048 characters, separate from its internal API origin.' }
-    if ($Mcp.redirectUris -isnot [array] -or $Mcp.redirectUris.Count -lt 1 -or $Mcp.redirectUris.Count -gt 32 -or
-        @($Mcp.redirectUris | Sort-Object -CaseSensitive -Unique).Count -ne $Mcp.redirectUris.Count) { throw 'MCP requires 1-32 distinct exact client redirect URIs.' }
+    if ($Mcp.redirectUris -isnot [array] -or $Mcp.redirectUris.Count -gt 32 -or
+        @($Mcp.redirectUris | Sort-Object -CaseSensitive -Unique).Count -ne $Mcp.redirectUris.Count) { throw 'MCP requires an array of 0-32 distinct exact client redirect URIs.' }
     foreach ($redirect in $Mcp.redirectUris) {
         $callback = $null
         if ($redirect -isnot [string] -or $redirect.Length -gt 2048 -or -not [Uri]::TryCreate($redirect,[UriKind]::Absolute,[ref]$callback) -or
@@ -111,8 +111,15 @@ function Read-LocalMcpSettings {
         if (-not [string]::IsNullOrWhiteSpace($url)) { break }
         Write-Warning 'MCP public HTTPS resource URL is required. Enter the full endpoint, for example https://mcp.example.com/mcp.'
     }
-    $redirects = [string](Read-Host "Allowed client callback URLs, comma-separated [$(@($Current.redirectUris) -join ','); Enter to keep]")
-    $redirectUris = if ([string]::IsNullOrWhiteSpace($redirects)) { @($Current.redirectUris) } else { @($redirects -split ',' | ForEach-Object { $_.Trim() }) }
+    $redirectPrompt = if ($Current -and $Current.redirectUris.Count) { "Allowed client callback URLs, comma-separated [$($Current.redirectUris -join ','); Enter to keep]" }
+        else { 'Allowed client callback URLs, comma-separated [optional; Enter to configure later]' }
+    $redirects = [string](Read-Host $redirectPrompt)
+    $redirectUris = @()
+    if (-not [string]::IsNullOrWhiteSpace($redirects)) { $redirectUris = @($redirects -split ',' | ForEach-Object { $_.Trim() }) }
+    elseif ($Current) { $redirectUris = @($Current.redirectUris) }
+    if (-not $redirectUris.Count) {
+        Write-Warning 'No client callback URLs are configured. MCP client sign-in is blocked until exact callback URLs are added. Rerun MCP setup for this project when they are known.'
+    }
     $result = [ordered]@{
         tenantId=$profile.tenantId.ToLowerInvariant(); apiClientId=$profile.clientId.ToLowerInvariant(); clientId=$client
         publicUrl=$url.Trim(); redirectUris=@($redirectUris)

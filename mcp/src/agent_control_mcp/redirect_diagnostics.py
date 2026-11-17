@@ -85,7 +85,7 @@ def configured_redirects(raw: str | None) -> set[str]:
         values = json.loads(raw)
         if (
             not isinstance(values, list)
-            or not 1 <= len(values) <= 32
+            or len(values) > 32
             or not all(isinstance(value, str) for value in values)
             or len(set(values)) != len(values)
         ):
